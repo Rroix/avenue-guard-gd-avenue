@@ -32,6 +32,7 @@ class CommandsCog(commands.Cog):
         self.tracking_group.command(name="reset", description="Reset current week's tracking stats (Admins/Owners only).")(self.tracking_reset)
         self.tracking_group.command(name="me", description="Show your activity stats for this week.")(self.tracking_me)
         self.tracking_group.command(name="force_dm", description="Force-send the weekly request DM to a user (Admins/Owners only).")(self.tracking_force_dm)
+        self.tracking_group.command(name="disable_reward", description="Disable this week's automatic weekly request reward (Admins/Owners only).")(self.tracking_disable_reward)
 
         self.ticket_group.command(name="close", description="Close the current ticket channel (Mods only).")(self.ticket_close)
         self.forum_group.command(name="required_word", description="View or update a forum required word (Admins only).")(self.forum_required_word)
@@ -63,6 +64,22 @@ class CommandsCog(commands.Cog):
     def _in_allowed_guild(self, ctx: discord.ApplicationContext) -> bool:
         return ctx.guild is not None and ctx.guild.id == self.allowed_guild_id
 
+    async def _resolve_member(self, guild: discord.Guild, user) -> Optional[discord.Member]:
+        if isinstance(user, discord.Member):
+            return user
+        user_id = getattr(user, "id", user)
+        try:
+            user_id = int(user_id)
+        except Exception:
+            return None
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(user_id)
+        except Exception:
+            return None
+
     # --- /tracking top ---
 
     async def tracking_top(self, ctx: discord.ApplicationContext):
@@ -83,7 +100,7 @@ class CommandsCog(commands.Cog):
 
         top = []
         for uid, cnt in raw:
-            member = ctx.guild.get_member(uid) if ctx.guild else None
+            member = await self._resolve_member(ctx.guild, uid)
             if member is None or member.bot:
                 continue
             if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
@@ -140,7 +157,7 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
         admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
-        invoker = ctx.guild.get_member(ctx.user.id) if ctx.guild else None
+        invoker = await self._resolve_member(ctx.guild, ctx.user)
         if invoker is None or not is_admin_or_owner(invoker, admin_roles):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
@@ -156,7 +173,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
-        member = ctx.guild.get_member(ctx.user.id)
+        member = await self._resolve_member(ctx.guild, ctx.user)
         admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
         if member is None or not is_admin_or_owner(member, admin_roles):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
@@ -168,12 +185,31 @@ class CommandsCog(commands.Cog):
         await tracking.reset_current_week(ctx.guild.id)
         await ctx.respond("Tracking stats for the current week have been reset.", ephemeral=True)
 
+    async def tracking_disable_reward(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+
+        member = await self._resolve_member(ctx.guild, ctx.user)
+        admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
+        if member is None or not is_admin_or_owner(member, admin_roles):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+
+        tracking = self.bot.get_cog("TrackingCog")
+        if tracking is None:
+            return await ctx.respond("Tracking cog not loaded.", ephemeral=True)
+
+        week_start_iso = await tracking.disable_weekly_reward_for_current_week(ctx.guild, ctx.user.id)
+        await ctx.respond(
+            f"Weekly request reward disabled for the current tracking week starting **{week_start_iso}**.",
+            ephemeral=True,
+        )
+
     # --- /ticket close ---
     async def ticket_close(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
-        member = ctx.guild.get_member(ctx.user.id)
+        member = await self._resolve_member(ctx.guild, ctx.user)
         mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
         if member is None or not is_mod(member, mod_role_id):
             return await ctx.respond("Only mods can close tickets.", ephemeral=True)
@@ -282,7 +318,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
-        member = ctx.guild.get_member(ctx.user.id)
+        member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not member.guild_permissions.administrator:
             return await ctx.respond("Nah, you can't use this", ephemeral=True)
 
@@ -327,7 +363,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
-        member = ctx.guild.get_member(ctx.user.id)
+        member = await self._resolve_member(ctx.guild, ctx.user)
         admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
         if member is None or not is_admin_or_owner(member, admin_roles):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
@@ -356,7 +392,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
-        member = ctx.guild.get_member(ctx.user.id)
+        member = await self._resolve_member(ctx.guild, ctx.user)
         admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
         if member is None or not is_admin_or_owner(member, admin_roles):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
@@ -437,7 +473,7 @@ class CommandsCog(commands.Cog):
                         reward_role_id = cfg.get_int("roles", "rps_streak_role_id")
                         if o == "win" and reward_role_id and streak >= 5 and interaction.guild:
                             role = interaction.guild.get_role(reward_role_id)
-                            member = interaction.guild.get_member(user_id)
+                            member = await parent._resolve_member(interaction.guild, user_id)
                             if role and member and role not in member.roles:
                                 try:
                                     await member.add_roles(role, reason="RPS 5-win streak reward")
@@ -560,7 +596,7 @@ class CommandsCog(commands.Cog):
 
         content = f"🎰 **{final}** 🎰\n"
         if won and role is not None:
-            member = ctx.guild.get_member(ctx.user.id)
+            member = await self._resolve_member(ctx.guild, ctx.user)
             if member and role not in member.roles:
                 try:
                     await member.add_roles(role, reason="Gambling win")

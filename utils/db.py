@@ -109,6 +109,13 @@ class Database:
                 ran_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, week_start)
             );""",
+            """CREATE TABLE IF NOT EXISTS weekly_reward_disabled(
+                guild_id INTEGER NOT NULL,
+                week_start TEXT NOT NULL,
+                disabled_ts INTEGER NOT NULL,
+                disabled_by INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, week_start)
+            );""",
             """CREATE TABLE IF NOT EXISTS tickets(
                 guild_id INTEGER NOT NULL,
                 channel_id INTEGER PRIMARY KEY,
@@ -331,6 +338,13 @@ class Database:
     guild_id INTEGER NOT NULL,
     week_start TEXT NOT NULL,
     ran_ts INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, week_start)
+);""",
+"""CREATE TABLE IF NOT EXISTS weekly_reward_disabled(
+    guild_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    disabled_ts INTEGER NOT NULL,
+    disabled_by INTEGER NOT NULL,
     PRIMARY KEY (guild_id, week_start)
 );""",
 """CREATE TABLE IF NOT EXISTS tickets(

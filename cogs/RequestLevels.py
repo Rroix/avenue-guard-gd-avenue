@@ -353,6 +353,25 @@ class RequestLevelsCog(commands.Cog):
     def _in_allowed_guild(self, ctx: discord.ApplicationContext) -> bool:
         return ctx.guild is not None and ctx.guild.id == self.allowed_guild_id
 
+    async def _resolve_member(self, guild: discord.Guild, user) -> Optional[discord.Member]:
+        if isinstance(user, discord.Member):
+            return user
+
+        user_id = getattr(user, "id", user)
+        try:
+            user_id = int(user_id)
+        except Exception:
+            return None
+
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member
+
+        try:
+            return await guild.fetch_member(user_id)
+        except Exception:
+            return None
+
     def _is_admin(self, member: discord.Member) -> bool:
         return is_admin_or_owner(member, self.bot.config.get_int_list("roles", "admin_owner_role_ids"))
 
@@ -362,6 +381,11 @@ class RequestLevelsCog(commands.Cog):
     async def _configured_channel(self, guild: discord.Guild, key: str) -> Optional[discord.TextChannel]:
         channel_id = self._cfg_int(key)
         channel = guild.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await guild.fetch_channel(channel_id)
+            except Exception:
+                channel = None
         return channel if isinstance(channel, discord.TextChannel) else None
 
     async def refresh_or_create_request_button(self, guild: discord.Guild) -> Optional[discord.Message]:
@@ -406,7 +430,7 @@ class RequestLevelsCog(commands.Cog):
     async def refresh_request_button(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
-        member = ctx.guild.get_member(ctx.user.id)
+        member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not self._is_mod(member):
             return await ctx.respond("Only mods can use this.", ephemeral=True)
 
@@ -418,7 +442,7 @@ class RequestLevelsCog(commands.Cog):
     async def open_requests(self, ctx: discord.ApplicationContext, number: int = 0, time: int = 0):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
-        member = ctx.guild.get_member(ctx.user.id)
+        member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not self._is_admin(member):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
@@ -445,7 +469,7 @@ class RequestLevelsCog(commands.Cog):
     async def close_requests(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
-        member = ctx.guild.get_member(ctx.user.id)
+        member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not self._is_admin(member):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
@@ -493,7 +517,7 @@ class RequestLevelsCog(commands.Cog):
                 await log_error(self.bot, f"Could not refresh request button after timed close: {repr(e)}")
             return
 
-        member = interaction.guild.get_member(interaction.user.id)
+        member = await self._resolve_member(interaction.guild, interaction.user)
         if member is None or not await self._requirements_ok(member):
             return await interaction.response.send_message(
                 self._message("no_requirements", "You don't meet the requirements, please read the requesting rules"),
@@ -524,7 +548,7 @@ class RequestLevelsCog(commands.Cog):
     async def handle_first_choice(self, interaction: discord.Interaction, will_request_again: bool):
         if interaction.guild is None:
             return await interaction.response.send_message("Wrong server.", ephemeral=True)
-        member = interaction.guild.get_member(interaction.user.id)
+        member = await self._resolve_member(interaction.guild, interaction.user)
         if member is None:
             return await interaction.response.send_message("Member not found.", ephemeral=True)
 
@@ -560,76 +584,95 @@ class RequestLevelsCog(commands.Cog):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
+        refresh_after_close = False
+        closed_before_submit = False
+        closed_by_timer = False
         async with self._submit_lock:
             row = await self._get_state(interaction.guild.id)
             if str(row["state"]) != STATE_OPEN:
-                return await self._reply_ephemeral(interaction, self._message("closed", "Requests are closed :/"))
-
-            wave_id = int(row["wave_id"])
-            user_id = interaction.user.id
-            normalized_level_id = str(data["level_id"]).strip().casefold()
-
-            existing_user = await self.bot.db.fetchone(
-                "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
-                (interaction.guild.id, wave_id, user_id),
-            )
-            if existing_user:
-                return await self._reply_ephemeral(interaction, self._message("already_submitted", "You already submitted a level during this request wave."))
-
-            existing_level = await self.bot.db.fetchone(
-                "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND level_id=?",
-                (interaction.guild.id, wave_id, normalized_level_id),
-            )
-            if existing_level:
-                return await self._reply_ephemeral(interaction, self._message("duplicate_level", "That level ID has already been submitted during this request wave."))
-
-            target_channel = await self._configured_channel(interaction.guild, "level_requested")
-            if target_channel is None:
-                return await self._reply_ephemeral(interaction, self._message("not_configured", "The request system is not fully configured yet."))
-
-            data = dict(data)
-            data["level_id"] = str(data["level_id"]).strip()
-            data["level_id_normalized"] = normalized_level_id
-            data_json = json.dumps(data, separators=(",", ":"))
-
-            await self.bot.db.execute(
-                "INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,status,created_ts,data_json) VALUES(?,?,?,?,?,?,?)",
-                (interaction.guild.id, wave_id, user_id, normalized_level_id, "pending", int(time_module.time()), data_json),
-            )
-
-            try:
-                temp_row = {"guild_id": interaction.guild.id, "wave_id": wave_id, "user_id": user_id}
-                embed = self._embed_from_template(
-                    self._cfg("level_requested_embed", default={}) or {},
-                    self._data_vars(temp_row, data),
-                    default_color=self._color_name("pending", "blurple"),
-                )
-                msg = await target_channel.send(embed=embed, view=LevelRequestReviewView())
-            except Exception as e:
+                closed_before_submit = True
+            elif row["close_ts"] is not None and int(row["close_ts"]) <= int(time_module.time()):
                 await self.bot.db.execute(
-                    "DELETE FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+                    "UPDATE level_request_state SET state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
+                    (STATE_CLOSED, int(time_module.time()), interaction.guild.id),
+                )
+                refresh_after_close = True
+                closed_by_timer = True
+
+            if not closed_before_submit and not refresh_after_close:
+                wave_id = int(row["wave_id"])
+                user_id = interaction.user.id
+                normalized_level_id = str(data["level_id"]).strip().casefold()
+
+                existing_user = await self.bot.db.fetchone(
+                    "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
                     (interaction.guild.id, wave_id, user_id),
                 )
-                await log_error(self.bot, f"Could not send level request embed: {repr(e)}")
-                return await self._reply_ephemeral(interaction, "I couldn't submit your request right now.")
+                if existing_user:
+                    return await self._reply_ephemeral(interaction, self._message("already_submitted", "You already submitted a level during this request wave."))
 
-            new_count = int(row["submitted_count"]) + 1
-            await self.bot.db.execute(
-                "UPDATE level_request_submissions SET request_message_id=? WHERE guild_id=? AND wave_id=? AND user_id=?",
-                (msg.id, interaction.guild.id, wave_id, user_id),
-            )
-            await self.bot.db.execute(
-                "UPDATE level_request_state SET submitted_count=? WHERE guild_id=?",
-                (new_count, interaction.guild.id),
-            )
+                existing_level = await self.bot.db.fetchone(
+                    "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND level_id=?",
+                    (interaction.guild.id, wave_id, normalized_level_id),
+                )
+                if existing_level:
+                    return await self._reply_ephemeral(interaction, self._message("duplicate_level", "That level ID has already been submitted during this request wave."))
 
-            limit_reached = row["request_limit"] is not None and new_count >= int(row["request_limit"])
+                target_channel = await self._configured_channel(interaction.guild, "level_requested")
+                if target_channel is None:
+                    return await self._reply_ephemeral(interaction, self._message("not_configured", "The request system is not fully configured yet."))
 
-        if limit_reached:
+                data = dict(data)
+                data["level_id"] = str(data["level_id"]).strip()
+                data["level_id_normalized"] = normalized_level_id
+                data_json = json.dumps(data, separators=(",", ":"))
+
+                await self.bot.db.execute(
+                    "INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,status,created_ts,data_json) VALUES(?,?,?,?,?,?,?)",
+                    (interaction.guild.id, wave_id, user_id, normalized_level_id, "pending", int(time_module.time()), data_json),
+                )
+
+                try:
+                    temp_row = {"guild_id": interaction.guild.id, "wave_id": wave_id, "user_id": user_id}
+                    embed = self._embed_from_template(
+                        self._cfg("level_requested_embed", default={}) or {},
+                        self._data_vars(temp_row, data),
+                        default_color=self._color_name("pending", "blurple"),
+                    )
+                    msg = await target_channel.send(embed=embed, view=LevelRequestReviewView())
+                except Exception as e:
+                    await self.bot.db.execute(
+                        "DELETE FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+                        (interaction.guild.id, wave_id, user_id),
+                    )
+                    await log_error(self.bot, f"Could not send level request embed: {repr(e)}")
+                    return await self._reply_ephemeral(interaction, "I couldn't submit your request right now.")
+
+                new_count = int(row["submitted_count"]) + 1
+                await self.bot.db.execute(
+                    "UPDATE level_request_submissions SET request_message_id=? WHERE guild_id=? AND wave_id=? AND user_id=?",
+                    (msg.id, interaction.guild.id, wave_id, user_id),
+                )
+
+                if row["request_limit"] is not None and new_count >= int(row["request_limit"]):
+                    await self.bot.db.execute(
+                        "UPDATE level_request_state SET submitted_count=?, state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
+                        (new_count, STATE_CLOSED, int(time_module.time()), interaction.guild.id),
+                    )
+                    refresh_after_close = True
+                else:
+                    await self.bot.db.execute(
+                        "UPDATE level_request_state SET submitted_count=? WHERE guild_id=?",
+                        (new_count, interaction.guild.id),
+                    )
+
+        if refresh_after_close:
             try:
-                await self._set_state_closed(interaction.guild, reason="request limit")
+                await self.refresh_or_create_request_button(interaction.guild)
             except Exception as e:
-                await log_error(self.bot, f"Could not refresh request button after limit close: {repr(e)}")
+                await log_error(self.bot, f"Could not refresh request button after request close: {repr(e)}")
+        if closed_before_submit or closed_by_timer:
+            return await self._reply_ephemeral(interaction, self._message("closed", "Requests are closed :/"))
 
         await self._reply_ephemeral(interaction, self._message("success", "Your request has been submitted!"))
 

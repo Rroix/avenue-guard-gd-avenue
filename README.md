@@ -20,6 +20,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - DMs weekly winners with a configurable request embed.
 - Supports claim, decline confirmation, timeout, reminders, and automatic offer to the next eligible member.
 - Posts weekly request submissions as configurable embeds.
+- Admins can disable the automatic weekly request reward for the current tracking week.
 - Logs weekly request events to SQLite and optionally to a log channel.
 
 ### Live Level Request Waves
@@ -80,6 +81,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - `/tracking me` shows your weekly count and rank.
 - `/tracking reset` resets this week's tracking data. Admins/owners only.
 - `/tracking force_dm` manually sends a weekly request DM. Admins/owners only.
+- `/tracking disable_reward` disables the automatic weekly request reward for the current tracking week. Admins/owners only.
 - `/refresh-request-button` refreshes or recreates the live request button. Mods only.
 - `/open-requests number:<optional> time:<optional>` opens a new request wave. Admins/owners only.
 - `/close-requests` closes the active request wave. Admins/owners only.

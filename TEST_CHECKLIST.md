@@ -56,6 +56,10 @@
 ## 6) Commands: `/tracking top`
 1. Run `/tracking top`
    - Expected: shows top list with counts.
+2. Run `/tracking disable_reward` as an admin.
+   - Expected: bot confirms the current tracking week reward is disabled.
+3. Run `/tracking force_dm` for the same week after disabling reward.
+   - Expected: bot refuses because weekly reward DMs are disabled for that tracking week.
 
 ---
 

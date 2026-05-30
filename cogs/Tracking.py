@@ -125,6 +125,22 @@ class TrackingCog(commands.Cog):
             embed.set_image(url=image_url)
         return embed
 
+    async def _resolve_member(self, guild: discord.Guild, user_or_id) -> Optional[discord.Member]:
+        if isinstance(user_or_id, discord.Member):
+            return user_or_id
+        user_id = getattr(user_or_id, "id", user_or_id)
+        try:
+            user_id = int(user_id)
+        except Exception:
+            return None
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(user_id)
+        except Exception:
+            return None
+
     # ----------------------------
     # Startup / schema
     # ----------------------------
@@ -141,6 +157,15 @@ class TrackingCog(commands.Cog):
                     guild_id INTEGER NOT NULL,
                     week_start TEXT NOT NULL,
                     ran_ts INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, week_start)
+                );"""
+            )
+            await self.bot.db.execute(
+                """CREATE TABLE IF NOT EXISTS weekly_reward_disabled(
+                    guild_id INTEGER NOT NULL,
+                    week_start TEXT NOT NULL,
+                    disabled_ts INTEGER NOT NULL,
+                    disabled_by INTEGER NOT NULL,
                     PRIMARY KEY (guild_id, week_start)
                 );"""
             )
@@ -185,6 +210,30 @@ class TrackingCog(commands.Cog):
             (allowed_guild_id, user_id),
         )
         return row is not None
+
+    async def weekly_reward_disabled(self, guild_id: int, week_start_iso: str) -> bool:
+        row = await self.bot.db.fetchone(
+            "SELECT 1 FROM weekly_reward_disabled WHERE guild_id=? AND week_start=?",
+            (guild_id, week_start_iso),
+        )
+        return row is not None
+
+    async def disable_weekly_reward_for_current_week(self, guild: discord.Guild, disabled_by: int) -> str:
+        week_start_iso = week_start_sunday(now_madrid()).isoformat()
+        await self.bot.db.execute(
+            "INSERT OR REPLACE INTO weekly_reward_disabled(guild_id, week_start, disabled_ts, disabled_by) VALUES(?,?,?,?)",
+            (guild.id, week_start_iso, int(time.time()), int(disabled_by)),
+        )
+        await self.bot.db.execute(
+            "UPDATE weekly_claims SET status='disabled' WHERE guild_id=? AND week_start=? AND status='pending'",
+            (guild.id, week_start_iso),
+        )
+        await self.bot.db.execute(
+            "UPDATE weekly_sessions SET active=0 WHERE guild_id=? AND week_start=?",
+            (guild.id, week_start_iso),
+        )
+        await self._log_weekly(guild, week_start_iso, disabled_by, "weekly_reward_disabled", "Reward disabled for this tracking week")
+        return week_start_iso
 
     # ----------------------------
     # Logging helpers
@@ -235,7 +284,7 @@ class TrackingCog(commands.Cog):
         # Exclude blacklisted roles
         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
         if excluded_role_ids:
-            m = message.guild.get_member(message.author.id)
+            m = await self._resolve_member(message.guild, message.author)
             if m and any(r.id in excluded_role_ids for r in m.roles):
                 return
 
@@ -278,7 +327,7 @@ class TrackingCog(commands.Cog):
         guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
         if guild is None:
             return
-        if guild.get_member(message.author.id) is None:
+        if await self._resolve_member(guild, message.author.id) is None:
             return
 
         # Find active session for this user (latest week_start)
@@ -529,6 +578,10 @@ class TrackingCog(commands.Cog):
         if guild is None:
             return
 
+        if await self.weekly_reward_disabled(guild.id, week_start_iso):
+            await self._log_weekly(guild, week_start_iso, 0, "weekly_reward_skipped", "Reward disabled for this tracking week")
+            return
+
         top_limit = self._cfg_int("tracking", "top_limit", 20)
         winners_to_dm = self._cfg_int("tracking", "winners_to_dm", 1)
         timeout_h = self._cfg_int("tracking", "dm_timeout_hours", 48)
@@ -544,7 +597,7 @@ class TrackingCog(commands.Cog):
         ranked: List[int] = []
         for r in rows:
             uid = int(r["user_id"])
-            member = guild.get_member(uid)
+            member = await self._resolve_member(guild, uid)
             if member is None or member.bot:
                 continue
             if excluded_role_ids and any(role.id in excluded_role_ids for role in member.roles):
@@ -562,6 +615,10 @@ class TrackingCog(commands.Cog):
         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted={contacted} eligible_ranked={len(ranked)}")
 
     async def _contact_user_for_week(self, guild: discord.Guild, week_start_iso: str, user_id: int, rank: int, timeout_hours: int) -> bool:
+        if await self.weekly_reward_disabled(guild.id, week_start_iso):
+            await self._log_weekly(guild, week_start_iso, user_id, "skipped_reward_disabled", "")
+            return False
+
         # don't contact if already contacted this week
         row = await self.bot.db.fetchone(
             "SELECT status FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
@@ -610,6 +667,10 @@ class TrackingCog(commands.Cog):
         return True
 
     async def _contact_next_eligible(self, guild: discord.Guild, week_start_iso: str):
+        if await self.weekly_reward_disabled(guild.id, week_start_iso):
+            await self._log_weekly(guild, week_start_iso, 0, "next_offer_skipped_reward_disabled", "")
+            return
+
         cfg_top_limit = self._cfg_int("tracking", "top_limit", 20)
         timeout_h = self._cfg_int("tracking", "dm_timeout_hours", 48)
         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
@@ -625,7 +686,7 @@ class TrackingCog(commands.Cog):
 
         for idx, r in enumerate(rows, start=1):
             uid = int(r["user_id"])
-            member = guild.get_member(uid)
+            member = await self._resolve_member(guild, uid)
             if member is None or member.bot:
                 skipped_missing += 1
                 continue
@@ -777,7 +838,7 @@ class TrackingCog(commands.Cog):
         )
         count = int(row["count"]) if row else 0
 
-        member = guild.get_member(user_id)
+        member = await self._resolve_member(guild, user_id)
         if member is None or member.bot:
             return count, None, 0
         if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
@@ -792,7 +853,7 @@ class TrackingCog(commands.Cog):
         eligible_total = 0
         for r in rows:
             uid = int(r["user_id"])
-            m = guild.get_member(uid)
+            m = await self._resolve_member(guild, uid)
             if m is None or m.bot:
                 continue
             if excluded_role_ids and any(role.id in excluded_role_ids for role in m.roles):
@@ -808,7 +869,10 @@ class TrackingCog(commands.Cog):
         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
         timeout_h = int(timeout_hours or self._cfg_int("tracking", "dm_timeout_hours", 48) or 48)
 
-        member = guild.get_member(user_id)
+        if await self.weekly_reward_disabled(guild.id, week_start_iso):
+            return False, "Weekly reward DMs are disabled for this tracking week."
+
+        member = await self._resolve_member(guild, user_id)
         if member is None:
             return False, "User is not in the server."
         if member.bot:
@@ -841,7 +905,7 @@ class TrackingCog(commands.Cog):
         rank = 1
         for r in rows:
             uid = int(r["user_id"])
-            m = guild.get_member(uid)
+            m = await self._resolve_member(guild, uid)
             if m is None or m.bot:
                 continue
             if excluded_role_ids and any(role.id in excluded_role_ids for role in m.roles):
