@@ -101,8 +101,8 @@ class FirstRequestChoiceView(discord.ui.View):
         self.cog = cog
         self.user_id = user_id
 
-        will = discord.ui.Button(label="I will", style=discord.ButtonStyle.danger)
-        wont = discord.ui.Button(label="I won't", style=discord.ButtonStyle.success)
+        will = discord.ui.Button(label="I will", style=discord.ButtonStyle.secondary)
+        wont = discord.ui.Button(label="I won't", style=discord.ButtonStyle.secondary)
         will.callback = self._will
         wont.callback = self._wont
         self.add_item(will)
@@ -257,6 +257,123 @@ class RequestLevelsCog(commands.Cog):
             embed.set_footer(text=footer)
         return embed
 
+    def _pct(self, amount: int, total: int) -> str:
+        if total <= 0:
+            return "0%"
+        return f"{(amount / total) * 100:.1f}%"
+
+    async def _wave_summary_vars(self, guild_id: int, wave_id: int) -> Dict[str, Any]:
+        rows = await self.bot.db.fetchall(
+            "SELECT status, result FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
+            (guild_id, wave_id),
+        )
+        total = len(rows)
+        reviewed = sum(1 for row in rows if str(row["status"]) == "reviewed")
+        sent = sum(1 for row in rows if str(row["status"]) == "reviewed" and str(row["result"]) == "sent")
+        rejected = sum(1 for row in rows if str(row["status"]) == "reviewed" and str(row["result"]) == "rejected")
+        level_doesnt_exist = sum(1 for row in rows if str(row["result"]) == "level_doesnt_exist")
+        stolen_level = sum(1 for row in rows if str(row["result"]) == "stolen_level")
+        already_rated = sum(1 for row in rows if str(row["result"]) == "already_rated")
+        other = level_doesnt_exist + stolen_level + already_rated
+        not_sent = rejected + other
+        pending = max(total - reviewed, 0)
+        return {
+            "wave_id": wave_id,
+            "total_requests": total,
+            "reviewed_count": reviewed,
+            "sent_count": sent,
+            "not_sent_count": not_sent,
+            "rejected_count": rejected,
+            "other_count": other,
+            "level_doesnt_exist_count": level_doesnt_exist,
+            "stolen_level_count": stolen_level,
+            "already_rated_count": already_rated,
+            "pending_count": pending,
+            "left_to_review": pending,
+            "reviewed_percent": self._pct(reviewed, total),
+            "pending_percent": self._pct(pending, total),
+            "sent_percent": self._pct(sent, total),
+            "not_sent_percent": self._pct(not_sent, total),
+            "sent_percent_reviewed": self._pct(sent, reviewed),
+            "not_sent_percent_reviewed": self._pct(not_sent, reviewed),
+            "summary_color": self._color_name("sent" if pending == 0 else "pending", "blurple"),
+        }
+
+    def _wave_summary_embed(self, variables: Dict[str, Any]) -> discord.Embed:
+        template = self._cfg("wave_summary_embed", default={}) or {}
+        if isinstance(template, dict) and template:
+            return self._embed_from_template(template, variables, default_color=str(variables.get("summary_color") or "blurple"))
+
+        embed = discord.Embed(
+            title=f"Wave {variables['wave_id']} Summary",
+            description="Live review progress for this request wave.",
+            color=basic_color(str(variables.get("summary_color") or "blurple")),
+        )
+        embed.add_field(name="Requested", value=str(variables["total_requests"]), inline=True)
+        embed.add_field(
+            name="Reviewed",
+            value=f"{variables['reviewed_count']} / {variables['total_requests']} ({variables['reviewed_percent']})",
+            inline=True,
+        )
+        embed.add_field(name="Left to review", value=f"{variables['pending_count']} ({variables['pending_percent']})", inline=True)
+        embed.add_field(name="Sent", value=f"{variables['sent_count']} ({variables['sent_percent_reviewed']} of reviewed)", inline=True)
+        embed.add_field(name="Not sent", value=f"{variables['not_sent_count']} ({variables['not_sent_percent_reviewed']} of reviewed)", inline=True)
+        embed.add_field(
+            name="Not sent breakdown",
+            value=(
+                f"Rejected: **{variables['rejected_count']}**\n"
+                f"Level doesn't exist: **{variables['level_doesnt_exist_count']}**\n"
+                f"Stolen level: **{variables['stolen_level_count']}**\n"
+                f"Already rated: **{variables['already_rated_count']}**"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="This updates whenever a request in the wave is reviewed.")
+        return embed
+
+    async def update_wave_summary(self, guild: discord.Guild, wave_id: int, create_if_missing: bool = True) -> Optional[discord.Message]:
+        channel = await self._configured_channel(guild, "level_requested")
+        if channel is None:
+            return None
+
+        variables = await self._wave_summary_vars(guild.id, wave_id)
+        embed = self._wave_summary_embed(variables)
+        now_ts = int(time_module.time())
+
+        row = await self.bot.db.fetchone(
+            "SELECT channel_id, message_id FROM level_request_wave_summaries WHERE guild_id=? AND wave_id=?",
+            (guild.id, wave_id),
+        )
+        if row:
+            old_channel = guild.get_channel(int(row["channel_id"]))
+            if old_channel is None:
+                try:
+                    old_channel = await guild.fetch_channel(int(row["channel_id"]))
+                except Exception:
+                    old_channel = None
+            if isinstance(old_channel, discord.TextChannel):
+                try:
+                    msg = await old_channel.fetch_message(int(row["message_id"]))
+                    await msg.edit(embed=embed)
+                    await self.bot.db.execute(
+                        "UPDATE level_request_wave_summaries SET channel_id=?, message_id=?, updated_ts=? WHERE guild_id=? AND wave_id=?",
+                        (old_channel.id, msg.id, now_ts, guild.id, wave_id),
+                    )
+                    return msg
+                except Exception:
+                    pass
+
+        if not create_if_missing:
+            return None
+
+        msg = await channel.send(embed=embed)
+        await self.bot.db.execute(
+            "INSERT INTO level_request_wave_summaries(guild_id,wave_id,channel_id,message_id,created_ts,updated_ts) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(guild_id,wave_id) DO UPDATE SET channel_id=excluded.channel_id, message_id=excluded.message_id, updated_ts=excluded.updated_ts",
+            (guild.id, wave_id, channel.id, msg.id, now_ts, now_ts),
+        )
+        return msg
+
     def _base_state_vars(self, row) -> Dict[str, Any]:
         if not row:
             return {"state": "Closed", "wave_id": 0, "submitted_count": 0, "request_limit": "", "close_ts": ""}
@@ -323,14 +440,25 @@ class RequestLevelsCog(commands.Cog):
 
     async def _set_state_closed(self, guild: discord.Guild, reason: str = "manual") -> None:
         row = await self._get_state(guild.id)
+        wave_id = int(row["wave_id"]) if row else 0
         if row and str(row["state"]) == STATE_CLOSED:
             await self.refresh_or_create_request_button(guild)
+            if wave_id:
+                try:
+                    await self.update_wave_summary(guild, wave_id)
+                except Exception as e:
+                    await log_error(self.bot, f"Could not update wave {wave_id} summary: {repr(e)}")
             return
         await self.bot.db.execute(
             "UPDATE level_request_state SET state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
             (STATE_CLOSED, int(time_module.time()), guild.id),
         )
         await self.refresh_or_create_request_button(guild)
+        if wave_id:
+            try:
+                await self.update_wave_summary(guild, wave_id)
+            except Exception as e:
+                await log_error(self.bot, f"Could not update wave {wave_id} summary: {repr(e)}")
 
     async def _auto_close_loop(self):
         await self.bot.wait_until_ready()
@@ -669,6 +797,7 @@ class RequestLevelsCog(commands.Cog):
         if refresh_after_close:
             try:
                 await self.refresh_or_create_request_button(interaction.guild)
+                await self.update_wave_summary(interaction.guild, int(row["wave_id"]))
             except Exception as e:
                 await log_error(self.bot, f"Could not refresh request button after request close: {repr(e)}")
         if closed_before_submit or closed_by_timer:
@@ -751,6 +880,14 @@ class RequestLevelsCog(commands.Cog):
                     await result_channel.send(content=f"<@{int(row['user_id'])}>", embed=result_embed)
                 except Exception as e:
                     await log_error(self.bot, f"Could not send level request result {message_id}: {repr(e)}")
+
+            try:
+                state_row = await self._get_state(interaction.guild.id)
+                request_wave_id = int(row["wave_id"])
+                create_summary = int(state_row["wave_id"]) != request_wave_id or str(state_row["state"]) == STATE_CLOSED
+                await self.update_wave_summary(interaction.guild, request_wave_id, create_if_missing=create_summary)
+            except Exception as e:
+                await log_error(self.bot, f"Could not update wave summary for reviewed request {message_id}: {repr(e)}")
 
         await self._reply_ephemeral(interaction, f"Request marked as {result_label}.")
 

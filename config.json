@@ -252,6 +252,20 @@
       "description_closed": "Requests are currently **closed**. Please wait for the next request wave...",
       "footer": "GD Avenue Level Requests, don't break any rules!"
     },
+    "wave_summary_embed": {
+      "title": "Wave {wave_id} Summary",
+      "description": "Live review progress for this request wave.",
+      "color": "{summary_color}",
+      "fields": [
+        { "name": "Requested", "value": "{total_requests}", "inline": true },
+        { "name": "Reviewed", "value": "{reviewed_count} / {total_requests} ({reviewed_percent})", "inline": true },
+        { "name": "Left to review", "value": "{pending_count} ({pending_percent})", "inline": true },
+        { "name": "Sent", "value": "{sent_count} ({sent_percent_reviewed} of reviewed)", "inline": true },
+        { "name": "Not sent", "value": "{not_sent_count} ({not_sent_percent_reviewed} of reviewed)", "inline": true },
+        { "name": "Not sent breakdown", "value": "Rejected: **{rejected_count}**\nLevel doesn't exist: **{level_doesnt_exist_count}**\nStolen level: **{stolen_level_count}**\nAlready rated: **{already_rated_count}**", "inline": false }
+      ],
+      "footer": "This updates whenever a request in the wave is reviewed."
+    },
     "level_requested_embed": {
       "title": "New Level Request",
       "description": "**{level_name}** by **{creators}**",
@@ -259,7 +273,7 @@
       "fields": [
         { "name": "Requester", "value": "{requester_mention} (`{requester_id}`)", "inline": false },
         { "name": "Level ID", "value": "{level_id}", "inline": true },
-        { "name": "Level Info", "value": "https://gdbrowser.com/{level_id}", "inline": true },
+        { "name": "Level Info", "value": "[Level](https://gdbrowser.com/{level_id})", "inline": true },
         { "name": "Showcase", "value": "{level_showcase}", "inline": false },
         { "name": "Notes", "value": "{notes}", "inline": false },
         { "name": "Wave", "value": "{wave_id}", "inline": true }
@@ -279,7 +293,7 @@
     },
     "sent_result_embed": {
       "title": "Your level was sent!",
-      "description": "{requester_mention}, your level **{level_name}** has been **sent**.",
+      "description": "{requester_mention}, your level **{level_name}** has been **sent**. Reviewed by {reviewer_mention}.",
       "color": "{result_color}",
       "fields": [
         { "name": "Review", "value": "{review}", "inline": false }
@@ -287,7 +301,7 @@
     },
     "rejected_result_embed": {
       "title": "Your level was rejected",
-      "description": "{requester_mention}, your level **{level_name}** has been **rejected**.",
+      "description": "{requester_mention}, your level **{level_name}** has been **rejected**. Reviewed by {reviewer_mention}.",
       "color": "{result_color}",
       "fields": [
         { "name": "Review", "value": "{review}", "inline": false }
@@ -295,7 +309,7 @@
     },
     "other_result_embed": {
       "title": "Your level request could not be accepted",
-      "description": "{requester_mention}, your level **{level_name}** has been marked as **{result}**.",
+      "description": "{requester_mention}, your level **{level_name}** has been marked as **{result}**. Reviewed by {reviewer_mention}.",
       "color": "{result_color}",
       "fields": [
         { "name": "Reason", "value": "{result}", "inline": false }

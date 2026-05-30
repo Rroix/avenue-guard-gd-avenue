@@ -210,6 +210,15 @@ class Database:
                 PRIMARY KEY (guild_id, wave_id, user_id),
                 UNIQUE (guild_id, wave_id, level_id)
             );""",
+            """CREATE TABLE IF NOT EXISTS level_request_wave_summaries(
+                guild_id INTEGER NOT NULL,
+                wave_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, wave_id)
+            );""",
         ]
         for stmt in stmts:
             self._conn.execute(stmt)
@@ -223,6 +232,10 @@ class Database:
         self._ensure_column_sync("level_request_submissions", "review_text", "TEXT")
         self._ensure_column_sync("level_request_submissions", "reviewed_by", "INTEGER")
         self._ensure_column_sync("level_request_submissions", "reviewed_ts", "INTEGER")
+        self._ensure_column_sync("level_request_wave_summaries", "channel_id", "INTEGER")
+        self._ensure_column_sync("level_request_wave_summaries", "message_id", "INTEGER")
+        self._ensure_column_sync("level_request_wave_summaries", "created_ts", "INTEGER")
+        self._ensure_column_sync("level_request_wave_summaries", "updated_ts", "INTEGER")
         self._normalize_weekly_dm_log_sync()
         self._init_ticket_sequences_sync()
         self._conn.commit()
@@ -413,6 +426,43 @@ class Database:
                 updated_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, user_id)
             );""",
+            """CREATE TABLE IF NOT EXISTS level_request_state(
+                guild_id INTEGER PRIMARY KEY,
+                state TEXT NOT NULL DEFAULT 'closed',
+                wave_id INTEGER NOT NULL DEFAULT 0,
+                request_limit INTEGER,
+                close_ts INTEGER,
+                submitted_count INTEGER NOT NULL DEFAULT 0,
+                opened_ts INTEGER,
+                closed_ts INTEGER,
+                request_channel_id INTEGER,
+                request_message_id INTEGER
+            );""",
+            """CREATE TABLE IF NOT EXISTS level_request_submissions(
+                guild_id INTEGER NOT NULL,
+                wave_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                level_id TEXT NOT NULL,
+                request_message_id INTEGER UNIQUE,
+                status TEXT NOT NULL,
+                result TEXT,
+                review_text TEXT,
+                reviewed_by INTEGER,
+                reviewed_ts INTEGER,
+                created_ts INTEGER NOT NULL,
+                data_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (guild_id, wave_id, user_id),
+                UNIQUE (guild_id, wave_id, level_id)
+            );""",
+            """CREATE TABLE IF NOT EXISTS level_request_wave_summaries(
+                guild_id INTEGER NOT NULL,
+                wave_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, wave_id)
+            );""",
         ]
         for s in stmts:
             await self.execute(s)
@@ -420,6 +470,17 @@ class Database:
         # Ensure columns exist on older DBs
         await self._ensure_column("tickets", "ticket_id", "INTEGER")
         await self._ensure_column("transcript_requests", "ticket_id", "INTEGER")
+        await self._ensure_column("level_request_state", "request_channel_id", "INTEGER")
+        await self._ensure_column("level_request_state", "request_message_id", "INTEGER")
+        await self._ensure_column("level_request_submissions", "request_message_id", "INTEGER")
+        await self._ensure_column("level_request_submissions", "result", "TEXT")
+        await self._ensure_column("level_request_submissions", "review_text", "TEXT")
+        await self._ensure_column("level_request_submissions", "reviewed_by", "INTEGER")
+        await self._ensure_column("level_request_submissions", "reviewed_ts", "INTEGER")
+        await self._ensure_column("level_request_wave_summaries", "channel_id", "INTEGER")
+        await self._ensure_column("level_request_wave_summaries", "message_id", "INTEGER")
+        await self._ensure_column("level_request_wave_summaries", "created_ts", "INTEGER")
+        await self._ensure_column("level_request_wave_summaries", "updated_ts", "INTEGER")
         await self._normalize_weekly_dm_log()
 
         # Ensure sequence exists (set next_ticket_id based on max ticket_id)

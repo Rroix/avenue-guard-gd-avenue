@@ -39,6 +39,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Reviewers can choose `Send`, `Reject`, or `Other`.
 - Sends final result embeds to `level_requests.sent_channel` or `level_requests.rejected_channel`.
 - Disables review buttons after a request is processed.
+- Posts one live summary embed per closed wave in `level_requests.level_requested`, including requested, reviewed, sent, not sent, percentages, and remaining reviews.
 - Stores request state, request button message ID, wave count, submitted users, and submitted level IDs in SQLite so restarts do not wipe the wave.
 
 ### Help Menu And Staff Tickets
@@ -152,7 +153,7 @@ Set these before opening requests:
 - `has_requested_role_id`: role used for users who already passed the first-request prompt.
 - `request_banned_role_id`: role assigned by the `I will` choice and blocked from requesting.
 
-The same section controls the request button text, all user-facing messages, request/review/result embed templates, weekly request embeds, and final-result colors.
+The same section controls the request button text, all user-facing messages, request/review/result embed templates, wave summary embed, weekly request embeds, and final-result colors.
 
 ## Running The Bot
 

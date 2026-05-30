@@ -208,18 +208,22 @@
     - Expected: duplicate-level message; no new staff embed.
 11. Submit enough successful requests to hit the `number` limit.
     - Expected: requests close automatically and the request embed changes to closed.
+    - Expected: one wave summary embed appears in `level_requested`.
 12. Open requests with only `time:1`.
     - Expected: requests close automatically after the timer expires.
 13. Open requests without `number` or `time`, then run `/close-requests`.
     - Expected: requests close manually and the embed changes to closed.
 14. On a pending staff request embed, press `Send`.
     - Expected: review modal opens; submitted review edits the staff embed, disables all buttons, and posts a pinged result in `sent_channel`.
+    - Expected: the wave summary updates reviewed/sent/left-to-review counts and percentages.
 15. On another pending staff request embed, press `Reject`.
     - Expected: review modal opens; submitted review edits the staff embed, disables all buttons, and posts a pinged result in `rejected_channel`.
+    - Expected: the wave summary updates reviewed/not-sent/left-to-review counts and percentages.
 16. On another pending staff request embed, press `Other`.
     - Expected: ephemeral options appear for `Level doesn't exist`, `Stolen level`, and `Already rated`.
 17. Choose each `Other` reason on separate requests.
     - Expected: staff embed color/result updates, buttons disable, and a pinged result appears in `rejected_channel`.
+    - Expected: the wave summary updates the not-sent breakdown.
 
 ---
 
