@@ -33,6 +33,7 @@ class CommandsCog(commands.Cog):
         self.tracking_group.command(name="me", description="Show your activity stats for this week.")(self.tracking_me)
         self.tracking_group.command(name="force_dm", description="Force-send the weekly request DM to a user (Admins/Owners only).")(self.tracking_force_dm)
         self.tracking_group.command(name="disable_reward", description="Disable this week's automatic weekly request reward (Admins/Owners only).")(self.tracking_disable_reward)
+        self.tracking_group.command(name="enable_reward", description="Re-enable this week's automatic weekly request reward (Admins/Owners only).")(self.tracking_enable_reward)
 
         self.ticket_group.command(name="close", description="Close the current ticket channel (Mods only).")(self.ticket_close)
         self.forum_group.command(name="required_word", description="View or update a forum required word (Admins only).")(self.forum_required_word)
@@ -203,6 +204,26 @@ class CommandsCog(commands.Cog):
             f"Weekly request reward disabled for the current tracking week starting **{week_start_iso}**.",
             ephemeral=True,
         )
+
+    async def tracking_enable_reward(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+
+        member = await self._resolve_member(ctx.guild, ctx.user)
+        admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
+        if member is None or not is_admin_or_owner(member, admin_roles):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+
+        tracking = self.bot.get_cog("TrackingCog")
+        if tracking is None:
+            return await ctx.respond("Tracking cog not loaded.", ephemeral=True)
+
+        week_start_iso, was_disabled = await tracking.enable_weekly_reward_for_current_week(ctx.guild, ctx.user.id)
+        if was_disabled:
+            msg = f"Weekly request reward re-enabled for the current tracking week starting **{week_start_iso}**."
+        else:
+            msg = f"Weekly request reward was already enabled for the current tracking week starting **{week_start_iso}**."
+        await ctx.respond(msg, ephemeral=True)
 
     # --- /ticket close ---
     async def ticket_close(self, ctx: discord.ApplicationContext):

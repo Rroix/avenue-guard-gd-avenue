@@ -235,6 +235,33 @@ class TrackingCog(commands.Cog):
         await self._log_weekly(guild, week_start_iso, disabled_by, "weekly_reward_disabled", "Reward disabled for this tracking week")
         return week_start_iso
 
+    async def enable_weekly_reward_for_current_week(self, guild: discord.Guild, enabled_by: int) -> tuple[str, bool]:
+        week_start_iso = week_start_sunday(now_madrid()).isoformat()
+        was_disabled = await self.weekly_reward_disabled(guild.id, week_start_iso)
+
+        await self.bot.db.execute(
+            "DELETE FROM weekly_reward_disabled WHERE guild_id=? AND week_start=?",
+            (guild.id, week_start_iso),
+        )
+        await self.bot.db.execute(
+            "UPDATE weekly_sessions SET active=1, stage='awaiting_request' "
+            "WHERE guild_id=? AND week_start=? AND EXISTS ("
+            "SELECT 1 FROM weekly_claims c "
+            "WHERE c.guild_id=weekly_sessions.guild_id "
+            "AND c.week_start=weekly_sessions.week_start "
+            "AND c.user_id=weekly_sessions.user_id "
+            "AND c.status='disabled'"
+            ")",
+            (guild.id, week_start_iso),
+        )
+        await self.bot.db.execute(
+            "UPDATE weekly_claims SET status='pending' WHERE guild_id=? AND week_start=? AND status='disabled'",
+            (guild.id, week_start_iso),
+        )
+
+        await self._log_weekly(guild, week_start_iso, enabled_by, "weekly_reward_enabled", "Reward enabled for this tracking week")
+        return week_start_iso, was_disabled
+
     # ----------------------------
     # Logging helpers
     # ----------------------------

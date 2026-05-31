@@ -60,6 +60,10 @@
    - Expected: bot confirms the current tracking week reward is disabled.
 3. Run `/tracking force_dm` for the same week after disabling reward.
    - Expected: bot refuses because weekly reward DMs are disabled for that tracking week.
+4. Run `/tracking enable_reward` as an admin.
+   - Expected: bot confirms the current tracking week reward is enabled again.
+5. Run `/tracking force_dm` again for an eligible user.
+   - Expected: bot allows the manual weekly request DM again unless the user already has a claim status.
 
 ---
 

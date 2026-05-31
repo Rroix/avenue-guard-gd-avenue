@@ -16,7 +16,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 ### Weekly Activity Requests
 - Counts eligible member messages per Madrid-time week.
 - Skips configured roles and channels.
-- Provides `/tracking top`, `/tracking me`, `/tracking reset`, and `/tracking force_dm`.
+- Provides `/tracking top`, `/tracking me`, `/tracking reset`, `/tracking force_dm`, `/tracking disable_reward`, and `/tracking enable_reward`.
 - DMs weekly winners with a configurable request embed.
 - Supports claim, decline confirmation, timeout, reminders, and automatic offer to the next eligible member.
 - Posts weekly request submissions as configurable embeds.
@@ -83,6 +83,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - `/tracking reset` resets this week's tracking data. Admins/owners only.
 - `/tracking force_dm` manually sends a weekly request DM. Admins/owners only.
 - `/tracking disable_reward` disables the automatic weekly request reward for the current tracking week. Admins/owners only.
+- `/tracking enable_reward` re-enables the automatic weekly request reward for the current tracking week. Admins/owners only.
 - `/refresh-request-button` refreshes or recreates the live request button. Mods only.
 - `/open-requests number:<optional> time:<optional>` opens a new request wave. Admins/owners only.
 - `/close-requests` closes the active request wave. Admins/owners only.
