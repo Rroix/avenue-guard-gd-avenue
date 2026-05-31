@@ -116,6 +116,21 @@ class Database:
                 disabled_by INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, week_start)
             );""",
+            """CREATE TABLE IF NOT EXISTS weekly_request_reviews(
+                guild_id INTEGER NOT NULL,
+                request_message_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                week_start TEXT NOT NULL,
+                rank INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                result TEXT,
+                review_text TEXT,
+                reviewed_by INTEGER,
+                reviewed_ts INTEGER,
+                created_ts INTEGER NOT NULL,
+                data_json TEXT NOT NULL DEFAULT '{}'
+            );""",
             """CREATE TABLE IF NOT EXISTS tickets(
                 guild_id INTEGER NOT NULL,
                 channel_id INTEGER PRIMARY KEY,
@@ -232,6 +247,13 @@ class Database:
         self._ensure_column_sync("level_request_submissions", "review_text", "TEXT")
         self._ensure_column_sync("level_request_submissions", "reviewed_by", "INTEGER")
         self._ensure_column_sync("level_request_submissions", "reviewed_ts", "INTEGER")
+        self._ensure_column_sync("weekly_request_reviews", "channel_id", "INTEGER")
+        self._ensure_column_sync("weekly_request_reviews", "rank", "INTEGER")
+        self._ensure_column_sync("weekly_request_reviews", "result", "TEXT")
+        self._ensure_column_sync("weekly_request_reviews", "review_text", "TEXT")
+        self._ensure_column_sync("weekly_request_reviews", "reviewed_by", "INTEGER")
+        self._ensure_column_sync("weekly_request_reviews", "reviewed_ts", "INTEGER")
+        self._ensure_column_sync("weekly_request_reviews", "data_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column_sync("level_request_wave_summaries", "channel_id", "INTEGER")
         self._ensure_column_sync("level_request_wave_summaries", "message_id", "INTEGER")
         self._ensure_column_sync("level_request_wave_summaries", "created_ts", "INTEGER")
@@ -360,6 +382,21 @@ class Database:
     disabled_by INTEGER NOT NULL,
     PRIMARY KEY (guild_id, week_start)
 );""",
+"""CREATE TABLE IF NOT EXISTS weekly_request_reviews(
+    guild_id INTEGER NOT NULL,
+    request_message_id INTEGER PRIMARY KEY,
+    channel_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    rank INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending',
+    result TEXT,
+    review_text TEXT,
+    reviewed_by INTEGER,
+    reviewed_ts INTEGER,
+    created_ts INTEGER NOT NULL,
+    data_json TEXT NOT NULL DEFAULT '{}'
+);""",
 """CREATE TABLE IF NOT EXISTS tickets(
                 guild_id INTEGER NOT NULL,
                 channel_id INTEGER PRIMARY KEY,
@@ -477,6 +514,13 @@ class Database:
         await self._ensure_column("level_request_submissions", "review_text", "TEXT")
         await self._ensure_column("level_request_submissions", "reviewed_by", "INTEGER")
         await self._ensure_column("level_request_submissions", "reviewed_ts", "INTEGER")
+        await self._ensure_column("weekly_request_reviews", "channel_id", "INTEGER")
+        await self._ensure_column("weekly_request_reviews", "rank", "INTEGER")
+        await self._ensure_column("weekly_request_reviews", "result", "TEXT")
+        await self._ensure_column("weekly_request_reviews", "review_text", "TEXT")
+        await self._ensure_column("weekly_request_reviews", "reviewed_by", "INTEGER")
+        await self._ensure_column("weekly_request_reviews", "reviewed_ts", "INTEGER")
+        await self._ensure_column("weekly_request_reviews", "data_json", "TEXT NOT NULL DEFAULT '{}'")
         await self._ensure_column("level_request_wave_summaries", "channel_id", "INTEGER")
         await self._ensure_column("level_request_wave_summaries", "message_id", "INTEGER")
         await self._ensure_column("level_request_wave_summaries", "created_ts", "INTEGER")

@@ -239,10 +239,17 @@
 
 1. Run `/tracking force_dm` for a test user.
    - Expected: user receives the configurable weekly request DM embed.
+   - Expected: the weekly log records a `force_dm_sent` event, or the matching blocked/failed force-DM event if the DM cannot be sent.
 2. Wait until reminder timing or temporarily lower `tracking.reminder_after_hours`.
    - Expected: user receives the configurable weekly reminder embed.
 3. Reply in DM with a valid request containing name, creator, and ID.
-   - Expected: `weekly_request_channel_ID` receives the configurable weekly submitted embed.
+   - Expected: `weekly_request_channel_ID` receives the configurable weekly submitted embed with `Send`, `Reject`, and `Other` buttons.
+4. Press `Send` or `Reject`.
+   - Expected: the optional review modal appears, the weekly submitted embed changes to the reviewed template, buttons become disabled, and the requester is pinged in the configured sent/rejected result channel.
+   - Expected: no live request wave count or wave summary changes.
+5. Press `Other` on a separate weekly submitted request.
+   - Expected: the three reason buttons appear, the original weekly embed is finalized, buttons become disabled, and the requester is pinged in `rejected_channel`.
+   - Expected: no live request wave count or wave summary changes.
 
 ---
 

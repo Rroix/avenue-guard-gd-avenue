@@ -19,9 +19,10 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Provides `/tracking top`, `/tracking me`, `/tracking reset`, `/tracking force_dm`, `/tracking disable_reward`, and `/tracking enable_reward`.
 - DMs weekly winners with a configurable request embed.
 - Supports claim, decline confirmation, timeout, reminders, and automatic offer to the next eligible member.
-- Posts weekly request submissions as configurable embeds.
+- Posts weekly request submissions as configurable embeds with `Send`, `Reject`, and `Other` review buttons.
+- Weekly submitted requests use the same staff review/result workflow as live wave requests, but do not count toward or appear in any request wave summary.
 - Admins can disable the automatic weekly request reward for the current tracking week.
-- Logs weekly request events to SQLite and optionally to a log channel.
+- Logs weekly request events, including manual `/tracking force_dm` outcomes, to SQLite and optionally to a log channel.
 - Weekly request log embeds use readable event names, colors, member context, and structured details.
 
 ### Live Level Request Waves
@@ -82,7 +83,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - `/tracking top` shows the current weekly leaderboard.
 - `/tracking me` shows your weekly count and rank.
 - `/tracking reset` resets this week's tracking data. Admins/owners only.
-- `/tracking force_dm` manually sends a weekly request DM, even to members excluded from normal tracking. Admins/owners only.
+- `/tracking force_dm` manually sends a weekly request DM, even to members excluded from normal tracking, and logs the outcome. Admins/owners only.
 - `/tracking disable_reward` disables the automatic weekly request reward for the current tracking week. Admins/owners only.
 - `/tracking enable_reward` re-enables the automatic weekly request reward for the current tracking week. Admins/owners only.
 - `/refresh-request-button` refreshes or recreates the live request button. Mods only.

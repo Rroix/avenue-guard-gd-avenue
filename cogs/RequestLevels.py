@@ -386,11 +386,25 @@ class RequestLevelsCog(commands.Cog):
             "close_ts": "" if close_ts is None else int(close_ts),
         }
 
+    def _row_value(self, row, key: str, default: Any = "") -> Any:
+        if isinstance(row, dict):
+            return row.get(key, default)
+        try:
+            return row[key]
+        except Exception:
+            return default
+
     def _data_vars(self, row, data: Dict[str, Any], result_key: str = "", review: str = "", reviewer_id: int = 0) -> Dict[str, Any]:
         level_showcase = str(data.get("level_showcase") or "").strip() or "Not provided"
         notes = str(data.get("notes") or "").strip() or "No notes provided"
         result_label = self._result_label(result_key)
         result_color = self._color_name(result_key, self._color_name("pending", "blurple"))
+        requester_id = int(self._row_value(row, "user_id", 0) or 0)
+        wave_raw = self._row_value(row, "wave_id", "")
+        try:
+            wave_id = int(wave_raw)
+        except Exception:
+            wave_id = str(wave_raw or "")
         variables = {
             **data,
             "level_id": data.get("level_id", ""),
@@ -399,9 +413,9 @@ class RequestLevelsCog(commands.Cog):
             "level_showcase": level_showcase,
             "showcase": level_showcase,
             "notes": notes,
-            "requester_id": int(row["user_id"]),
-            "requester_mention": f"<@{int(row['user_id'])}>",
-            "wave_id": int(row["wave_id"]),
+            "requester_id": requester_id,
+            "requester_mention": f"<@{requester_id}>",
+            "wave_id": wave_id,
             "result": result_label,
             "result_key": result_key,
             "review": review or "No review provided.",
@@ -410,6 +424,30 @@ class RequestLevelsCog(commands.Cog):
             "pending_color": self._color_name("pending", "blurple"),
             "result_color": result_color,
         }
+        return variables
+
+    def _weekly_data_vars(self, row, data: Dict[str, Any], result_key: str = "", review: str = "", reviewer_id: int = 0) -> Dict[str, Any]:
+        rank = self._row_value(row, "rank", None)
+        try:
+            rank_text = f"#{int(rank)}"
+        except Exception:
+            rank_text = "Unknown"
+        variables = self._data_vars(
+            {"user_id": int(self._row_value(row, "user_id", 0) or 0), "wave_id": "Weekly"},
+            data,
+            result_key=result_key,
+            review=review,
+            reviewer_id=reviewer_id,
+        )
+        variables.update(
+            {
+                "review_kind": "weekly",
+                "week_start": self._row_value(row, "week_start", ""),
+                "rank": rank_text,
+                "weekly_rank": rank_text,
+                "request_content": str(data.get("request_content") or ""),
+            }
+        )
         return variables
 
     def _result_label(self, result_key: str) -> str:
@@ -811,10 +849,39 @@ class RequestLevelsCog(commands.Cog):
             (guild_id, message_id),
         )
 
+    async def _weekly_submission_by_message(self, guild_id: int, message_id: int):
+        return await self.bot.db.fetchone(
+            "SELECT * FROM weekly_request_reviews WHERE guild_id=? AND request_message_id=?",
+            (guild_id, message_id),
+        )
+
+    async def _review_target_by_message(self, guild_id: int, message_id: int):
+        row = await self._submission_by_message(guild_id, message_id)
+        if row:
+            return "wave", row
+        row = await self._weekly_submission_by_message(guild_id, message_id)
+        if row:
+            return "weekly", row
+        return "", None
+
+    async def _channel_by_id(self, guild: discord.Guild, channel_id: int) -> Optional[discord.TextChannel]:
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await guild.fetch_channel(channel_id)
+            except Exception:
+                channel = None
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    async def _review_target_channel(self, guild: discord.Guild, target_kind: str, row) -> Optional[discord.TextChannel]:
+        if target_kind == "weekly":
+            return await self._channel_by_id(guild, int(self._row_value(row, "channel_id", 0) or 0))
+        return await self._configured_channel(guild, "level_requested")
+
     async def handle_review_button(self, interaction: discord.Interaction, action: str):
         if interaction.guild is None or interaction.message is None:
             return await interaction.response.send_message("Request not found.", ephemeral=True)
-        row = await self._submission_by_message(interaction.guild.id, interaction.message.id)
+        _, row = await self._review_target_by_message(interaction.guild.id, interaction.message.id)
         if not row:
             return await interaction.response.send_message("Request not found.", ephemeral=True)
         if str(row["status"]) != "pending":
@@ -839,7 +906,7 @@ class RequestLevelsCog(commands.Cog):
             await interaction.response.defer(ephemeral=True)
 
         async with self._review_lock:
-            row = await self._submission_by_message(interaction.guild.id, message_id)
+            target_kind, row = await self._review_target_by_message(interaction.guild.id, message_id)
             if not row:
                 return await self._reply_ephemeral(interaction, "Request not found.")
             if str(row["status"]) != "pending":
@@ -848,14 +915,23 @@ class RequestLevelsCog(commands.Cog):
             data = json.loads(row["data_json"] or "{}")
             reviewer_id = interaction.user.id
             result_label = self._result_label(result_key)
-            variables = self._data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
+            if target_kind == "weekly":
+                variables = self._weekly_data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
+            else:
+                variables = self._data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
 
-            await self.bot.db.execute(
-                "UPDATE level_request_submissions SET status='reviewed', result=?, review_text=?, reviewed_by=?, reviewed_ts=? WHERE guild_id=? AND request_message_id=?",
-                (result_key, review, reviewer_id, int(time_module.time()), interaction.guild.id, message_id),
-            )
+            if target_kind == "weekly":
+                await self.bot.db.execute(
+                    "UPDATE weekly_request_reviews SET status='reviewed', result=?, review_text=?, reviewed_by=?, reviewed_ts=? WHERE guild_id=? AND request_message_id=?",
+                    (result_key, review, reviewer_id, int(time_module.time()), interaction.guild.id, message_id),
+                )
+            else:
+                await self.bot.db.execute(
+                    "UPDATE level_request_submissions SET status='reviewed', result=?, review_text=?, reviewed_by=?, reviewed_ts=? WHERE guild_id=? AND request_message_id=?",
+                    (result_key, review, reviewer_id, int(time_module.time()), interaction.guild.id, message_id),
+                )
 
-            request_channel = await self._configured_channel(interaction.guild, "level_requested")
+            request_channel = await self._review_target_channel(interaction.guild, target_kind, row)
             if request_channel is not None:
                 try:
                     msg = await request_channel.fetch_message(message_id)
@@ -869,7 +945,7 @@ class RequestLevelsCog(commands.Cog):
                     await log_error(self.bot, f"Could not edit reviewed level request {message_id}: {repr(e)}")
 
             result_channel_id = self._status_channel_id(result_key)
-            result_channel = interaction.guild.get_channel(result_channel_id) if result_channel_id else None
+            result_channel = await self._channel_by_id(interaction.guild, result_channel_id)
             if isinstance(result_channel, discord.TextChannel):
                 try:
                     result_embed = self._embed_from_template(
@@ -877,17 +953,18 @@ class RequestLevelsCog(commands.Cog):
                         variables,
                         default_color=self._color_name(result_key, "red"),
                     )
-                    await result_channel.send(content=f"<@{int(row['user_id'])}>", embed=result_embed)
+                    await result_channel.send(content=f"<@{int(self._row_value(row, 'user_id', 0) or 0)}>", embed=result_embed)
                 except Exception as e:
                     await log_error(self.bot, f"Could not send level request result {message_id}: {repr(e)}")
 
-            try:
-                state_row = await self._get_state(interaction.guild.id)
-                request_wave_id = int(row["wave_id"])
-                create_summary = int(state_row["wave_id"]) != request_wave_id or str(state_row["state"]) == STATE_CLOSED
-                await self.update_wave_summary(interaction.guild, request_wave_id, create_if_missing=create_summary)
-            except Exception as e:
-                await log_error(self.bot, f"Could not update wave summary for reviewed request {message_id}: {repr(e)}")
+            if target_kind == "wave":
+                try:
+                    state_row = await self._get_state(interaction.guild.id)
+                    request_wave_id = int(row["wave_id"])
+                    create_summary = int(state_row["wave_id"]) != request_wave_id or str(state_row["state"]) == STATE_CLOSED
+                    await self.update_wave_summary(interaction.guild, request_wave_id, create_if_missing=create_summary)
+                except Exception as e:
+                    await log_error(self.bot, f"Could not update wave summary for reviewed request {message_id}: {repr(e)}")
 
         await self._reply_ephemeral(interaction, f"Request marked as {result_label}.")
 

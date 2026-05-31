@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -11,7 +12,7 @@ from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, basic_color
 from utils.timeutils import now_madrid, week_start_sunday, TZ
-from utils.views import TrackingDeclineConfirmView
+from utils.views import LevelRequestReviewView, TrackingDeclineConfirmView
 
 REQUEST_DM_TEXT = (
     "Congratulations! You have been the most active member this week, so you have earned a **level request**. "
@@ -124,6 +125,66 @@ class TrackingCog(commands.Cog):
         if image_url:
             embed.set_image(url=image_url)
         return embed
+
+    def _weekly_request_review_data(self, content: str) -> dict[str, str]:
+        aliases = {
+            "name": "level_name",
+            "level name": "level_name",
+            "id": "level_id",
+            "level id": "level_id",
+            "creator": "creators",
+            "creators": "creators",
+            "creator s": "creators",
+            "level showcase": "level_showcase",
+            "showcase": "level_showcase",
+            "video": "level_showcase",
+            "notes": "notes",
+            "note": "notes",
+        }
+        data: dict[str, str] = {"request_content": str(content or "").strip()}
+        current_key: Optional[str] = None
+
+        for raw_line in str(content or "").splitlines():
+            line = raw_line.strip()
+            if line.startswith(">"):
+                line = line.lstrip("> ").strip()
+            if not line:
+                continue
+
+            if ":" in line:
+                raw_key, value = line.split(":", 1)
+                normalized = re.sub(r"[^a-z0-9]+", " ", raw_key.casefold()).strip()
+                field_key = aliases.get(normalized)
+                if field_key:
+                    current_key = field_key
+                    if value.strip() or field_key not in data:
+                        data[field_key] = value.strip()
+                    continue
+
+            if current_key:
+                previous = str(data.get(current_key) or "").strip()
+                data[current_key] = f"{previous}\n{line}".strip() if previous else line
+
+        if not data.get("level_id"):
+            match = re.search(r"\b(?:level\s*)?id\s*[:#-]?\s*([0-9]{3,})\b", str(content or ""), flags=re.I)
+            if match:
+                data["level_id"] = match.group(1)
+        if not data.get("level_name"):
+            match = re.search(r"\b(?:level\s*)?name\s*[:#-]?\s*(.+)", str(content or ""), flags=re.I)
+            if match:
+                data["level_name"] = match.group(1).strip()
+        if not data.get("creators"):
+            match = re.search(r"\bcreators?\s*[:#-]?\s*(.+)", str(content or ""), flags=re.I)
+            if match:
+                data["creators"] = match.group(1).strip()
+
+        data["level_id"] = str(data.get("level_id") or "Not provided").strip()
+        data["level_id_normalized"] = data["level_id"].casefold()
+        data["level_name"] = str(data.get("level_name") or "Weekly request").strip()
+        data["creators"] = str(data.get("creators") or "Not provided").strip()
+        data["level_showcase"] = str(data.get("level_showcase") or "Not provided").strip()
+        data["notes"] = str(data.get("notes") or data["request_content"] or "No notes provided").strip()
+        return data
 
     async def _resolve_member(self, guild: discord.Guild, user_or_id) -> Optional[discord.Member]:
         if isinstance(user_or_id, discord.Member):
@@ -286,6 +347,9 @@ class TrackingCog(commands.Cog):
             "weekly_reward_skipped": ("Weekly reward skipped", discord.Color.red()),
             "skipped_reward_disabled": ("Skipped while reward disabled", discord.Color.dark_grey()),
             "next_offer_skipped_reward_disabled": ("Next offer skipped", discord.Color.dark_grey()),
+            "force_dm_sent": ("Force DM sent", discord.Color.green()),
+            "force_dm_failed": ("Force DM failed", discord.Color.red()),
+            "force_dm_blocked": ("Force DM blocked", discord.Color.orange()),
         }
         return mapping.get(str(event), (str(event).replace("_", " ").title(), discord.Color.blurple()))
 
@@ -463,10 +527,15 @@ class TrackingCog(commands.Cog):
         rank = int(row["rank"]) if row else None
 
         if isinstance(channel, discord.TextChannel):
+            review_data = self._weekly_request_review_data(content)
             variables = {
+                **review_data,
                 "user_id": user_id,
                 "user_mention": f"<@{user_id}>",
+                "requester_id": user_id,
+                "requester_mention": f"<@{user_id}>",
                 "rank": f"#{rank}" if rank else "Unknown",
+                "weekly_rank": f"#{rank}" if rank else "Unknown",
                 "week_start": week_start_iso,
                 "request_content": content,
             }
@@ -480,10 +549,35 @@ class TrackingCog(commands.Cog):
                     embed.add_field(name="Rank", value=f"#{rank}", inline=True)
                 embed.add_field(name="Week start", value=week_start_iso, inline=False)
                 embed.add_field(name="Content", value=content[:1024], inline=False)
+            msg = None
             try:
-                await channel.send(embed=embed)
+                msg = await channel.send(embed=embed, view=LevelRequestReviewView())
             except Exception:
                 pass
+
+            if msg is not None:
+                try:
+                    await self.bot.db.execute(
+                        "INSERT OR REPLACE INTO weekly_request_reviews("
+                        "guild_id,request_message_id,channel_id,user_id,week_start,rank,status,created_ts,data_json"
+                        ") VALUES(?,?,?,?,?,?,?,?,?)",
+                        (
+                            guild.id,
+                            msg.id,
+                            channel.id,
+                            user_id,
+                            week_start_iso,
+                            rank,
+                            "pending",
+                            int(time.time()),
+                            json.dumps(review_data, separators=(",", ":")),
+                        ),
+                    )
+                except Exception:
+                    try:
+                        await msg.edit(view=LevelRequestReviewView(disabled=True))
+                    except Exception:
+                        pass
 
         # Mark claimed & close session
         await self.bot.db.execute(
@@ -946,12 +1040,15 @@ class TrackingCog(commands.Cog):
         timeout_h = int(timeout_hours or self._cfg_int("tracking", "dm_timeout_hours", 48) or 48)
 
         if await self.weekly_reward_disabled(guild.id, week_start_iso):
+            await self._log_weekly(guild, week_start_iso, user_id, "force_dm_blocked", "reason=weekly_reward_disabled")
             return False, "Weekly reward DMs are disabled for this tracking week."
 
         member = await self._resolve_member(guild, user_id)
         if member is None:
+            await self._log_weekly(guild, week_start_iso, user_id, "force_dm_failed", "reason=user_not_in_server")
             return False, "User is not in the server."
         if member.bot:
+            await self._log_weekly(guild, week_start_iso, user_id, "force_dm_failed", "reason=bot_user")
             return False, "Bots cannot receive weekly requests."
 
         existing = await self.bot.db.fetchone(
@@ -961,6 +1058,7 @@ class TrackingCog(commands.Cog):
         if existing is not None:
             status = str(existing["status"])
             if status != "dm_closed":
+                await self._log_weekly(guild, week_start_iso, user_id, "force_dm_blocked", f"reason=existing_status status={status}")
                 return False, f"Cannot force DM: user already has status '{status}' for this week."
             await self.bot.db.execute(
                 "DELETE FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
@@ -991,7 +1089,9 @@ class TrackingCog(commands.Cog):
 
         ok = await self._contact_user_for_week(guild, week_start_iso, user_id, rank=rank, timeout_hours=timeout_h)
         if ok:
+            await self._log_weekly(guild, week_start_iso, user_id, "force_dm_sent", f"rank={rank} timeout_hours={timeout_h}")
             return True, f"Weekly request DM sent (rank {rank})."
+        await self._log_weekly(guild, week_start_iso, user_id, "force_dm_failed", f"reason=dm_send_failed rank={rank}")
         return False, "Could not DM that user (DMs likely closed)."
 
     async def reset_current_week(self, guild_id: int) -> None:
