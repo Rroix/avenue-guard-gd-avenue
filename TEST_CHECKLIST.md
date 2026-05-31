@@ -260,3 +260,29 @@
    - Expected: summary embed includes activity, community, voice/presence, commands, highlights, top channels, top members, and top commands.
 2. Compare with the previous day if data exists.
    - Expected: message and command lines show day-over-day change.
+
+---
+
+## 23) Bot diagnostics and performance safety
+**Setup:** use an admin/owner account for `/bot` commands and a mod account for `/requests pending`.
+
+1. Run `/bot health`.
+   - Expected: an ephemeral health embed shows database status, latency, loaded cogs, background task states, open tickets, weekly sessions, pending requests, and request state.
+2. Run `/bot config_check`.
+   - Expected: configured channels and roles are reported as OK or listed as issues.
+3. Run `/requests pending`.
+   - Expected: pending live request reviews and weekly request reviews are listed separately with jump links when message IDs are available.
+4. Send several normal chat messages.
+   - Expected: tracking still counts activity, but writes are flushed according to `tracking.activity_flush_seconds`.
+5. Run `/restart` after sending a counted message.
+   - Expected: buffered tracking counts and current daily stats are flushed before the bot exits.
+6. Create two tickets quickly with two users.
+   - Expected: ticket IDs do not duplicate.
+7. Temporarily misconfigure `channels.weekly_request_channel_ID`, restart or resync, then submit a weekly request in DM.
+   - Expected: the user is told the request could not be recorded, the weekly log records `request_record_failed`, and the claim is not silently closed as successfully claimed.
+8. Reply to a weekly request DM with text missing the actual level ID field.
+   - Expected: the request is not recorded, and the bot tells the user which required field is missing.
+9. Disable this week's reward with `/tracking disable_reward`, then run `/tracking force_dm`.
+   - Expected: the manual force DM still sends if the user has no active/past non-resettable claim, and the override is logged.
+10. Temporarily misconfigure an appeal/report/bot-issue log channel, then complete that DM flow.
+   - Expected: the user is told the submission could not be sent instead of receiving a false success message.

@@ -16,6 +16,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 ### Weekly Activity Requests
 - Counts eligible member messages per Madrid-time week.
 - Skips configured roles and channels.
+- Buffers activity writes briefly with `tracking.activity_flush_seconds` so busy chat does less SQLite work.
 - Provides `/tracking top`, `/tracking me`, `/tracking reset`, `/tracking force_dm`, `/tracking disable_reward`, and `/tracking enable_reward`.
 - DMs weekly winners with a configurable request embed.
 - Supports claim, decline confirmation, timeout, reminders, and automatic offer to the next eligible member.
@@ -23,6 +24,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Weekly submitted requests use the same staff review/result workflow as live wave requests, but do not count toward or appear in any request wave summary.
 - Admins can disable the automatic weekly request reward for the current tracking week.
 - Logs weekly request events, including manual `/tracking force_dm` outcomes, to SQLite and optionally to a log channel.
+- Logs weekly request recording failures instead of silently closing a claim when the staff request channel cannot be used.
 - Weekly request log embeds use readable event names, colors, member context, and structured details.
 
 ### Live Level Request Waves
@@ -39,6 +41,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Supports the first-request `I will` / `I won't` choice flow with configurable roles.
 - Sends staff review embeds to `level_requests.level_requested`.
 - Reviewers can choose `Send`, `Reject`, or `Other`.
+- Review actions verify the original request message and result channel before marking the request reviewed.
 - Sends final result embeds to `level_requests.sent_channel` or `level_requests.rejected_channel`.
 - Disables review buttons after a request is processed.
 - Posts one live summary embed per closed wave in `level_requests.level_requested`, including requested, reviewed, sent, not sent, percentages, and remaining reviews.
@@ -48,6 +51,8 @@ The bot is intentionally built around one configured server. Most behavior is co
 - DMs members a persistent help menu.
 - Supports FAQ, punishment appeals, user reports, bot issue reports, weekly status checks, transcript requests, and staff contact tickets.
 - Creates private ticket channels for the requester and staff.
+- Uses atomic ticket IDs to avoid duplicate ticket numbers during simultaneous ticket creation.
+- Caches active ticket channels so normal server messages do not hit the database for ticket checks.
 - Tracks ticket inactivity and prompts staff to close stale tickets.
 - Saves transcripts before deleting tickets.
 - Lets staff approve or deny transcript requests.
@@ -68,6 +73,9 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Stops after the first matching rule.
 
 ### Background Utilities
+- `/bot health` shows database, background task, request, ticket, and weekly workflow status. Admins/owners only.
+- `/bot config_check` validates configured channels and roles. Admins/owners only.
+- `/requests pending` shows pending live-wave and weekly request reviews. Mods only.
 - Optional rotating bot status with placeholders like `{members}`, `{online}`, `{week_msgs}`, `{week_top}`, `{open_tickets}`, and `{today_msgs}`.
 - Optional daily server summary embeds with highlights, day-over-day movement, active members/channels, moderation signals, command health, voice/presence, and top channels/members/commands.
 - Tracks daily messages, edits, deletes, reactions, joins, leaves, bans, boosts, voice minutes, command usage, and top channels/users.
@@ -83,9 +91,12 @@ The bot is intentionally built around one configured server. Most behavior is co
 - `/tracking top` shows the current weekly leaderboard.
 - `/tracking me` shows your weekly count and rank.
 - `/tracking reset` resets this week's tracking data. Admins/owners only.
-- `/tracking force_dm` manually sends a weekly request DM, even to members excluded from normal tracking, and logs the outcome. Admins/owners only.
+- `/tracking force_dm` manually sends a weekly request DM, even to members excluded from normal tracking or during a disabled automatic reward week, and logs the outcome. Admins/owners only.
 - `/tracking disable_reward` disables the automatic weekly request reward for the current tracking week. Admins/owners only.
 - `/tracking enable_reward` re-enables the automatic weekly request reward for the current tracking week. Admins/owners only.
+- `/bot health` shows a compact live health report. Admins/owners only.
+- `/bot config_check` checks configured channels and roles. Admins/owners only.
+- `/requests pending` shows pending live and weekly request reviews. Mods only.
 - `/refresh-request-button` refreshes or recreates the live request button. Mods only.
 - `/open-requests number:<optional> time:<optional>` opens a new request wave. Admins/owners only.
 - `/close-requests` closes the active request wave. Admins/owners only.
@@ -93,7 +104,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - `/ticket close` closes the current ticket channel. Mods only.
 - `/forum required_word` views or changes the forum required word. Discord administrators only.
 - `/resync` reloads config and response rules without restarting. Admins/owners only.
-- `/restart` exits the bot so the host can restart it. Admins/owners only.
+- `/restart` flushes buffered tracking/daily stats, then exits the bot so the host can restart it. Admins/owners only.
 - `/dance`, `/rock-paper-scissors`, `/gambling` are public fun commands.
 
 ## Required-Word Forum Enforcement

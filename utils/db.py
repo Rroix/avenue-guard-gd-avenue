@@ -234,6 +234,27 @@ class Database:
                 updated_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, wave_id)
             );""",
+            """CREATE TABLE IF NOT EXISTS daily_stats(
+                guild_id INTEGER NOT NULL,
+                day_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, day_key)
+            );""",
+            """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
+                ON activity_counts(guild_id, week_start, count DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry
+                ON weekly_sessions(guild_id, active, expires_ts);""",
+            """CREATE INDEX IF NOT EXISTS idx_weekly_claims_status
+                ON weekly_claims(guild_id, week_start, status);""",
+            """CREATE INDEX IF NOT EXISTS idx_tickets_status_activity
+                ON tickets(guild_id, status, last_user_activity_ts);""",
+            """CREATE INDEX IF NOT EXISTS idx_level_request_submissions_status
+                ON level_request_submissions(guild_id, status, wave_id);""",
+            """CREATE INDEX IF NOT EXISTS idx_weekly_request_reviews_status
+                ON weekly_request_reviews(guild_id, status, week_start);""",
+            """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status
+                ON transcript_requests(guild_id, ticket_id, status);""",
         ]
         for stmt in stmts:
             self._conn.execute(stmt)
@@ -500,6 +521,27 @@ class Database:
                 updated_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, wave_id)
             );""",
+            """CREATE TABLE IF NOT EXISTS daily_stats(
+                guild_id INTEGER NOT NULL,
+                day_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, day_key)
+            );""",
+            """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
+                ON activity_counts(guild_id, week_start, count DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry
+                ON weekly_sessions(guild_id, active, expires_ts);""",
+            """CREATE INDEX IF NOT EXISTS idx_weekly_claims_status
+                ON weekly_claims(guild_id, week_start, status);""",
+            """CREATE INDEX IF NOT EXISTS idx_tickets_status_activity
+                ON tickets(guild_id, status, last_user_activity_ts);""",
+            """CREATE INDEX IF NOT EXISTS idx_level_request_submissions_status
+                ON level_request_submissions(guild_id, status, wave_id);""",
+            """CREATE INDEX IF NOT EXISTS idx_weekly_request_reviews_status
+                ON weekly_request_reviews(guild_id, status, week_start);""",
+            """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status
+                ON transcript_requests(guild_id, ticket_id, status);""",
         ]
         for s in stmts:
             await self.execute(s)

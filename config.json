@@ -59,6 +59,7 @@
     "top_limit": 20,
     "winners_to_dm": 1,
     "count_cooldown_seconds": 10,
+    "activity_flush_seconds": 30,
     "dm_timeout_hours": 24,
     "reminder_after_hours": 12,
     "reminder_repeat_hours": 0,

@@ -40,11 +40,15 @@ class HelpCog(commands.Cog):
         self.bot = bot
         self._ticket_scan_task: Optional[asyncio.Task] = None
         self._started = False
+        self._active_ticket_channels: set[int] = set()
+        self._ticket_cache_ready = False
+        self._last_error_log: Dict[str, float] = {}
 
     async def start_background(self):
         if self._started:
             return
         self._started = True
+        await self._load_active_ticket_channels()
         self._ticket_scan_task = asyncio.create_task(self._ticket_scan_loop())
 
     def on_config_reload(self) -> None:
@@ -60,8 +64,28 @@ class HelpCog(commands.Cog):
                 await self._scan_tickets()
             except asyncio.CancelledError:
                 return
-            except Exception:
-                continue
+            except Exception as e:
+                await self._log_background_error("ticket_scan", f"Ticket scan loop error: {repr(e)}")
+
+    async def _log_background_error(self, key: str, message: str) -> None:
+        now = time.time()
+        if now - self._last_error_log.get(key, 0.0) < 300:
+            return
+        self._last_error_log[key] = now
+        await log_error(self.bot, message)
+
+    async def _load_active_ticket_channels(self) -> None:
+        cfg = self.bot.config
+        allowed_guild_id = cfg.get_int("guild", "allowed_guild_id")
+        if not allowed_guild_id:
+            self._ticket_cache_ready = True
+            return
+        rows = await self.bot.db.fetchall(
+            "SELECT channel_id FROM tickets WHERE guild_id=? AND status IN ('open','closing_prompted')",
+            (allowed_guild_id,),
+        )
+        self._active_ticket_channels = {int(row["channel_id"]) for row in rows}
+        self._ticket_cache_ready = True
 
     async def _scan_tickets(self):
         cfg = self.bot.config
@@ -81,10 +105,12 @@ class HelpCog(commands.Cog):
             channel_id = int(r["channel_id"])
             channel = guild.get_channel(channel_id)
             if not isinstance(channel, discord.TextChannel):
+                self._active_ticket_channels.discard(channel_id)
                 continue
             try:
                 await channel.send("Do you want to close the ticket?", view=TicketClosePromptView())
                 await self.bot.db.execute("UPDATE tickets SET status='closing_prompted' WHERE channel_id=?", (channel_id,))
+                self._active_ticket_channels.add(channel_id)
             except Exception:
                 continue
 
@@ -102,12 +128,18 @@ class HelpCog(commands.Cog):
 
         # Ticket activity in guild
         if message.guild is not None and ensure_allowed_guild_id(message.guild, allowed_guild_id):
+            if not self._ticket_cache_ready:
+                await self._load_active_ticket_channels()
+            if message.channel.id not in self._active_ticket_channels:
+                return
             row = await self.bot.db.fetchone("SELECT status FROM tickets WHERE channel_id=?", (message.channel.id,))
             if row and row["status"] in ("open", "closing_prompted"):
                 await self.bot.db.execute(
                     "UPDATE tickets SET last_user_activity_ts=?, status='open' WHERE channel_id=?",
                     (int(time.time()), message.channel.id),
                 )
+            else:
+                self._active_ticket_channels.discard(message.channel.id)
             return
 
         # DM help
@@ -360,23 +392,32 @@ class HelpCog(commands.Cog):
 
         if stage == "appeal_reason":
             data["reason"] = content
-            await self._submit_appeal(guild, message.author.id, data)
             await self._clear_help_session(message.author.id, guild.id)
-            await message.channel.send("Thanks! We will look into your appeal soon")
+            ok = await self._submit_appeal(guild, message.author.id, data)
+            if ok:
+                await message.channel.send("Thanks! We will look into your appeal soon")
+            else:
+                await message.channel.send("I couldn't send your appeal to staff right now. Please contact staff directly.")
             return True
 
         if stage == "report_details":
             data["report"] = content
-            await self._submit_report(guild, message.author.id, data)
             await self._clear_help_session(message.author.id, guild.id)
-            await message.channel.send("Thanks! Your report has been sent to our staff team")
+            ok = await self._submit_report(guild, message.author.id, data)
+            if ok:
+                await message.channel.send("Thanks! Your report has been sent to our staff team")
+            else:
+                await message.channel.send("I couldn't send your report to staff right now. Please contact staff directly.")
             return True
 
         if stage == "bot_issue_details":
             data["issue"] = content
-            await self._submit_bot_issue(guild, message.author.id, data)
             await self._clear_help_session(message.author.id, guild.id)
-            await message.channel.send("Thanks! Your bug report has been sent to our developer team")
+            ok = await self._submit_bot_issue(guild, message.author.id, data)
+            if ok:
+                await message.channel.send("Thanks! Your bug report has been sent to our developer team")
+            else:
+                await message.channel.send("I couldn't send your bug report to staff right now. Please contact staff directly.")
             return True
 
         if stage == "transcript_ticket":
@@ -443,39 +484,57 @@ class HelpCog(commands.Cog):
     # -----------------------------
     # Staff submissions
     # -----------------------------
-    async def _submit_appeal(self, guild: discord.Guild, user_id: int, data: Dict[str, Any]):
+    async def _submit_appeal(self, guild: discord.Guild, user_id: int, data: Dict[str, Any]) -> bool:
         cfg = self.bot.config
         ch_id = cfg.get_int("channels", "appeals_log_channel_id")
         channel = guild.get_channel(ch_id) if ch_id else None
         if not isinstance(channel, discord.TextChannel):
-            return
+            await log_error(self.bot, "Appeal submission failed: appeals_log_channel_id is missing or invalid.")
+            return False
         embed = discord.Embed(title="Punishment Appeal")
         embed.add_field(name="User", value=f"<@{user_id}> ({user_id})", inline=False)
         embed.add_field(name="Punishment", value=str(data.get("punishment", ""))[:1024], inline=False)
         embed.add_field(name="Why lift?", value=str(data.get("reason", ""))[:1024], inline=False)
-        await channel.send(embed=embed)
+        try:
+            await channel.send(embed=embed)
+            return True
+        except Exception as e:
+            await log_error(self.bot, f"Appeal submission failed: {repr(e)}")
+            return False
 
-    async def _submit_report(self, guild: discord.Guild, user_id: int, data: Dict[str, Any]):
+    async def _submit_report(self, guild: discord.Guild, user_id: int, data: Dict[str, Any]) -> bool:
         cfg = self.bot.config
         ch_id = cfg.get_int("channels", "reports_log_channel_id")
         channel = guild.get_channel(ch_id) if ch_id else None
         if not isinstance(channel, discord.TextChannel):
-            return
+            await log_error(self.bot, "Report submission failed: reports_log_channel_id is missing or invalid.")
+            return False
         embed = discord.Embed(title="User Report")
         embed.add_field(name="Reporter", value=f"<@{user_id}> ({user_id})", inline=False)
         embed.add_field(name="Details", value=str(data.get("report", ""))[:1024], inline=False)
-        await channel.send(embed=embed)
+        try:
+            await channel.send(embed=embed)
+            return True
+        except Exception as e:
+            await log_error(self.bot, f"Report submission failed: {repr(e)}")
+            return False
 
-    async def _submit_bot_issue(self, guild: discord.Guild, user_id: int, data: Dict[str, Any]):
+    async def _submit_bot_issue(self, guild: discord.Guild, user_id: int, data: Dict[str, Any]) -> bool:
         cfg = self.bot.config
         ch_id = cfg.get_int("channels", "bot_issues_log_channel_id")
         channel = guild.get_channel(ch_id) if ch_id else None
         if not isinstance(channel, discord.TextChannel):
-            return
+            await log_error(self.bot, "Bot issue submission failed: bot_issues_log_channel_id is missing or invalid.")
+            return False
         embed = discord.Embed(title="Bot Issue Report")
         embed.add_field(name="Reporter", value=f"<@{user_id}> ({user_id})", inline=False)
         embed.add_field(name="Issue", value=str(data.get("issue", ""))[:1024], inline=False)
-        await channel.send(embed=embed)
+        try:
+            await channel.send(embed=embed)
+            return True
+        except Exception as e:
+            await log_error(self.bot, f"Bot issue submission failed: {repr(e)}")
+            return False
 
     # -----------------------------
     # Transcript requests (staff approval)
@@ -673,7 +732,7 @@ class HelpCog(commands.Cog):
         if mod_role:
             overwrites[mod_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
-        ticket_id = await self._next_ticket_id(guild.id)
+        ticket_id = await self.bot.db.next_ticket_id(guild.id)
         name = f"ticket-{ticket_id}-{member.name}".lower().replace(" ", "-")[:90]
 
         try:
@@ -690,6 +749,7 @@ class HelpCog(commands.Cog):
             "VALUES(?,?,?,?,?, 'open', ?)",
             (guild.id, channel.id, member.id, now, now, ticket_id),
         )
+        self._active_ticket_channels.add(channel.id)
 
         # DM includes Ticket ID
         try:
@@ -713,14 +773,7 @@ class HelpCog(commands.Cog):
             pass
 
     async def _next_ticket_id(self, guild_id: int) -> int:
-        row = await self.bot.db.fetchone("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (guild_id,))
-        if not row:
-            await self.bot.db.execute("INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?, ?)", (guild_id, 2))
-            return 1
-
-        next_id = int(row["next_ticket_id"])
-        await self.bot.db.execute("UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?", (next_id + 1, guild_id))
-        return next_id
+        return await self.bot.db.next_ticket_id(guild_id)
 
     async def handle_ticket_close_prompt(self, interaction: discord.Interaction, confirmed: bool):
         cfg = self.bot.config
@@ -796,12 +849,12 @@ class HelpCog(commands.Cog):
                 return False
 
         try:
-            await self.bot.db.execute("UPDATE tickets SET status='closed' WHERE channel_id=?", (channel_id,))
-        except Exception as e:
-            await log_error(self.bot, f"Ticket status update failed for channel_id={channel_id}: {repr(e)}")
-
-        try:
             await channel.delete(reason="Ticket closed")
+            try:
+                await self.bot.db.execute("UPDATE tickets SET status='closed' WHERE channel_id=?", (channel_id,))
+                self._active_ticket_channels.discard(channel_id)
+            except Exception as e:
+                await log_error(self.bot, f"Ticket status update failed after deletion for channel_id={channel_id}: {repr(e)}")
             return True
         except Exception as e:
             await log_error(self.bot, f"Ticket delete failed for channel_id={channel_id}: {repr(e)}")

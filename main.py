@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import traceback
 import discord
 
 from utils.config import Config
@@ -21,7 +22,22 @@ from utils.checks import ensure_allowed_guild_id
 DB_PATH = "data/bot.db"
 
 def create_bot() -> discord.Bot:
-    intents = discord.Intents.all()
+    intents = discord.Intents.default()
+    for intent_name in (
+        "bans",
+        "dm_messages",
+        "guild_messages",
+        "guild_reactions",
+        "members",
+        "message_content",
+        "messages",
+        "moderation",
+        "presences",
+        "reactions",
+        "voice_states",
+    ):
+        if hasattr(intents, intent_name):
+            setattr(intents, intent_name, True)
     bot = discord.Bot(intents=intents)
 
     bot.config = Config("config.json")
@@ -100,7 +116,19 @@ def create_bot() -> discord.Bot:
 
     bot.register_persistent_views = register_persistent_views
 
-    bot.loop.create_task(_load_cogs())
+    async def _load_cogs_logged():
+        try:
+            await _load_cogs()
+        except Exception as e:
+            details = f"Cog load failed: {repr(e)}\n{traceback.format_exc()}"
+            print(details)
+            try:
+                await log_error(bot, details)
+            except Exception:
+                pass
+            await bot.close()
+
+    bot.loop.create_task(_load_cogs_logged())
     return bot
 
 if __name__ == "__main__":

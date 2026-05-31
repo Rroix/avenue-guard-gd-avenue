@@ -79,11 +79,17 @@ class MessageResponsesCog(commands.Cog):
                 # channel filter
                 chans = rule.get("Channels", [])
                 if isinstance(chans, list) and chans:
-                    try:
-                        chan_ids = {int(x) for x in chans}
-                    except Exception:
-                        chan_ids = set()
-                    if chan_ids and message.channel.id not in chan_ids:
+                    chan_ids = set()
+                    has_non_empty_filter = False
+                    for raw_channel_id in chans:
+                        try:
+                            text = str(raw_channel_id).strip()
+                            if text:
+                                has_non_empty_filter = True
+                                chan_ids.add(int(text))
+                        except Exception:
+                            continue
+                    if has_non_empty_filter and (not chan_ids or message.channel.id not in chan_ids):
                         continue
 
                 respond = bool(rule.get("Respond", False))

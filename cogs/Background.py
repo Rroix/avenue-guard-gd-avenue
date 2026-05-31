@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands, tasks
 
 from utils.checks import ensure_allowed_guild_id
+from utils.errors import log_error
 from utils.timeutils import TZ, now_madrid, week_start_sunday
 
 def _day_key(dt: Optional[datetime] = None) -> str:
@@ -94,20 +95,10 @@ class BackgroundCog(commands.Cog):
             return
         self._started = True
 
-        # Ensure DB schema exists
         try:
             await self.bot.db.connect()
-            await self.bot.db.execute(
-                """CREATE TABLE IF NOT EXISTS daily_stats(
-                    guild_id INTEGER NOT NULL,
-                    day_key TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_ts INTEGER NOT NULL,
-                    PRIMARY KEY (guild_id, day_key)
-                );"""
-            )
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(self.bot, f"Background DB setup failed: {repr(e)}")
 
         # Initialize voice sessions from current state (best-effort)
         cfg = self.bot.config
@@ -134,8 +125,6 @@ class BackgroundCog(commands.Cog):
         try:
             if not self.update_snapshot.is_running():
                 self.update_snapshot.start()
-                if not self.rotate_status.is_running():
-                    self.rotate_status.start()
         except Exception:
             pass
 
@@ -148,6 +137,14 @@ class BackgroundCog(commands.Cog):
             pass
         if self._started and self._daily_summary_enabled():
             self._start_daily_report_loop()
+        try:
+            if self._status_rotation_enabled():
+                if not self.rotate_status.is_running():
+                    self.rotate_status.start()
+            elif self.rotate_status.is_running():
+                self.rotate_status.cancel()
+        except Exception:
+            pass
 
     # --------------------
     # Config helpers
@@ -313,21 +310,71 @@ class BackgroundCog(commands.Cog):
             (guild_id, day_key, json.dumps(payload, separators=(',', ':')), int(time.time())),
         )
 
+    async def _persist_current_day(self) -> None:
+        allowed = self.bot.config.get_int("guild", "allowed_guild_id")
+        if allowed:
+            guild = self.bot.get_guild(allowed)
+            now_ts = int(time.time())
+            if guild is not None:
+                self._add_voice_until(self.stats, now_ts)
+                self.voice_sessions = self._voice_sessions_from_guild(guild, now_ts)
+            await self._persist_daily_stats(allowed, self._current_day, self.stats)
+
+    def _rollover_boundary_ts(self, old_day: str) -> int:
+        try:
+            boundary = datetime.strptime(old_day, "%Y-%m-%d").replace(tzinfo=TZ) + timedelta(days=1)
+            return int(boundary.timestamp())
+        except Exception:
+            return int(time.time())
+
+    def _add_voice_until(self, snapshot: DailyStats, boundary_ts: int) -> None:
+        for joined_ts in list(self.voice_sessions.values()):
+            try:
+                minutes = int((boundary_ts - int(joined_ts)) // 60)
+                if minutes > 0:
+                    snapshot.voice_minutes += minutes
+            except Exception:
+                continue
+
+    def _track_background_persist(self, task: asyncio.Task) -> None:
+        def _done(done: asyncio.Task):
+            try:
+                exc = done.exception()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                exc = e
+            if exc:
+                try:
+                    asyncio.create_task(log_error(self.bot, f"Daily stats persist failed: {repr(exc)}"))
+                except Exception:
+                    pass
+
+        task.add_done_callback(_done)
+
     def _rollover_if_needed(self, guild: Optional[discord.Guild] = None):
         today = _day_key()
         if today != self._current_day:
             allowed = self.bot.config.get_int("guild", "allowed_guild_id")
+            old_day = self._current_day
+            old_stats = self.stats
+            boundary_ts = self._rollover_boundary_ts(old_day)
             if allowed:
-                old_day = self._current_day
-                old_stats = self.stats
+                self._add_voice_until(old_stats, boundary_ts)
                 try:
-                    asyncio.create_task(self._persist_daily_stats(allowed, old_day, old_stats))
-                except Exception:
-                    pass
+                    task = asyncio.create_task(self._persist_daily_stats(allowed, old_day, old_stats))
+                    self._track_background_persist(task)
+                except Exception as e:
+                    try:
+                        asyncio.create_task(log_error(self.bot, f"Daily stats rollover persist could not start: {repr(e)}"))
+                    except Exception:
+                        pass
+            else:
+                boundary_ts = int(time.time())
             self._current_day = today
             self.stats = DailyStats()
             if guild is not None:
-                self.voice_sessions = self._voice_sessions_from_guild(guild, int(time.time()))
+                self.voice_sessions = self._voice_sessions_from_guild(guild, boundary_ts)
             else:
                 self.voice_sessions.clear()
 
@@ -511,6 +558,10 @@ class BackgroundCog(commands.Cog):
     async def _before_snapshot(self):
         await self.bot.wait_until_ready()
 
+    @update_snapshot.error
+    async def _snapshot_error(self, error: Exception):
+        await log_error(self.bot, f"Daily snapshot task error: {repr(error)}")
+
     @tasks.loop(seconds=10)
     async def rotate_status(self):
         if not self._status_rotation_enabled():
@@ -551,6 +602,10 @@ class BackgroundCog(commands.Cog):
     @rotate_status.before_loop
     async def _before_rotate(self):
         await self.bot.wait_until_ready()
+
+    @rotate_status.error
+    async def _rotate_error(self, error: Exception):
+        await log_error(self.bot, f"Status rotation task error: {repr(error)}")
 
     def _start_daily_report_loop(self):
         hh, mm = _parse_hhmm(str(self.bot.config.get("background", "daily_summary", "time", default="00:00") or "00:00"))
@@ -626,8 +681,9 @@ class BackgroundCog(commands.Cog):
             prev_snapshot = None
 
         voice_minutes = int(snapshot.voice_minutes)
+        report_boundary_ts = self._rollover_boundary_ts(day_key)
         if day_key == self._current_day:
-            now_ts = int(time.time())
+            now_ts = report_boundary_ts if day_key != today else int(time.time())
             for joined_ts in self.voice_sessions.values():
                 try:
                     minutes = int((now_ts - int(joined_ts)) // 60)
@@ -740,11 +796,16 @@ class BackgroundCog(commands.Cog):
         if self._daily_reset_after_report() and self._current_day == day_key:
             self._current_day = today
             self.stats = DailyStats()
-            self.voice_sessions = self._voice_sessions_from_guild(guild, int(time.time()))
+            reset_ts = report_boundary_ts if day_key != today else int(time.time())
+            self.voice_sessions = self._voice_sessions_from_guild(guild, reset_ts)
 
     @daily_report.before_loop
     async def _before_daily(self):
         await self.bot.wait_until_ready()
+
+    @daily_report.error
+    async def _daily_error(self, error: Exception):
+        await log_error(self.bot, f"Daily report task error: {repr(error)}")
 
 def setup(bot: discord.Bot):
     bot.add_cog(BackgroundCog(bot))

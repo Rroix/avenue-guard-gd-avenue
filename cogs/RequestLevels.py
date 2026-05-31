@@ -793,10 +793,14 @@ class RequestLevelsCog(commands.Cog):
                 data["level_id_normalized"] = normalized_level_id
                 data_json = json.dumps(data, separators=(",", ":"))
 
-                await self.bot.db.execute(
-                    "INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,status,created_ts,data_json) VALUES(?,?,?,?,?,?,?)",
-                    (interaction.guild.id, wave_id, user_id, normalized_level_id, "pending", int(time_module.time()), data_json),
-                )
+                try:
+                    await self.bot.db.execute(
+                        "INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,status,created_ts,data_json) VALUES(?,?,?,?,?,?,?)",
+                        (interaction.guild.id, wave_id, user_id, normalized_level_id, "pending", int(time_module.time()), data_json),
+                    )
+                except Exception as e:
+                    await log_error(self.bot, f"Could not save level request submission before sending embed: {repr(e)}")
+                    return await self._reply_ephemeral(interaction, "I couldn't submit your request right now.")
 
                 try:
                     temp_row = {"guild_id": interaction.guild.id, "wave_id": wave_id, "user_id": user_id}
@@ -807,30 +811,51 @@ class RequestLevelsCog(commands.Cog):
                     )
                     msg = await target_channel.send(embed=embed, view=LevelRequestReviewView())
                 except Exception as e:
-                    await self.bot.db.execute(
-                        "DELETE FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
-                        (interaction.guild.id, wave_id, user_id),
-                    )
+                    try:
+                        await self.bot.db.execute(
+                            "DELETE FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+                            (interaction.guild.id, wave_id, user_id),
+                        )
+                    except Exception as cleanup_error:
+                        await log_error(self.bot, f"Could not clean up unsent level request submission: {repr(cleanup_error)}")
                     await log_error(self.bot, f"Could not send level request embed: {repr(e)}")
                     return await self._reply_ephemeral(interaction, "I couldn't submit your request right now.")
 
                 new_count = int(row["submitted_count"]) + 1
-                await self.bot.db.execute(
-                    "UPDATE level_request_submissions SET request_message_id=? WHERE guild_id=? AND wave_id=? AND user_id=?",
-                    (msg.id, interaction.guild.id, wave_id, user_id),
-                )
+                try:
+                    await self.bot.db.execute(
+                        "UPDATE level_request_submissions SET request_message_id=? WHERE guild_id=? AND wave_id=? AND user_id=?",
+                        (msg.id, interaction.guild.id, wave_id, user_id),
+                    )
 
-                if row["request_limit"] is not None and new_count >= int(row["request_limit"]):
-                    await self.bot.db.execute(
-                        "UPDATE level_request_state SET submitted_count=?, state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
-                        (new_count, STATE_CLOSED, int(time_module.time()), interaction.guild.id),
-                    )
-                    refresh_after_close = True
-                else:
-                    await self.bot.db.execute(
-                        "UPDATE level_request_state SET submitted_count=? WHERE guild_id=?",
-                        (new_count, interaction.guild.id),
-                    )
+                    if row["request_limit"] is not None and new_count >= int(row["request_limit"]):
+                        await self.bot.db.execute(
+                            "UPDATE level_request_state SET submitted_count=?, state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
+                            (new_count, STATE_CLOSED, int(time_module.time()), interaction.guild.id),
+                        )
+                        refresh_after_close = True
+                    else:
+                        await self.bot.db.execute(
+                            "UPDATE level_request_state SET submitted_count=? WHERE guild_id=?",
+                            (new_count, interaction.guild.id),
+                        )
+                except Exception as e:
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        try:
+                            await msg.edit(view=LevelRequestReviewView(disabled=True))
+                        except Exception:
+                            pass
+                    try:
+                        await self.bot.db.execute(
+                            "DELETE FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+                            (interaction.guild.id, wave_id, user_id),
+                        )
+                    except Exception as cleanup_error:
+                        await log_error(self.bot, f"Could not clean up failed level request submission: {repr(cleanup_error)}")
+                    await log_error(self.bot, f"Could not finish level request submission after sending embed: {repr(e)}")
+                    return await self._reply_ephemeral(interaction, "I couldn't finish submitting your request right now.")
 
         if refresh_after_close:
             try:
@@ -920,42 +945,58 @@ class RequestLevelsCog(commands.Cog):
             else:
                 variables = self._data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
 
-            if target_kind == "weekly":
-                await self.bot.db.execute(
-                    "UPDATE weekly_request_reviews SET status='reviewed', result=?, review_text=?, reviewed_by=?, reviewed_ts=? WHERE guild_id=? AND request_message_id=?",
-                    (result_key, review, reviewer_id, int(time_module.time()), interaction.guild.id, message_id),
-                )
-            else:
-                await self.bot.db.execute(
-                    "UPDATE level_request_submissions SET status='reviewed', result=?, review_text=?, reviewed_by=?, reviewed_ts=? WHERE guild_id=? AND request_message_id=?",
-                    (result_key, review, reviewer_id, int(time_module.time()), interaction.guild.id, message_id),
-                )
-
             request_channel = await self._review_target_channel(interaction.guild, target_kind, row)
-            if request_channel is not None:
-                try:
-                    msg = await request_channel.fetch_message(message_id)
-                    final_embed = self._embed_from_template(
-                        self._cfg("level_reviewed_embed", default={}) or {},
-                        variables,
-                        default_color=self._color_name(result_key, "red"),
-                    )
-                    await msg.edit(embed=final_embed, view=LevelRequestReviewView(disabled=True))
-                except Exception as e:
-                    await log_error(self.bot, f"Could not edit reviewed level request {message_id}: {repr(e)}")
+            if request_channel is None:
+                return await self._reply_ephemeral(interaction, "I couldn't find the original request channel, so I did not mark it reviewed.")
+            try:
+                msg = await request_channel.fetch_message(message_id)
+            except Exception as e:
+                await log_error(self.bot, f"Could not fetch reviewed level request {message_id}: {repr(e)}")
+                return await self._reply_ephemeral(interaction, "I couldn't find the original request message, so I did not mark it reviewed.")
 
             result_channel_id = self._status_channel_id(result_key)
             result_channel = await self._channel_by_id(interaction.guild, result_channel_id)
-            if isinstance(result_channel, discord.TextChannel):
-                try:
-                    result_embed = self._embed_from_template(
-                        self._cfg(self._result_template_key(result_key), default={}) or {},
-                        variables,
-                        default_color=self._color_name(result_key, "red"),
+            if not isinstance(result_channel, discord.TextChannel):
+                return await self._reply_ephemeral(interaction, "I couldn't find the result channel, so I did not mark it reviewed.")
+
+            reviewed_ts = int(time_module.time())
+            try:
+                if target_kind == "weekly":
+                    await self.bot.db.execute(
+                        "UPDATE weekly_request_reviews SET status='reviewed', result=?, review_text=?, reviewed_by=?, reviewed_ts=? WHERE guild_id=? AND request_message_id=? AND status='pending'",
+                        (result_key, review, reviewer_id, reviewed_ts, interaction.guild.id, message_id),
                     )
-                    await result_channel.send(content=f"<@{int(self._row_value(row, 'user_id', 0) or 0)}>", embed=result_embed)
-                except Exception as e:
-                    await log_error(self.bot, f"Could not send level request result {message_id}: {repr(e)}")
+                else:
+                    await self.bot.db.execute(
+                        "UPDATE level_request_submissions SET status='reviewed', result=?, review_text=?, reviewed_by=?, reviewed_ts=? WHERE guild_id=? AND request_message_id=? AND status='pending'",
+                        (result_key, review, reviewer_id, reviewed_ts, interaction.guild.id, message_id),
+                    )
+            except Exception as e:
+                await log_error(self.bot, f"Could not save reviewed level request {message_id}: {repr(e)}")
+                return await self._reply_ephemeral(interaction, "I couldn't save the review, so I did not update the request.")
+
+            result_warning = ""
+            try:
+                final_embed = self._embed_from_template(
+                    self._cfg("level_reviewed_embed", default={}) or {},
+                    variables,
+                    default_color=self._color_name(result_key, "red"),
+                )
+                await msg.edit(embed=final_embed, view=LevelRequestReviewView(disabled=True))
+            except Exception as e:
+                result_warning += " I saved the review, but couldn't update the original request embed."
+                await log_error(self.bot, f"Could not edit reviewed level request {message_id}: {repr(e)}")
+
+            try:
+                result_embed = self._embed_from_template(
+                    self._cfg(self._result_template_key(result_key), default={}) or {},
+                    variables,
+                    default_color=self._color_name(result_key, "red"),
+                )
+                await result_channel.send(content=f"<@{int(self._row_value(row, 'user_id', 0) or 0)}>", embed=result_embed)
+            except Exception as e:
+                result_warning += " I couldn't send the result notification, so please check the configured result channel permissions."
+                await log_error(self.bot, f"Could not send level request result {message_id}: {repr(e)}")
 
             if target_kind == "wave":
                 try:
@@ -966,7 +1007,7 @@ class RequestLevelsCog(commands.Cog):
                 except Exception as e:
                     await log_error(self.bot, f"Could not update wave summary for reviewed request {message_id}: {repr(e)}")
 
-        await self._reply_ephemeral(interaction, f"Request marked as {result_label}.")
+        await self._reply_ephemeral(interaction, f"Request marked as {result_label}.{result_warning}")
 
 
 def setup(bot: discord.Bot):

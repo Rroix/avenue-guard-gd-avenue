@@ -11,6 +11,7 @@ import discord
 from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, basic_color
+from utils.errors import log_error
 from utils.timeutils import now_madrid, week_start_sunday, TZ
 from utils.views import LevelRequestReviewView, TrackingDeclineConfirmView
 
@@ -45,6 +46,12 @@ class TrackingCog(commands.Cog):
         self._started = False
         self._weekly_task: Optional[asyncio.Task] = None
         self._timeout_task: Optional[asyncio.Task] = None
+        self._activity_flush_task: Optional[asyncio.Task] = None
+        self._activity_lock = asyncio.Lock()
+        self._pending_activity_counts: dict[tuple[int, int, str], int] = {}
+        self._pending_last_counted: dict[tuple[int, int], int] = {}
+        self._last_counted_cache: dict[tuple[int, int], int] = {}
+        self._last_error_log: dict[str, float] = {}
 
     # ----------------------------
     # Config helpers (robust)
@@ -126,7 +133,7 @@ class TrackingCog(commands.Cog):
             embed.set_image(url=image_url)
         return embed
 
-    def _weekly_request_review_data(self, content: str) -> dict[str, str]:
+    def _weekly_request_review_data(self, content: str, apply_defaults: bool = True) -> dict[str, str]:
         aliases = {
             "name": "level_name",
             "level name": "level_name",
@@ -178,6 +185,9 @@ class TrackingCog(commands.Cog):
             if match:
                 data["creators"] = match.group(1).strip()
 
+        if not apply_defaults:
+            return data
+
         data["level_id"] = str(data.get("level_id") or "Not provided").strip()
         data["level_id_normalized"] = data["level_id"].casefold()
         data["level_name"] = str(data.get("level_name") or "Weekly request").strip()
@@ -185,6 +195,17 @@ class TrackingCog(commands.Cog):
         data["level_showcase"] = str(data.get("level_showcase") or "Not provided").strip()
         data["notes"] = str(data.get("notes") or data["request_content"] or "No notes provided").strip()
         return data
+
+    def _weekly_request_missing_fields(self, content: str) -> list[str]:
+        data = self._weekly_request_review_data(content, apply_defaults=False)
+        missing = []
+        if not str(data.get("level_name") or "").strip():
+            missing.append("Level Name")
+        if not str(data.get("level_id") or "").strip():
+            missing.append("Level ID")
+        if not str(data.get("creators") or "").strip():
+            missing.append("Creator")
+        return missing
 
     async def _resolve_member(self, guild: discord.Guild, user_or_id) -> Optional[discord.Member]:
         if isinstance(user_or_id, discord.Member):
@@ -194,6 +215,22 @@ class TrackingCog(commands.Cog):
             user_id = int(user_id)
         except Exception:
             return None
+
+    async def _configured_channel(self, guild: discord.Guild, channel_id: int) -> Optional[discord.TextChannel]:
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await guild.fetch_channel(channel_id)
+            except Exception:
+                channel = None
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    async def _log_background_error(self, key: str, message: str) -> None:
+        now = time.time()
+        if now - self._last_error_log.get(key, 0.0) < 300:
+            return
+        self._last_error_log[key] = now
+        await log_error(self.bot, message)
         member = guild.get_member(user_id)
         if member is not None:
             return member
@@ -254,6 +291,7 @@ class TrackingCog(commands.Cog):
 
         self._weekly_task = asyncio.create_task(self._weekly_loop())
         self._timeout_task = asyncio.create_task(self._timeout_loop())
+        self._activity_flush_task = asyncio.create_task(self._activity_flush_loop())
 
     def on_config_reload(self) -> None:
         # no cached config in this cog
@@ -338,6 +376,7 @@ class TrackingCog(commands.Cog):
             "reminder_sent": ("Reminder sent", discord.Color.gold()),
             "reminder_failed": ("Reminder failed", discord.Color.red()),
             "request_recorded": ("Request recorded", discord.Color.green()),
+            "request_record_failed": ("Request record failed", discord.Color.red()),
             "declined": ("Request declined", discord.Color.orange()),
             "offered_next": ("Offered to next member", discord.Color.blurple()),
             "no_eligible_member": ("No eligible member", discord.Color.dark_grey()),
@@ -350,6 +389,7 @@ class TrackingCog(commands.Cog):
             "force_dm_sent": ("Force DM sent", discord.Color.green()),
             "force_dm_failed": ("Force DM failed", discord.Color.red()),
             "force_dm_blocked": ("Force DM blocked", discord.Color.orange()),
+            "force_dm_override": ("Force DM override", discord.Color.gold()),
         }
         return mapping.get(str(event), (str(event).replace("_", " ").title(), discord.Color.blurple()))
 
@@ -438,27 +478,69 @@ class TrackingCog(commands.Cog):
 
         cd = self._cfg_int("tracking", "count_cooldown_seconds", 10)
         now = int(time.time())
-        db = self.bot.db
+        cache_key = (message.guild.id, message.author.id)
 
-        row = await db.fetchone(
-            "SELECT last_counted_ts FROM activity_last_counted WHERE guild_id=? AND user_id=?",
-            (message.guild.id, message.author.id),
-        )
-        if row and now - int(row["last_counted_ts"]) < cd:
+        last_counted = self._last_counted_cache.get(cache_key)
+        if last_counted is None:
+            row = await self.bot.db.fetchone(
+                "SELECT last_counted_ts FROM activity_last_counted WHERE guild_id=? AND user_id=?",
+                (message.guild.id, message.author.id),
+            )
+            last_counted = int(row["last_counted_ts"]) if row else 0
+            self._last_counted_cache[cache_key] = last_counted
+
+        if last_counted and now - int(last_counted) < cd:
             return
 
         ws_iso = week_start_sunday(now_madrid()).isoformat()
+        self._last_counted_cache[cache_key] = now
 
-        await db.execute(
-            "INSERT INTO activity_counts(guild_id,user_id,week_start,count) VALUES(?,?,?,1) "
-            "ON CONFLICT(guild_id,user_id,week_start) DO UPDATE SET count=count+1",
-            (message.guild.id, message.author.id, ws_iso),
-        )
-        await db.execute(
-            "INSERT INTO activity_last_counted(guild_id,user_id,last_counted_ts) VALUES(?,?,?) "
-            "ON CONFLICT(guild_id,user_id) DO UPDATE SET last_counted_ts=excluded.last_counted_ts",
-            (message.guild.id, message.author.id, now),
-        )
+        async with self._activity_lock:
+            count_key = (message.guild.id, message.author.id, ws_iso)
+            self._pending_activity_counts[count_key] = self._pending_activity_counts.get(count_key, 0) + 1
+            self._pending_last_counted[cache_key] = now
+
+    async def _activity_flush_loop(self):
+        await self.bot.wait_until_ready()
+        while True:
+            try:
+                await asyncio.sleep(max(5, self._cfg_int("tracking", "activity_flush_seconds", 30) or 30))
+                await self.flush_activity_counts()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                await self._log_background_error("activity_flush", f"Activity flush loop error: {repr(e)}")
+
+    async def flush_activity_counts(self) -> None:
+        async with self._activity_lock:
+            counts = self._pending_activity_counts
+            last_seen = self._pending_last_counted
+            self._pending_activity_counts = {}
+            self._pending_last_counted = {}
+
+        if not counts and not last_seen:
+            return
+
+        try:
+            if counts:
+                await self.bot.db.executemany(
+                    "INSERT INTO activity_counts(guild_id,user_id,week_start,count) VALUES(?,?,?,?) "
+                    "ON CONFLICT(guild_id,user_id,week_start) DO UPDATE SET count=count+excluded.count",
+                    [(guild_id, user_id, week_start, amount) for (guild_id, user_id, week_start), amount in counts.items()],
+                )
+            if last_seen:
+                await self.bot.db.executemany(
+                    "INSERT INTO activity_last_counted(guild_id,user_id,last_counted_ts) VALUES(?,?,?) "
+                    "ON CONFLICT(guild_id,user_id) DO UPDATE SET last_counted_ts=excluded.last_counted_ts",
+                    [(guild_id, user_id, ts) for (guild_id, user_id), ts in last_seen.items()],
+                )
+        except Exception as e:
+            async with self._activity_lock:
+                for key, amount in counts.items():
+                    self._pending_activity_counts[key] = self._pending_activity_counts.get(key, 0) + amount
+                for key, ts in last_seen.items():
+                    self._pending_last_counted[key] = max(self._pending_last_counted.get(key, 0), ts)
+            await self._log_background_error("activity_flush_db", f"Activity flush failed: {repr(e)}")
 
     # ----------------------------
     # Weekly DM workflow in DMs
@@ -505,20 +587,31 @@ class TrackingCog(commands.Cog):
         if sess["stage"] == "confirm_decline":
             return
 
-        # Forgiving parser: contains name, creator, id
-        low = content.casefold()
-        if ("name" in low) and ("creator" in low) and ("id" in low):
+        missing = self._weekly_request_missing_fields(content)
+        if not missing:
             await self._record_request(guild, message.author.id, sess["week_start"], content)
             return
 
         try:
-            await message.channel.send("Please send your request using the format provided (Name, Creator, and ID).")
+            await message.channel.send(
+                "Please send your request using the format provided. "
+                f"Missing: **{', '.join(missing)}**."
+            )
         except Exception:
             pass
 
     async def _record_request(self, guild: discord.Guild, user_id: int, week_start_iso: str, content: str):
         weekly_channel_id = self._cfg_int("channels", "weekly_request_channel_ID", 0)
-        channel = guild.get_channel(weekly_channel_id) if weekly_channel_id else None
+        channel = await self._configured_channel(guild, weekly_channel_id)
+        if channel is None:
+            await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", "reason=weekly_request_channel_missing")
+            await log_error(self.bot, f"Weekly request from user_id={user_id} could not be recorded: weekly_request_channel_ID is missing or invalid.")
+            try:
+                user = await self.bot.fetch_user(user_id)
+                await user.send("I couldn't record your request because the staff request channel is not configured correctly. Please contact staff.")
+            except Exception:
+                pass
+            return
 
         row = await self.bot.db.fetchone(
             "SELECT rank FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
@@ -526,58 +619,75 @@ class TrackingCog(commands.Cog):
         )
         rank = int(row["rank"]) if row else None
 
-        if isinstance(channel, discord.TextChannel):
-            review_data = self._weekly_request_review_data(content)
-            variables = {
-                **review_data,
-                "user_id": user_id,
-                "user_mention": f"<@{user_id}>",
-                "requester_id": user_id,
-                "requester_mention": f"<@{user_id}>",
-                "rank": f"#{rank}" if rank else "Unknown",
-                "weekly_rank": f"#{rank}" if rank else "Unknown",
-                "week_start": week_start_iso,
-                "request_content": content,
-            }
-            template = self.bot.config.get("level_requests", "weekly_request_submitted_embed", default={}) or {}
-            if isinstance(template, dict) and template:
-                embed = self._embed_from_template(template, variables, "Weekly Request Submitted", "gold")
-            else:
-                embed = discord.Embed(title="Weekly Request Submitted")
-                embed.add_field(name="User", value=f"<@{user_id}> ({user_id})", inline=False)
-                if rank:
-                    embed.add_field(name="Rank", value=f"#{rank}", inline=True)
-                embed.add_field(name="Week start", value=week_start_iso, inline=False)
-                embed.add_field(name="Content", value=content[:1024], inline=False)
-            msg = None
+        review_data = self._weekly_request_review_data(content)
+        variables = {
+            **review_data,
+            "user_id": user_id,
+            "user_mention": f"<@{user_id}>",
+            "requester_id": user_id,
+            "requester_mention": f"<@{user_id}>",
+            "rank": f"#{rank}" if rank else "Unknown",
+            "weekly_rank": f"#{rank}" if rank else "Unknown",
+            "week_start": week_start_iso,
+            "request_content": content,
+        }
+        template = self.bot.config.get("level_requests", "weekly_request_submitted_embed", default={}) or {}
+        if isinstance(template, dict) and template:
+            embed = self._embed_from_template(template, variables, "Weekly Request Submitted", "gold")
+        else:
+            embed = discord.Embed(title="Weekly Request Submitted")
+            embed.add_field(name="User", value=f"<@{user_id}> ({user_id})", inline=False)
+            if rank:
+                embed.add_field(name="Rank", value=f"#{rank}", inline=True)
+            embed.add_field(name="Week start", value=week_start_iso, inline=False)
+            embed.add_field(name="Content", value=content[:1024], inline=False)
+
+        msg = None
+        try:
+            msg = await channel.send(embed=embed, view=LevelRequestReviewView())
+        except Exception as e:
+            await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=weekly_request_send_failed error={type(e).__name__}")
+            await log_error(self.bot, f"Weekly request from user_id={user_id} could not be sent to staff channel {channel.id}: {repr(e)}")
             try:
-                msg = await channel.send(embed=embed, view=LevelRequestReviewView())
+                user = await self.bot.fetch_user(user_id)
+                await user.send("I couldn't record your request right now because I could not send it to the staff channel. Please contact staff.")
             except Exception:
                 pass
+            return
 
-            if msg is not None:
+        try:
+            await self.bot.db.execute(
+                "INSERT OR REPLACE INTO weekly_request_reviews("
+                "guild_id,request_message_id,channel_id,user_id,week_start,rank,status,created_ts,data_json"
+                ") VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    guild.id,
+                    msg.id,
+                    channel.id,
+                    user_id,
+                    week_start_iso,
+                    rank,
+                    "pending",
+                    int(time.time()),
+                    json.dumps(review_data, separators=(",", ":")),
+                ),
+            )
+        except Exception as e:
+            try:
+                await msg.delete()
+            except Exception:
                 try:
-                    await self.bot.db.execute(
-                        "INSERT OR REPLACE INTO weekly_request_reviews("
-                        "guild_id,request_message_id,channel_id,user_id,week_start,rank,status,created_ts,data_json"
-                        ") VALUES(?,?,?,?,?,?,?,?,?)",
-                        (
-                            guild.id,
-                            msg.id,
-                            channel.id,
-                            user_id,
-                            week_start_iso,
-                            rank,
-                            "pending",
-                            int(time.time()),
-                            json.dumps(review_data, separators=(",", ":")),
-                        ),
-                    )
+                    await msg.edit(view=LevelRequestReviewView(disabled=True))
                 except Exception:
-                    try:
-                        await msg.edit(view=LevelRequestReviewView(disabled=True))
-                    except Exception:
-                        pass
+                    pass
+            await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=weekly_review_db_failed error={type(e).__name__}")
+            await log_error(self.bot, f"Weekly request review row could not be saved for message_id={msg.id}: {repr(e)}")
+            try:
+                user = await self.bot.fetch_user(user_id)
+                await user.send("I couldn't finish recording your request because of a database issue. Please try again or contact staff.")
+            except Exception:
+                pass
+            return
 
         # Mark claimed & close session
         await self.bot.db.execute(
@@ -676,6 +786,7 @@ class TrackingCog(commands.Cog):
                     continue
 
                 # Run job for previous week
+                await self.flush_activity_counts()
                 prev_week_start = week_start_sunday(this_sunday - timedelta(seconds=1)).isoformat()
                 await self.run_weekly_job(prev_week_start)
 
@@ -691,8 +802,8 @@ class TrackingCog(commands.Cog):
                     pass
             except asyncio.CancelledError:
                 return
-            except Exception:
-                continue
+            except Exception as e:
+                await self._log_background_error("weekly_loop", f"Weekly loop error: {repr(e)}")
 
     async def _timeout_loop(self):
         await self.bot.wait_until_ready()
@@ -703,8 +814,8 @@ class TrackingCog(commands.Cog):
                 await self._process_reminders()
             except asyncio.CancelledError:
                 return
-            except Exception:
-                continue
+            except Exception as e:
+                await self._log_background_error("timeout_loop", f"Weekly timeout/reminder loop error: {repr(e)}")
 
     async def _process_timeouts(self):
         allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
@@ -748,6 +859,7 @@ class TrackingCog(commands.Cog):
         guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
         if guild is None:
             return
+        await self.flush_activity_counts()
 
         if await self.weekly_reward_disabled(guild.id, week_start_iso):
             await self._log_weekly(guild, week_start_iso, 0, "weekly_reward_skipped", "Reward disabled for this tracking week")
@@ -785,8 +897,8 @@ class TrackingCog(commands.Cog):
 
         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted={contacted} eligible_ranked={len(ranked)}")
 
-    async def _contact_user_for_week(self, guild: discord.Guild, week_start_iso: str, user_id: int, rank: int, timeout_hours: int) -> bool:
-        if await self.weekly_reward_disabled(guild.id, week_start_iso):
+    async def _contact_user_for_week(self, guild: discord.Guild, week_start_iso: str, user_id: int, rank: int, timeout_hours: int, force: bool = False) -> bool:
+        if not force and await self.weekly_reward_disabled(guild.id, week_start_iso):
             await self._log_weekly(guild, week_start_iso, user_id, "skipped_reward_disabled", "")
             return False
 
@@ -993,6 +1105,7 @@ class TrackingCog(commands.Cog):
     # Public helpers used by Commands.py
     # ----------------------------
     async def get_top(self, guild_id: int, week_start_iso: str, limit: int = 20) -> List[Tuple[int, int]]:
+        await self.flush_activity_counts()
         rows = await self.bot.db.fetchall(
             "SELECT user_id, count FROM activity_counts WHERE guild_id=? AND week_start=? ORDER BY count DESC LIMIT ?",
             (guild_id, week_start_iso, limit),
@@ -1001,6 +1114,7 @@ class TrackingCog(commands.Cog):
 
     async def get_member_stats(self, guild: discord.Guild, week_start_iso: str, user_id: int) -> tuple[int, Optional[int], int]:
         """Return (count, rank among eligible, eligible_total). Rank is 1-based, or None if not ranked/eligible."""
+        await self.flush_activity_counts()
         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
 
         row = await self.bot.db.fetchone(
@@ -1037,11 +1151,11 @@ class TrackingCog(commands.Cog):
         return count, rank, eligible_total
 
     async def force_dm_for_user(self, guild: discord.Guild, week_start_iso: str, user_id: int, timeout_hours: Optional[int] = None) -> tuple[bool, str]:
+        await self.flush_activity_counts()
         timeout_h = int(timeout_hours or self._cfg_int("tracking", "dm_timeout_hours", 48) or 48)
 
         if await self.weekly_reward_disabled(guild.id, week_start_iso):
-            await self._log_weekly(guild, week_start_iso, user_id, "force_dm_blocked", "reason=weekly_reward_disabled")
-            return False, "Weekly reward DMs are disabled for this tracking week."
+            await self._log_weekly(guild, week_start_iso, user_id, "force_dm_override", "reason=weekly_reward_disabled")
 
         member = await self._resolve_member(guild, user_id)
         if member is None:
@@ -1057,7 +1171,7 @@ class TrackingCog(commands.Cog):
         )
         if existing is not None:
             status = str(existing["status"])
-            if status != "dm_closed":
+            if status not in {"dm_closed", "disabled"}:
                 await self._log_weekly(guild, week_start_iso, user_id, "force_dm_blocked", f"reason=existing_status status={status}")
                 return False, f"Cannot force DM: user already has status '{status}' for this week."
             await self.bot.db.execute(
@@ -1087,7 +1201,7 @@ class TrackingCog(commands.Cog):
                 break
             rank += 1
 
-        ok = await self._contact_user_for_week(guild, week_start_iso, user_id, rank=rank, timeout_hours=timeout_h)
+        ok = await self._contact_user_for_week(guild, week_start_iso, user_id, rank=rank, timeout_hours=timeout_h, force=True)
         if ok:
             await self._log_weekly(guild, week_start_iso, user_id, "force_dm_sent", f"rank={rank} timeout_hours={timeout_h}")
             return True, f"Weekly request DM sent (rank {rank})."
@@ -1095,9 +1209,20 @@ class TrackingCog(commands.Cog):
         return False, "Could not DM that user (DMs likely closed)."
 
     async def reset_current_week(self, guild_id: int) -> None:
+        await self.flush_activity_counts()
         ws = week_start_sunday(now_madrid()).isoformat()
         await self.bot.db.execute("DELETE FROM activity_counts WHERE guild_id=? AND week_start=?", (guild_id, ws))
         await self.bot.db.execute("DELETE FROM activity_last_counted WHERE guild_id=?", (guild_id,))
+        async with self._activity_lock:
+            self._pending_activity_counts = {
+                key: value for key, value in self._pending_activity_counts.items()
+                if not (key[0] == guild_id and key[2] == ws)
+            }
+            self._pending_last_counted = {
+                key: value for key, value in self._pending_last_counted.items()
+                if key[0] != guild_id
+            }
+        self._last_counted_cache = {key: value for key, value in self._last_counted_cache.items() if key[0] != guild_id}
 
 
 def setup(bot: discord.Bot):
