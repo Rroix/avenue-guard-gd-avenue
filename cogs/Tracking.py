@@ -265,6 +265,45 @@ class TrackingCog(commands.Cog):
     # ----------------------------
     # Logging helpers
     # ----------------------------
+    def _weekly_log_meta(self, event: str) -> tuple[str, discord.Color]:
+        mapping = {
+            "weekly_job_start": ("Weekly scan started", discord.Color.blurple()),
+            "weekly_job_done": ("Weekly scan finished", discord.Color.green()),
+            "dm_sent": ("Request DM sent", discord.Color.green()),
+            "dm_failed": ("Request DM failed", discord.Color.red()),
+            "dm_closed": ("DMs closed", discord.Color.red()),
+            "timeout_dm_sent": ("Timeout notice sent", discord.Color.orange()),
+            "timed_out": ("Request timed out", discord.Color.orange()),
+            "reminder_sent": ("Reminder sent", discord.Color.gold()),
+            "reminder_failed": ("Reminder failed", discord.Color.red()),
+            "request_recorded": ("Request recorded", discord.Color.green()),
+            "declined": ("Request declined", discord.Color.orange()),
+            "offered_next": ("Offered to next member", discord.Color.blurple()),
+            "no_eligible_member": ("No eligible member", discord.Color.dark_grey()),
+            "skipped_already_contacted": ("Skipped already contacted member", discord.Color.dark_grey()),
+            "weekly_reward_disabled": ("Weekly reward disabled", discord.Color.red()),
+            "weekly_reward_enabled": ("Weekly reward enabled", discord.Color.green()),
+            "weekly_reward_skipped": ("Weekly reward skipped", discord.Color.red()),
+            "skipped_reward_disabled": ("Skipped while reward disabled", discord.Color.dark_grey()),
+            "next_offer_skipped_reward_disabled": ("Next offer skipped", discord.Color.dark_grey()),
+        }
+        return mapping.get(str(event), (str(event).replace("_", " ").title(), discord.Color.blurple()))
+
+    def _weekly_detail_lines(self, detail: str) -> str:
+        detail = str(detail or "").strip()
+        if not detail:
+            return "No extra details."
+
+        parts = detail.split()
+        if parts and all("=" in part for part in parts):
+            lines = []
+            for part in parts:
+                key, value = part.split("=", 1)
+                label = key.replace("_", " ").title()
+                lines.append(f"**{label}:** {value}")
+            return "\n".join(lines)[:1024]
+        return detail[:1024]
+
     async def _log_weekly(self, guild: discord.Guild, week_start: str, user_id: int, event: str, detail: str = "") -> None:
         # DB log (best-effort)
         try:
@@ -283,10 +322,21 @@ class TrackingCog(commands.Cog):
         ch = guild.get_channel(log_channel_id) if log_channel_id else None
         if isinstance(ch, discord.TextChannel):
             try:
-                emb = discord.Embed(title="Weekly request log", description=f"**{event}**\n{detail}".strip())
+                label, color = self._weekly_log_meta(event)
+                emb = discord.Embed(
+                    title=f"Weekly Request: {label}",
+                    description="A weekly request workflow event was recorded.",
+                    color=color,
+                    timestamp=now_madrid(),
+                )
+                emb.add_field(name="Event", value=f"`{event}`", inline=True)
                 emb.add_field(name="Week", value=week_start, inline=True)
                 if user_id:
-                    emb.add_field(name="User", value=f"<@{user_id}> ({user_id})", inline=True)
+                    emb.add_field(name="Member", value=f"<@{user_id}>\n`{user_id}`", inline=True)
+                else:
+                    emb.add_field(name="Member", value="Server-wide", inline=True)
+                emb.add_field(name="Details", value=self._weekly_detail_lines(detail), inline=False)
+                emb.set_footer(text="Weekly request workflow")
                 await ch.send(embed=emb)
             except Exception:
                 pass
@@ -893,7 +943,6 @@ class TrackingCog(commands.Cog):
         return count, rank, eligible_total
 
     async def force_dm_for_user(self, guild: discord.Guild, week_start_iso: str, user_id: int, timeout_hours: Optional[int] = None) -> tuple[bool, str]:
-        excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
         timeout_h = int(timeout_hours or self._cfg_int("tracking", "dm_timeout_hours", 48) or 48)
 
         if await self.weekly_reward_disabled(guild.id, week_start_iso):
@@ -904,8 +953,6 @@ class TrackingCog(commands.Cog):
             return False, "User is not in the server."
         if member.bot:
             return False, "Bots cannot receive weekly requests."
-        if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
-            return False, "That user is excluded from tracking (blacklisted role)."
 
         existing = await self.bot.db.fetchone(
             "SELECT status FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
@@ -925,6 +972,7 @@ class TrackingCog(commands.Cog):
             )
 
         # Estimate rank among eligible (best-effort)
+        excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
         rows = await self.bot.db.fetchall(
             "SELECT user_id, count FROM activity_counts WHERE guild_id=? AND week_start=? ORDER BY count DESC",
             (guild.id, week_start_iso),

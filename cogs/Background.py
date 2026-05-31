@@ -35,6 +35,23 @@ def _fmt_minutes(total_minutes: int) -> str:
         return f"{hours}h {mins}m"
     return f"{mins}m"
 
+def _fmt_num(value: int) -> str:
+    return f"{int(value):,}"
+
+def _fmt_delta(current: int, previous: Optional[int]) -> str:
+    if previous is None:
+        return "no previous day"
+    diff = int(current) - int(previous)
+    if diff == 0:
+        return "no change"
+    sign = "+" if diff > 0 else ""
+    return f"{sign}{diff:,}"
+
+def _fmt_percent(part: int, total: int) -> str:
+    if total <= 0:
+        return "0%"
+    return f"{(part / total) * 100:.1f}%"
+
 @dataclass
 class DailyStats:
     messages: int = 0
@@ -550,6 +567,39 @@ class BackgroundCog(commands.Cog):
         except Exception:
             pass
 
+    def _top_channel_lines(self, items: List[Tuple[int, int]], total_messages: int) -> str:
+        if not items:
+            return "No channel activity recorded."
+        lines = []
+        for idx, (channel_id, count) in enumerate(items[:5], start=1):
+            lines.append(f"**{idx}.** <#{channel_id}> - **{_fmt_num(count)}** ({_fmt_percent(count, total_messages)})")
+        return "\n".join(lines)
+
+    def _top_member_lines(self, items: List[Tuple[int, int]], total_messages: int) -> str:
+        if not items:
+            return "No member activity recorded."
+        lines = []
+        for idx, (user_id, count) in enumerate(items[:5], start=1):
+            lines.append(f"**{idx}.** <@{user_id}> - **{_fmt_num(count)}** ({_fmt_percent(count, total_messages)})")
+        return "\n".join(lines)
+
+    def _top_command_lines(self, items: List[Tuple[str, int]], total_commands: int) -> str:
+        if not items:
+            return "No slash commands recorded."
+        lines = []
+        for idx, (name, count) in enumerate(items[:5], start=1):
+            lines.append(f"**{idx}.** `/{name}` - **{_fmt_num(count)}** ({_fmt_percent(count, total_commands)})")
+        return "\n".join(lines)
+
+    def _summary_color(self, snapshot: DailyStats, net_members: int) -> discord.Color:
+        if snapshot.bans or snapshot.command_errors >= 5:
+            return discord.Color.orange()
+        if net_members < 0:
+            return discord.Color.red()
+        if snapshot.boosts > snapshot.unboosts or snapshot.messages >= 500:
+            return discord.Color.green()
+        return discord.Color.blurple()
+
     @tasks.loop(time=dtime(hour=0, minute=0, tzinfo=TZ))
     async def daily_report(self):
         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
@@ -567,49 +617,111 @@ class BackgroundCog(commands.Cog):
             snapshot = DailyStats()
         day_key = report_day
 
-        embed = discord.Embed(
-            title="Daily Server Summary",
-            description=f"Date (Madrid): **{day_key}**",
-            timestamp=now_madrid(),
-        )
+        prev_snapshot = None
+        try:
+            report_dt = datetime.strptime(day_key, "%Y-%m-%d").replace(tzinfo=TZ)
+            prev_day_key = (report_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+            prev_snapshot = await self._load_daily_stats(guild.id, prev_day_key)
+        except Exception:
+            prev_snapshot = None
 
-        embed.add_field(name="Messages", value=str(snapshot.messages), inline=True)
-        embed.add_field(name="Edits / Deletes", value=f"{snapshot.edits} / {snapshot.deletes}", inline=True)
-        embed.add_field(name="Reactions", value=str(snapshot.reactions), inline=True)
+        voice_minutes = int(snapshot.voice_minutes)
+        if day_key == self._current_day:
+            now_ts = int(time.time())
+            for joined_ts in self.voice_sessions.values():
+                try:
+                    minutes = int((now_ts - int(joined_ts)) // 60)
+                    if minutes > 0:
+                        voice_minutes += minutes
+                except Exception:
+                    continue
 
-        embed.add_field(name="Joins / Leaves", value=f"{snapshot.joins} / {snapshot.leaves}", inline=True)
-        embed.add_field(name="Bans / Unbans", value=f"{snapshot.bans} / {snapshot.unbans}", inline=True)
-        embed.add_field(name="Boosts / Unboosts", value=f"{snapshot.boosts} / {snapshot.unboosts}", inline=True)
-
-        embed.add_field(name="Voice minutes", value=_fmt_minutes(snapshot.voice_minutes), inline=True)
-        embed.add_field(name="Peak in voice", value=str(snapshot.peak_voice_users), inline=True)
-        embed.add_field(name="Peak online", value=str(snapshot.peak_online_members), inline=True)
-
-        embed.add_field(name="Commands", value=f"{snapshot.commands} (errors: {snapshot.command_errors})", inline=False)
+        active_channels = len(snapshot.by_channel)
+        active_members = len(snapshot.by_user)
+        net_members = int(snapshot.joins) - int(snapshot.leaves)
+        moderation_actions = int(snapshot.deletes) + int(snapshot.bans) + int(snapshot.unbans)
+        command_successes = max(int(snapshot.commands) - int(snapshot.command_errors), 0)
+        command_success_rate = _fmt_percent(command_successes, int(snapshot.commands))
+        avg_messages = (snapshot.messages / active_members) if active_members else 0.0
+        reaction_rate = _fmt_percent(snapshot.reactions, snapshot.messages)
 
         top_channels = sorted(snapshot.by_channel.items(), key=lambda kv: kv[1], reverse=True)[:5]
-        if top_channels:
-            embed.add_field(
-                name="Top channels",
-                value="\n".join([f"<#{cid}> — **{cnt}**" for cid, cnt in top_channels]),
-                inline=False
-            )
-
         top_users = sorted(snapshot.by_user.items(), key=lambda kv: kv[1], reverse=True)[:5]
-        if top_users:
-            embed.add_field(
-                name="Top members",
-                value="\n".join([f"<@{uid}> — **{cnt}**" for uid, cnt in top_users]),
-                inline=False
-            )
-
         top_cmds = sorted(snapshot.commands_by_name.items(), key=lambda kv: kv[1], reverse=True)[:5]
-        if top_cmds:
-            embed.add_field(
-                name="Top commands",
-                value="\n".join([f"`/{name}` — **{cnt}**" for name, cnt in top_cmds]),
-                inline=False
-            )
+
+        busiest_channel = f"<#{top_channels[0][0]}> with **{_fmt_num(top_channels[0][1])}** messages" if top_channels else "No active channel"
+        most_active_member = f"<@{top_users[0][0]}> with **{_fmt_num(top_users[0][1])}** messages" if top_users else "No active member"
+        top_command = f"`/{top_cmds[0][0]}` used **{_fmt_num(top_cmds[0][1])}** times" if top_cmds else "No commands used"
+        previous_messages = int(prev_snapshot.messages) if prev_snapshot else None
+        previous_commands = int(prev_snapshot.commands) if prev_snapshot else None
+
+        embed = discord.Embed(
+            title=f"Daily Server Summary - {day_key}",
+            description=(
+                f"Messages: **{_fmt_num(snapshot.messages)}** ({_fmt_delta(snapshot.messages, previous_messages)} vs previous day)\n"
+                f"Active members: **{_fmt_num(active_members)}** across **{_fmt_num(active_channels)}** channels\n"
+                f"Member movement: **{net_members:+,}** net"
+            ),
+            color=self._summary_color(snapshot, net_members),
+            timestamp=now_madrid(),
+        )
+        try:
+            if guild.icon:
+                embed.set_thumbnail(url=guild.icon.url)
+        except Exception:
+            pass
+
+        embed.add_field(
+            name="Activity",
+            value=(
+                f"Messages: **{_fmt_num(snapshot.messages)}**\n"
+                f"Edits / deletes: **{_fmt_num(snapshot.edits)}** / **{_fmt_num(snapshot.deletes)}**\n"
+                f"Reactions: **{_fmt_num(snapshot.reactions)}** ({reaction_rate} of messages)\n"
+                f"Avg per active member: **{avg_messages:.1f}** messages"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Community",
+            value=(
+                f"Joins / leaves: **{_fmt_num(snapshot.joins)}** / **{_fmt_num(snapshot.leaves)}**\n"
+                f"Net change: **{net_members:+,}**\n"
+                f"Boosts / unboosts: **{_fmt_num(snapshot.boosts)}** / **{_fmt_num(snapshot.unboosts)}**\n"
+                f"Moderation actions: **{_fmt_num(moderation_actions)}**"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Voice And Presence",
+            value=(
+                f"Total voice time: **{_fmt_minutes(voice_minutes)}**\n"
+                f"Peak in voice: **{_fmt_num(snapshot.peak_voice_users)}**\n"
+                f"Peak online: **{_fmt_num(snapshot.peak_online_members)}**"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Commands",
+            value=(
+                f"Used: **{_fmt_num(snapshot.commands)}** ({_fmt_delta(snapshot.commands, previous_commands)} vs previous day)\n"
+                f"Errors: **{_fmt_num(snapshot.command_errors)}**\n"
+                f"Success rate: **{command_success_rate}**"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Highlights",
+            value=(
+                f"Busiest channel: {busiest_channel}\n"
+                f"Most active member: {most_active_member}\n"
+                f"Top command: {top_command}"
+            ),
+            inline=False,
+        )
+        embed.add_field(name="Top Channels", value=self._top_channel_lines(top_channels, snapshot.messages), inline=False)
+        embed.add_field(name="Top Members", value=self._top_member_lines(top_users, snapshot.messages), inline=False)
+        embed.add_field(name="Top Commands", value=self._top_command_lines(top_cmds, snapshot.commands), inline=False)
+        embed.set_footer(text="Madrid-time daily report")
 
         ch_id = self._daily_summary_channel_id()
         channel = guild.get_channel(ch_id) if ch_id else None

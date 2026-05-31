@@ -22,6 +22,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Posts weekly request submissions as configurable embeds.
 - Admins can disable the automatic weekly request reward for the current tracking week.
 - Logs weekly request events to SQLite and optionally to a log channel.
+- Weekly request log embeds use readable event names, colors, member context, and structured details.
 
 ### Live Level Request Waves
 - Posts a persistent request embed/button in `level_requests.request_channel`.
@@ -67,7 +68,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 
 ### Background Utilities
 - Optional rotating bot status with placeholders like `{members}`, `{online}`, `{week_msgs}`, `{week_top}`, `{open_tickets}`, and `{today_msgs}`.
-- Optional daily server summary embeds.
+- Optional daily server summary embeds with highlights, day-over-day movement, active members/channels, moderation signals, command health, voice/presence, and top channels/members/commands.
 - Tracks daily messages, edits, deletes, reactions, joins, leaves, bans, boosts, voice minutes, command usage, and top channels/users.
 - Includes a small keepalive HTTP server for hosted environments.
 
@@ -81,7 +82,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - `/tracking top` shows the current weekly leaderboard.
 - `/tracking me` shows your weekly count and rank.
 - `/tracking reset` resets this week's tracking data. Admins/owners only.
-- `/tracking force_dm` manually sends a weekly request DM. Admins/owners only.
+- `/tracking force_dm` manually sends a weekly request DM, even to members excluded from normal tracking. Admins/owners only.
 - `/tracking disable_reward` disables the automatic weekly request reward for the current tracking week. Admins/owners only.
 - `/tracking enable_reward` re-enables the automatic weekly request reward for the current tracking week. Admins/owners only.
 - `/refresh-request-button` refreshes or recreates the live request button. Mods only.

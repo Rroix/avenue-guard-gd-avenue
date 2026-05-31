@@ -60,10 +60,13 @@
    - Expected: bot confirms the current tracking week reward is disabled.
 3. Run `/tracking force_dm` for the same week after disabling reward.
    - Expected: bot refuses because weekly reward DMs are disabled for that tracking week.
+   - Expected: the weekly request log embed has a clear title, event field, week, member context, and readable details.
 4. Run `/tracking enable_reward` as an admin.
    - Expected: bot confirms the current tracking week reward is enabled again.
 5. Run `/tracking force_dm` again for an eligible user.
    - Expected: bot allows the manual weekly request DM again unless the user already has a claim status.
+6. Run `/tracking force_dm` for a member with an excluded tracking role.
+   - Expected: bot still sends the manual weekly request DM unless that member already has a claim status.
 
 ---
 
@@ -240,3 +243,13 @@
    - Expected: user receives the configurable weekly reminder embed.
 3. Reply in DM with a valid request containing name, creator, and ID.
    - Expected: `weekly_request_channel_ID` receives the configurable weekly submitted embed.
+
+---
+
+## 22) Daily server summary
+**Setup:** `background.daily_summary.enabled` is true and `background.daily_summary.channel_id` points to a staff-visible channel.
+
+1. Let the daily summary run, or temporarily set `background.daily_summary.time` to a near-future Madrid time and restart.
+   - Expected: summary embed includes activity, community, voice/presence, commands, highlights, top channels, top members, and top commands.
+2. Compare with the previous day if data exists.
+   - Expected: message and command lines show day-over-day change.
