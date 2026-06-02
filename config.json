@@ -37,7 +37,7 @@
     "_comment_core": "Core channels used by features.",
     "autodelete_channel_id": "820590823573815326",
     "weekly_request_channel_ID": "1120741230570127371",
-    "dm_fail_log_channel_id": "1455041917925589002",
+    "dm_fail_log_channel_id": "1445502925081284729",
     "global_error_log_channel_id": "1455041991531430136",
     "general_logging_channel_id": "1445502925081284729",
     "_comment_exclusions": "Excluded from tracking.",
@@ -52,7 +52,7 @@
     "appeals_log_channel_id": "1455042313855307939",
     "reports_log_channel_id": "1455042313855307939",
     "bot_issues_log_channel_id": "1455042313855307939",
-    "transcript_requests_channel_id": "1455042456432152646"
+    "transcript_requests_channel_id": "1455042313855307939"
   },
   "tracking": {
     "_comment": "Weekly activity tracking.",
@@ -225,14 +225,22 @@
     "sent_channel": "1112748495019982899",
     "rejected_channel": "1120740229633015829",
     "required_role_ids": [1396099787098558506],
+    "reviewer_role_ids": [
+      "785212232786640966",
+      "1430214323720163498"
+    ],
     "has_requested_role_id": "1510348407384965252",
     "request_banned_role_id": "1463987510236545127",
+    "request_post_close_edit_minutes": 5,
     "request_button_label": "Request your level!",
     "messages": {
       "closed": "Requests are closed :/",
       "no_requirements": "You don't meet the requirements, please read the requesting rules",
       "first_time_prompt": "It seems like it is your first time requesting a level, **bad things will happen if you do not read the following carefully**.\n- If the level utilizes an external song, there must be a fitting in-game replacement and you must say it on your request.\n- Requesting any level that breaks Geometry Dash's upload guidelines such as controversial or nsfw levels will lead to request restriction or ban depending on the rule broken.\n- Submit levels that you think deserve a rate. Don't send previews or layouts (also short length levels no allowed)\n- Don't force us to revise, review or send to mods your level.\n- Don't get mad if your level hasn't been sent.\n- Send the level only 1 time.\n- Don't promote your level on any other channel or send it to private messages.\nIf you plan on breaking any of these rules, please press I Will. If you plan on following and not breaking our rules, please press I Won't.",
       "success": "Your request has been submitted!",
+      "edit_success": "Your request has been updated!",
+      "edit_window_expired": "Your request can no longer be edited.",
+      "validation_error": "Please fix your request before submitting: {errors}",
       "already_submitted": "You already submitted a level during this request wave...",
       "duplicate_level": "This level has already been requested in this wave",
       "not_configured": "The request system is not fully configured yet or is faulty... mb, contact Average."
@@ -263,7 +271,8 @@
         { "name": "Left to review", "value": "{pending_count} ({pending_percent})", "inline": true },
         { "name": "Sent", "value": "{sent_count} ({sent_percent_reviewed} of reviewed)", "inline": true },
         { "name": "Not sent", "value": "{not_sent_count} ({not_sent_percent_reviewed} of reviewed)", "inline": true },
-        { "name": "Not sent breakdown", "value": "Rejected: **{rejected_count}**\nLevel doesn't exist: **{level_doesnt_exist_count}**\nStolen level: **{stolen_level_count}**\nAlready rated: **{already_rated_count}**", "inline": false }
+        { "name": "Not sent breakdown", "value": "Rejected: **{rejected_count}**\nLevel doesn't exist: **{level_doesnt_exist_count}**\nStolen level: **{stolen_level_count}**\nAlready rated: **{already_rated_count}**", "inline": false },
+        { "name": "Reviewer stats", "value": "{reviewer_stats}", "inline": false }
       ],
       "footer": "This updates whenever a request in the wave is reviewed."
     },
@@ -275,8 +284,10 @@
         { "name": "Requester", "value": "{requester_mention} (`{requester_id}`)", "inline": false },
         { "name": "Level ID", "value": "{level_id}", "inline": true },
         { "name": "Level Info", "value": "[Level](https://gdbrowser.com/{level_id})", "inline": true },
+        { "name": "Submitted", "value": "{submitted_ago}", "inline": true },
         { "name": "Showcase", "value": "{level_showcase}", "inline": false },
         { "name": "Notes", "value": "{notes}", "inline": false },
+        { "name": "History warning", "value": "{duplicate_history_warning}", "inline": false },
         { "name": "Wave", "value": "{wave_id}", "inline": true }
       ]
     },
@@ -287,6 +298,7 @@
       "fields": [
         { "name": "Requester", "value": "{requester_mention} (`{requester_id}`)", "inline": false },
         { "name": "Level ID", "value": "{level_id}", "inline": true },
+        { "name": "Submitted", "value": "{submitted_ago}", "inline": true },
         { "name": "Reviewed by", "value": "{reviewer_mention}", "inline": true },
         { "name": "Result", "value": "{result}", "inline": true },
         { "name": "Review", "value": "{review}", "inline": false }
@@ -338,6 +350,7 @@
         { "name": "User", "value": "{user_mention} (`{user_id}`)", "inline": false },
         { "name": "Rank", "value": "{rank}", "inline": true },
         { "name": "Week start", "value": "{week_start}", "inline": true },
+        { "name": "Submitted", "value": "{submitted_ago}", "inline": true },
         { "name": "Request", "value": "{request_content}", "inline": false }
       ]
     }

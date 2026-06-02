@@ -14,6 +14,8 @@ from utils.checks import is_admin_or_owner, is_mod
 from utils.timeutils import now_madrid, week_start_sunday
 from utils.errors import log_error
 
+DEFAULT_REQUEST_REVIEWER_ROLE_IDS = [785212232786640966, 1430214323720163498]
+
 class CommandsCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
@@ -31,19 +33,19 @@ class CommandsCog(commands.Cog):
         self.requests_group = discord.SlashCommandGroup("requests", "Level request staff tools", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
 
         # register commands
-        self.bot_group.command(name="health", description="Show bot health and live system status (Admins/Owners only).")(self.bot_health)
-        self.bot_group.command(name="config_check", description="Check configured channels and roles (Admins/Owners only).")(self.bot_config_check)
+        self.bot_group.command(name="health", description="Show bot health and live system status")(self.bot_health)
+        self.bot_group.command(name="config_check", description="Check configured channels and roles")(self.bot_config_check)
 
-        self.tracking_group.command(name="top", description="Show the current week's top 20 active members.")(self.tracking_top)
-        self.tracking_group.command(name="reset", description="Reset current week's tracking stats (Admins/Owners only).")(self.tracking_reset)
-        self.tracking_group.command(name="me", description="Show your activity stats for this week.")(self.tracking_me)
-        self.tracking_group.command(name="force_dm", description="Force-send the weekly request DM to a user (Admins/Owners only).")(self.tracking_force_dm)
-        self.tracking_group.command(name="disable_reward", description="Disable this week's automatic weekly request reward (Admins/Owners only).")(self.tracking_disable_reward)
-        self.tracking_group.command(name="enable_reward", description="Re-enable this week's automatic weekly request reward (Admins/Owners only).")(self.tracking_enable_reward)
+        self.tracking_group.command(name="top", description="Show the current week's top 20 active members")(self.tracking_top)
+        self.tracking_group.command(name="reset", description="Reset current week's tracking stats")(self.tracking_reset)
+        self.tracking_group.command(name="me", description="Show your activity stats for this week")(self.tracking_me)
+        self.tracking_group.command(name="force_dm", description="Force-send the weekly request DM to a user")(self.tracking_force_dm)
+        self.tracking_group.command(name="disable_reward", description="Disable this week's automatic weekly request reward")(self.tracking_disable_reward)
+        self.tracking_group.command(name="enable_reward", description="Re-enable this week's automatic weekly request reward")(self.tracking_enable_reward)
 
-        self.ticket_group.command(name="close", description="Close the current ticket channel (Mods only).")(self.ticket_close)
-        self.forum_group.command(name="required_word", description="View or update a forum required word (Admins only).")(self.forum_required_word)
-        self.requests_group.command(name="pending", description="Show pending live and weekly request reviews (Mods only).")(self.requests_pending)
+        self.ticket_group.command(name="close", description="Close the current ticket channel")(self.ticket_close)
+        self.forum_group.command(name="required_word", description="View or update a forum required word")(self.forum_required_word)
+        self.requests_group.command(name="pending", description="Show and filter pending request reviews")(self.requests_pending)
 
         bot.add_application_command(self.bot_group)
         bot.add_application_command(self.tracking_group)
@@ -51,23 +53,23 @@ class CommandsCog(commands.Cog):
         bot.add_application_command(self.forum_group)
         bot.add_application_command(self.requests_group)
 
-        @bot.slash_command(name="resync", description="Reload config, views, and responses without restart.", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
+        @bot.slash_command(name="resync", description="Reload config, views, and responses without restart", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         async def resync(ctx: discord.ApplicationContext):
             await self._resync(ctx)
 
-        @bot.slash_command(name="restart", description="Restart the bot (Admins/Owners only).", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
+        @bot.slash_command(name="restart", description="Restart the bot", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         async def restart(ctx: discord.ApplicationContext):
             await self._restart(ctx)
 
-        @bot.slash_command(name="dance", description="Send a dance GIF.", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
+        @bot.slash_command(name="dance", description="Send a dance GIF", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         async def dance(ctx: discord.ApplicationContext):
             await self._dance(ctx)
 
-        @bot.slash_command(name="rock-paper-scissors", description="Play Rock Paper Scissors.", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
+        @bot.slash_command(name="rock-paper-scissors", description="Play Rock Paper Scissors", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         async def rps(ctx: discord.ApplicationContext):
             await self._rps(ctx)
 
-        @bot.slash_command(name="gambling", description="Try your luck in a quick slots game.", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
+        @bot.slash_command(name="gambling", description="Try your luck in a quick slots game", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         async def gambling(ctx: discord.ApplicationContext):
             await self._gambling(ctx)
 
@@ -99,6 +101,23 @@ class CommandsCog(commands.Cog):
         member = await self._resolve_member(ctx.guild, ctx.user)
         mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
         return member is not None and is_mod(member, mod_role_id)
+
+    def _request_reviewer_role_ids(self) -> list[int]:
+        configured = self.bot.config.get_int_list("level_requests", "reviewer_role_ids")
+        return configured or list(DEFAULT_REQUEST_REVIEWER_ROLE_IDS)
+
+    async def _is_request_staff_ctx(self, ctx: discord.ApplicationContext) -> bool:
+        if ctx.guild is None:
+            return False
+        member = await self._resolve_member(ctx.guild, ctx.user)
+        if member is None:
+            return False
+        if is_mod(member, self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0):
+            return True
+        if is_admin_or_owner(member, self.bot.config.get_int_list("roles", "admin_owner_role_ids")):
+            return True
+        role_ids = set(self._request_reviewer_role_ids())
+        return any(role.id in role_ids for role in getattr(member, "roles", []))
 
     async def _resolve_member(self, guild: discord.Guild, user) -> Optional[discord.Member]:
         if isinstance(user, discord.Member):
@@ -260,6 +279,8 @@ class CommandsCog(commands.Cog):
             check_role(f"level_requests.{key}", cfg.get_int("level_requests", key))
         for idx, role_id in enumerate(cfg.get_int_list("level_requests", "required_role_ids"), start=1):
             check_role(f"level_requests.required_role_ids[{idx}]", role_id)
+        for idx, role_id in enumerate(self._request_reviewer_role_ids(), start=1):
+            check_role(f"level_requests.reviewer_role_ids[{idx}]", role_id)
 
         entries = cfg.get("forum_first_message", "entries", default=[]) or []
         if isinstance(entries, list):
@@ -285,23 +306,55 @@ class CommandsCog(commands.Cog):
             embed.add_field(name="Result", value="Everything checked out.", inline=False)
         await self._send(ctx, embed=embed, ephemeral=True)
 
-    async def requests_pending(self, ctx: discord.ApplicationContext):
+    async def requests_pending(self, ctx: discord.ApplicationContext, scope: str = "current_wave", status: str = "pending", wave: int = 0):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
-        if not await self._is_mod_ctx(ctx):
-            return await ctx.respond("Only mods can use this.", ephemeral=True)
+        if not await self._is_request_staff_ctx(ctx):
+            return await ctx.respond("Only request reviewers can use this.", ephemeral=True)
 
         await self._defer(ctx, ephemeral=True)
-        live_rows = await self.bot.db.fetchall(
-            "SELECT wave_id, user_id, request_message_id, data_json FROM level_request_submissions "
-            "WHERE guild_id=? AND status='pending' ORDER BY created_ts DESC LIMIT 10",
+        scope_key = str(scope or "current_wave").strip().casefold().replace("-", "_")
+        status_key = str(status or "pending").strip().casefold()
+        if status_key in {"unreviewed", "open"}:
+            status_key = "pending"
+        if status_key not in {"pending", "reviewed", "all"}:
+            status_key = "pending"
+
+        state_row = await self.bot.db.fetchone(
+            "SELECT wave_id FROM level_request_state WHERE guild_id=?",
             (ctx.guild.id,),
         )
-        weekly_rows = await self.bot.db.fetchall(
-            "SELECT week_start, user_id, request_message_id, channel_id, data_json FROM weekly_request_reviews "
-            "WHERE guild_id=? AND status='pending' ORDER BY created_ts DESC LIMIT 10",
-            (ctx.guild.id,),
-        )
+        current_wave = int(state_row["wave_id"]) if state_row else 0
+        target_wave = int(wave) if int(wave or 0) > 0 else current_wave
+
+        live_where = ["guild_id=?"]
+        live_params: list = [ctx.guild.id]
+        if scope_key in {"current", "current_wave", "wave"}:
+            live_where.append("wave_id=?")
+            live_params.append(target_wave)
+        if status_key != "all":
+            live_where.append("status=?")
+            live_params.append(status_key)
+        live_rows = []
+        if scope_key not in {"weekly", "weekly_only"}:
+            live_rows = await self.bot.db.fetchall(
+                "SELECT wave_id, user_id, request_message_id, data_json, status, created_ts FROM level_request_submissions "
+                f"WHERE {' AND '.join(live_where)} ORDER BY created_ts DESC LIMIT 15",
+                tuple(live_params),
+            )
+
+        weekly_rows = []
+        if scope_key in {"all", "weekly", "weekly_only"}:
+            weekly_where = ["guild_id=?"]
+            weekly_params: list = [ctx.guild.id]
+            if status_key != "all":
+                weekly_where.append("status=?")
+                weekly_params.append(status_key)
+            weekly_rows = await self.bot.db.fetchall(
+                "SELECT week_start, user_id, request_message_id, channel_id, data_json, status, created_ts FROM weekly_request_reviews "
+                f"WHERE {' AND '.join(weekly_where)} ORDER BY created_ts DESC LIMIT 15",
+                tuple(weekly_params),
+            )
 
         def request_name(row) -> str:
             try:
@@ -322,7 +375,10 @@ class CommandsCog(commands.Cog):
                 link = f"message `{msg_id}`"
             else:
                 link = "no message linked"
-            live_lines.append(f"Wave **{row['wave_id']}** - {request_name(row)} by <@{row['user_id']}> - {link}")
+            live_lines.append(
+                f"Wave **{row['wave_id']}** - {request_name(row)} by <@{row['user_id']}> "
+                f"- `{row['status']}` - {link} - submitted <t:{int(row['created_ts'])}:R>"
+            )
 
         weekly_lines = []
         for row in weekly_rows:
@@ -332,11 +388,18 @@ class CommandsCog(commands.Cog):
                 tail = f"[jump]({link})"
             else:
                 tail = "no message linked"
-            weekly_lines.append(f"Week **{row['week_start']}** - {request_name(row)} by <@{row['user_id']}> - {tail}")
+            weekly_lines.append(
+                f"Week **{row['week_start']}** - {request_name(row)} by <@{row['user_id']}> "
+                f"- `{row['status']}` - {tail} - submitted <t:{int(row['created_ts'])}:R>"
+            )
 
-        embed = discord.Embed(title="Pending Request Reviews", color=discord.Color.blurple())
-        embed.add_field(name=f"Live waves ({len(live_rows)} shown)", value="\n".join(live_lines)[:1024] or "No pending live wave requests.", inline=False)
-        embed.add_field(name=f"Weekly requests ({len(weekly_rows)} shown)", value="\n".join(weekly_lines)[:1024] or "No pending weekly requests.", inline=False)
+        embed = discord.Embed(
+            title="Request Review Queue",
+            description=f"Scope: **{scope_key}** | Status: **{status_key}** | Wave: **{target_wave or 'all'}**",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name=f"Live requests ({len(live_rows)} shown)", value="\n".join(live_lines)[:1024] or "No matching live requests.", inline=False)
+        embed.add_field(name=f"Weekly requests ({len(weekly_rows)} shown)", value="\n".join(weekly_lines)[:1024] or "No matching weekly requests.", inline=False)
         await self._send(ctx, embed=embed, ephemeral=True)
 
     # --- /tracking top ---
@@ -374,20 +437,24 @@ class CommandsCog(commands.Cog):
 
         lines = []
         for i, (uid, cnt) in enumerate(top, start=1):
-            lines.append(f"**#{i:02d}**  <@{uid}> — **{cnt}** messages")
+            lines.append(f"**#{i:02d}** <@{uid}> - **{cnt}** messages")
 
         week_label = week_start_sunday(now_madrid()).strftime("%Y-%m-%d")
         embed = discord.Embed(
             title="Weekly Activity Leaderboard",
-            description=f"Week starting **{week_label}** — top {len(top)}\n\n" + "\n".join(lines),
+            description=f"Week starting **{week_label}**",
+            color=discord.Color.blurple(),
         )
+        embed.add_field(name="Top Members", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name="Tracked Members", value=str(len(raw)), inline=True)
+        embed.add_field(name="Eligible Shown", value=str(len(top)), inline=True)
         try:
             if ctx.guild and ctx.guild.icon:
                 embed.set_thumbnail(url=ctx.guild.icon.url)
         except Exception:
             pass
 
-        embed.set_footer(text="This is the most active members, do you see yourself here?")
+        embed.set_footer(text="Madrid-time weekly tracking")
         await self._send(ctx, embed=embed)
 
 
@@ -407,10 +474,22 @@ class CommandsCog(commands.Cog):
             return await self._send(ctx, "You are not eligible for weekly tracking (or have no tracked messages yet)", ephemeral=True)
 
         week_label = week_start_sunday(now_madrid()).strftime("%Y-%m-%d")
-        embed = discord.Embed(title="Your Weekly Activity")
-        embed.add_field(name="Week starting", value=week_label, inline=False)
-        embed.add_field(name="Messages", value=str(count), inline=True)
-        embed.add_field(name="Rank", value=f"#{rank} of {eligible_total}", inline=True)
+        embed = discord.Embed(
+            title="Your Weekly Activity",
+            description=f"Week starting **{week_label}**",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Messages counted", value=f"**{count}**", inline=True)
+        embed.add_field(name="Rank", value=f"**#{rank}** of **{eligible_total}**", inline=True)
+        embed.add_field(name="Status", value="Eligible for weekly tracking", inline=False)
+        try:
+            member = await self._resolve_member(ctx.guild, ctx.user)
+            avatar = getattr(member or ctx.user, "display_avatar", None)
+            if avatar:
+                embed.set_thumbnail(url=avatar.url)
+        except Exception:
+            pass
+        embed.set_footer(text="Madrid-time weekly tracking")
         await self._send(ctx, embed=embed, ephemeral=True)
 
     async def tracking_force_dm(self, ctx: discord.ApplicationContext, member: discord.Member):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import traceback
 import discord
 
@@ -14,10 +15,21 @@ async def log_error(bot: discord.Client, message: str) -> None:
         channel = bot.get_channel(ch_id)
         if channel is None:
             return
-        # Avoid huge messages
-        if len(message) > 1800:
-            message = message[:1800] + "\n...truncated..."
-        await channel.send(f"```py\n{message}\n```")
+        if len(message) > 3800:
+            message = message[:3800] + "\n...truncated..."
+        embed = discord.Embed(
+            title="Bot Error",
+            description=f"```py\n{message}\n```",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="Avenue Guard error log")
+        try:
+            await channel.send(embed=embed)
+        except Exception:
+            if len(message) > 1800:
+                message = message[:1800] + "\n...truncated..."
+            await channel.send(f"```py\n{message}\n```")
     except Exception:
         pass
 

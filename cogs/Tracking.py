@@ -620,6 +620,7 @@ class TrackingCog(commands.Cog):
         rank = int(row["rank"]) if row else None
 
         review_data = self._weekly_request_review_data(content)
+        created_ts = int(time.time())
         variables = {
             **review_data,
             "user_id": user_id,
@@ -630,6 +631,9 @@ class TrackingCog(commands.Cog):
             "weekly_rank": f"#{rank}" if rank else "Unknown",
             "week_start": week_start_iso,
             "request_content": content,
+            "created_ts": created_ts,
+            "submitted_ts": created_ts,
+            "submitted_ago": f"<t:{created_ts}:R>",
         }
         template = self.bot.config.get("level_requests", "weekly_request_submitted_embed", default={}) or {}
         if isinstance(template, dict) and template:
@@ -668,7 +672,7 @@ class TrackingCog(commands.Cog):
                     week_start_iso,
                     rank,
                     "pending",
-                    int(time.time()),
+                    created_ts,
                     json.dumps(review_data, separators=(",", ":")),
                 ),
             )
@@ -929,9 +933,16 @@ class TrackingCog(commands.Cog):
             log_ch_id = self._cfg_int("channels", "dm_fail_log_channel_id", 0)
             log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
             if isinstance(log_ch, discord.TextChannel):
-                embed = discord.Embed(title="DM Failed", description=f"Could not DM <@{user_id}> for weekly request.")
-                embed.add_field(name="User ID", value=str(user_id), inline=True)
-                embed.add_field(name="Week start", value=week_start_iso, inline=False)
+                embed = discord.Embed(
+                    title="Weekly Request DM Failed",
+                    description=f"A weekly request DM could not be delivered to <@{user_id}>",
+                    color=discord.Color.red(),
+                    timestamp=now_madrid(),
+                )
+                embed.add_field(name="Member", value=f"<@{user_id}>\n`{user_id}`", inline=True)
+                embed.add_field(name="Week", value=week_start_iso, inline=True)
+                embed.add_field(name="Reason", value=type(e).__name__, inline=True)
+                embed.set_footer(text="Weekly request workflow")
                 try:
                     await log_ch.send(embed=embed)
                 except Exception:

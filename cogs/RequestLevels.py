@@ -1,13 +1,18 @@
 import asyncio
+import calendar
 import json
+import re
 import time as time_module
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import discord
 from discord.ext import commands
 
 from utils.checks import basic_color, is_admin_or_owner, is_mod, member_has_any_role
 from utils.errors import log_error
+from utils.timeutils import TZ, now_madrid
 from utils.views import LevelRequestButtonView, LevelRequestReviewView
 
 
@@ -20,6 +25,8 @@ OTHER_REASONS = {
     "already_rated": "Already rated",
 }
 
+DEFAULT_REVIEWER_ROLE_IDS = [785212232786640966, 1430214323720163498]
+
 
 class _SafeDict(dict):
     def __missing__(self, key):
@@ -27,26 +34,30 @@ class _SafeDict(dict):
 
 
 class LevelRequestModal(discord.ui.Modal):
-    def __init__(self, cog, user_id: int):
-        super().__init__(title="Request your level")
+    def __init__(self, cog, user_id: int, edit: bool = False, initial: Optional[Dict[str, Any]] = None):
+        super().__init__(title="Edit your request" if edit else "Request your level")
         self.cog = cog
         self.user_id = user_id
+        self.edit = edit
+        initial = initial or {}
 
-        self.level_id = discord.ui.InputText(label="Level ID", required=True, max_length=100)
-        self.level_name = discord.ui.InputText(label="Level name", required=True, max_length=150)
-        self.creators = discord.ui.InputText(label="Creator(s)", required=True, max_length=200)
+        self.level_id = discord.ui.InputText(label="Level ID", required=True, max_length=100, value=str(initial.get("level_id") or "")[:100])
+        self.level_name = discord.ui.InputText(label="Level name", required=True, max_length=150, value=str(initial.get("level_name") or "")[:150])
+        self.creators = discord.ui.InputText(label="Creator(s)", required=True, max_length=200, value=str(initial.get("creators") or "")[:200])
         self.showcase = discord.ui.InputText(
             label="Level showcase",
             required=False,
             style=discord.InputTextStyle.long,
             max_length=1000,
             placeholder="Optional, but demons and platformers need a showcase.",
+            value=str(initial.get("level_showcase") or "")[:1000],
         )
         self.notes = discord.ui.InputText(
             label="Notes",
             required=False,
             style=discord.InputTextStyle.long,
             max_length=1000,
+            value=str(initial.get("notes") or "")[:1000],
         )
 
         self.add_item(self.level_id)
@@ -59,16 +70,17 @@ class LevelRequestModal(discord.ui.Modal):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("This form is not for you.", ephemeral=True)
 
-        await self.cog.handle_request_form(
-            interaction,
-            {
-                "level_id": str(self.level_id.value or "").strip(),
-                "level_name": str(self.level_name.value or "").strip(),
-                "creators": str(self.creators.value or "").strip(),
-                "level_showcase": str(self.showcase.value or "").strip(),
-                "notes": str(self.notes.value or "").strip(),
-            },
-        )
+        data = {
+            "level_id": str(self.level_id.value or "").strip(),
+            "level_name": str(self.level_name.value or "").strip(),
+            "creators": str(self.creators.value or "").strip(),
+            "level_showcase": str(self.showcase.value or "").strip(),
+            "notes": str(self.notes.value or "").strip(),
+        }
+        if self.edit:
+            await self.cog.handle_request_edit_form(interaction, data)
+        else:
+            await self.cog.handle_request_form(interaction, data)
 
 
 class ReviewModal(discord.ui.Modal):
@@ -142,26 +154,43 @@ class RequestLevelsCog(commands.Cog):
         self.allowed_guild_id = bot.config.get_int("guild", "allowed_guild_id") or 0
         self._started = False
         self._close_task: Optional[asyncio.Task] = None
+        self._scheduled_open_task: Optional[asyncio.Task] = None
         self._submit_lock = asyncio.Lock()
         self._review_lock = asyncio.Lock()
 
         guild_ids = [self.allowed_guild_id] if self.allowed_guild_id else None
 
-        @bot.slash_command(name="refresh-request-button", description="Refresh or recreate the request button embed.", guild_ids=guild_ids)
+        @bot.slash_command(name="refresh-request-button", description="Refresh or recreate the request button embed", guild_ids=guild_ids)
         async def refresh_request_button(ctx: discord.ApplicationContext):
             await self.refresh_request_button(ctx)
 
-        @bot.slash_command(name="open-requests", description="Open level requests.", guild_ids=guild_ids)
-        async def open_requests(ctx: discord.ApplicationContext, number: int = 0, time: int = 0):
-            await self.open_requests(ctx, number, time)
+        @bot.slash_command(name="open-requests", description="Open level requests now or schedule them", guild_ids=guild_ids)
+        async def open_requests(ctx: discord.ApplicationContext, number: int = 0, time: int = 0, when: str = "", day: int = 0):
+            await self.open_requests(ctx, number, time, when, day)
 
-        @bot.slash_command(name="close-requests", description="Close level requests.", guild_ids=guild_ids)
+        @bot.slash_command(name="close-requests", description="Close level requests", guild_ids=guild_ids)
         async def close_requests(ctx: discord.ApplicationContext):
             await self.close_requests(ctx)
 
-        @bot.slash_command(name="requests-are", description="Check whether level requests are open.", guild_ids=guild_ids)
+        @bot.slash_command(name="requests-are", description="Check whether level requests are open", guild_ids=guild_ids)
         async def requests_are(ctx: discord.ApplicationContext):
             await self.requests_are(ctx)
+
+        @bot.slash_command(name="edit-request", description="Edit your current pending level request", guild_ids=guild_ids)
+        async def edit_request(ctx: discord.ApplicationContext):
+            await self.edit_request(ctx)
+
+        @bot.slash_command(name="pending-openings", description="List, edit, or delete scheduled request openings", guild_ids=guild_ids)
+        async def pending_openings(
+            ctx: discord.ApplicationContext,
+            action: str = "list",
+            opening_id: int = 0,
+            number: int = -1,
+            time: int = -1,
+            when: str = "",
+            day: int = 0,
+        ):
+            await self.pending_openings(ctx, action, opening_id, number, time, when, day)
 
     async def start_background(self):
         if self._started:
@@ -169,6 +198,7 @@ class RequestLevelsCog(commands.Cog):
         self._started = True
         await self.bot.db.connect()
         self._close_task = asyncio.create_task(self._auto_close_loop())
+        self._scheduled_open_task = asyncio.create_task(self._scheduled_open_loop())
 
     def on_config_reload(self) -> None:
         pass
@@ -182,8 +212,91 @@ class RequestLevelsCog(commands.Cog):
     def _cfg_int_list(self, *path: str) -> list[int]:
         return self.bot.config.get_int_list("level_requests", *path)
 
+    def _reviewer_role_ids(self) -> list[int]:
+        configured = self._cfg_int_list("reviewer_role_ids")
+        return configured or list(DEFAULT_REVIEWER_ROLE_IDS)
+
+    def _post_close_edit_seconds(self) -> int:
+        minutes = self._cfg_int("request_post_close_edit_minutes", default=5)
+        return max(0, int(minutes) * 60)
+
+    def _edit_deadline_ts_for_state(self, state_row) -> Any:
+        if not state_row:
+            return ""
+        grace = self._post_close_edit_seconds()
+        if str(state_row["state"]) == STATE_OPEN:
+            close_ts = self._row_value(state_row, "close_ts", None)
+            if close_ts is not None:
+                try:
+                    return int(close_ts) + grace
+                except Exception:
+                    return ""
+            return ""
+        closed_ts = self._row_value(state_row, "closed_ts", None)
+        if closed_ts is None:
+            return ""
+        try:
+            return int(closed_ts) + grace
+        except Exception:
+            return ""
+
+    def _edit_window_text(self, state_row) -> str:
+        grace_minutes = max(0, self._post_close_edit_seconds() // 60)
+        deadline_ts = self._edit_deadline_ts_for_state(state_row)
+        if deadline_ts:
+            return f"until <t:{int(deadline_ts)}:R>"
+        return f"until requests close, plus {grace_minutes} minutes afterward"
+
+    def _can_edit_submission(self, state_row, submission_row) -> bool:
+        if not state_row or not submission_row:
+            return False
+        if str(submission_row["status"]) != "pending":
+            return False
+        try:
+            if int(submission_row["wave_id"]) != int(state_row["wave_id"]):
+                return False
+        except Exception:
+            return False
+        if str(state_row["state"]) == STATE_OPEN:
+            return True
+        deadline_ts = self._edit_deadline_ts_for_state(state_row)
+        if not deadline_ts:
+            return False
+        try:
+            return int(time_module.time()) <= int(deadline_ts)
+        except Exception:
+            return False
+
+    async def _current_user_submission(self, guild_id: int, wave_id: int, user_id: int):
+        return await self.bot.db.fetchone(
+            "SELECT * FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+            (guild_id, wave_id, user_id),
+        )
+
+    async def _state_after_timed_close_check(self, guild: discord.Guild, state_row):
+        if not state_row:
+            return state_row
+        if str(state_row["state"]) != STATE_OPEN or state_row["close_ts"] is None:
+            return state_row
+        try:
+            if int(state_row["close_ts"]) > int(time_module.time()):
+                return state_row
+        except Exception:
+            return state_row
+        await self._set_state_closed(guild, reason="time limit")
+        return await self._get_state(guild.id)
+
+    def _request_initial_values(self, submission_row) -> Dict[str, Any]:
+        try:
+            return json.loads(submission_row["data_json"] or "{}")
+        except Exception:
+            return {}
+
     def _message(self, key: str, default: str) -> str:
         return str(self._cfg("messages", key, default=default) or default)
+
+    def _message_formatted(self, key: str, default: str, variables: Dict[str, Any]) -> str:
+        return self._format(self._message(key, default), variables)
 
     def _request_button_label(self) -> str:
         return str(self._cfg("request_button_label", default="Request your level!") or "Request your level!")
@@ -196,6 +309,47 @@ class RequestLevelsCog(commands.Cog):
             return str(text or "").format_map(_SafeDict({k: str(v) for k, v in variables.items()}))
         except Exception:
             return str(text or "")
+
+    def _submitted_ago(self, created_ts: Any) -> str:
+        try:
+            ts = int(created_ts)
+        except Exception:
+            return "Unknown"
+        return f"<t:{ts}:R>"
+
+    def _clean_level_id(self, value: Any) -> str:
+        return str(value or "").strip()
+
+    def _normalize_level_id(self, value: Any) -> str:
+        return self._clean_level_id(value).casefold()
+
+    def _valid_url(self, value: str) -> bool:
+        try:
+            parsed = urlparse(str(value).strip())
+            return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+        except Exception:
+            return False
+
+    def _validate_request_data(self, data: Dict[str, str]) -> list[str]:
+        errors = []
+        level_id = self._clean_level_id(data.get("level_id"))
+        if not re.fullmatch(r"\d{7,9}", level_id):
+            errors.append("Level ID must be 7 to 9 numbers, like `111111111`.")
+
+        showcase = str(data.get("level_showcase") or "").strip()
+        if showcase and not self._valid_url(showcase):
+            errors.append("Level showcase must be a valid URL, usually YouTube or Streamable.")
+        return errors
+
+    def _has_reviewer_role(self, member: discord.Member) -> bool:
+        role_ids = self._reviewer_role_ids()
+        return member_has_any_role(member, role_ids) or self._is_admin(member)
+
+    async def _is_reviewer_interaction(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            return False
+        member = await self._resolve_member(interaction.guild, interaction.user)
+        return member is not None and self._has_reviewer_role(member)
 
     def _embed_from_template(self, template: Dict[str, Any], variables: Dict[str, Any], default_color: str = "blurple") -> discord.Embed:
         if not isinstance(template, dict):
@@ -264,7 +418,7 @@ class RequestLevelsCog(commands.Cog):
 
     async def _wave_summary_vars(self, guild_id: int, wave_id: int) -> Dict[str, Any]:
         rows = await self.bot.db.fetchall(
-            "SELECT status, result FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
+            "SELECT status, result, reviewed_by FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
             (guild_id, wave_id),
         )
         total = len(rows)
@@ -277,6 +431,7 @@ class RequestLevelsCog(commands.Cog):
         other = level_doesnt_exist + stolen_level + already_rated
         not_sent = rejected + other
         pending = max(total - reviewed, 0)
+        reviewer_stats = await self._reviewer_stats_lines(rows)
         return {
             "wave_id": wave_id,
             "total_requests": total,
@@ -296,8 +451,31 @@ class RequestLevelsCog(commands.Cog):
             "not_sent_percent": self._pct(not_sent, total),
             "sent_percent_reviewed": self._pct(sent, reviewed),
             "not_sent_percent_reviewed": self._pct(not_sent, reviewed),
+            "reviewer_stats": reviewer_stats,
             "summary_color": self._color_name("sent" if pending == 0 else "pending", "blurple"),
         }
+
+    async def _reviewer_stats_lines(self, rows) -> str:
+        stats: dict[int, dict[str, int]] = {}
+        for row in rows:
+            if str(row["status"]) != "reviewed" or row["reviewed_by"] is None:
+                continue
+            reviewer_id = int(row["reviewed_by"])
+            bucket = stats.setdefault(reviewer_id, {"total": 0, "sent": 0, "not_sent": 0})
+            bucket["total"] += 1
+            if str(row["result"]) == "sent":
+                bucket["sent"] += 1
+            else:
+                bucket["not_sent"] += 1
+        if not stats:
+            return "No reviews yet."
+        lines = []
+        for reviewer_id, bucket in sorted(stats.items(), key=lambda item: item[1]["total"], reverse=True)[:8]:
+            lines.append(
+                f"<@{reviewer_id}> - **{bucket['total']}** reviewed "
+                f"({bucket['sent']} sent / {bucket['not_sent']} not sent)"
+            )
+        return "\n".join(lines)
 
     def _wave_summary_embed(self, variables: Dict[str, Any]) -> discord.Embed:
         template = self._cfg("wave_summary_embed", default={}) or {}
@@ -318,6 +496,7 @@ class RequestLevelsCog(commands.Cog):
         embed.add_field(name="Left to review", value=f"{variables['pending_count']} ({variables['pending_percent']})", inline=True)
         embed.add_field(name="Sent", value=f"{variables['sent_count']} ({variables['sent_percent_reviewed']} of reviewed)", inline=True)
         embed.add_field(name="Not sent", value=f"{variables['not_sent_count']} ({variables['not_sent_percent_reviewed']} of reviewed)", inline=True)
+        embed.add_field(name="Reviewer stats", value=str(variables.get("reviewer_stats") or "No reviews yet.")[:1024], inline=False)
         embed.add_field(
             name="Not sent breakdown",
             value=(
@@ -394,6 +573,73 @@ class RequestLevelsCog(commands.Cog):
         except Exception:
             return default
 
+    async def _duplicate_history_warning(
+        self,
+        guild_id: int,
+        normalized_level_id: str,
+        current_wave_id: int = 0,
+        current_user_id: int = 0,
+    ) -> str:
+        if not normalized_level_id:
+            return ""
+        rows = await self.bot.db.fetchall(
+            "SELECT wave_id, user_id, status, result, created_ts FROM level_request_submissions "
+            "WHERE guild_id=? AND level_id=? AND NOT (wave_id=? AND user_id=?) "
+            "ORDER BY created_ts DESC LIMIT 5",
+            (guild_id, normalized_level_id, current_wave_id, current_user_id),
+        )
+        if not rows:
+            return ""
+        lines = ["This level was requested before:"]
+        for row in rows[:4]:
+            result = str(row["result"] or row["status"] or "pending").replace("_", " ")
+            lines.append(
+                f"- Wave **{int(row['wave_id'])}** by <@{int(row['user_id'])}> "
+                f"{self._submitted_ago(row['created_ts'])} ({result})"
+            )
+        return "\n".join(lines)[:1024]
+
+    def _days_in_month(self, year: int, month: int) -> int:
+        return calendar.monthrange(year, month)[1]
+
+    def _add_month(self, year: int, month: int) -> tuple[int, int]:
+        month += 1
+        if month > 12:
+            return year + 1, 1
+        return year, month
+
+    def _parse_scheduled_open_ts(self, when: str, day: int = 0) -> tuple[Optional[int], str]:
+        when_text = str(when or "").strip()
+        if not when_text:
+            return None, ""
+        match = re.fullmatch(r"\s*(\d{1,2})(?::?(\d{2}))?\s*", when_text)
+        if not match:
+            return None, "Use `HH:MM` in Madrid time, for example `18:30`."
+
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        if hour > 23 or minute > 59:
+            return None, "Hour must be 0-23 and minute must be 0-59."
+
+        now = now_madrid()
+        if day and int(day) > 0:
+            target_day = int(day)
+            if target_day > 31:
+                return None, "Day must be between 1 and 31."
+            year, month = now.year, now.month
+            for _ in range(2):
+                if target_day <= self._days_in_month(year, month):
+                    candidate = datetime(year, month, target_day, hour, minute, tzinfo=TZ)
+                    if candidate > now:
+                        return int(candidate.timestamp()), ""
+                year, month = self._add_month(year, month)
+            return None, "That day does not exist in this or next month."
+
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate = candidate + timedelta(days=1)
+        return int(candidate.timestamp()), ""
+
     def _data_vars(self, row, data: Dict[str, Any], result_key: str = "", review: str = "", reviewer_id: int = 0) -> Dict[str, Any]:
         level_showcase = str(data.get("level_showcase") or "").strip() or "Not provided"
         notes = str(data.get("notes") or "").strip() or "No notes provided"
@@ -405,6 +651,8 @@ class RequestLevelsCog(commands.Cog):
             wave_id = int(wave_raw)
         except Exception:
             wave_id = str(wave_raw or "")
+        created_ts = self._row_value(row, "created_ts", "")
+        edit_deadline_ts = data.get("edit_deadline_ts") or self._row_value(row, "edit_deadline_ts", "")
         variables = {
             **data,
             "level_id": data.get("level_id", ""),
@@ -416,6 +664,11 @@ class RequestLevelsCog(commands.Cog):
             "requester_id": requester_id,
             "requester_mention": f"<@{requester_id}>",
             "wave_id": wave_id,
+            "submitted_ts": created_ts,
+            "submitted_ago": self._submitted_ago(created_ts),
+            "edit_deadline_ts": edit_deadline_ts,
+            "edit_deadline": f"<t:{edit_deadline_ts}:R>" if edit_deadline_ts else "",
+            "duplicate_history_warning": str(data.get("duplicate_history_warning") or ""),
             "result": result_label,
             "result_key": result_key,
             "review": review or "No review provided.",
@@ -433,7 +686,11 @@ class RequestLevelsCog(commands.Cog):
         except Exception:
             rank_text = "Unknown"
         variables = self._data_vars(
-            {"user_id": int(self._row_value(row, "user_id", 0) or 0), "wave_id": "Weekly"},
+            {
+                "user_id": int(self._row_value(row, "user_id", 0) or 0),
+                "wave_id": "Weekly",
+                "created_ts": self._row_value(row, "created_ts", ""),
+            },
             data,
             result_key=result_key,
             review=review,
@@ -498,6 +755,17 @@ class RequestLevelsCog(commands.Cog):
             except Exception as e:
                 await log_error(self.bot, f"Could not update wave {wave_id} summary: {repr(e)}")
 
+    async def _open_requests_now(self, guild: discord.Guild, request_limit: Optional[int], close_minutes: Optional[int]) -> tuple[int, Optional[int]]:
+        current = await self._get_state(guild.id)
+        wave_id = int(current["wave_id"]) + 1
+        close_ts = int(time_module.time()) + int(close_minutes) * 60 if close_minutes and int(close_minutes) > 0 else None
+        await self.bot.db.execute(
+            "UPDATE level_request_state SET state=?, wave_id=?, request_limit=?, close_ts=?, submitted_count=0, opened_ts=?, closed_ts=NULL WHERE guild_id=?",
+            (STATE_OPEN, wave_id, request_limit, close_ts, int(time_module.time()), guild.id),
+        )
+        await self.refresh_or_create_request_button(guild)
+        return wave_id, close_ts
+
     async def _auto_close_loop(self):
         await self.bot.wait_until_ready()
         while True:
@@ -515,6 +783,37 @@ class RequestLevelsCog(commands.Cog):
                 return
             except Exception as e:
                 await log_error(self.bot, f"Level request auto-close loop error: {repr(e)}")
+
+    async def _scheduled_open_loop(self):
+        await self.bot.wait_until_ready()
+        while True:
+            try:
+                await asyncio.sleep(30)
+                guild = self.bot.get_guild(self.allowed_guild_id) if self.allowed_guild_id else None
+                if guild is None:
+                    continue
+                now_ts = int(time_module.time())
+                rows = await self.bot.db.fetchall(
+                    "SELECT id, request_limit, close_minutes FROM level_request_scheduled_openings "
+                    "WHERE guild_id=? AND status='pending' AND open_ts<=? ORDER BY open_ts ASC LIMIT 5",
+                    (guild.id, now_ts),
+                )
+                for row in rows:
+                    opening_id = int(row["id"])
+                    try:
+                        request_limit = int(row["request_limit"]) if row["request_limit"] is not None else None
+                        close_minutes = int(row["close_minutes"]) if row["close_minutes"] is not None else None
+                        wave_id, _ = await self._open_requests_now(guild, request_limit, close_minutes)
+                        await self.bot.db.execute(
+                            "UPDATE level_request_scheduled_openings SET status='opened', opened_wave_id=? WHERE id=? AND guild_id=?",
+                            (wave_id, opening_id, guild.id),
+                        )
+                    except Exception as e:
+                        await log_error(self.bot, f"Scheduled request opening {opening_id} failed: {repr(e)}")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                await log_error(self.bot, f"Scheduled request opening loop error: {repr(e)}")
 
     def _in_allowed_guild(self, ctx: discord.ApplicationContext) -> bool:
         return ctx.guild is not None and ctx.guild.id == self.allowed_guild_id
@@ -605,23 +904,33 @@ class RequestLevelsCog(commands.Cog):
             return await ctx.respond(self._message("not_configured", "The request system is not fully configured yet."), ephemeral=True)
         await ctx.respond(f"Request button refreshed: {msg.jump_url}", ephemeral=True)
 
-    async def open_requests(self, ctx: discord.ApplicationContext, number: int = 0, time: int = 0):
+    async def open_requests(self, ctx: discord.ApplicationContext, number: int = 0, time: int = 0, when: str = "", day: int = 0):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not self._is_admin(member):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
-        current = await self._get_state(ctx.guild.id)
-        wave_id = int(current["wave_id"]) + 1
         request_limit = int(number) if number and int(number) > 0 else None
-        close_ts = int(time_module.time()) + int(time) * 60 if time and int(time) > 0 else None
+        close_minutes = int(time) if time and int(time) > 0 else None
 
-        await self.bot.db.execute(
-            "UPDATE level_request_state SET state=?, wave_id=?, request_limit=?, close_ts=?, submitted_count=0, opened_ts=?, closed_ts=NULL WHERE guild_id=?",
-            (STATE_OPEN, wave_id, request_limit, close_ts, int(time_module.time()), ctx.guild.id),
-        )
-        await self.refresh_or_create_request_button(ctx.guild)
+        if str(when or "").strip():
+            open_ts, error = self._parse_scheduled_open_ts(when, day)
+            if open_ts is None:
+                return await ctx.respond(error or "I couldn't parse that opening time.", ephemeral=True)
+            await self.bot.db.execute(
+                "INSERT INTO level_request_scheduled_openings(guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,status) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (ctx.guild.id, request_limit, close_minutes, open_ts, ctx.user.id, int(time_module.time()), "pending"),
+            )
+            details = [f"Request opening scheduled for <t:{open_ts}:F> (<t:{open_ts}:R>)."]
+            if request_limit:
+                details.append(f"Limit: **{request_limit}** successful requests.")
+            if close_minutes:
+                details.append(f"Requests will close after **{close_minutes}** minutes unless the limit is reached first.")
+            return await ctx.respond(" ".join(details), ephemeral=True)
+
+        wave_id, close_ts = await self._open_requests_now(ctx.guild, request_limit, close_minutes)
 
         details = [f"Wave **{wave_id}** opened."]
         if request_limit:
@@ -631,6 +940,84 @@ class RequestLevelsCog(commands.Cog):
         if not request_limit and not close_ts:
             details.append("No limit or timer set.")
         await ctx.respond(" ".join(details), ephemeral=True)
+
+    async def pending_openings(
+        self,
+        ctx: discord.ApplicationContext,
+        action: str = "list",
+        opening_id: int = 0,
+        number: int = -1,
+        time: int = -1,
+        when: str = "",
+        day: int = 0,
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        member = await self._resolve_member(ctx.guild, ctx.user)
+        if member is None or not self._is_admin(member):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+
+        action = str(action or "list").strip().casefold()
+        if action in {"delete", "remove", "cancel"}:
+            if not opening_id:
+                return await ctx.respond("Please provide the scheduled opening ID to delete.", ephemeral=True)
+            await self.bot.db.execute(
+                "UPDATE level_request_scheduled_openings SET status='deleted' WHERE guild_id=? AND id=? AND status='pending'",
+                (ctx.guild.id, opening_id),
+            )
+            return await ctx.respond(f"Deleted scheduled opening **#{opening_id}** if it was still pending.", ephemeral=True)
+
+        if action in {"edit", "update"}:
+            if not opening_id:
+                return await ctx.respond("Please provide the scheduled opening ID to edit.", ephemeral=True)
+            row = await self.bot.db.fetchone(
+                "SELECT * FROM level_request_scheduled_openings WHERE guild_id=? AND id=? AND status='pending'",
+                (ctx.guild.id, opening_id),
+            )
+            if not row:
+                return await ctx.respond("I couldn't find a pending opening with that ID.", ephemeral=True)
+
+            new_limit = row["request_limit"]
+            new_close = row["close_minutes"]
+            new_open_ts = int(row["open_ts"])
+            if number >= 0:
+                new_limit = int(number) if int(number) > 0 else None
+            if time >= 0:
+                new_close = int(time) if int(time) > 0 else None
+            if str(when or "").strip():
+                parsed_ts, error = self._parse_scheduled_open_ts(when, day)
+                if parsed_ts is None:
+                    return await ctx.respond(error or "I couldn't parse that opening time.", ephemeral=True)
+                new_open_ts = parsed_ts
+
+            await self.bot.db.execute(
+                "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=? WHERE guild_id=? AND id=? AND status='pending'",
+                (new_limit, new_close, new_open_ts, ctx.guild.id, opening_id),
+            )
+            return await ctx.respond(
+                f"Updated scheduled opening **#{opening_id}** for <t:{new_open_ts}:F> (<t:{new_open_ts}:R>).",
+                ephemeral=True,
+            )
+
+        rows = await self.bot.db.fetchall(
+            "SELECT id, request_limit, close_minutes, open_ts, created_by FROM level_request_scheduled_openings "
+            "WHERE guild_id=? AND status='pending' ORDER BY open_ts ASC LIMIT 15",
+            (ctx.guild.id,),
+        )
+        embed = discord.Embed(title="Pending Request Openings", color=discord.Color.blurple())
+        if not rows:
+            embed.description = "No request openings are currently scheduled."
+        else:
+            lines = []
+            for row in rows:
+                limit = int(row["request_limit"]) if row["request_limit"] is not None else "none"
+                close = f"{int(row['close_minutes'])}m" if row["close_minutes"] is not None else "none"
+                lines.append(
+                    f"**#{int(row['id'])}** - <t:{int(row['open_ts'])}:F> (<t:{int(row['open_ts'])}:R>)\n"
+                    f"Limit: **{limit}** | Close timer: **{close}** | Created by <@{int(row['created_by'])}>"
+                )
+            embed.description = "\n\n".join(lines)[:4096]
+        await ctx.respond(embed=embed, ephemeral=True)
 
     async def close_requests(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
@@ -673,30 +1060,38 @@ class RequestLevelsCog(commands.Cog):
             return await interaction.response.send_message("Wrong server.", ephemeral=True)
 
         row = await self._get_state(interaction.guild.id)
+        try:
+            row = await self._state_after_timed_close_check(interaction.guild, row)
+        except Exception as e:
+            await log_error(self.bot, f"Could not refresh request button after timed close: {repr(e)}")
+
+        request_row = await self._current_user_submission(interaction.guild.id, int(row["wave_id"]), interaction.user.id)
+        if request_row:
+            if self._can_edit_submission(row, request_row):
+                return await interaction.response.send_modal(
+                    LevelRequestModal(
+                        self,
+                        interaction.user.id,
+                        edit=True,
+                        initial=self._request_initial_values(request_row),
+                    )
+                )
+            if str(request_row["status"]) != "pending":
+                return await interaction.response.send_message("That request has already been reviewed.", ephemeral=True)
+            if str(row["state"]) != STATE_OPEN:
+                return await interaction.response.send_message(self._message("edit_window_expired", "Your request can no longer be edited."), ephemeral=True)
+            return await interaction.response.send_message(
+                self._message("already_submitted", "You already submitted a level during this request wave."),
+                ephemeral=True,
+            )
+
         if str(row["state"]) != STATE_OPEN:
             return await interaction.response.send_message(self._message("closed", "Requests are closed :/"), ephemeral=True)
-        if row["close_ts"] is not None and int(row["close_ts"]) <= int(time_module.time()):
-            await interaction.response.send_message(self._message("closed", "Requests are closed :/"), ephemeral=True)
-            try:
-                await self._set_state_closed(interaction.guild, reason="time limit")
-            except Exception as e:
-                await log_error(self.bot, f"Could not refresh request button after timed close: {repr(e)}")
-            return
 
         member = await self._resolve_member(interaction.guild, interaction.user)
         if member is None or not await self._requirements_ok(member):
             return await interaction.response.send_message(
                 self._message("no_requirements", "You don't meet the requirements, please read the requesting rules"),
-                ephemeral=True,
-            )
-
-        existing_user = await self.bot.db.fetchone(
-            "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
-            (interaction.guild.id, int(row["wave_id"]), interaction.user.id),
-        )
-        if existing_user:
-            return await interaction.response.send_message(
-                self._message("already_submitted", "You already submitted a level during this request wave."),
                 ephemeral=True,
             )
 
@@ -710,6 +1105,24 @@ class RequestLevelsCog(commands.Cog):
             view=FirstRequestChoiceView(self, interaction.user.id),
             ephemeral=True,
         )
+
+    async def edit_request(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        row = await self._get_state(ctx.guild.id)
+        try:
+            row = await self._state_after_timed_close_check(ctx.guild, row)
+        except Exception as e:
+            await log_error(self.bot, f"Could not close expired request wave before edit command: {repr(e)}")
+        request_row = await self._current_user_submission(ctx.guild.id, int(row["wave_id"]), ctx.user.id)
+        if not request_row:
+            return await ctx.respond("You do not have a request in the current wave.", ephemeral=True)
+        if str(request_row["status"]) != "pending":
+            return await ctx.respond("That request has already been reviewed.", ephemeral=True)
+        if not self._can_edit_submission(row, request_row):
+            return await ctx.respond(self._message("edit_window_expired", "Your request can no longer be edited."), ephemeral=True)
+        initial = self._request_initial_values(request_row)
+        await ctx.send_modal(LevelRequestModal(self, ctx.user.id, edit=True, initial=initial))
 
     async def handle_first_choice(self, interaction: discord.Interaction, will_request_again: bool):
         if interaction.guild is None:
@@ -746,6 +1159,16 @@ class RequestLevelsCog(commands.Cog):
             return await self._reply_ephemeral(interaction, "Wrong server.")
         if not data.get("level_id") or not data.get("level_name") or not data.get("creators"):
             return await self._reply_ephemeral(interaction, "Missing required fields.")
+        validation_errors = self._validate_request_data(data)
+        if validation_errors:
+            return await self._reply_ephemeral(
+                interaction,
+                self._message_formatted(
+                    "validation_error",
+                    "Please fix your request before submitting: {errors}",
+                    {"errors": " ".join(validation_errors)},
+                ),
+            )
 
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
@@ -768,7 +1191,7 @@ class RequestLevelsCog(commands.Cog):
             if not closed_before_submit and not refresh_after_close:
                 wave_id = int(row["wave_id"])
                 user_id = interaction.user.id
-                normalized_level_id = str(data["level_id"]).strip().casefold()
+                normalized_level_id = self._normalize_level_id(data["level_id"])
 
                 existing_user = await self.bot.db.fetchone(
                     "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
@@ -791,19 +1214,27 @@ class RequestLevelsCog(commands.Cog):
                 data = dict(data)
                 data["level_id"] = str(data["level_id"]).strip()
                 data["level_id_normalized"] = normalized_level_id
+                data["edit_deadline_ts"] = self._edit_deadline_ts_for_state(row)
+                data["duplicate_history_warning"] = await self._duplicate_history_warning(
+                    interaction.guild.id,
+                    normalized_level_id,
+                    current_wave_id=wave_id,
+                    current_user_id=user_id,
+                )
                 data_json = json.dumps(data, separators=(",", ":"))
+                created_ts = int(time_module.time())
 
                 try:
                     await self.bot.db.execute(
                         "INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,status,created_ts,data_json) VALUES(?,?,?,?,?,?,?)",
-                        (interaction.guild.id, wave_id, user_id, normalized_level_id, "pending", int(time_module.time()), data_json),
+                        (interaction.guild.id, wave_id, user_id, normalized_level_id, "pending", created_ts, data_json),
                     )
                 except Exception as e:
                     await log_error(self.bot, f"Could not save level request submission before sending embed: {repr(e)}")
                     return await self._reply_ephemeral(interaction, "I couldn't submit your request right now.")
 
                 try:
-                    temp_row = {"guild_id": interaction.guild.id, "wave_id": wave_id, "user_id": user_id}
+                    temp_row = {"guild_id": interaction.guild.id, "wave_id": wave_id, "user_id": user_id, "created_ts": created_ts}
                     embed = self._embed_from_template(
                         self._cfg("level_requested_embed", default={}) or {},
                         self._data_vars(temp_row, data),
@@ -866,7 +1297,96 @@ class RequestLevelsCog(commands.Cog):
         if closed_before_submit or closed_by_timer:
             return await self._reply_ephemeral(interaction, self._message("closed", "Requests are closed :/"))
 
-        await self._reply_ephemeral(interaction, self._message("success", "Your request has been submitted!"))
+        success_text = self._message("success", "Your request has been submitted!")
+        final_state = await self._get_state(interaction.guild.id)
+        success_text += (
+            " You can edit it with `/edit-request` or by pressing the request button "
+            f"{self._edit_window_text(final_state)}."
+        )
+        await self._reply_ephemeral(interaction, success_text)
+
+    async def handle_request_edit_form(self, interaction: discord.Interaction, data: Dict[str, str]):
+        if interaction.guild is None:
+            return await self._reply_ephemeral(interaction, "Wrong server.")
+        if not data.get("level_id") or not data.get("level_name") or not data.get("creators"):
+            return await self._reply_ephemeral(interaction, "Missing required fields.")
+        validation_errors = self._validate_request_data(data)
+        if validation_errors:
+            return await self._reply_ephemeral(
+                interaction,
+                self._message_formatted(
+                    "validation_error",
+                    "Please fix your request before submitting: {errors}",
+                    {"errors": " ".join(validation_errors)},
+                ),
+            )
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+        async with self._submit_lock:
+            state_row = await self._get_state(interaction.guild.id)
+            try:
+                state_row = await self._state_after_timed_close_check(interaction.guild, state_row)
+            except Exception as e:
+                await log_error(self.bot, f"Could not close expired request wave before edit submit: {repr(e)}")
+            wave_id = int(state_row["wave_id"])
+            row = await self.bot.db.fetchone(
+                "SELECT * FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+                (interaction.guild.id, wave_id, interaction.user.id),
+            )
+            if not row:
+                return await self._reply_ephemeral(interaction, "You do not have a request in the current wave.")
+            if str(row["status"]) != "pending":
+                return await self._reply_ephemeral(interaction, "That request has already been reviewed.")
+            if not self._can_edit_submission(state_row, row):
+                return await self._reply_ephemeral(interaction, self._message("edit_window_expired", "Your request can no longer be edited."))
+
+            normalized_level_id = self._normalize_level_id(data["level_id"])
+            existing_level = await self.bot.db.fetchone(
+                "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND level_id=? AND user_id<>?",
+                (interaction.guild.id, wave_id, normalized_level_id, interaction.user.id),
+            )
+            if existing_level:
+                return await self._reply_ephemeral(interaction, self._message("duplicate_level", "That level ID has already been submitted during this request wave."))
+
+            message_id = int(row["request_message_id"] or 0)
+            target_channel = await self._configured_channel(interaction.guild, "level_requested")
+            if target_channel is None or not message_id:
+                return await self._reply_ephemeral(interaction, "I couldn't find the original request message.")
+            try:
+                msg = await target_channel.fetch_message(message_id)
+            except Exception as e:
+                await log_error(self.bot, f"Could not fetch request for edit message_id={message_id}: {repr(e)}")
+                return await self._reply_ephemeral(interaction, "I couldn't find the original request message.")
+
+            data = dict(data)
+            data["level_id"] = self._clean_level_id(data["level_id"])
+            data["level_id_normalized"] = normalized_level_id
+            data["edit_deadline_ts"] = self._edit_deadline_ts_for_state(state_row)
+            data["duplicate_history_warning"] = await self._duplicate_history_warning(
+                interaction.guild.id,
+                normalized_level_id,
+                current_wave_id=wave_id,
+                current_user_id=interaction.user.id,
+            )
+            data_json = json.dumps(data, separators=(",", ":"))
+            embed = self._embed_from_template(
+                self._cfg("level_requested_embed", default={}) or {},
+                self._data_vars(row, data),
+                default_color=self._color_name("pending", "blurple"),
+            )
+
+            try:
+                await self.bot.db.execute(
+                    "UPDATE level_request_submissions SET level_id=?, data_json=? WHERE guild_id=? AND wave_id=? AND user_id=? AND status='pending'",
+                    (normalized_level_id, data_json, interaction.guild.id, wave_id, interaction.user.id),
+                )
+                await msg.edit(embed=embed, view=LevelRequestReviewView())
+            except Exception as e:
+                await log_error(self.bot, f"Could not edit level request message_id={message_id}: {repr(e)}")
+                return await self._reply_ephemeral(interaction, "I couldn't update your request right now.")
+
+        await self._reply_ephemeral(interaction, self._message("edit_success", "Your request has been updated!"))
 
     async def _submission_by_message(self, guild_id: int, message_id: int):
         return await self.bot.db.fetchone(
@@ -906,6 +1426,8 @@ class RequestLevelsCog(commands.Cog):
     async def handle_review_button(self, interaction: discord.Interaction, action: str):
         if interaction.guild is None or interaction.message is None:
             return await interaction.response.send_message("Request not found.", ephemeral=True)
+        if not await self._is_reviewer_interaction(interaction):
+            return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
         _, row = await self._review_target_by_message(interaction.guild.id, interaction.message.id)
         if not row:
             return await interaction.response.send_message("Request not found.", ephemeral=True)
@@ -921,11 +1443,15 @@ class RequestLevelsCog(commands.Cog):
         await self._finalize_review(interaction, message_id, result_key, review)
 
     async def handle_other_reason(self, interaction: discord.Interaction, message_id: int, reason_key: str):
+        if not await self._is_reviewer_interaction(interaction):
+            return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
         await self._finalize_review(interaction, message_id, reason_key, "")
 
     async def _finalize_review(self, interaction: discord.Interaction, message_id: int, result_key: str, review: str):
         if interaction.guild is None:
             return await self._reply_ephemeral(interaction, "Wrong server.")
+        if not await self._is_reviewer_interaction(interaction):
+            return await self._reply_ephemeral(interaction, "Only reviewers can use these controls.")
 
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)

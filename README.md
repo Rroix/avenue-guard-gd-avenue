@@ -22,6 +22,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Supports claim, decline confirmation, timeout, reminders, and automatic offer to the next eligible member.
 - Posts weekly request submissions as configurable embeds with `Send`, `Reject`, and `Other` review buttons.
 - Weekly submitted requests use the same staff review/result workflow as live wave requests, but do not count toward or appear in any request wave summary.
+- Weekly submitted request embeds include submission timing and reviewer action buttons.
 - Admins can disable the automatic weekly request reward for the current tracking week.
 - Logs weekly request events, including manual `/tracking force_dm` outcomes, to SQLite and optionally to a log channel.
 - Logs weekly request recording failures instead of silently closing a claim when the staff request channel cannot be used.
@@ -31,20 +32,27 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Posts a persistent request embed/button in `level_requests.request_channel`.
 - Mods can recreate or refresh the request button with `/refresh-request-button`.
 - Admins can open request waves with `/open-requests`.
+- Admins can schedule future request openings with `/open-requests when:<HH:MM> day:<optional>`.
+- Admins can list, edit, or delete scheduled openings with `/pending-openings`.
 - Admins can close request waves with `/close-requests`.
 - Anyone can check the current state with `/requests-are`.
 - Supports open, closed, limited-count, timed, and indefinite request waves.
 - Counts a request only after the modal form is successfully submitted.
 - Blocks duplicate users and duplicate level IDs inside the same wave.
+- Warns staff when a submitted level ID has appeared in previous waves.
+- Validates level IDs as 7 to 9 digits and validates showcase links as URLs.
+- Lets users edit their pending request with `/edit-request` or by pressing the request button until the wave closes, plus the configured grace period.
+- Shows request age with Discord relative timestamps.
 - Resets per-user and per-level duplicate tracking when a new wave starts.
 - Checks configurable required roles before showing the request form.
 - Supports the first-request `I will` / `I won't` choice flow with configurable roles.
 - Sends staff review embeds to `level_requests.level_requested`.
-- Reviewers can choose `Send`, `Reject`, or `Other`.
+- Configured reviewer roles, admins, and owners can choose `Send`, `Reject`, or `Other`.
+- Staff can filter pending live-wave and weekly requests with `/requests pending`.
 - Review actions verify the original request message and result channel before marking the request reviewed.
 - Sends final result embeds to `level_requests.sent_channel` or `level_requests.rejected_channel`.
 - Disables review buttons after a request is processed.
-- Posts one live summary embed per closed wave in `level_requests.level_requested`, including requested, reviewed, sent, not sent, percentages, and remaining reviews.
+- Posts one live summary embed per closed wave in `level_requests.level_requested`, including requested, reviewed, sent, not sent, percentages, remaining reviews, and reviewer stats.
 - Stores request state, request button message ID, wave count, submitted users, and submitted level IDs in SQLite so restarts do not wipe the wave.
 
 ### Help Menu And Staff Tickets
@@ -56,6 +64,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Tracks ticket inactivity and prompts staff to close stale tickets.
 - Saves transcripts before deleting tickets.
 - Lets staff approve or deny transcript requests.
+- Posts appeals, reports, bot issues, transcript requests, ticket transcripts, and bot errors as structured staff-log embeds.
 
 ### Forum And Sticky Automation
 - Posts sticky reminder messages at the bottom of configured text channels.
@@ -73,9 +82,9 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Stops after the first matching rule.
 
 ### Background Utilities
-- `/bot health` shows database, background task, request, ticket, and weekly workflow status. Admins/owners only.
-- `/bot config_check` validates configured channels and roles. Admins/owners only.
-- `/requests pending` shows pending live-wave and weekly request reviews. Mods only.
+- `/bot health` shows database, background task, request, ticket, and weekly workflow status.
+- `/bot config_check` validates configured channels and roles.
+- `/requests pending` shows and filters pending live-wave and weekly request reviews.
 - Optional rotating bot status with placeholders like `{members}`, `{online}`, `{week_msgs}`, `{week_top}`, `{open_tickets}`, and `{today_msgs}`.
 - Optional daily server summary embeds with highlights, day-over-day movement, active members/channels, moderation signals, command health, voice/presence, and top channels/members/commands.
 - Tracks daily messages, edits, deletes, reactions, joins, leaves, bans, boosts, voice minutes, command usage, and top channels/users.
@@ -90,21 +99,23 @@ The bot is intentionally built around one configured server. Most behavior is co
 
 - `/tracking top` shows the current weekly leaderboard.
 - `/tracking me` shows your weekly count and rank.
-- `/tracking reset` resets this week's tracking data. Admins/owners only.
-- `/tracking force_dm` manually sends a weekly request DM, even to members excluded from normal tracking or during a disabled automatic reward week, and logs the outcome. Admins/owners only.
-- `/tracking disable_reward` disables the automatic weekly request reward for the current tracking week. Admins/owners only.
-- `/tracking enable_reward` re-enables the automatic weekly request reward for the current tracking week. Admins/owners only.
-- `/bot health` shows a compact live health report. Admins/owners only.
-- `/bot config_check` checks configured channels and roles. Admins/owners only.
-- `/requests pending` shows pending live and weekly request reviews. Mods only.
-- `/refresh-request-button` refreshes or recreates the live request button. Mods only.
-- `/open-requests number:<optional> time:<optional>` opens a new request wave. Admins/owners only.
-- `/close-requests` closes the active request wave. Admins/owners only.
+- `/tracking reset` resets this week's tracking data.
+- `/tracking force_dm` manually sends a weekly request DM, even to members excluded from normal tracking or during a disabled automatic reward week, and logs the outcome.
+- `/tracking disable_reward` disables the automatic weekly request reward for the current tracking week.
+- `/tracking enable_reward` re-enables the automatic weekly request reward for the current tracking week.
+- `/bot health` shows a compact live health report.
+- `/bot config_check` checks configured channels and roles.
+- `/requests pending scope:<optional> status:<optional> wave:<optional>` shows filtered live and weekly request reviews.
+- `/refresh-request-button` refreshes or recreates the live request button.
+- `/open-requests number:<optional> time:<optional> when:<optional> day:<optional>` opens or schedules a request wave.
+- `/pending-openings action:<list|edit|delete> opening_id:<optional>` manages scheduled request openings.
+- `/edit-request` lets a user edit their current pending live-wave request during the edit window.
+- `/close-requests` closes the active request wave.
 - `/requests-are` shows whether requests are currently open or closed.
-- `/ticket close` closes the current ticket channel. Mods only.
+- `/ticket close` closes the current ticket channel.
 - `/forum required_word` views or changes the forum required word. Discord administrators only.
-- `/resync` reloads config and response rules without restarting. Admins/owners only.
-- `/restart` flushes buffered tracking/daily stats, then exits the bot so the host can restart it. Admins/owners only.
+- `/resync` reloads config and response rules without restarting.
+- `/restart` flushes buffered tracking/daily stats, then exits the bot so the host can restart it.
 - `/dance`, `/rock-paper-scissors`, `/gambling` are public fun commands.
 
 ## Required-Word Forum Enforcement
@@ -166,8 +177,10 @@ Set these before opening requests:
 - `required_role_ids`: roles allowed to request. Empty means everyone can request unless banned.
 - `has_requested_role_id`: role used for users who already passed the first-request prompt.
 - `request_banned_role_id`: role assigned by the `I will` choice and blocked from requesting.
+- `reviewer_role_ids`: roles allowed to use request review controls and reviewer filters.
+- `request_post_close_edit_minutes`: how long users may keep editing pending requests after the wave closes.
 
-The same section controls the request button text, all user-facing messages, request/review/result embed templates, wave summary embed, weekly request embeds, and final-result colors.
+The same section controls the request button text, all user-facing messages, request/review/result embed templates, wave summary embed, weekly request embeds, duplicate-history warnings, aging fields, and final-result colors.
 
 ## Running The Bot
 

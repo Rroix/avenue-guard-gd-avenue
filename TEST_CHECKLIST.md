@@ -89,7 +89,7 @@
 2. Reply with your punishment details.
 3. Reply with why it should be lifted.
    - Expected: confirmation DM.
-   - Expected: embed posted to `channels.appeals_log_channel_id`.
+   - Expected: structured staff-log embed posted to `channels.appeals_log_channel_id`.
 
 ---
 
@@ -97,7 +97,7 @@
 1. DM bot → select `Report a user/message`
 2. Reply with message link or user ID + reason.
    - Expected: confirmation DM.
-   - Expected: embed posted to `channels.reports_log_channel_id`.
+   - Expected: structured staff-log embed posted to `channels.reports_log_channel_id`.
 
 ---
 
@@ -105,7 +105,7 @@
 1. DM bot → select `Report a bot issue`
 2. Reply with the issue details.
    - Expected: confirmation DM.
-   - Expected: embed posted to `channels.bot_issues_log_channel_id`.
+   - Expected: structured staff-log embed posted to `channels.bot_issues_log_channel_id`.
 
 ---
 
@@ -131,7 +131,7 @@
 3. Press No
    - Expected: ticket remains open
 4. Press Yes
-   - Expected: transcript posted to `channels.general_logging_channel_id`
+   - Expected: transcript file and structured ticket transcript embed posted to `channels.general_logging_channel_id`
    - Expected: channel deleted
 
 ---
@@ -140,12 +140,13 @@
 1. Create a ticket (so you have a ticket channel)
 2. DM bot → select `Request transcript`
 3. Reply with the ticket channel mention or ID.
-   - Expected: request posted in `channels.transcript_requests_channel_id` with Approve/Deny buttons.
+   - Expected: structured transcript request embed posted in `channels.transcript_requests_channel_id` with Approve/Deny buttons.
 4. As a mod, press Approve
    - Expected: user receives transcript file in DM
    - Expected: request message updates to approved
 5. Press Deny (on another request)
    - Expected: user receives denial DM
+   - Expected: the request message updates without creating duplicate transcript requests.
 
 ---
 
@@ -209,26 +210,52 @@
    - Expected: user receives `has_requested_role_id` and the request modal opens.
 8. Submit a valid modal.
    - Expected: staff embed appears in `level_requested`; user sees success; `/requests-are` count increases by 1.
-9. Try submitting again in the same wave.
+   - Expected: staff embed shows how long ago it was submitted.
+   - Expected: success message says the request can be edited with `/edit-request` or by pressing the request button.
+9. Submit an invalid modal with a non-numeric ID or a showcase that is not a URL.
+   - Expected: ephemeral validation message; no staff embed; wave count does not increase.
+10. Run `/edit-request` while the wave is still open.
+    - Expected: modal opens and editing updates the original staff embed instead of creating a new request.
+11. Press the request button again while the wave is still open.
+    - Expected: the same prefilled edit modal opens instead of starting a second request.
+12. Close the wave, then run `/edit-request` or press the request button within 5 minutes.
+    - Expected: the prefilled edit modal still opens and updates the original staff embed.
+13. Run `/edit-request` or press the request button more than 5 minutes after requests close.
+    - Expected: edit is refused.
+14. Try submitting again in the same wave.
    - Expected: duplicate-user message; no new staff embed.
-10. Have another user submit the same level ID in the same wave.
+15. Have another user submit the same level ID in the same wave.
     - Expected: duplicate-level message; no new staff embed.
-11. Submit enough successful requests to hit the `number` limit.
+16. Submit a level ID that was used in an earlier wave but not in the current wave.
+    - Expected: request is allowed and the staff embed includes a history warning.
+17. Submit enough successful requests to hit the `number` limit.
     - Expected: requests close automatically and the request embed changes to closed.
     - Expected: one wave summary embed appears in `level_requested`.
-12. Open requests with only `time:1`.
+18. Open requests with only `time:1`.
     - Expected: requests close automatically after the timer expires.
-13. Open requests without `number` or `time`, then run `/close-requests`.
+19. Open requests without `number` or `time`, then run `/close-requests`.
     - Expected: requests close manually and the embed changes to closed.
-14. On a pending staff request embed, press `Send`.
+20. Run `/open-requests when:18:30 day:0` as an admin.
+    - Expected: bot schedules the opening and replies with Discord absolute and relative timestamps.
+21. Run `/pending-openings action:list`.
+    - Expected: scheduled openings list includes ID, time, limit, close timer, and creator.
+22. Run `/pending-openings action:edit opening_id:<id> number:3 time:10 when:19:00`.
+    - Expected: the scheduled opening updates.
+23. Run `/pending-openings action:delete opening_id:<id>`.
+    - Expected: the scheduled opening is removed from the pending list.
+24. Run `/requests pending scope:current_wave status:pending` as a judge or head judge.
+    - Expected: current-wave unreviewed requests are listed with jump links and submission age.
+25. On a pending staff request embed, press `Send` as a judge/head judge.
     - Expected: review modal opens; submitted review edits the staff embed, disables all buttons, and posts a pinged result in `sent_channel`.
-    - Expected: the wave summary updates reviewed/sent/left-to-review counts and percentages.
-15. On another pending staff request embed, press `Reject`.
+    - Expected: the wave summary updates reviewed/sent/left-to-review counts, percentages, and reviewer stats.
+26. Press `Send`, `Reject`, or `Other` as someone without a reviewer role.
+    - Expected: ephemeral permission denial and no request update.
+27. On another pending staff request embed, press `Reject`.
     - Expected: review modal opens; submitted review edits the staff embed, disables all buttons, and posts a pinged result in `rejected_channel`.
-    - Expected: the wave summary updates reviewed/not-sent/left-to-review counts and percentages.
-16. On another pending staff request embed, press `Other`.
+    - Expected: the wave summary updates reviewed/not-sent/left-to-review counts, percentages, and reviewer stats.
+28. On another pending staff request embed, press `Other`.
     - Expected: ephemeral options appear for `Level doesn't exist`, `Stolen level`, and `Already rated`.
-17. Choose each `Other` reason on separate requests.
+29. Choose each `Other` reason on separate requests.
     - Expected: staff embed color/result updates, buttons disable, and a pinged result appears in `rejected_channel`.
     - Expected: the wave summary updates the not-sent breakdown.
 
@@ -244,6 +271,7 @@
    - Expected: user receives the configurable weekly reminder embed.
 3. Reply in DM with a valid request containing name, creator, and ID.
    - Expected: `weekly_request_channel_ID` receives the configurable weekly submitted embed with `Send`, `Reject`, and `Other` buttons.
+   - Expected: the weekly submitted embed shows how long ago it was submitted.
 4. Press `Send` or `Reject`.
    - Expected: the optional review modal appears, the weekly submitted embed changes to the reviewed template, buttons become disabled, and the requester is pinged in the configured sent/rejected result channel.
    - Expected: no live request wave count or wave summary changes.
@@ -264,13 +292,13 @@
 ---
 
 ## 23) Bot diagnostics and performance safety
-**Setup:** use an admin/owner account for `/bot` commands and a mod account for `/requests pending`.
+**Setup:** use an admin/owner account for `/bot` commands and a mod, judge, or head judge account for `/requests pending`.
 
 1. Run `/bot health`.
    - Expected: an ephemeral health embed shows database status, latency, loaded cogs, background task states, open tickets, weekly sessions, pending requests, and request state.
 2. Run `/bot config_check`.
    - Expected: configured channels and roles are reported as OK or listed as issues.
-3. Run `/requests pending`.
+3. Run `/requests pending scope:all status:pending`.
    - Expected: pending live request reviews and weekly request reviews are listed separately with jump links when message IDs are available.
 4. Send several normal chat messages.
    - Expected: tracking still counts activity, but writes are flushed according to `tracking.activity_flush_seconds`.

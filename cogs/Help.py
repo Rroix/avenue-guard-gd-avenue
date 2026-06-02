@@ -481,6 +481,24 @@ class HelpCog(commands.Cog):
             return int(digits), None
         return None, int(digits)
 
+    def _staff_log_embed(self, guild: discord.Guild, title: str, description: str, color: discord.Color) -> discord.Embed:
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+            timestamp=now_madrid(),
+        )
+        try:
+            if guild.icon:
+                embed.set_thumbnail(url=guild.icon.url)
+        except Exception:
+            pass
+        embed.set_footer(text="Avenue Guard staff log")
+        return embed
+
+    def _ticket_label(self, ticket_id: Optional[int], fallback_channel_id: int) -> str:
+        return f"`T{ticket_id}`" if ticket_id is not None else f"`{fallback_channel_id}`"
+
     # -----------------------------
     # Staff submissions
     # -----------------------------
@@ -491,8 +509,14 @@ class HelpCog(commands.Cog):
         if not isinstance(channel, discord.TextChannel):
             await log_error(self.bot, "Appeal submission failed: appeals_log_channel_id is missing or invalid.")
             return False
-        embed = discord.Embed(title="Punishment Appeal")
-        embed.add_field(name="User", value=f"<@{user_id}> ({user_id})", inline=False)
+        embed = self._staff_log_embed(
+            guild,
+            "Punishment Appeal",
+            f"<@{user_id}> submitted a punishment appeal",
+            discord.Color.gold(),
+        )
+        embed.add_field(name="User", value=f"<@{user_id}>\n`{user_id}`", inline=True)
+        embed.add_field(name="Status", value="Pending staff review", inline=True)
         embed.add_field(name="Punishment", value=str(data.get("punishment", ""))[:1024], inline=False)
         embed.add_field(name="Why lift?", value=str(data.get("reason", ""))[:1024], inline=False)
         try:
@@ -509,8 +533,14 @@ class HelpCog(commands.Cog):
         if not isinstance(channel, discord.TextChannel):
             await log_error(self.bot, "Report submission failed: reports_log_channel_id is missing or invalid.")
             return False
-        embed = discord.Embed(title="User Report")
-        embed.add_field(name="Reporter", value=f"<@{user_id}> ({user_id})", inline=False)
+        embed = self._staff_log_embed(
+            guild,
+            "User Report",
+            f"<@{user_id}> submitted a user or message report",
+            discord.Color.orange(),
+        )
+        embed.add_field(name="Reporter", value=f"<@{user_id}>\n`{user_id}`", inline=True)
+        embed.add_field(name="Status", value="Pending staff review", inline=True)
         embed.add_field(name="Details", value=str(data.get("report", ""))[:1024], inline=False)
         try:
             await channel.send(embed=embed)
@@ -526,8 +556,14 @@ class HelpCog(commands.Cog):
         if not isinstance(channel, discord.TextChannel):
             await log_error(self.bot, "Bot issue submission failed: bot_issues_log_channel_id is missing or invalid.")
             return False
-        embed = discord.Embed(title="Bot Issue Report")
-        embed.add_field(name="Reporter", value=f"<@{user_id}> ({user_id})", inline=False)
+        embed = self._staff_log_embed(
+            guild,
+            "Bot Issue Report",
+            f"<@{user_id}> reported a bot issue",
+            discord.Color.blurple(),
+        )
+        embed.add_field(name="Reporter", value=f"<@{user_id}>\n`{user_id}`", inline=True)
+        embed.add_field(name="Status", value="Pending developer review", inline=True)
         embed.add_field(name="Issue", value=str(data.get("issue", ""))[:1024], inline=False)
         try:
             await channel.send(embed=embed)
@@ -564,12 +600,18 @@ class HelpCog(commands.Cog):
             if status in ("approved", "denied"):
                 return False, f"That ticket's transcript request is already **{status}**."
 
-        embed = discord.Embed(title="Transcript Request")
-        embed.add_field(name="Requester", value=f"<@{requester_id}> ({requester_id})", inline=False)
-        embed.add_field(name="Ticket Channel", value=f"<#{ticket_channel_id}> ({ticket_channel_id})", inline=False)
+        embed = self._staff_log_embed(
+            guild,
+            "Transcript Request",
+            f"<@{requester_id}> requested a ticket transcript",
+            discord.Color.blurple(),
+        )
+        embed.add_field(name="Requester", value=f"<@{requester_id}>\n`{requester_id}`", inline=True)
+        embed.add_field(name="Ticket", value=self._ticket_label(ticket_id, ticket_channel_id), inline=True)
+        embed.add_field(name="Ticket Channel", value=f"<#{ticket_channel_id}>\n`{ticket_channel_id}`", inline=False)
         if ticket_id is not None:
-            embed.add_field(name="Ticket ID", value=f"T{ticket_id}", inline=False)
-        embed.set_footer(text="Staff: Approve or Deny")
+            embed.add_field(name="Ticket ID", value=f"`T{ticket_id}`", inline=True)
+        embed.set_footer(text="Avenue Guard staff log - approve or deny")
 
         msg = await channel.send(embed=embed, view=TranscriptRequestView())
 
@@ -809,8 +851,10 @@ class HelpCog(commands.Cog):
         if not isinstance(channel, discord.TextChannel):
             return False
 
-        row = await self.bot.db.fetchone("SELECT ticket_id FROM tickets WHERE channel_id=?", (channel_id,))
+        row = await self.bot.db.fetchone("SELECT ticket_id, creator_id, created_ts FROM tickets WHERE channel_id=?", (channel_id,))
         ticket_id = int(row["ticket_id"]) if row and row["ticket_id"] is not None else None
+        creator_id = int(row["creator_id"]) if row and row["creator_id"] is not None else 0
+        created_ts = int(row["created_ts"]) if row and row["created_ts"] is not None else 0
 
         if not isinstance(log_channel, discord.TextChannel):
             try:
@@ -821,8 +865,21 @@ class HelpCog(commands.Cog):
 
         try:
             transcript_path = await build_text_transcript(channel)
+            embed = self._staff_log_embed(
+                guild,
+                "Ticket Transcript",
+                f"{channel.mention} was closed and its transcript was saved",
+                discord.Color.dark_grey(),
+            )
+            embed.add_field(name="Ticket", value=self._ticket_label(ticket_id, channel.id), inline=True)
+            embed.add_field(name="Channel", value=f"{channel.mention}\n`{channel.id}`", inline=True)
+            if creator_id:
+                embed.add_field(name="Created by", value=f"<@{creator_id}>\n`{creator_id}`", inline=True)
+            if created_ts:
+                embed.add_field(name="Opened", value=f"<t:{created_ts}:R>", inline=True)
+            embed.add_field(name="Closed", value=f"<t:{int(time.time())}:R>", inline=True)
             sent = await log_channel.send(
-                content=f"Transcript for {channel.name} ({channel.id})" + (f" | Ticket T{ticket_id}" if ticket_id else ""),
+                embed=embed,
                 file=discord.File(transcript_path, filename=f"transcript-{ticket_id or channel.id}.txt"),
             )
         except Exception as e:

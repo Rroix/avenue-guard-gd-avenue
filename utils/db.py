@@ -234,6 +234,17 @@ class Database:
                 updated_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, wave_id)
             );""",
+            """CREATE TABLE IF NOT EXISTS level_request_scheduled_openings(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                request_limit INTEGER,
+                close_minutes INTEGER,
+                open_ts INTEGER NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                opened_wave_id INTEGER
+            );""",
             """CREATE TABLE IF NOT EXISTS daily_stats(
                 guild_id INTEGER NOT NULL,
                 day_key TEXT NOT NULL,
@@ -251,6 +262,8 @@ class Database:
                 ON tickets(guild_id, status, last_user_activity_ts);""",
             """CREATE INDEX IF NOT EXISTS idx_level_request_submissions_status
                 ON level_request_submissions(guild_id, status, wave_id);""",
+            """CREATE INDEX IF NOT EXISTS idx_level_request_scheduled_openings_pending
+                ON level_request_scheduled_openings(guild_id, status, open_ts);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_request_reviews_status
                 ON weekly_request_reviews(guild_id, status, week_start);""",
             """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status
@@ -279,6 +292,7 @@ class Database:
         self._ensure_column_sync("level_request_wave_summaries", "message_id", "INTEGER")
         self._ensure_column_sync("level_request_wave_summaries", "created_ts", "INTEGER")
         self._ensure_column_sync("level_request_wave_summaries", "updated_ts", "INTEGER")
+        self._ensure_column_sync("level_request_scheduled_openings", "opened_wave_id", "INTEGER")
         self._normalize_weekly_dm_log_sync()
         self._init_ticket_sequences_sync()
         self._conn.commit()
@@ -521,6 +535,17 @@ class Database:
                 updated_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, wave_id)
             );""",
+            """CREATE TABLE IF NOT EXISTS level_request_scheduled_openings(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                request_limit INTEGER,
+                close_minutes INTEGER,
+                open_ts INTEGER NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                opened_wave_id INTEGER
+            );""",
             """CREATE TABLE IF NOT EXISTS daily_stats(
                 guild_id INTEGER NOT NULL,
                 day_key TEXT NOT NULL,
@@ -538,6 +563,8 @@ class Database:
                 ON tickets(guild_id, status, last_user_activity_ts);""",
             """CREATE INDEX IF NOT EXISTS idx_level_request_submissions_status
                 ON level_request_submissions(guild_id, status, wave_id);""",
+            """CREATE INDEX IF NOT EXISTS idx_level_request_scheduled_openings_pending
+                ON level_request_scheduled_openings(guild_id, status, open_ts);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_request_reviews_status
                 ON weekly_request_reviews(guild_id, status, week_start);""",
             """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status
@@ -567,6 +594,7 @@ class Database:
         await self._ensure_column("level_request_wave_summaries", "message_id", "INTEGER")
         await self._ensure_column("level_request_wave_summaries", "created_ts", "INTEGER")
         await self._ensure_column("level_request_wave_summaries", "updated_ts", "INTEGER")
+        await self._ensure_column("level_request_scheduled_openings", "opened_wave_id", "INTEGER")
         await self._normalize_weekly_dm_log()
 
         # Ensure sequence exists (set next_ticket_id based on max ticket_id)
