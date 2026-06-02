@@ -245,6 +245,24 @@ class Database:
                 status TEXT NOT NULL DEFAULT 'pending',
                 opened_wave_id INTEGER
             );""",
+            """CREATE TABLE IF NOT EXISTS level_request_edit_audit(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                wave_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                request_message_id INTEGER,
+                old_level_id TEXT,
+                new_level_id TEXT,
+                old_data_json TEXT NOT NULL DEFAULT '{}',
+                new_data_json TEXT NOT NULL DEFAULT '{}',
+                edited_ts INTEGER NOT NULL
+            );""",
+            """CREATE TABLE IF NOT EXISTS gd_level_validation_cache(
+                level_id TEXT PRIMARY KEY,
+                checked_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                data_json TEXT NOT NULL DEFAULT '{}'
+            );""",
             """CREATE TABLE IF NOT EXISTS daily_stats(
                 guild_id INTEGER NOT NULL,
                 day_key TEXT NOT NULL,
@@ -264,6 +282,12 @@ class Database:
                 ON level_request_submissions(guild_id, status, wave_id);""",
             """CREATE INDEX IF NOT EXISTS idx_level_request_scheduled_openings_pending
                 ON level_request_scheduled_openings(guild_id, status, open_ts);""",
+            """CREATE INDEX IF NOT EXISTS idx_level_request_edit_audit_lookup
+                ON level_request_edit_audit(guild_id, wave_id, user_id, edited_ts DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_level_request_edit_audit_message
+                ON level_request_edit_audit(guild_id, request_message_id);""",
+            """CREATE INDEX IF NOT EXISTS idx_gd_level_validation_cache_expiry
+                ON gd_level_validation_cache(expires_ts);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_request_reviews_status
                 ON weekly_request_reviews(guild_id, status, week_start);""",
             """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status
@@ -546,6 +570,24 @@ class Database:
                 status TEXT NOT NULL DEFAULT 'pending',
                 opened_wave_id INTEGER
             );""",
+            """CREATE TABLE IF NOT EXISTS level_request_edit_audit(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                wave_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                request_message_id INTEGER,
+                old_level_id TEXT,
+                new_level_id TEXT,
+                old_data_json TEXT NOT NULL DEFAULT '{}',
+                new_data_json TEXT NOT NULL DEFAULT '{}',
+                edited_ts INTEGER NOT NULL
+            );""",
+            """CREATE TABLE IF NOT EXISTS gd_level_validation_cache(
+                level_id TEXT PRIMARY KEY,
+                checked_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                data_json TEXT NOT NULL DEFAULT '{}'
+            );""",
             """CREATE TABLE IF NOT EXISTS daily_stats(
                 guild_id INTEGER NOT NULL,
                 day_key TEXT NOT NULL,
@@ -565,6 +607,12 @@ class Database:
                 ON level_request_submissions(guild_id, status, wave_id);""",
             """CREATE INDEX IF NOT EXISTS idx_level_request_scheduled_openings_pending
                 ON level_request_scheduled_openings(guild_id, status, open_ts);""",
+            """CREATE INDEX IF NOT EXISTS idx_level_request_edit_audit_lookup
+                ON level_request_edit_audit(guild_id, wave_id, user_id, edited_ts DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_level_request_edit_audit_message
+                ON level_request_edit_audit(guild_id, request_message_id);""",
+            """CREATE INDEX IF NOT EXISTS idx_gd_level_validation_cache_expiry
+                ON gd_level_validation_cache(expires_ts);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_request_reviews_status
                 ON weekly_request_reviews(guild_id, status, week_start);""",
             """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status

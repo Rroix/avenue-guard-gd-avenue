@@ -232,6 +232,21 @@
     "has_requested_role_id": "1510348407384965252",
     "request_banned_role_id": "1463987510236545127",
     "request_post_close_edit_minutes": 5,
+    "level_validation": {
+      "_comment": "Checks submitted level IDs through GDBrowser and the direct GD/Boomlings endpoint. Cache keeps repeated submissions fast and refreshes after cache_seconds.",
+      "enabled": true,
+      "cache_seconds": 1800,
+      "request_timeout_seconds": 8,
+      "auto_reject_missing": true,
+      "providers": {
+        "gdbrowser": true,
+        "boomlings": true
+      },
+      "messages": {
+        "missing": "That level ID does not seem to exist. Please check the ID and try again.",
+        "showcase_required": "This level appears to be a demon or platformer, so a showcase URL is required."
+      }
+    },
     "request_button_label": "Request your level!",
     "messages": {
       "closed": "Requests are closed :/",
@@ -285,9 +300,12 @@
         { "name": "Level ID", "value": "{level_id}", "inline": true },
         { "name": "Level Info", "value": "[Level](https://gdbrowser.com/{level_id})", "inline": true },
         { "name": "Submitted", "value": "{submitted_ago}", "inline": true },
+        { "name": "GD Info", "value": "{gd_info}", "inline": false },
         { "name": "Showcase", "value": "{level_showcase}", "inline": false },
         { "name": "Notes", "value": "{notes}", "inline": false },
+        { "name": "Validation", "value": "{level_validation_warning}", "inline": false },
         { "name": "History warning", "value": "{duplicate_history_warning}", "inline": false },
+        { "name": "Edit trail", "value": "{edit_count} edits", "inline": true },
         { "name": "Wave", "value": "{wave_id}", "inline": true }
       ]
     },

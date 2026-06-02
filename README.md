@@ -33,15 +33,19 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Mods can recreate or refresh the request button with `/refresh-request-button`.
 - Admins can open request waves with `/open-requests`.
 - Admins can schedule future request openings with `/open-requests when:<HH:MM> day:<optional>`.
-- Admins can list, edit, or delete scheduled openings with `/pending-openings`.
+- Admins can list, edit, delete, refresh, or immediately open scheduled openings from the `/pending-openings` interactive panel.
 - Admins can close request waves with `/close-requests`.
 - Anyone can check the current state with `/requests-are`.
 - Supports open, closed, limited-count, timed, and indefinite request waves.
 - Counts a request only after the modal form is successfully submitted.
 - Blocks duplicate users and duplicate level IDs inside the same wave.
 - Warns staff when a submitted level ID has appeared in previous waves.
-- Validates level IDs as 7 to 9 digits and validates showcase links as URLs.
+- Validates level IDs as 7 to 9 digits, validates showcase links as URLs, and checks level existence through GDBrowser plus the direct GD/Boomlings endpoint.
+- Auto-rejects confidently missing level IDs while surfacing uncertain validation warnings to reviewers.
+- Warns reviewers when a level appears rated, when validation sources disagree, or when validation will refresh after the configured cache time.
+- Automatically requires a showcase URL when validation detects a demon or platformer.
 - Lets users edit their pending request with `/edit-request` or by pressing the request button until the wave closes, plus the configured grace period.
+- Stores every request edit in an audit trail and exposes it with `/requests history`.
 - Shows request age with Discord relative timestamps.
 - Resets per-user and per-level duplicate tracking when a new wave starts.
 - Checks configurable required roles before showing the request form.
@@ -49,6 +53,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Sends staff review embeds to `level_requests.level_requested`.
 - Configured reviewer roles, admins, and owners can choose `Send`, `Reject`, or `Other`.
 - Staff can filter pending live-wave and weekly requests with `/requests pending`.
+- Admins can run `/requests repair` to refresh the request button, rebuild wave summaries, recreate missing pending request messages, refresh stale validation warnings, and relock reviewed messages.
 - Review actions verify the original request message and result channel before marking the request reviewed.
 - Sends final result embeds to `level_requests.sent_channel` or `level_requests.rejected_channel`.
 - Disables review buttons after a request is processed.
@@ -83,7 +88,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 
 ### Background Utilities
 - `/bot health` shows database, background task, request, ticket, and weekly workflow status.
-- `/bot config_check` validates configured channels and roles.
+- `/bot config_check` validates configured channels, roles, and request embed template variables.
 - `/requests pending` shows and filters pending live-wave and weekly request reviews.
 - Optional rotating bot status with placeholders like `{members}`, `{online}`, `{week_msgs}`, `{week_top}`, `{open_tickets}`, and `{today_msgs}`.
 - Optional daily server summary embeds with highlights, day-over-day movement, active members/channels, moderation signals, command health, voice/presence, and top channels/members/commands.
@@ -97,6 +102,8 @@ The bot is intentionally built around one configured server. Most behavior is co
 
 ## Main Slash Commands
 
+Command options include Discord-side descriptions for confusing fields such as request limits, close timers, scheduled opening time, day of month, filters, message IDs, and target members.
+
 - `/tracking top` shows the current weekly leaderboard.
 - `/tracking me` shows your weekly count and rank.
 - `/tracking reset` resets this week's tracking data.
@@ -104,11 +111,13 @@ The bot is intentionally built around one configured server. Most behavior is co
 - `/tracking disable_reward` disables the automatic weekly request reward for the current tracking week.
 - `/tracking enable_reward` re-enables the automatic weekly request reward for the current tracking week.
 - `/bot health` shows a compact live health report.
-- `/bot config_check` checks configured channels and roles.
+- `/bot config_check` checks configured channels, roles, and request template variables.
 - `/requests pending scope:<optional> status:<optional> wave:<optional>` shows filtered live and weekly request reviews.
+- `/requests history message_id:<optional> user_id:<optional> wave:<optional>` shows the edit audit trail for a live-wave request.
+- `/requests repair` runs request-system recovery and message refresh tasks.
 - `/refresh-request-button` refreshes or recreates the live request button.
 - `/open-requests number:<optional> time:<optional> when:<optional> day:<optional>` opens or schedules a request wave.
-- `/pending-openings action:<list|edit|delete> opening_id:<optional>` manages scheduled request openings.
+- `/pending-openings action:<list|edit|delete> opening_id:<optional>` manages scheduled request openings and shows an interactive management panel by default.
 - `/edit-request` lets a user edit their current pending live-wave request during the edit window.
 - `/close-requests` closes the active request wave.
 - `/requests-are` shows whether requests are currently open or closed.
@@ -163,7 +172,7 @@ Use `off`, `disable`, `none`, or `clear` as the word to disable enforcement for 
 
 - `config.json` controls guild IDs, roles, channels, live request waves, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, and background summaries.
 - `responses.json` controls automatic message responses.
-- `data/bot.db` stores persistent bot data such as live request waves, request submissions, weekly counts, tickets, cooldowns, transcript pointers, reminders, and daily stats.
+- `data/bot.db` stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, tickets, cooldowns, transcript pointers, reminders, and daily stats.
 
 ### Level Request Config
 
@@ -179,8 +188,17 @@ Set these before opening requests:
 - `request_banned_role_id`: role assigned by the `I will` choice and blocked from requesting.
 - `reviewer_role_ids`: roles allowed to use request review controls and reviewer filters.
 - `request_post_close_edit_minutes`: how long users may keep editing pending requests after the wave closes.
+- `level_validation.enabled`: enables GDBrowser plus GD/Boomlings existence/rating/showcase checks.
+- `level_validation.cache_seconds`: how long validation warnings stay fresh before repair or the next submission refreshes them.
+- `level_validation.auto_reject_missing`: blocks the modal when enabled sources confidently agree that the ID is missing.
 
-The same section controls the request button text, all user-facing messages, request/review/result embed templates, wave summary embed, weekly request embeds, duplicate-history warnings, aging fields, and final-result colors.
+The same section controls the request button text, all user-facing messages, request/review/result embed templates, wave summary embed, weekly request embeds, duplicate-history warnings, validation warnings, aging fields, edit-audit counters, and final-result colors.
+
+Validated live requests also expose compact GD details for embeds:
+- `{gd_info}`: clean preformatted difficulty, length, stars/status, and detected flags.
+- `{gd_difficulty}`, `{gd_length}`, `{gd_stars}`, `{gd_rated}`.
+- `{gd_demon}`, `{gd_platformer}`, `{gd_featured}`, `{gd_epic}`, `{gd_flags}`.
+- `{gd_level_name}` and `{gd_creator}` when the validation provider returns them.
 
 ## Running The Bot
 

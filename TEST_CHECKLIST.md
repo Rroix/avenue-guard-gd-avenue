@@ -214,48 +214,61 @@
    - Expected: success message says the request can be edited with `/edit-request` or by pressing the request button.
 9. Submit an invalid modal with a non-numeric ID or a showcase that is not a URL.
    - Expected: ephemeral validation message; no staff embed; wave count does not increase.
-10. Run `/edit-request` while the wave is still open.
+10. Submit a valid-looking but nonexistent level ID.
+    - Expected: if GDBrowser and the GD/Boomlings check both agree it is missing, the modal is rejected and wave count does not increase.
+11. Submit a known rated level ID.
+    - Expected: request is allowed unless it is otherwise invalid; staff embed includes a validation warning that the level seems rated.
+12. Submit a known demon or platformer without a showcase URL.
+    - Expected: modal is rejected with the configured showcase-required message.
+13. Submit the same demon or platformer with a valid showcase URL.
+    - Expected: request is accepted; staff embed includes a compact GD Info field with difficulty, length, stars/status, detected flags, plus the validation source summary and refresh timing.
+14. Run `/edit-request` while the wave is still open.
     - Expected: modal opens and editing updates the original staff embed instead of creating a new request.
-11. Press the request button again while the wave is still open.
+15. Press the request button again while the wave is still open.
     - Expected: the same prefilled edit modal opens instead of starting a second request.
-12. Close the wave, then run `/edit-request` or press the request button within 5 minutes.
+16. Run `/requests history message_id:<request message id>` as a judge, head judge, mod, or admin after an edit.
+    - Expected: an ephemeral audit embed shows the changed form fields with old and new values.
+17. Close the wave, then run `/edit-request` or press the request button within 5 minutes.
     - Expected: the prefilled edit modal still opens and updates the original staff embed.
-13. Run `/edit-request` or press the request button more than 5 minutes after requests close.
+18. Run `/edit-request` or press the request button more than 5 minutes after requests close.
     - Expected: edit is refused.
-14. Try submitting again in the same wave.
+19. Try submitting again in the same wave.
    - Expected: duplicate-user message; no new staff embed.
-15. Have another user submit the same level ID in the same wave.
+20. Have another user submit the same level ID in the same wave.
     - Expected: duplicate-level message; no new staff embed.
-16. Submit a level ID that was used in an earlier wave but not in the current wave.
+21. Submit a level ID that was used in an earlier wave but not in the current wave.
     - Expected: request is allowed and the staff embed includes a history warning.
-17. Submit enough successful requests to hit the `number` limit.
+22. Submit enough successful requests to hit the `number` limit.
     - Expected: requests close automatically and the request embed changes to closed.
     - Expected: one wave summary embed appears in `level_requested`.
-18. Open requests with only `time:1`.
+23. Open requests with only `time:1`.
     - Expected: requests close automatically after the timer expires.
-19. Open requests without `number` or `time`, then run `/close-requests`.
+24. Open requests without `number` or `time`, then run `/close-requests`.
     - Expected: requests close manually and the embed changes to closed.
-20. Run `/open-requests when:18:30 day:0` as an admin.
+25. Run `/open-requests when:18:30 day:0` as an admin.
     - Expected: bot schedules the opening and replies with Discord absolute and relative timestamps.
-21. Run `/pending-openings action:list`.
-    - Expected: scheduled openings list includes ID, time, limit, close timer, and creator.
-22. Run `/pending-openings action:edit opening_id:<id> number:3 time:10 when:19:00`.
+    - Expected: command options explain that `when` is Madrid `HH:MM`, `day` is optional, and `time` is the close timer in minutes.
+26. Run `/pending-openings action:list`.
+    - Expected: scheduled openings list includes ID, time, limit, close timer, and creator, plus selector/buttons for refresh, edit, delete, and open now.
+27. Use the `/pending-openings` panel `Edit` button.
+    - Expected: modal opens with the scheduled time, day, limit, and close timer prefilled.
+28. Run `/pending-openings action:edit opening_id:<id> number:3 time:10 when:19:00`.
     - Expected: the scheduled opening updates.
-23. Run `/pending-openings action:delete opening_id:<id>`.
+29. Run `/pending-openings action:delete opening_id:<id>`.
     - Expected: the scheduled opening is removed from the pending list.
-24. Run `/requests pending scope:current_wave status:pending` as a judge or head judge.
+30. Run `/requests pending scope:current_wave status:pending` as a judge or head judge.
     - Expected: current-wave unreviewed requests are listed with jump links and submission age.
-25. On a pending staff request embed, press `Send` as a judge/head judge.
+31. On a pending staff request embed, press `Send` as a judge/head judge.
     - Expected: review modal opens; submitted review edits the staff embed, disables all buttons, and posts a pinged result in `sent_channel`.
     - Expected: the wave summary updates reviewed/sent/left-to-review counts, percentages, and reviewer stats.
-26. Press `Send`, `Reject`, or `Other` as someone without a reviewer role.
+32. Press `Send`, `Reject`, or `Other` as someone without a reviewer role.
     - Expected: ephemeral permission denial and no request update.
-27. On another pending staff request embed, press `Reject`.
+33. On another pending staff request embed, press `Reject`.
     - Expected: review modal opens; submitted review edits the staff embed, disables all buttons, and posts a pinged result in `rejected_channel`.
     - Expected: the wave summary updates reviewed/not-sent/left-to-review counts, percentages, and reviewer stats.
-28. On another pending staff request embed, press `Other`.
+34. On another pending staff request embed, press `Other`.
     - Expected: ephemeral options appear for `Level doesn't exist`, `Stolen level`, and `Already rated`.
-29. Choose each `Other` reason on separate requests.
+35. Choose each `Other` reason on separate requests.
     - Expected: staff embed color/result updates, buttons disable, and a pinged result appears in `rejected_channel`.
     - Expected: the wave summary updates the not-sent breakdown.
 
@@ -298,19 +311,24 @@
    - Expected: an ephemeral health embed shows database status, latency, loaded cogs, background task states, open tickets, weekly sessions, pending requests, and request state.
 2. Run `/bot config_check`.
    - Expected: configured channels and roles are reported as OK or listed as issues.
-3. Run `/requests pending scope:all status:pending`.
+   - Expected: request embed template variables, field shapes, and suspicious color values are reported as OK or listed as issues.
+3. Temporarily add an invalid request template variable such as `{bad_variable}` to a request embed template, run `/bot config_check`, then revert it.
+   - Expected: config check reports the unknown template variable.
+4. Run `/requests pending scope:all status:pending`.
    - Expected: pending live request reviews and weekly request reviews are listed separately with jump links when message IDs are available.
-4. Send several normal chat messages.
+5. Run `/requests repair` as an admin.
+   - Expected: recovery embed reports the request button refresh, wave summary refresh, recreated/refreshed pending messages, stale validations refreshed, and reviewed messages relocked.
+6. Send several normal chat messages.
    - Expected: tracking still counts activity, but writes are flushed according to `tracking.activity_flush_seconds`.
-5. Run `/restart` after sending a counted message.
+7. Run `/restart` after sending a counted message.
    - Expected: buffered tracking counts and current daily stats are flushed before the bot exits.
-6. Create two tickets quickly with two users.
+8. Create two tickets quickly with two users.
    - Expected: ticket IDs do not duplicate.
-7. Temporarily misconfigure `channels.weekly_request_channel_ID`, restart or resync, then submit a weekly request in DM.
+9. Temporarily misconfigure `channels.weekly_request_channel_ID`, restart or resync, then submit a weekly request in DM.
    - Expected: the user is told the request could not be recorded, the weekly log records `request_record_failed`, and the claim is not silently closed as successfully claimed.
-8. Reply to a weekly request DM with text missing the actual level ID field.
+10. Reply to a weekly request DM with text missing the actual level ID field.
    - Expected: the request is not recorded, and the bot tells the user which required field is missing.
-9. Disable this week's reward with `/tracking disable_reward`, then run `/tracking force_dm`.
+11. Disable this week's reward with `/tracking disable_reward`, then run `/tracking force_dm`.
    - Expected: the manual force DM still sends if the user has no active/past non-resettable claim, and the override is logged.
-10. Temporarily misconfigure an appeal/report/bot-issue log channel, then complete that DM flow.
+12. Temporarily misconfigure an appeal/report/bot-issue log channel, then complete that DM flow.
    - Expected: the user is told the submission could not be sent instead of receiving a false success message.

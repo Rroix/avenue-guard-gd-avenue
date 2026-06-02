@@ -5,6 +5,7 @@ import secrets
 import asyncio
 import time
 import re
+import string
 from typing import Optional
 
 import discord
@@ -46,6 +47,8 @@ class CommandsCog(commands.Cog):
         self.ticket_group.command(name="close", description="Close the current ticket channel")(self.ticket_close)
         self.forum_group.command(name="required_word", description="View or update a forum required word")(self.forum_required_word)
         self.requests_group.command(name="pending", description="Show and filter pending request reviews")(self.requests_pending)
+        self.requests_group.command(name="history", description="Show request edit history")(self.requests_history)
+        self.requests_group.command(name="repair", description="Repair request system messages")(self.requests_repair)
 
         bot.add_application_command(self.bot_group)
         bot.add_application_command(self.tracking_group)
@@ -216,6 +219,191 @@ class CommandsCog(commands.Cog):
         )
         await self._send(ctx, embed=embed, ephemeral=True)
 
+    def _template_variables(self, text: str) -> tuple[set[str], Optional[str]]:
+        variables: set[str] = set()
+        try:
+            for _, field_name, _, _ in string.Formatter().parse(str(text or "")):
+                if not field_name:
+                    continue
+                root = re.split(r"[.\[]", field_name, maxsplit=1)[0]
+                if root:
+                    variables.add(root)
+        except Exception as e:
+            return variables, type(e).__name__
+        return variables, None
+
+    def _request_template_allowed_vars(self) -> set[str]:
+        return {
+            "state",
+            "wave_id",
+            "submitted_count",
+            "request_limit",
+            "close_ts",
+            "total_requests",
+            "reviewed_count",
+            "sent_count",
+            "not_sent_count",
+            "rejected_count",
+            "other_count",
+            "level_doesnt_exist_count",
+            "stolen_level_count",
+            "already_rated_count",
+            "pending_count",
+            "left_to_review",
+            "reviewed_percent",
+            "pending_percent",
+            "sent_percent",
+            "not_sent_percent",
+            "sent_percent_reviewed",
+            "not_sent_percent_reviewed",
+            "reviewer_stats",
+            "summary_color",
+            "level_id",
+            "level_name",
+            "creators",
+            "level_showcase",
+            "showcase",
+            "notes",
+            "requester_id",
+            "requester_mention",
+            "submitted_ts",
+            "submitted_ago",
+            "edit_deadline_ts",
+            "edit_deadline",
+            "edit_count",
+            "duplicate_history_warning",
+            "level_validation_warning",
+            "level_validation_sources",
+            "level_validation_checked",
+            "level_validation_refresh",
+            "level_exists",
+            "level_rated",
+            "level_requires_showcase",
+            "gd_level_name",
+            "gd_creator",
+            "gd_difficulty",
+            "gd_length",
+            "gd_stars",
+            "gd_rated",
+            "gd_demon",
+            "gd_platformer",
+            "gd_featured",
+            "gd_epic",
+            "gd_flags",
+            "gd_info",
+            "result",
+            "result_key",
+            "review",
+            "reviewer_id",
+            "reviewer_mention",
+            "pending_color",
+            "result_color",
+            "review_kind",
+            "week_start",
+            "rank",
+            "weekly_rank",
+            "request_content",
+            "user_id",
+            "user_mention",
+            "request_text",
+            "deadline",
+            "reminder_text",
+        }
+
+    def _looks_like_color_value(self, value: str) -> bool:
+        text = str(value or "").strip()
+        if not text or "{" in text:
+            return True
+        if re.fullmatch(r"#?[0-9a-fA-F]{6}", text):
+            return True
+        return text.casefold() in {
+            "blue",
+            "red",
+            "green",
+            "purple",
+            "gold",
+            "orange",
+            "teal",
+            "blurple",
+            "dark",
+            "light",
+            "grey",
+            "gray",
+            "black",
+            "white",
+            "pink",
+        }
+
+    def _validate_request_templates(self, issues: list[str]) -> int:
+        cfg = self.bot.config.get("level_requests", default={}) or {}
+        if not isinstance(cfg, dict):
+            issues.append("level_requests: must be an object")
+            return 0
+
+        allowed = self._request_template_allowed_vars()
+        template_keys = (
+            "request_button_embed",
+            "wave_summary_embed",
+            "level_requested_embed",
+            "level_reviewed_embed",
+            "sent_result_embed",
+            "rejected_result_embed",
+            "other_result_embed",
+            "weekly_request_dm_embed",
+            "weekly_request_reminder_embed",
+            "weekly_request_submitted_embed",
+        )
+        checked = 0
+
+        def check_text(label: str, value: str):
+            variables, parse_error = self._template_variables(value)
+            if parse_error:
+                issues.append(f"{label}: invalid template braces ({parse_error})")
+                return
+            unknown = sorted(var for var in variables if var not in allowed)
+            if unknown:
+                issues.append(f"{label}: unknown template variable(s) {', '.join(unknown[:5])}")
+
+        def walk(label: str, node):
+            if isinstance(node, str):
+                check_text(label, node)
+            elif isinstance(node, list):
+                for idx, item in enumerate(node, start=1):
+                    walk(f"{label}[{idx}]", item)
+            elif isinstance(node, dict):
+                if "color" in node and not self._looks_like_color_value(str(node.get("color") or "")):
+                    issues.append(f"{label}.color: unknown color `{node.get('color')}`")
+                fields = node.get("fields")
+                if fields is not None:
+                    if not isinstance(fields, list):
+                        issues.append(f"{label}.fields: must be a list")
+                    else:
+                        for idx, field in enumerate(fields, start=1):
+                            if not isinstance(field, dict):
+                                issues.append(f"{label}.fields[{idx}]: must be an object")
+                                continue
+                            if not str(field.get("name") or "").strip():
+                                issues.append(f"{label}.fields[{idx}].name: missing")
+                            if not str(field.get("value") or "").strip():
+                                issues.append(f"{label}.fields[{idx}].value: missing")
+                for key, value in node.items():
+                    if key.startswith("_"):
+                        continue
+                    walk(f"{label}.{key}", value)
+
+        for key in template_keys:
+            template = cfg.get(key)
+            if template is None:
+                continue
+            before = len(issues)
+            if not isinstance(template, dict):
+                issues.append(f"level_requests.{key}: must be an object")
+                continue
+            walk(f"level_requests.{key}", template)
+            if len(issues) == before:
+                checked += 1
+        return checked
+
     async def bot_config_check(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -281,6 +469,7 @@ class CommandsCog(commands.Cog):
             check_role(f"level_requests.required_role_ids[{idx}]", role_id)
         for idx, role_id in enumerate(self._request_reviewer_role_ids(), start=1):
             check_role(f"level_requests.reviewer_role_ids[{idx}]", role_id)
+        ok_count += self._validate_request_templates(issues)
 
         entries = cfg.get("forum_first_message", "entries", default=[]) or []
         if isinstance(entries, list):
@@ -306,7 +495,126 @@ class CommandsCog(commands.Cog):
             embed.add_field(name="Result", value="Everything checked out.", inline=False)
         await self._send(ctx, embed=embed, ephemeral=True)
 
-    async def requests_pending(self, ctx: discord.ApplicationContext, scope: str = "current_wave", status: str = "pending", wave: int = 0):
+    def _parse_snowflake_arg(self, value: str) -> int:
+        match = re.search(r"\d{15,25}", str(value or ""))
+        if not match:
+            return 0
+        try:
+            return int(match.group(0))
+        except Exception:
+            return 0
+
+    def _request_change_lines(self, old_data: dict, new_data: dict) -> str:
+        labels = (
+            ("Level ID", "level_id"),
+            ("Level name", "level_name"),
+            ("Creator(s)", "creators"),
+            ("Showcase", "level_showcase"),
+            ("Notes", "notes"),
+        )
+
+        def short(value) -> str:
+            text = str(value or "blank").strip() or "blank"
+            if len(text) > 120:
+                text = text[:117] + "..."
+            return text
+
+        lines = []
+        for label, key in labels:
+            old_value = short(old_data.get(key))
+            new_value = short(new_data.get(key))
+            if old_value != new_value:
+                lines.append(f"**{label}:** `{old_value}` -> `{new_value}`")
+        return "\n".join(lines)[:1024] or "No visible form-field changes."
+
+    async def requests_history(
+        self,
+        ctx: discord.ApplicationContext,
+        message_id: discord.Option(str, "Request message ID or message link to inspect", required=False, default=""),
+        user_id: discord.Option(str, "Requester ID or mention to inspect when no message ID is given", required=False, default=""),
+        wave: discord.Option(int, "Optional wave number to narrow a user history search", required=False, default=0),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_request_staff_ctx(ctx):
+            return await ctx.respond("Only request reviewers can use this.", ephemeral=True)
+
+        message_id_int = self._parse_snowflake_arg(message_id)
+        user_id_int = self._parse_snowflake_arg(user_id)
+        await self._defer(ctx, ephemeral=True)
+
+        if message_id_int:
+            rows = await self.bot.db.fetchall(
+                "SELECT * FROM level_request_edit_audit WHERE guild_id=? AND request_message_id=? ORDER BY edited_ts DESC LIMIT 10",
+                (ctx.guild.id, message_id_int),
+            )
+            title_tail = f"message `{message_id_int}`"
+        elif user_id_int:
+            if int(wave or 0) > 0:
+                rows = await self.bot.db.fetchall(
+                    "SELECT * FROM level_request_edit_audit WHERE guild_id=? AND user_id=? AND wave_id=? ORDER BY edited_ts DESC LIMIT 10",
+                    (ctx.guild.id, user_id_int, int(wave)),
+                )
+                title_tail = f"<@{user_id_int}> in wave {int(wave)}"
+            else:
+                rows = await self.bot.db.fetchall(
+                    "SELECT * FROM level_request_edit_audit WHERE guild_id=? AND user_id=? ORDER BY edited_ts DESC LIMIT 10",
+                    (ctx.guild.id, user_id_int),
+                )
+                title_tail = f"<@{user_id_int}>"
+        else:
+            return await self._send(ctx, "Provide a request `message_id` or `user_id` to inspect.", ephemeral=True)
+
+        embed = discord.Embed(title="Request Edit History", description=f"Showing recent edits for {title_tail}.", color=discord.Color.blurple())
+        if not rows:
+            embed.add_field(name="History", value="No edits found.", inline=False)
+        for row in rows[:10]:
+            try:
+                old_data = json.loads(row["old_data_json"] or "{}")
+            except Exception:
+                old_data = {}
+            try:
+                new_data = json.loads(row["new_data_json"] or "{}")
+            except Exception:
+                new_data = {}
+            embed.add_field(
+                name=f"Edit #{int(row['id'])} - <t:{int(row['edited_ts'])}:R>",
+                value=self._request_change_lines(old_data, new_data),
+                inline=False,
+            )
+        await self._send(ctx, embed=embed, ephemeral=True)
+
+    async def requests_repair(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_admin_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+
+        cog = self.bot.get_cog("RequestLevelsCog")
+        if cog is None or not hasattr(cog, "repair_request_system"):
+            return await ctx.respond("Request system cog not loaded.", ephemeral=True)
+
+        await self._defer(ctx, ephemeral=True)
+        result = await cog.repair_request_system(ctx.guild)
+        embed = discord.Embed(title="Request System Repair", color=discord.Color.green() if not result.get("errors") else discord.Color.orange())
+        embed.add_field(name="Request button", value="refreshed" if result.get("request_button_refreshed") else "not refreshed", inline=True)
+        embed.add_field(name="Wave summary", value="refreshed" if result.get("wave_summary_refreshed") else "not refreshed", inline=True)
+        embed.add_field(name="Recreated pending", value=str(result.get("pending_messages_recreated", 0)), inline=True)
+        embed.add_field(name="Refreshed pending", value=str(result.get("pending_messages_refreshed", 0)), inline=True)
+        embed.add_field(name="Locked reviewed", value=str(result.get("reviewed_messages_locked", 0)), inline=True)
+        embed.add_field(name="Validation refreshed", value=str(result.get("stale_validations_refreshed", 0)), inline=True)
+        embed.add_field(name="Cache cleanup", value="done" if result.get("validation_cache_pruned") else "skipped", inline=True)
+        if result.get("errors"):
+            embed.add_field(name="Notes", value="\n".join(f"- {item}" for item in result["errors"][:8])[:1024], inline=False)
+        await self._send(ctx, embed=embed, ephemeral=True)
+
+    async def requests_pending(
+        self,
+        ctx: discord.ApplicationContext,
+        scope: discord.Option(str, "What to show: current_wave, all, weekly, or weekly_only", required=False, default="current_wave"),
+        status: discord.Option(str, "Review status to show: pending, reviewed, or all", required=False, default="pending"),
+        wave: discord.Option(int, "Specific live request wave to show; leave 0 for the current wave", required=False, default=0),
+    ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
         if not await self._is_request_staff_ctx(ctx):
@@ -492,7 +800,11 @@ class CommandsCog(commands.Cog):
         embed.set_footer(text="Madrid-time weekly tracking")
         await self._send(ctx, embed=embed, ephemeral=True)
 
-    async def tracking_force_dm(self, ctx: discord.ApplicationContext, member: discord.Member):
+    async def tracking_force_dm(
+        self,
+        ctx: discord.ApplicationContext,
+        member: discord.Option(discord.Member, "Member who should receive the weekly request DM"),
+    ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
@@ -674,8 +986,8 @@ class CommandsCog(commands.Cog):
     async def forum_required_word(
         self,
         ctx: discord.ApplicationContext,
-        word: str = "",
-        forum_channel_id: str = "",
+        word: discord.Option(str, "New required word; leave blank to view, or use off/none/clear to disable", required=False, default=""),
+        forum_channel_id: discord.Option(str, "Forum channel ID or mention; needed when more than one forum is configured", required=False, default=""),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
