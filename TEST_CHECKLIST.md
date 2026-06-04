@@ -78,22 +78,24 @@
 1. DM the bot.
    - Expected: help dashboard embed + select menu.
    - Expected: dashboard shows active ticket status, weekly activity, live request state, recent help submissions, and cooldowns.
+   - Expected: the dashboard menu does not include a Dashboard option.
 2. If you are currently in weekly request DM flow (pending), DM the bot.
    - Expected: help menu should NOT interrupt.
 3. Start any help flow and press `Cancel`.
-   - Expected: session is cleared and the menu/dashboard controls return.
+   - Expected: the previous help prompt is deleted, the session is cleared, and the menu controls return.
 4. Start any help flow and press `Start over`.
-   - Expected: session is cleared and the dashboard is shown again.
+   - Expected: the previous help prompt is deleted, the session is cleared, and the dashboard is shown again.
 
 ---
 
 ## 8) Help: FAQ
 1. DM bot → select `FAQ`
    - Expected: embed with FAQ entries.
+   - Expected: the previous dashboard message is deleted and the FAQ menu does not include FAQ.
 2. DM bot → select `Search FAQ`, then type `request`.
    - Expected: matching FAQ entries appear with Back/Cancel/Start Over controls.
 3. DM bot outside a flow with `faq collab`.
-   - Expected: matching FAQ entries appear directly.
+   - Expected: matching FAQ entries appear directly and the menu does not include Search FAQ.
 
 ---
 

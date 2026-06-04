@@ -65,6 +65,8 @@ The bot is intentionally built around one configured server. Most behavior is co
 ### Help Menu And Staff Tickets
 - DMs members a help dashboard with active tickets, weekly activity, live request state, recent help submissions, and cooldowns.
 - Supports Back, Cancel, and Start Over controls during active DM help flows.
+- Cleans up the previous DM help screen when members select a new option, press a flow button, cancel, or start over.
+- Hides the current help screen from the menu so members are not offered the same page they are already viewing.
 - Supports FAQ browsing and keyword search from the menu or by typing phrases like `faq request`.
 - Supports FAQ, punishment appeals, user reports, bot issue reports, weekly status checks, transcript requests, and staff contact tickets.
 - Appeals, reports, and bot issue reports show a preview before submission, keep attachment links, receive tracked IDs, and can be checked later from My submissions.

@@ -200,10 +200,28 @@ class HelpCog(commands.Cog):
             title=title,
             description=description or None,
             color=self._help_color(color),
-            timestamp=now_madrid(),
         )
         embed.set_footer(text="Avenue Guard help desk")
         return embed
+
+    async def _delete_interaction_source(self, interaction: discord.Interaction) -> None:
+        message = getattr(interaction, "message", None)
+        if message is not None:
+            try:
+                await message.delete()
+                return
+            except Exception:
+                pass
+        try:
+            await interaction.delete_original_response()
+            return
+        except Exception:
+            pass
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(content="\u200b", embed=None, view=None)
+        except Exception:
+            pass
 
     def _cooldowns(self) -> Dict[str, tuple[str, int]]:
         return {
@@ -266,6 +284,10 @@ class HelpCog(commands.Cog):
             if url:
                 lines.append(f"{idx}. [{filename}]({url})")
         return "\n".join(lines)[:1024] or "No attachments provided."
+
+    def _has_attachments(self, data: Dict[str, Any]) -> bool:
+        attachments = data.get("attachments")
+        return isinstance(attachments, list) and bool(attachments)
 
     def _short_text(self, value: Any, limit: int = 700) -> str:
         text = str(value or "").strip()
@@ -475,7 +497,7 @@ class HelpCog(commands.Cog):
             )
             count = int(row["count"]) if row else 0
             rank = None
-        return f"Week `{ws}`\nMessages: **{count}**\nRank: **{f'#{rank}' if rank and rank <= 20 else 'Not in top 20'}**"
+        return f"**{count}** messages this week\nRank: **{f'#{rank}' if rank and rank <= 20 else 'Not in top 20'}**"
 
     async def _request_state_text(self, guild_id: int, user_id: int) -> str:
         row = await self.bot.db.fetchone("SELECT state, wave_id, submitted_count, request_limit, close_ts FROM level_request_state WHERE guild_id=?", (guild_id,))
@@ -483,7 +505,7 @@ class HelpCog(commands.Cog):
             return "Live requests are not initialized yet."
         state = str(row["state"]).title()
         limit = "none" if row["request_limit"] is None else str(int(row["request_limit"]))
-        close_text = f"\nCloses: <t:{int(row['close_ts'])}:R>" if row["close_ts"] is not None and str(row["state"]) == "open" else ""
+        close_text = f" | closes <t:{int(row['close_ts'])}:R>" if row["close_ts"] is not None and str(row["state"]) == "open" else ""
         submission = await self.bot.db.fetchone(
             "SELECT status, result, created_ts FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
             (guild_id, int(row["wave_id"]), user_id),
@@ -491,8 +513,8 @@ class HelpCog(commands.Cog):
         mine = ""
         if submission:
             result = str(submission["result"] or submission["status"] or "pending").replace("_", " ")
-            mine = f"\nYour wave request: **{result.title()}** (<t:{int(submission['created_ts'])}:R>)"
-        return f"State: **{state}** | Wave **{int(row['wave_id'])}**\nSubmitted: **{int(row['submitted_count'])}** / **{limit}**{close_text}{mine}"
+            mine = f"\nYour request: **{result.title()}**"
+        return f"**{state}** wave {int(row['wave_id'])}{close_text}\nSubmitted: **{int(row['submitted_count'])}** / **{limit}**{mine}"
 
     async def _active_ticket_text(self, guild: discord.Guild, user_id: int) -> str:
         rows = await self.bot.db.fetchall(
@@ -524,27 +546,30 @@ class HelpCog(commands.Cog):
         for row in t_rows:
             ticket = f"T{int(row['ticket_id'])}" if row["ticket_id"] is not None else "ticket"
             lines.append(f"`TR-{ticket}` Transcript: **{str(row['status']).title()}** (<t:{int(row['created_ts'])}:R>)")
-        return "\n".join(lines[:6]) or "No recent help submissions."
+        return "\n".join(lines[:3]) or "No recent help submissions."
 
     async def _cooldown_status_text(self, guild_id: int, user_id: int) -> str:
         lines = []
         for action, (label, seconds) in self._cooldowns().items():
             until_ts = await self._cooldown_until(guild_id, user_id, action, seconds)
-            lines.append(f"**{label}:** {'available' if not until_ts else f'<t:{until_ts}:R>'}")
-        return "\n".join(lines)
+            if until_ts:
+                lines.append(f"**{label}:** <t:{until_ts}:R>")
+        return "\n".join(lines) or "All help actions are available."
 
     async def _send_dm_dashboard(self, channel, guild: discord.Guild, user_id: int) -> None:
         embed = self._help_embed(
             "Avenue Guard Help Desk",
-            "Choose an option below, or type `faq request`, `faq collab`, or `status`.",
+            "Choose what you need below, or type `faq request` to search quickly.",
             "blurple",
         )
-        embed.add_field(name="Active Ticket", value=await self._active_ticket_text(guild, user_id), inline=False)
+        embed.add_field(name="Staff Ticket", value=await self._active_ticket_text(guild, user_id), inline=False)
+        embed.add_field(name="Level Requests", value=await self._request_state_text(guild.id, user_id), inline=False)
         embed.add_field(name="Weekly Activity", value=await self._weekly_status_text(guild, user_id), inline=True)
-        embed.add_field(name="Level Requests", value=await self._request_state_text(guild.id, user_id), inline=True)
-        embed.add_field(name="Recent Help", value=await self._recent_help_status_text(guild.id, user_id), inline=False)
-        embed.add_field(name="Cooldowns", value=await self._cooldown_status_text(guild.id, user_id), inline=False)
-        await channel.send(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+        embed.add_field(name="Cooldowns", value=await self._cooldown_status_text(guild.id, user_id), inline=True)
+        recent = await self._recent_help_status_text(guild.id, user_id)
+        if recent != "No recent help submissions.":
+            embed.add_field(name="Recent Help", value=recent, inline=False)
+        await channel.send(embed=embed, view=HelpMenuView(exclude_values={"dashboard"}), allowed_mentions=no_mentions())
 
     def _faq_entries(self) -> list[str]:
         faq = self.bot.config.get("help", "faq", default={}) or {}
@@ -568,10 +593,11 @@ class HelpCog(commands.Cog):
         matches = self._faq_matches(query)
         embed = self._help_embed("FAQ Search", f"Search: `{str(query)[:80]}`", "blurple")
         if matches:
-            embed.add_field(name="Matches", value="\n\n".join(f"- {item}" for item in matches)[:4096], inline=False)
+            for idx, item in enumerate(matches[:4], start=1):
+                embed.add_field(name=f"Match {idx}", value=self._short_text(item, 850), inline=False)
         else:
             embed.add_field(name="Matches", value="I couldn't find a matching FAQ entry. Try a simpler keyword like `request`, `collab`, `appeal`, or `ticket`.", inline=False)
-        view = HelpSessionControlView(self, user_id, guild_id, allow_back=False) if user_id and guild_id else HelpMenuView()
+        view = HelpSessionControlView(self, user_id, guild_id, allow_back=False) if user_id and guild_id else HelpMenuView(exclude_values={"faq_search"})
         await channel.send(embed=embed, view=view, allowed_mentions=no_mentions())
 
     # -----------------------------
@@ -587,8 +613,13 @@ class HelpCog(commands.Cog):
         if interaction.guild is not None:
             return await interaction.response.send_message("Please DM me to use the help menu.")
 
-        if value == "dashboard":
+        await self._delete_interaction_source(interaction)
+        try:
             await interaction.response.defer()
+        except Exception:
+            pass
+
+        if value == "dashboard":
             return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
 
         if value == "faq":
@@ -597,13 +628,13 @@ class HelpCog(commands.Cog):
         if value == "faq_search":
             limit_msg = self._flow_start_limit_message(interaction.user.id)
             if limit_msg:
-                return await interaction.response.send_message(limit_msg)
+                return await interaction.channel.send(limit_msg, allowed_mentions=no_mentions())
             await self._start_help_session(interaction.user.id, guild.id, "faq_search", {})
             embed = self._help_embed(
                 "Search FAQ",
-                "Send one or two keywords, like `request`, `collab`, `appeal`, `ticket`, or `weekly`.\n\nUseful screenshots are not needed for FAQ search.",
+                "Send one or two keywords, like `request`, `collab`, `appeal`, `ticket`, or `weekly`.",
             )
-            return await interaction.response.send_message(
+            return await interaction.channel.send(
                 embed=embed,
                 view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
                 allowed_mentions=no_mentions(),
@@ -616,26 +647,26 @@ class HelpCog(commands.Cog):
             embed = self._help_embed("My Help Status", "Recent submissions and transcript requests.", "blurple")
             embed.add_field(name="Recent Items", value=await self._recent_help_status_text(guild.id, interaction.user.id), inline=False)
             embed.add_field(name="Cooldowns", value=await self._cooldown_status_text(guild.id, interaction.user.id), inline=False)
-            return await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+            return await interaction.channel.send(embed=embed, view=HelpMenuView(exclude_values={"submission_status"}), allowed_mentions=no_mentions())
 
         cds = self._cooldowns()
         if value in {"appeal", "report", "bot_issue", "transcript", "mod_contact"}:
             limit_msg = self._flow_start_limit_message(interaction.user.id)
             if limit_msg:
-                return await interaction.response.send_message(limit_msg)
+                return await interaction.channel.send(limit_msg, allowed_mentions=no_mentions())
 
         if value == "appeal":
             remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "appeal", cds["appeal"][1])
             if remaining:
                 embed = await self._cooldown_embed(guild.id, interaction.user.id, "appeal", cds["appeal"][0], cds["appeal"][1])
-                return await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+                return await interaction.channel.send(embed=embed, view=HelpMenuView(exclude_values={"appeal"}), allowed_mentions=no_mentions())
 
             await self._start_help_session(interaction.user.id, guild.id, "appeal_punishment", {})
             embed = self._help_embed(
                 title="Appeal punishment",
                 description="You can use our [Google form](https://forms.gle/1fgqKtyo6okiQzjBA), or continue here.\n\nIf you continue here, send the punishment you are appealing and what happened. Attach screenshots if they help. You will preview before staff sees it.",
             )
-            return await interaction.response.send_message(
+            return await interaction.channel.send(
                 embed=embed,
                 view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
                 allowed_mentions=no_mentions(),
@@ -645,7 +676,7 @@ class HelpCog(commands.Cog):
             remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "report_user", cds["report_user"][1])
             if remaining:
                 embed = await self._cooldown_embed(guild.id, interaction.user.id, "report_user", cds["report_user"][0], cds["report_user"][1])
-                return await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+                return await interaction.channel.send(embed=embed, view=HelpMenuView(exclude_values={"report"}), allowed_mentions=no_mentions())
 
             warning = bool(cfg.get("help", "report_warning_enabled", default=True))
             text = "Send the message link if you have it, or the user ID/name, plus the reason and evidence. Attach screenshots if useful. You will preview before staff sees it."
@@ -654,7 +685,7 @@ class HelpCog(commands.Cog):
 
             await self._start_help_session(interaction.user.id, guild.id, "report_details", {})
             embed = self._help_embed(title="Report a user", description=text, color="orange")
-            return await interaction.response.send_message(
+            return await interaction.channel.send(
                 embed=embed,
                 view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
                 allowed_mentions=no_mentions(),
@@ -664,14 +695,14 @@ class HelpCog(commands.Cog):
             remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "bot_issue", cds["bot_issue"][1])
             if remaining:
                 embed = await self._cooldown_embed(guild.id, interaction.user.id, "bot_issue", cds["bot_issue"][0], cds["bot_issue"][1])
-                return await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+                return await interaction.channel.send(embed=embed, view=HelpMenuView(exclude_values={"bot_issue"}), allowed_mentions=no_mentions())
 
             await self._start_help_session(interaction.user.id, guild.id, "bot_issue_details", {})
             embed = self._help_embed(
                 title="Report a bot issue",
                 description="Describe what broke, where it happened, and the steps to reproduce it. Attach screenshots if useful. You will preview before staff sees it.",
             )
-            return await interaction.response.send_message(
+            return await interaction.channel.send(
                 embed=embed,
                 view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
                 allowed_mentions=no_mentions(),
@@ -681,27 +712,27 @@ class HelpCog(commands.Cog):
             remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "transcript", cds["transcript"][1])
             if remaining:
                 embed = await self._cooldown_embed(guild.id, interaction.user.id, "transcript", cds["transcript"][0], cds["transcript"][1])
-                return await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+                return await interaction.channel.send(embed=embed, view=HelpMenuView(exclude_values={"transcript"}), allowed_mentions=no_mentions())
 
             await self._start_help_session(interaction.user.id, guild.id, "transcript_ticket", {})
             embed = self._help_embed(
                 title="Request transcript",
                 description="Send your **ticket channel** (mention like <#123> or ID), or your **Ticket ID** (example: `T21`).\n\nType **cancel** to stop.",
             )
-            return await interaction.response.send_message(
+            return await interaction.channel.send(
                 embed=embed,
                 view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
                 allowed_mentions=no_mentions(),
             )
 
         if value == "mod_contact":
-            return await interaction.response.send_message(
+            return await interaction.channel.send(
                 "What do you need staff for? Pick the closest topic so the ticket starts in the right lane.",
                 view=HelpTicketTopicView(self, interaction.user.id, guild.id),
                 allowed_mentions=no_mentions(),
             )
 
-        return await interaction.response.send_message("That option isn't available yet.")
+        return await interaction.channel.send("That option isn't available yet.", allowed_mentions=no_mentions())
 
     async def _send_faq(self, interaction: discord.Interaction):
         cfg = self.bot.config
@@ -710,19 +741,22 @@ class HelpCog(commands.Cog):
         entries = faq.get("entries", [])
         if not isinstance(entries, list):
             entries = []
-        desc = "\n".join([f"• {str(x)}" for x in entries][:20]) or "Not available right now, sorry"
-        embed = self._help_embed(title, desc, "blurple")
-        await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+        embed = self._help_embed(title, "Use Search FAQ if you want a specific topic.", "blurple")
+        for idx, entry in enumerate(entries[:8], start=1):
+            embed.add_field(name=f"FAQ {idx}", value=self._short_text(entry, 850), inline=False)
+        if not entries:
+            embed.description = "Not available right now, sorry"
+        await interaction.channel.send(embed=embed, view=HelpMenuView(exclude_values={"faq"}), allowed_mentions=no_mentions())
 
     async def _send_weekly_status(self, interaction: discord.Interaction, guild: discord.Guild):
         cfg = self.bot.config
         excluded_role_ids = set(cfg.get_int_list("roles", "excluded_tracking_role_id"))
         member = guild.get_member(interaction.user.id)
         if member is None:
-            return await interaction.response.send_message("You must be in the server... If you want to appeal a ban, please use our google form")
+            return await interaction.channel.send("You must be in the server... If you want to appeal a ban, please use our google form", allowed_mentions=no_mentions())
 
         if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
-            return await interaction.response.send_message("You are excluded from weekly tracking.")
+            return await interaction.channel.send("You are excluded from weekly tracking.", allowed_mentions=no_mentions())
 
         ws = week_start_sunday(now_madrid()).isoformat()
         tracking = self.bot.get_cog("TrackingCog")
@@ -754,7 +788,7 @@ class HelpCog(commands.Cog):
         embed = self._help_embed("Weekly status", color="blurple")
         embed.add_field(name="Messages counted", value=str(count), inline=True)
         embed.add_field(name="Top 20 rank", value=(f"#{rank}" if rank and rank <= 20 else "Not in top 20"), inline=True)
-        await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+        await interaction.channel.send(embed=embed, view=HelpMenuView(exclude_values={"weekly_status"}), allowed_mentions=no_mentions())
 
     # -----------------------------
     # Help sessions
@@ -802,7 +836,7 @@ class HelpCog(commands.Cog):
         return json.dumps(data, sort_keys=True)
 
     def _submission_preview_embed(self, kind: str, data: Dict[str, Any]) -> discord.Embed:
-        embed = self._help_embed(f"Preview: {self._submission_label(kind)}", "Review this before staff sees it.", "gold")
+        embed = self._help_embed(f"Review {self._submission_label(kind)}", "Check the details before staff sees them.", "gold")
         if kind == "appeal":
             embed.add_field(name="Punishment / What happened", value=self._short_text(data.get("punishment"), 1024), inline=False)
             embed.add_field(name="Why it should be lifted", value=self._short_text(data.get("reason"), 1024), inline=False)
@@ -810,8 +844,9 @@ class HelpCog(commands.Cog):
             embed.add_field(name="Report details", value=self._short_text(data.get("report"), 1024), inline=False)
         elif kind == "bot_issue":
             embed.add_field(name="Issue details", value=self._short_text(data.get("issue"), 1024), inline=False)
-        embed.add_field(name="Attachments", value=self._attachments_text(data), inline=False)
-        embed.set_footer(text="Submit sends this to staff. Edit lets you rewrite the last answer.")
+        if self._has_attachments(data):
+            embed.add_field(name="Attachments", value=self._attachments_text(data), inline=False)
+        embed.set_footer(text="Submit sends this to staff. Edit rewrites the last answer.")
         return embed
 
     async def _show_submission_preview(self, channel, user_id: int, guild_id: int, kind: str, data: Dict[str, Any]) -> None:
@@ -876,7 +911,8 @@ class HelpCog(commands.Cog):
             embed.add_field(name="Details", value=self._short_text(data.get("report"), 1024), inline=False)
         elif kind == "bot_issue":
             embed.add_field(name="Issue", value=self._short_text(data.get("issue"), 1024), inline=False)
-        embed.add_field(name="Attachments", value=self._attachments_text(data), inline=False)
+        if self._has_attachments(data):
+            embed.add_field(name="Attachments", value=self._attachments_text(data), inline=False)
         embed.set_footer(text="Reply to this message to DM the submitter and mark it responded")
         return embed
 
@@ -1110,24 +1146,27 @@ class HelpCog(commands.Cog):
         guild = self.bot.get_guild(int(guild_id))
         if guild is None:
             return await interaction.response.send_message("Guild not found.")
+        await self._delete_interaction_source(interaction)
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
         if action == "cancel":
             await self._clear_help_session(interaction.user.id, guild.id)
-            return await interaction.response.send_message("Cancelled.", view=HelpMenuView(), allowed_mentions=no_mentions())
+            return await interaction.channel.send("Cancelled.", view=HelpMenuView(), allowed_mentions=no_mentions())
         if action == "start_over":
             await self._clear_help_session(interaction.user.id, guild.id)
-            await interaction.response.defer()
             return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
         if action == "back":
             sess = await self._get_help_session(interaction.user.id, guild.id)
             if not sess:
-                await interaction.response.defer()
                 return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
             stage = str(sess["stage"])
             data = sess["data"]
             if stage == "appeal_reason":
                 await self._start_help_session(interaction.user.id, guild.id, "appeal_punishment", data)
                 embed = self._help_embed("Appeal punishment", "Back to the first appeal step. Send the punishment and what happened.", "gold")
-                return await interaction.response.send_message(
+                return await interaction.channel.send(
                     embed=embed,
                     view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
                     allowed_mentions=no_mentions(),
@@ -1137,50 +1176,52 @@ class HelpCog(commands.Cog):
                 edit_stage = self._edit_stage_for_kind(kind)
                 if edit_stage:
                     await self._start_help_session(interaction.user.id, guild.id, edit_stage, data)
-                    return await interaction.response.send_message(
+                    return await interaction.channel.send(
                         embed=self._edit_prompt_embed(kind),
                         view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=True),
                         allowed_mentions=no_mentions(),
                     )
             await self._clear_help_session(interaction.user.id, guild.id)
-            await interaction.response.defer()
             return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
 
     async def handle_help_submission_preview(self, interaction: discord.Interaction, guild_id: int, kind: str, action: str) -> None:
         guild = self.bot.get_guild(int(guild_id))
         if guild is None:
             return await interaction.response.send_message("Guild not found.")
+        await self._delete_interaction_source(interaction)
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
         sess = await self._get_help_session(interaction.user.id, guild.id)
         data = sess["data"] if sess else {}
         if action == "cancel":
             await self._clear_help_session(interaction.user.id, guild.id)
-            return await interaction.response.send_message("Cancelled.", view=HelpMenuView(), allowed_mentions=no_mentions())
+            return await interaction.channel.send("Cancelled.", view=HelpMenuView(), allowed_mentions=no_mentions())
         if action == "start_over":
             await self._clear_help_session(interaction.user.id, guild.id)
-            await interaction.response.defer()
             return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
         if action == "edit":
             edit_stage = self._edit_stage_for_kind(kind)
             if not edit_stage:
-                return await interaction.response.send_message("I don't know how to edit that submission.")
+                return await interaction.channel.send("I don't know how to edit that submission.", allowed_mentions=no_mentions())
             await self._start_help_session(interaction.user.id, guild.id, edit_stage, data)
-            return await interaction.response.send_message(
+            return await interaction.channel.send(
                 embed=self._edit_prompt_embed(kind),
                 view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=True),
                 allowed_mentions=no_mentions(),
             )
         if action != "submit":
-            return await interaction.response.send_message("Unknown action.")
+            return await interaction.channel.send("Unknown action.", allowed_mentions=no_mentions())
 
-        await interaction.response.defer()
         ok, message, code = await self._submit_help_submission(guild, interaction.user.id, kind, data)
         if ok:
             await self._clear_help_session(interaction.user.id, guild.id)
             embed = self._help_embed("Submitted", message, "green")
             embed.add_field(name="Help ID", value=f"`{code}`", inline=True)
-            return await interaction.followup.send(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+            return await interaction.channel.send(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
         embed = self._help_embed("Not submitted", message, "orange")
-        return await interaction.followup.send(
+        return await interaction.channel.send(
             embed=embed,
             view=HelpSubmissionPreviewView(self, interaction.user.id, guild.id, kind),
             allowed_mentions=no_mentions(),
@@ -1512,10 +1553,18 @@ class HelpCog(commands.Cog):
         guild = self.bot.get_guild(int(guild_id))
         if guild is None:
             return await interaction.response.send_message("Guild not found.", ephemeral=True)
+        await self._delete_interaction_source(interaction)
         if topic_key == "cancel":
-            return await interaction.response.send_message("Cancelled.", ephemeral=True)
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+            return await interaction.channel.send("Cancelled.", view=HelpMenuView(), allowed_mentions=no_mentions())
         if topic_key in {"back", "start_over"}:
-            await interaction.response.defer()
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
             return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
         await self._create_staff_ticket(interaction, guild, topic_key, topic_label)
 
@@ -1526,8 +1575,13 @@ class HelpCog(commands.Cog):
         if guild is None:
             return await interaction.response.send_message("Guild not found.", ephemeral=True)
 
+        await self._delete_interaction_source(interaction)
         if not confirmed:
-            return await interaction.response.send_message("Cancelled.", ephemeral=True)
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+            return await interaction.channel.send("Cancelled.", view=HelpMenuView(), allowed_mentions=no_mentions())
 
         await self._create_staff_ticket(interaction, guild, "staff-contact", "Staff contact")
 

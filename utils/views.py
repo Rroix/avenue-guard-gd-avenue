@@ -74,7 +74,8 @@ class HelpModConfirmView(discord.ui.View):
 
 
 class _HelpMenuSelect(discord.ui.Select):
-    def __init__(self):
+    def __init__(self, exclude_values=None):
+        exclude = {str(value) for value in (exclude_values or set())}
         options = [
             discord.SelectOption(
                 label="Dashboard",
@@ -127,6 +128,7 @@ class _HelpMenuSelect(discord.ui.Select):
                 description="Check recent appeals, reports, bugs, and transcript requests",
             ),
         ]
+        options = [option for option in options if option.value not in exclude]
         super().__init__(
             placeholder="Select what you need help with…",
             min_values=1,
@@ -144,9 +146,9 @@ class _HelpMenuSelect(discord.ui.Select):
 
 
 class HelpMenuView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, exclude_values=None):
         super().__init__(timeout=None)
-        self.add_item(_HelpMenuSelect())
+        self.add_item(_HelpMenuSelect(exclude_values=exclude_values))
 
 
 class TrackingDeclineConfirmView(discord.ui.View):
