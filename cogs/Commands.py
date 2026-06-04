@@ -13,7 +13,13 @@ from discord.ext import commands
 
 from utils.checks import is_admin_or_owner, is_mod
 from utils.mentions import no_mentions
-from utils.server_icons import ensure_server_icon_config, is_valid_icon_url, normalize_server_icon_mode, VALID_SERVER_ICON_MODES
+from utils.server_icons import (
+    ensure_server_icon_config,
+    is_valid_icon_url,
+    normalize_server_icon_mode,
+    parse_server_icon_index,
+    VALID_SERVER_ICON_MODES,
+)
 from utils.timeutils import now_madrid, week_start_sunday
 from utils.errors import log_error
 
@@ -58,6 +64,7 @@ class CommandsCog(commands.Cog):
         self.server_icon_group.command(name="add", description="Add a server icon URL")(self.server_icon_add)
         self.server_icon_group.command(name="replace", description="Replace a server icon URL by number")(self.server_icon_replace)
         self.server_icon_group.command(name="remove", description="Remove a server icon URL by number")(self.server_icon_remove)
+        self.server_icon_group.command(name="set", description="Change to a specific configured server icon now")(self.server_icon_set)
         self.server_icon_group.command(name="next", description="Change to the next configured server icon now")(self.server_icon_next)
 
         bot.add_application_command(self.bot_group)
@@ -159,9 +166,11 @@ class CommandsCog(commands.Cog):
         cfg = ensure_server_icon_config(self.bot.config)
         urls = list(cfg.get("urls", []) or [])
         mode = normalize_server_icon_mode(cfg.get("mode"))
-        current_index = int(cfg.get("current_index", -1) or -1)
+        current_index = parse_server_icon_index(cfg.get("current_index", -1), len(urls))
         interval = int(cfg.get("interval_seconds", 86400) or 86400)
         last_changed = int(cfg.get("last_changed_ts", 0) or 0)
+        last_error = str(cfg.get("last_error", "") or "").strip()
+        last_error_ts = int(cfg.get("last_error_ts", 0) or 0)
 
         embed = discord.Embed(
             title="Server Icon Rotation",
@@ -191,6 +200,9 @@ class CommandsCog(commands.Cog):
             embed.add_field(name=f"Configured icons ({len(urls)})", value="\n".join(lines)[:1024], inline=False)
         else:
             embed.add_field(name="Configured icons", value="No URLs configured.", inline=False)
+        if last_error:
+            when = f" <t:{last_error_ts}:R>" if last_error_ts else ""
+            embed.add_field(name="Last error", value=f"{last_error[:900]}{when}", inline=False)
         return embed
 
     def _notify_background_config_reload(self) -> None:
@@ -282,8 +294,12 @@ class CommandsCog(commands.Cog):
         idx = int(number) - 1
         if idx < 0 or idx >= len(urls):
             return await ctx.respond("That icon number does not exist.", ephemeral=True)
+        old_url = urls[idx]
         urls[idx] = str(url).strip()
         cfg["urls"] = urls
+        if parse_server_icon_index(cfg.get("current_index", -1), len(urls)) == idx or str(cfg.get("current_url", "") or "") == old_url:
+            cfg["current_index"] = -1
+            cfg["current_url"] = ""
         if not await self._save_server_icon_config(ctx, "server_icon_url_replaced", f"number={number}"):
             return
         await ctx.respond(f"Replaced server icon image #{number}.", ephemeral=True)
@@ -304,15 +320,42 @@ class CommandsCog(commands.Cog):
         if idx < 0 or idx >= len(urls):
             return await ctx.respond("That icon number does not exist.", ephemeral=True)
         removed = urls.pop(idx)
-        current_index = int(cfg.get("current_index", -1) or -1)
+        current_index = parse_server_icon_index(cfg.get("current_index", -1), len(urls) + 1)
         if current_index == idx:
             cfg["current_index"] = -1
+            cfg["current_url"] = ""
         elif current_index > idx:
             cfg["current_index"] = current_index - 1
+        if str(cfg.get("current_url", "") or "") == removed:
+            cfg["current_url"] = ""
         cfg["urls"] = urls
         if not await self._save_server_icon_config(ctx, "server_icon_url_removed", f"number={number} url={removed[:120]}"):
             return
         await ctx.respond(f"Removed server icon image #{number}.", ephemeral=True)
+
+    async def server_icon_set(
+        self,
+        ctx: discord.ApplicationContext,
+        number: discord.Option(int, "One-based icon number from /server_icon status"),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_admin_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        cfg = ensure_server_icon_config(self.bot.config)
+        urls = list(cfg.get("urls", []) or [])
+        target_index = parse_server_icon_index(int(number) - 1, len(urls))
+        if target_index < 0:
+            return await self._send(ctx, "That icon number does not exist.", ephemeral=True)
+        background = self.bot.get_cog("BackgroundCog")
+        rotate = getattr(background, "rotate_server_icon_once", None)
+        if not callable(rotate):
+            return await self._send(ctx, "Server icon rotation is not available right now.", ephemeral=True)
+        ok, message = await rotate(ctx.guild, force=True, actor_id=ctx.user.id, target_index=target_index)
+        if ok:
+            await self._log_admin_action(ctx.guild, ctx.user.id, "server_icon_set_now", message)
+        await self._send(ctx, message, ephemeral=True)
 
     async def server_icon_next(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):

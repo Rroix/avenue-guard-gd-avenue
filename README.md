@@ -128,6 +128,7 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/server_icon status` shows the server icon rotation mode, interval, current image, and configured URLs.
 - `/server_icon mode mode:<random|linear|disabled>` changes automatic server icon rotation mode.
 - `/server_icon add url:<url>`, `/server_icon replace number:<n> url:<url>`, and `/server_icon remove number:<n>` manage configured server icon URLs.
+- `/server_icon set number:<n>` changes to a specific configured server icon immediately.
 - `/server_icon next` changes to the next configured server icon immediately.
 - `/requests pending scope:<optional> status:<optional> wave:<optional>` shows filtered live and weekly request reviews.
 - `/requests history message_id:<optional> user_id:<optional> wave:<optional>` shows the edit audit trail for a live-wave request.
@@ -205,7 +206,8 @@ Server icon rotation lives under `background.server_icon_rotation` in `config.js
 - `mode`: `disabled`, `linear`, or `random`.
 - `interval_seconds`: time between automatic changes, with a minimum of 600 seconds.
 - `urls`: direct image URLs used for the server icon.
-- `current_index` and `last_changed_ts`: saved state used by the rotation loop.
+- `current_index`, `current_url`, and `last_changed_ts`: saved state used by the rotation loop.
+- `last_error` and `last_error_ts`: the most recent rotation failure shown in `/server_icon status`.
 
 ### Level Request Config
 

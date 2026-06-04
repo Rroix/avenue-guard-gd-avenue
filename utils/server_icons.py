@@ -32,6 +32,16 @@ def clean_icon_urls(value: Any) -> list[str]:
     return out[:25]
 
 
+def parse_server_icon_index(value: Any, url_count: int) -> int:
+    try:
+        index = int(value)
+    except Exception:
+        return -1
+    if index < 0 or index >= max(0, int(url_count)):
+        return -1
+    return index
+
+
 def ensure_server_icon_config(config) -> dict:
     background = config.data.setdefault("background", {})
     rotation = background.setdefault("server_icon_rotation", {})
@@ -45,14 +55,16 @@ def ensure_server_icon_config(config) -> dict:
     except Exception:
         rotation["interval_seconds"] = 86400
     rotation["urls"] = clean_icon_urls(rotation.get("urls", []))
-    try:
-        rotation["current_index"] = int(rotation.get("current_index", -1))
-    except Exception:
-        rotation["current_index"] = -1
-    if rotation["current_index"] >= len(rotation["urls"]):
-        rotation["current_index"] = -1
+    rotation["current_index"] = parse_server_icon_index(rotation.get("current_index", -1), len(rotation["urls"]))
+    current_url = str(rotation.get("current_url", "") or "").strip()
+    rotation["current_url"] = current_url if current_url in rotation["urls"] else ""
     try:
         rotation["last_changed_ts"] = max(0, int(rotation.get("last_changed_ts", 0) or 0))
     except Exception:
         rotation["last_changed_ts"] = 0
+    rotation["last_error"] = str(rotation.get("last_error", "") or "")[:500]
+    try:
+        rotation["last_error_ts"] = max(0, int(rotation.get("last_error_ts", 0) or 0))
+    except Exception:
+        rotation["last_error_ts"] = 0
     return rotation

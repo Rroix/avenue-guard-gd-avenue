@@ -442,9 +442,12 @@
     "server_icon_rotation": {
       "_comment": "Rotates the server icon from configured image URLs. mode is disabled, linear, or random.",
       "mode": "linear",
-      "interval_seconds": 300,
+      "interval_seconds": 600,
       "current_index": -1,
+      "current_url": "",
       "last_changed_ts": 0,
+      "last_error": "",
+      "last_error_ts": 0,
       "urls": [
         "https://i.ibb.co/VWK8xxQf/Adobe-Express-file.png",
         "https://i.ibb.co/mVQRJ1Kz/Adobe-Express-file-1.png"

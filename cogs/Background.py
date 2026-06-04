@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import random
 import time
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ from discord.ext import commands, tasks
 
 from utils.checks import ensure_allowed_guild_id
 from utils.errors import log_error
-from utils.server_icons import ensure_server_icon_config, normalize_server_icon_mode
+from utils.server_icons import ensure_server_icon_config, normalize_server_icon_mode, parse_server_icon_index
 from utils.timeutils import TZ, now_madrid, week_start_sunday
 
 def _day_key(dt: Optional[datetime] = None) -> str:
@@ -205,15 +206,40 @@ class BackgroundCog(commands.Cog):
         urls = cfg.get("urls", [])
         return list(urls) if isinstance(urls, list) else []
 
-    def _choose_server_icon_index(self, mode: str, urls: list[str], current_index: int) -> int:
+    def _server_icon_current_index(self, cfg: dict, urls: list[str]) -> int:
+        current_index = parse_server_icon_index(cfg.get("current_index", -1), len(urls))
+        if current_index >= 0:
+            return current_index
+        current_url = str(cfg.get("current_url", "") or "").strip()
+        if current_url in urls:
+            return urls.index(current_url)
+        return -1
+
+    def _server_icon_candidate_indices(self, mode: str, urls: list[str], current_index: int) -> list[int]:
         if not urls:
-            return -1
+            return []
         if mode == "random":
-            if len(urls) == 1:
-                return 0
             choices = [idx for idx in range(len(urls)) if idx != current_index]
-            return random.choice(choices or list(range(len(urls))))
-        return (current_index + 1) % len(urls)
+            random.shuffle(choices)
+            if 0 <= current_index < len(urls):
+                choices.append(current_index)
+            return choices or [0]
+        if current_index < 0:
+            return list(range(len(urls)))
+        ordered = list(range(current_index + 1, len(urls))) + list(range(0, current_index))
+        ordered.append(current_index)
+        return ordered
+
+    def _looks_like_server_icon_image(self, data: bytes) -> bool:
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return True
+        if data.startswith(b"\xff\xd8\xff"):
+            return True
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return True
+        if len(data) > 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return True
+        return False
 
     async def _download_server_icon(self, url: str) -> bytes:
         timeout = aiohttp.ClientTimeout(total=20)
@@ -226,7 +252,36 @@ class BackgroundCog(commands.Cog):
             raise RuntimeError("image URL returned an empty file")
         if len(data) > 8 * 1024 * 1024:
             raise RuntimeError("image is larger than 8 MB")
+        if not self._looks_like_server_icon_image(data):
+            raise RuntimeError("image URL did not return a supported image file")
         return data
+
+    async def _detect_current_server_icon_index(self, guild: discord.Guild, urls: list[str]) -> int:
+        icon = getattr(guild, "icon", None)
+        icon_url = str(getattr(icon, "url", "") or "")
+        if not icon_url or not urls:
+            return -1
+        try:
+            current_bytes = await self._download_server_icon(icon_url)
+            current_hash = hashlib.sha256(current_bytes).hexdigest()
+        except Exception:
+            return -1
+        for idx, url in enumerate(urls):
+            try:
+                candidate_hash = hashlib.sha256(await self._download_server_icon(url)).hexdigest()
+            except Exception:
+                continue
+            if candidate_hash == current_hash:
+                return idx
+        return -1
+
+    def _remember_server_icon_error(self, cfg: dict, message: str) -> None:
+        cfg["last_error"] = str(message or "")[:500]
+        cfg["last_error_ts"] = int(time.time())
+        try:
+            self.bot.config.save()
+        except Exception:
+            pass
 
     async def rotate_server_icon_once(
         self,
@@ -234,6 +289,7 @@ class BackgroundCog(commands.Cog):
         *,
         force: bool = False,
         actor_id: int = 0,
+        target_index: int = -1,
     ) -> tuple[bool, str]:
         cfg = ensure_server_icon_config(self.bot.config)
         urls = self._server_icon_urls()
@@ -246,32 +302,58 @@ class BackgroundCog(commands.Cog):
         if mode == "disabled":
             mode = "linear"
 
-        current_index = int(cfg.get("current_index", -1) or -1)
-        next_index = self._choose_server_icon_index(mode, urls, current_index)
-        if next_index < 0:
+        current_index = self._server_icon_current_index(cfg, urls)
+        if current_index < 0:
+            detected_index = await self._detect_current_server_icon_index(guild, urls)
+            if detected_index >= 0:
+                current_index = detected_index
+                cfg["current_index"] = detected_index
+                cfg["current_url"] = urls[detected_index]
+            elif force and target_index < 0 and len(urls) > 1:
+                current_index = 0
+
+        if target_index >= 0:
+            target_index = parse_server_icon_index(target_index, len(urls))
+            candidates = [target_index] if target_index >= 0 else []
+        else:
+            candidates = self._server_icon_candidate_indices(mode, urls, current_index)
+        if not candidates:
             return False, "No usable server icon URL was found."
 
-        url = urls[next_index]
-        try:
-            icon_bytes = await self._download_server_icon(url)
-            reason = "Avenue Guard server icon rotation"
-            if actor_id:
-                reason = f"Avenue Guard server icon rotation by {actor_id}"
-            await guild.edit(icon=icon_bytes, reason=reason[:512])
-        except Exception as e:
-            await log_error(self.bot, f"Server icon rotation failed for url={url}: {repr(e)}")
-            return False, f"I couldn't change the server icon: {e}"
+        failures: list[str] = []
+        changed_index = -1
+        for candidate_index in candidates:
+            url = urls[candidate_index]
+            try:
+                icon_bytes = await self._download_server_icon(url)
+                reason = f"Avenue Guard server icon rotation to #{candidate_index + 1}"
+                if actor_id:
+                    reason = f"Avenue Guard server icon rotation by {actor_id} to #{candidate_index + 1}"
+                await guild.edit(icon=icon_bytes, reason=reason[:512])
+                changed_index = candidate_index
+                break
+            except Exception as e:
+                failures.append(f"#{candidate_index + 1}: {type(e).__name__}: {e}")
+                await log_error(self.bot, f"Server icon rotation failed for url={url}: {repr(e)}")
+
+        if changed_index < 0:
+            detail = "; ".join(failures[:3]) or "all configured images failed"
+            self._remember_server_icon_error(cfg, detail)
+            return False, f"I couldn't change the server icon. {detail}"
 
         now_ts = int(time.time())
-        cfg["current_index"] = next_index
+        cfg["current_index"] = changed_index
+        cfg["current_url"] = urls[changed_index]
         cfg["last_changed_ts"] = now_ts
+        cfg["last_error"] = ""
+        cfg["last_error_ts"] = 0
         try:
             self.bot.config.save()
         except Exception as e:
             await log_error(self.bot, f"Server icon rotation changed icon but failed to save config: {repr(e)}")
-            return True, f"Changed the server icon to image #{next_index + 1}, but couldn't save the new index."
+            return True, f"Changed the server icon to image #{changed_index + 1}, but couldn't save the new index."
 
-        return True, f"Changed the server icon to image #{next_index + 1}."
+        return True, f"Changed the server icon to image #{changed_index + 1}."
 
     async def _render_status_text(self, guild: discord.Guild, text: str) -> str:
         """Replace supported placeholders inside status rotation text."""

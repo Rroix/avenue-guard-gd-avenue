@@ -353,16 +353,20 @@
 **Setup:** use an admin/owner account and make sure the bot has Manage Server.
 
 1. Run `/server_icon status`.
-   - Expected: status shows mode, interval, current image, last change, next automatic change, and configured URLs.
+   - Expected: status shows mode, interval, current image, last change, next automatic change, configured URLs, and the last error if one exists.
 2. Run `/server_icon mode mode:linear`.
    - Expected: mode changes to `linear` and the background rotation task is enabled after config reload.
 3. Run `/server_icon next`.
-   - Expected: the server icon changes to the next configured image and `current_index`/`last_changed_ts` are saved.
-4. Run `/server_icon mode mode:random`, then `/server_icon next`.
+   - Expected: the server icon changes to the next configured image and `current_index`, `current_url`, and `last_changed_ts` are saved.
+4. Run `/server_icon set number:2`.
+   - Expected: the server icon changes specifically to configured image #2.
+5. Run `/server_icon mode mode:random`, then `/server_icon next`.
    - Expected: the server icon changes to a configured image without repeating the current image when more than one URL exists.
-5. Run `/server_icon add url:<direct image URL>`, then `/server_icon replace number:<n> url:<direct image URL>`, then `/server_icon remove number:<n>`.
+6. Run `/server_icon add url:<direct image URL>`, then `/server_icon replace number:<n> url:<direct image URL>`, then `/server_icon remove number:<n>`.
    - Expected: each command updates `config.json` and `/server_icon status` reflects the new list.
-6. Run `/server_icon mode mode:disabled`.
+7. Temporarily set one configured URL to a broken image URL, then run `/server_icon next`.
+   - Expected: the bot tries the next usable configured URL and records the failed URL in the last-error field if all candidates fail.
+8. Run `/server_icon mode mode:disabled`.
    - Expected: automatic changes stop, but `/server_icon next` can still force a manual change.
 
 ---
