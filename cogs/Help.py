@@ -12,7 +12,7 @@ from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, is_mod
 from utils.errors import log_error
-from utils.mentions import user_and_role_mentions, user_mentions
+from utils.mentions import no_mentions, user_and_role_mentions, user_mentions
 from utils.views import HelpMenuView, HelpModConfirmView, TicketClosePromptView, TranscriptRequestView
 from utils.transcript import build_text_transcript
 from utils.timeutils import now_madrid, week_start_sunday
@@ -32,6 +32,135 @@ def _format_duration(seconds: int) -> str:
     return f"{days}d"
 
 
+class HelpSessionControlView(discord.ui.View):
+    def __init__(self, cog, user_id: int, guild_id: int, allow_back: bool = True):
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+        for item in self.children:
+            if getattr(item, "label", "") == "Back":
+                item.disabled = not allow_back
+
+    async def _allowed(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This help flow is not for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def back(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_help_session_control(interaction, self.guild_id, "back")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_help_session_control(interaction, self.guild_id, "cancel")
+
+    @discord.ui.button(label="Start over", style=discord.ButtonStyle.primary)
+    async def start_over(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_help_session_control(interaction, self.guild_id, "start_over")
+
+
+class HelpSubmissionPreviewView(discord.ui.View):
+    def __init__(self, cog, user_id: int, guild_id: int, kind: str):
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+        self.kind = str(kind)
+
+    async def _allowed(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This preview is not for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Submit", style=discord.ButtonStyle.success)
+    async def submit(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_help_submission_preview(interaction, self.guild_id, self.kind, "submit")
+
+    @discord.ui.button(label="Edit", style=discord.ButtonStyle.secondary)
+    async def edit(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_help_submission_preview(interaction, self.guild_id, self.kind, "edit")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_help_submission_preview(interaction, self.guild_id, self.kind, "cancel")
+
+    @discord.ui.button(label="Start over", style=discord.ButtonStyle.primary)
+    async def start_over(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_help_submission_preview(interaction, self.guild_id, self.kind, "start_over")
+
+
+class HelpTicketTopicView(discord.ui.View):
+    def __init__(self, cog, user_id: int, guild_id: int):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+
+    async def _allowed(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This ticket prompt is not for you.", ephemeral=True)
+            return False
+        return True
+
+    def _make_topic_callback(self, key: str, label: str):
+        async def _callback(interaction: discord.Interaction):
+            if not await self._allowed(interaction):
+                return
+            await self.cog.handle_ticket_topic(interaction, self.guild_id, key, label)
+        return _callback
+
+    @discord.ui.button(label="Moderation", style=discord.ButtonStyle.secondary)
+    async def moderation(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._make_topic_callback("moderation", "Moderation or punishment help")(interaction)
+
+    @discord.ui.button(label="Level requests", style=discord.ButtonStyle.secondary)
+    async def requests(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._make_topic_callback("level-requests", "Level request help")(interaction)
+
+    @discord.ui.button(label="Server help", style=discord.ButtonStyle.secondary)
+    async def server(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._make_topic_callback("server-help", "Server help")(interaction)
+
+    @discord.ui.button(label="Other", style=discord.ButtonStyle.secondary)
+    async def other(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._make_topic_callback("other", "Other staff help")(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_ticket_topic(interaction, self.guild_id, "cancel", "Cancel")
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_ticket_topic(interaction, self.guild_id, "back", "Back")
+
+    @discord.ui.button(label="Start over", style=discord.ButtonStyle.primary, row=1)
+    async def start_over(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_ticket_topic(interaction, self.guild_id, "start_over", "Start over")
+
+
 class HelpCog(commands.Cog):
     """DM help system + ticket system helpers + transcript requests."""
 
@@ -42,6 +171,7 @@ class HelpCog(commands.Cog):
         self._active_ticket_channels: set[int] = set()
         self._ticket_cache_ready = False
         self._last_error_log: Dict[str, float] = {}
+        self._flow_start_attempts: Dict[int, list[int]] = {}
 
     async def start_background(self):
         if self._started:
@@ -52,6 +182,99 @@ class HelpCog(commands.Cog):
 
     def on_config_reload(self) -> None:
         pass
+
+    def _help_color(self, name: str = "blurple") -> discord.Color:
+        colors = {
+            "blurple": discord.Color.blurple(),
+            "green": discord.Color.green(),
+            "gold": discord.Color.gold(),
+            "orange": discord.Color.orange(),
+            "red": discord.Color.red(),
+            "grey": discord.Color.dark_grey(),
+            "gray": discord.Color.dark_grey(),
+        }
+        return colors.get(str(name or "blurple").casefold(), discord.Color.blurple())
+
+    def _help_embed(self, title: str, description: str = "", color: str = "blurple") -> discord.Embed:
+        embed = discord.Embed(
+            title=title,
+            description=description or None,
+            color=self._help_color(color),
+            timestamp=now_madrid(),
+        )
+        embed.set_footer(text="Avenue Guard help desk")
+        return embed
+
+    def _cooldowns(self) -> Dict[str, tuple[str, int]]:
+        return {
+            "appeal": ("Appeal punishment", 48 * 3600),
+            "report_user": ("Report a user/message", 24 * 3600),
+            "bot_issue": ("Report a bot issue", 6 * 3600),
+            "transcript": ("Request transcript", 8 * 3600),
+        }
+
+    def _submission_label(self, kind: str) -> str:
+        return {
+            "appeal": "Appeal",
+            "report": "Report",
+            "bot_issue": "Bot issue",
+        }.get(str(kind), str(kind).replace("_", " ").title())
+
+    def _submission_prefix(self, kind: str) -> str:
+        return {
+            "appeal": "A",
+            "report": "R",
+            "bot_issue": "B",
+        }.get(str(kind), "H")
+
+    def _submission_code(self, kind: str, submission_id: int) -> str:
+        return f"{self._submission_prefix(kind)}-{int(submission_id)}"
+
+    def _attachment_data(self, message: discord.Message) -> list[dict[str, str]]:
+        out: list[dict[str, str]] = []
+        for attachment in getattr(message, "attachments", []) or []:
+            out.append(
+                {
+                    "filename": str(getattr(attachment, "filename", "attachment") or "attachment"),
+                    "url": str(getattr(attachment, "url", "") or ""),
+                }
+            )
+        return out
+
+    def _merge_attachments(self, data: Dict[str, Any], attachments: list[dict[str, str]]) -> None:
+        existing = data.get("attachments")
+        if not isinstance(existing, list):
+            existing = []
+        seen = {str(item.get("url") or "") for item in existing if isinstance(item, dict)}
+        for item in attachments:
+            url = str(item.get("url") or "")
+            if url and url not in seen:
+                existing.append(item)
+                seen.add(url)
+        data["attachments"] = existing[:10]
+
+    def _attachments_text(self, data: Dict[str, Any]) -> str:
+        attachments = data.get("attachments")
+        if not isinstance(attachments, list) or not attachments:
+            return "No attachments provided."
+        lines = []
+        for idx, item in enumerate(attachments[:10], start=1):
+            if not isinstance(item, dict):
+                continue
+            filename = str(item.get("filename") or f"Attachment {idx}")[:80]
+            url = str(item.get("url") or "")
+            if url:
+                lines.append(f"{idx}. [{filename}]({url})")
+        return "\n".join(lines)[:1024] or "No attachments provided."
+
+    def _short_text(self, value: Any, limit: int = 700) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "Not provided."
+        return text[: limit - 3] + "..." if len(text) > limit else text
+
+    def _normalize_duplicate_text(self, value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").casefold()).strip()
 
     # -----------------------------
     # Ticket inactivity scanning
@@ -127,6 +350,8 @@ class HelpCog(commands.Cog):
 
         # Ticket activity in guild
         if message.guild is not None and ensure_allowed_guild_id(message.guild, allowed_guild_id):
+            if await self._handle_staff_help_reply(message):
+                return
             if not self._ticket_cache_ready:
                 await self._load_active_ticket_channels()
             if message.channel.id not in self._active_ticket_channels:
@@ -156,12 +381,20 @@ class HelpCog(commands.Cog):
             if await self._handle_help_session_message(guild, message):
                 return
 
-            embed = discord.Embed(
-                title="Help Menu",
-                description="Hello! What do you need help with?\nSelect an option below",
-            )
+            content = (message.content or "").strip()
+            if content.casefold().startswith(("faq ", "search ")):
+                query = re.sub(r"^(faq|search)\s+", "", content, flags=re.I).strip()
+                if query:
+                    await self._send_faq_search_results(message.channel, query)
+                    return
+            if content and len(content) <= 60:
+                matches = self._faq_matches(content)
+                if matches:
+                    await self._send_faq_search_results(message.channel, content)
+                    return
+
             try:
-                await message.channel.send(embed=embed, view=HelpMenuView())
+                await self._send_dm_dashboard(message.channel, guild, message.author.id)
             except Exception:
                 pass
 
@@ -185,6 +418,162 @@ class HelpCog(commands.Cog):
             (guild_id, user_id, action, int(time.time())),
         )
 
+    async def _cooldown_until(self, guild_id: int, user_id: int, action: str, cooldown_seconds: int) -> int:
+        row = await self.bot.db.fetchone(
+            "SELECT last_used_ts FROM help_cooldowns WHERE guild_id=? AND user_id=? AND action=?",
+            (guild_id, user_id, action),
+        )
+        if not row:
+            return 0
+        until_ts = int(row["last_used_ts"]) + int(cooldown_seconds)
+        return until_ts if until_ts > int(time.time()) else 0
+
+    async def _cooldown_embed(self, guild_id: int, user_id: int, action: str, title: str, seconds: int) -> discord.Embed:
+        until_ts = await self._cooldown_until(guild_id, user_id, action, seconds)
+        embed = self._help_embed("Still cooling down", color="orange")
+        if until_ts:
+            embed.description = f"`{title}` will be available <t:{until_ts}:R>.\nYou can still use the dashboard, FAQ, status, or open an existing ticket."
+        else:
+            embed.description = f"`{title}` should be available now. Please try again."
+        return embed
+
+    def _flow_start_limit_message(self, user_id: int) -> str:
+        now = int(time.time())
+        try:
+            window = max(10, int(self.bot.config.get("help", "flow_start_window_seconds", default=60) or 60))
+        except Exception:
+            window = 60
+        try:
+            max_starts = max(1, int(self.bot.config.get("help", "max_flow_starts_per_window", default=6) or 6))
+        except Exception:
+            max_starts = 6
+        attempts = [ts for ts in self._flow_start_attempts.get(user_id, []) if now - int(ts) < window]
+        if len(attempts) >= max_starts:
+            self._flow_start_attempts[user_id] = attempts
+            retry_ts = int(attempts[0]) + window
+            return f"You're starting help flows too quickly. Try again <t:{retry_ts}:R>."
+        attempts.append(now)
+        self._flow_start_attempts[user_id] = attempts
+        return ""
+
+    async def _weekly_status_text(self, guild: discord.Guild, user_id: int) -> str:
+        cfg = self.bot.config
+        excluded_role_ids = set(cfg.get_int_list("roles", "excluded_tracking_role_id"))
+        member = guild.get_member(user_id)
+        if member is None:
+            return "You are not currently visible as a server member."
+        if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
+            return "You are excluded from weekly tracking."
+        ws = week_start_sunday(now_madrid()).isoformat()
+        tracking = self.bot.get_cog("TrackingCog")
+        if tracking:
+            count, rank, _eligible_total = await tracking.get_member_stats(guild, ws, member.id)
+        else:
+            row = await self.bot.db.fetchone(
+                "SELECT count FROM activity_counts WHERE guild_id=? AND user_id=? AND week_start=?",
+                (guild.id, member.id, ws),
+            )
+            count = int(row["count"]) if row else 0
+            rank = None
+        return f"Week `{ws}`\nMessages: **{count}**\nRank: **{f'#{rank}' if rank and rank <= 20 else 'Not in top 20'}**"
+
+    async def _request_state_text(self, guild_id: int, user_id: int) -> str:
+        row = await self.bot.db.fetchone("SELECT state, wave_id, submitted_count, request_limit, close_ts FROM level_request_state WHERE guild_id=?", (guild_id,))
+        if not row:
+            return "Live requests are not initialized yet."
+        state = str(row["state"]).title()
+        limit = "none" if row["request_limit"] is None else str(int(row["request_limit"]))
+        close_text = f"\nCloses: <t:{int(row['close_ts'])}:R>" if row["close_ts"] is not None and str(row["state"]) == "open" else ""
+        submission = await self.bot.db.fetchone(
+            "SELECT status, result, created_ts FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+            (guild_id, int(row["wave_id"]), user_id),
+        )
+        mine = ""
+        if submission:
+            result = str(submission["result"] or submission["status"] or "pending").replace("_", " ")
+            mine = f"\nYour wave request: **{result.title()}** (<t:{int(submission['created_ts'])}:R>)"
+        return f"State: **{state}** | Wave **{int(row['wave_id'])}**\nSubmitted: **{int(row['submitted_count'])}** / **{limit}**{close_text}{mine}"
+
+    async def _active_ticket_text(self, guild: discord.Guild, user_id: int) -> str:
+        rows = await self.bot.db.fetchall(
+            "SELECT channel_id, ticket_id, status, created_ts FROM tickets WHERE guild_id=? AND creator_id=? AND status IN ('open','closing_prompted') ORDER BY created_ts DESC LIMIT 3",
+            (guild.id, user_id),
+        )
+        if not rows:
+            return "No active staff tickets."
+        lines = []
+        for row in rows:
+            ticket = self._ticket_label(int(row["ticket_id"]) if row["ticket_id"] is not None else None, int(row["channel_id"]))
+            lines.append(f"{ticket} - <#{int(row['channel_id'])}> - `{row['status']}`")
+        return "\n".join(lines)
+
+    async def _recent_help_status_text(self, guild_id: int, user_id: int) -> str:
+        lines: list[str] = []
+        rows = await self.bot.db.fetchall(
+            "SELECT id, kind, status, created_ts, responded_ts FROM help_submissions WHERE guild_id=? AND user_id=? ORDER BY created_ts DESC LIMIT 5",
+            (guild_id, user_id),
+        )
+        for row in rows:
+            code = self._submission_code(str(row["kind"]), int(row["id"]))
+            ts = int(row["responded_ts"] or row["created_ts"])
+            lines.append(f"`{code}` {self._submission_label(row['kind'])}: **{str(row['status']).title()}** (<t:{ts}:R>)")
+        t_rows = await self.bot.db.fetchall(
+            "SELECT ticket_id, status, created_ts FROM transcript_requests WHERE guild_id=? AND requester_id=? ORDER BY created_ts DESC LIMIT 3",
+            (guild_id, user_id),
+        )
+        for row in t_rows:
+            ticket = f"T{int(row['ticket_id'])}" if row["ticket_id"] is not None else "ticket"
+            lines.append(f"`TR-{ticket}` Transcript: **{str(row['status']).title()}** (<t:{int(row['created_ts'])}:R>)")
+        return "\n".join(lines[:6]) or "No recent help submissions."
+
+    async def _cooldown_status_text(self, guild_id: int, user_id: int) -> str:
+        lines = []
+        for action, (label, seconds) in self._cooldowns().items():
+            until_ts = await self._cooldown_until(guild_id, user_id, action, seconds)
+            lines.append(f"**{label}:** {'available' if not until_ts else f'<t:{until_ts}:R>'}")
+        return "\n".join(lines)
+
+    async def _send_dm_dashboard(self, channel, guild: discord.Guild, user_id: int) -> None:
+        embed = self._help_embed(
+            "Avenue Guard Help Desk",
+            "Choose an option below, or type `faq request`, `faq collab`, or `status`.",
+            "blurple",
+        )
+        embed.add_field(name="Active Ticket", value=await self._active_ticket_text(guild, user_id), inline=False)
+        embed.add_field(name="Weekly Activity", value=await self._weekly_status_text(guild, user_id), inline=True)
+        embed.add_field(name="Level Requests", value=await self._request_state_text(guild.id, user_id), inline=True)
+        embed.add_field(name="Recent Help", value=await self._recent_help_status_text(guild.id, user_id), inline=False)
+        embed.add_field(name="Cooldowns", value=await self._cooldown_status_text(guild.id, user_id), inline=False)
+        await channel.send(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+
+    def _faq_entries(self) -> list[str]:
+        faq = self.bot.config.get("help", "faq", default={}) or {}
+        entries = faq.get("entries", [])
+        return [str(item) for item in entries if str(item or "").strip()] if isinstance(entries, list) else []
+
+    def _faq_matches(self, query: str) -> list[str]:
+        terms = [term for term in re.split(r"\s+", str(query or "").casefold()) if len(term) >= 3]
+        if not terms:
+            return []
+        matches = []
+        for entry in self._faq_entries():
+            lowered = entry.casefold()
+            score = sum(1 for term in terms if term in lowered)
+            if score:
+                matches.append((score, entry))
+        matches.sort(key=lambda item: item[0], reverse=True)
+        return [entry for _, entry in matches[:5]]
+
+    async def _send_faq_search_results(self, channel, query: str, user_id: int = 0, guild_id: int = 0) -> None:
+        matches = self._faq_matches(query)
+        embed = self._help_embed("FAQ Search", f"Search: `{str(query)[:80]}`", "blurple")
+        if matches:
+            embed.add_field(name="Matches", value="\n\n".join(f"- {item}" for item in matches)[:4096], inline=False)
+        else:
+            embed.add_field(name="Matches", value="I couldn't find a matching FAQ entry. Try a simpler keyword like `request`, `collab`, `appeal`, or `ticket`.", inline=False)
+        view = HelpSessionControlView(self, user_id, guild_id, allow_back=False) if user_id and guild_id else HelpMenuView()
+        await channel.send(embed=embed, view=view, allowed_mentions=no_mentions())
+
     # -----------------------------
     # Menu handler (DM only)
     # -----------------------------
@@ -198,94 +587,118 @@ class HelpCog(commands.Cog):
         if interaction.guild is not None:
             return await interaction.response.send_message("Please DM me to use the help menu.")
 
+        if value == "dashboard":
+            await interaction.response.defer()
+            return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
+
         if value == "faq":
             return await self._send_faq(interaction)
+
+        if value == "faq_search":
+            limit_msg = self._flow_start_limit_message(interaction.user.id)
+            if limit_msg:
+                return await interaction.response.send_message(limit_msg)
+            await self._start_help_session(interaction.user.id, guild.id, "faq_search", {})
+            embed = self._help_embed(
+                "Search FAQ",
+                "Send one or two keywords, like `request`, `collab`, `appeal`, `ticket`, or `weekly`.\n\nUseful screenshots are not needed for FAQ search.",
+            )
+            return await interaction.response.send_message(
+                embed=embed,
+                view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
+                allowed_mentions=no_mentions(),
+            )
 
         if value == "weekly_status":
             return await self._send_weekly_status(interaction, guild)
 
-        # Cooldowns
-        cds = {
-            "appeal": 48 * 3600,
-            "report_user": 24 * 3600,
-            "bot_issue": 6 * 3600,
-            "transcript": 8 * 3600,
-        }
+        if value == "submission_status":
+            embed = self._help_embed("My Help Status", "Recent submissions and transcript requests.", "blurple")
+            embed.add_field(name="Recent Items", value=await self._recent_help_status_text(guild.id, interaction.user.id), inline=False)
+            embed.add_field(name="Cooldowns", value=await self._cooldown_status_text(guild.id, interaction.user.id), inline=False)
+            return await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+
+        cds = self._cooldowns()
+        if value in {"appeal", "report", "bot_issue", "transcript", "mod_contact"}:
+            limit_msg = self._flow_start_limit_message(interaction.user.id)
+            if limit_msg:
+                return await interaction.response.send_message(limit_msg)
 
         if value == "appeal":
-            remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "appeal", cds["appeal"])
+            remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "appeal", cds["appeal"][1])
             if remaining:
-                embed = discord.Embed(
-                    title="On cooldown",
-                    description=f"You're on cooldown for **Appeal punishment**.\nTry again in **{_format_duration(remaining)}**.",
-                )
-                return await interaction.response.send_message(embed=embed)
+                embed = await self._cooldown_embed(guild.id, interaction.user.id, "appeal", cds["appeal"][0], cds["appeal"][1])
+                return await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
 
-            await self._touch_help_cooldown(guild.id, interaction.user.id, "appeal")
             await self._start_help_session(interaction.user.id, guild.id, "appeal_punishment", {})
-            embed = discord.Embed(
+            embed = self._help_embed(
                 title="Appeal punishment",
-                description="You can appeal either by our [google form](https://forms.gle/1fgqKtyo6okiQzjBA) or directly here.\n\nIf you chose the **first one**, click the link above and type **cancel**. If you chose the second one, please **state the reason for you punishment and what happened.**",
+                description="You can use our [Google form](https://forms.gle/1fgqKtyo6okiQzjBA), or continue here.\n\nIf you continue here, send the punishment you are appealing and what happened. Attach screenshots if they help. You will preview before staff sees it.",
             )
-            return await interaction.response.send_message(embed=embed)
+            return await interaction.response.send_message(
+                embed=embed,
+                view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
+                allowed_mentions=no_mentions(),
+            )
 
         if value == "report":
-            remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "report_user", cds["report_user"])
+            remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "report_user", cds["report_user"][1])
             if remaining:
-                embed = discord.Embed(
-                    title="On cooldown",
-                    description=f"You're on cooldown for **Report a user/message**.\nTry again in **{_format_duration(remaining)}**.",
-                )
-                return await interaction.response.send_message(embed=embed)
+                embed = await self._cooldown_embed(guild.id, interaction.user.id, "report_user", cds["report_user"][0], cds["report_user"][1])
+                return await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
 
-            await self._touch_help_cooldown(guild.id, interaction.user.id, "report_user")
             warning = bool(cfg.get("help", "report_warning_enabled", default=True))
-            text = "Please send the message link (preferred) OR user ID along with the reason for your report with evidence.\n\nType **cancel** to stop."
+            text = "Send the message link if you have it, or the user ID/name, plus the reason and evidence. Attach screenshots if useful. You will preview before staff sees it."
             if warning:
-                text = "**False reports will lead to punishment**.\n\n" + text
+                text = "**False reports can lead to punishment.**\n\n" + text
 
             await self._start_help_session(interaction.user.id, guild.id, "report_details", {})
-            embed = discord.Embed(title="Report a user", description=text)
-            return await interaction.response.send_message(embed=embed)
+            embed = self._help_embed(title="Report a user", description=text, color="orange")
+            return await interaction.response.send_message(
+                embed=embed,
+                view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
+                allowed_mentions=no_mentions(),
+            )
 
         if value == "bot_issue":
-            remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "bot_issue", cds["bot_issue"])
+            remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "bot_issue", cds["bot_issue"][1])
             if remaining:
-                embed = discord.Embed(
-                    title="On cooldown",
-                    description=f"You're on cooldown for **Report a bot issue**.\nTry again in **{_format_duration(remaining)}**.",
-                )
-                return await interaction.response.send_message(embed=embed)
+                embed = await self._cooldown_embed(guild.id, interaction.user.id, "bot_issue", cds["bot_issue"][0], cds["bot_issue"][1])
+                return await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
 
-            await self._touch_help_cooldown(guild.id, interaction.user.id, "bot_issue")
             await self._start_help_session(interaction.user.id, guild.id, "bot_issue_details", {})
-            embed = discord.Embed(
+            embed = self._help_embed(
                 title="Report a bot issue",
-                description="Please describe the bot issue/bug, and include screenshots or steps to reproduce/explanation in __a single message__.\n\nType **cancel** to stop.",
+                description="Describe what broke, where it happened, and the steps to reproduce it. Attach screenshots if useful. You will preview before staff sees it.",
             )
-            return await interaction.response.send_message(embed=embed)
+            return await interaction.response.send_message(
+                embed=embed,
+                view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
+                allowed_mentions=no_mentions(),
+            )
 
         if value == "transcript":
-            remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "transcript", cds["transcript"])
+            remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "transcript", cds["transcript"][1])
             if remaining:
-                embed = discord.Embed(
-                    title="On cooldown",
-                    description=f"You're on cooldown for **Request transcript**.\nTry again in **{_format_duration(remaining)}**.",
-                )
-                return await interaction.response.send_message(embed=embed)
+                embed = await self._cooldown_embed(guild.id, interaction.user.id, "transcript", cds["transcript"][0], cds["transcript"][1])
+                return await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
 
-            await self._touch_help_cooldown(guild.id, interaction.user.id, "transcript")
             await self._start_help_session(interaction.user.id, guild.id, "transcript_ticket", {})
-            embed = discord.Embed(
+            embed = self._help_embed(
                 title="Request transcript",
                 description="Send your **ticket channel** (mention like <#123> or ID), or your **Ticket ID** (example: `T21`).\n\nType **cancel** to stop.",
             )
-            return await interaction.response.send_message(embed=embed)
+            return await interaction.response.send_message(
+                embed=embed,
+                view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
+                allowed_mentions=no_mentions(),
+            )
 
         if value == "mod_contact":
             return await interaction.response.send_message(
-                "Do you want to contact staff? Please only use this if you **need staff**.",
-                view=HelpModConfirmView(),
+                "What do you need staff for? Pick the closest topic so the ticket starts in the right lane.",
+                view=HelpTicketTopicView(self, interaction.user.id, guild.id),
+                allowed_mentions=no_mentions(),
             )
 
         return await interaction.response.send_message("That option isn't available yet.")
@@ -298,8 +711,8 @@ class HelpCog(commands.Cog):
         if not isinstance(entries, list):
             entries = []
         desc = "\n".join([f"• {str(x)}" for x in entries][:20]) or "Not available right now, sorry"
-        embed = discord.Embed(title=title, description=desc)
-        await interaction.response.send_message(embed=embed)
+        embed = self._help_embed(title, desc, "blurple")
+        await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
 
     async def _send_weekly_status(self, interaction: discord.Interaction, guild: discord.Guild):
         cfg = self.bot.config
@@ -338,10 +751,10 @@ class HelpCog(commands.Cog):
                     rank = eligible_rank
                     break
 
-        embed = discord.Embed(title="Weekly status")
+        embed = self._help_embed("Weekly status", color="blurple")
         embed.add_field(name="Messages counted", value=str(count), inline=True)
         embed.add_field(name="Top 20 rank", value=(f"#{rank}" if rank and rank <= 20 else "Not in top 20"), inline=True)
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
 
     # -----------------------------
     # Help sessions
@@ -369,6 +782,151 @@ class HelpCog(commands.Cog):
             data = {}
         return {"stage": str(row["stage"]), "data": data}
 
+    def _preview_stage(self, kind: str) -> str:
+        return f"preview_{kind}"
+
+    def _edit_stage_for_kind(self, kind: str) -> str:
+        return {
+            "appeal": "appeal_reason",
+            "report": "report_details",
+            "bot_issue": "bot_issue_details",
+        }.get(kind, "")
+
+    def _submission_core_text(self, kind: str, data: Dict[str, Any]) -> str:
+        if kind == "report":
+            return str(data.get("report") or "")
+        if kind == "bot_issue":
+            return str(data.get("issue") or "")
+        if kind == "appeal":
+            return f"{data.get('punishment', '')}\n{data.get('reason', '')}"
+        return json.dumps(data, sort_keys=True)
+
+    def _submission_preview_embed(self, kind: str, data: Dict[str, Any]) -> discord.Embed:
+        embed = self._help_embed(f"Preview: {self._submission_label(kind)}", "Review this before staff sees it.", "gold")
+        if kind == "appeal":
+            embed.add_field(name="Punishment / What happened", value=self._short_text(data.get("punishment"), 1024), inline=False)
+            embed.add_field(name="Why it should be lifted", value=self._short_text(data.get("reason"), 1024), inline=False)
+        elif kind == "report":
+            embed.add_field(name="Report details", value=self._short_text(data.get("report"), 1024), inline=False)
+        elif kind == "bot_issue":
+            embed.add_field(name="Issue details", value=self._short_text(data.get("issue"), 1024), inline=False)
+        embed.add_field(name="Attachments", value=self._attachments_text(data), inline=False)
+        embed.set_footer(text="Submit sends this to staff. Edit lets you rewrite the last answer.")
+        return embed
+
+    async def _show_submission_preview(self, channel, user_id: int, guild_id: int, kind: str, data: Dict[str, Any]) -> None:
+        await self._start_help_session(user_id, guild_id, self._preview_stage(kind), data)
+        await channel.send(
+            embed=self._submission_preview_embed(kind, data),
+            view=HelpSubmissionPreviewView(self, user_id, guild_id, kind),
+            allowed_mentions=no_mentions(),
+        )
+
+    async def _is_duplicate_help_submission(self, guild_id: int, user_id: int, kind: str, data: Dict[str, Any]) -> bool:
+        if kind not in {"report", "bot_issue"}:
+            return False
+        try:
+            window_hours = max(1, int(self.bot.config.get("help", "duplicate_window_hours", default=24) or 24))
+        except Exception:
+            window_hours = 24
+        cutoff = int(time.time()) - window_hours * 3600
+        new_text = self._normalize_duplicate_text(self._submission_core_text(kind, data))
+        if not new_text:
+            return False
+        rows = await self.bot.db.fetchall(
+            "SELECT data_json FROM help_submissions WHERE guild_id=? AND user_id=? AND kind=? AND created_ts>=? ORDER BY created_ts DESC LIMIT 10",
+            (guild_id, user_id, kind, cutoff),
+        )
+        for row in rows:
+            try:
+                old_data = json.loads(row["data_json"] or "{}")
+            except Exception:
+                old_data = {}
+            if self._normalize_duplicate_text(self._submission_core_text(kind, old_data)) == new_text:
+                return True
+        return False
+
+    async def _submission_log_channel(self, guild: discord.Guild, kind: str) -> Optional[discord.TextChannel]:
+        key = {
+            "appeal": "appeals_log_channel_id",
+            "report": "reports_log_channel_id",
+            "bot_issue": "bot_issues_log_channel_id",
+        }.get(kind)
+        if not key:
+            return None
+        channel_id = self.bot.config.get_int("channels", key)
+        channel = guild.get_channel(channel_id) if channel_id else None
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    def _submission_staff_embed(self, guild: discord.Guild, user_id: int, kind: str, submission_id: int, data: Dict[str, Any]) -> discord.Embed:
+        color = {"appeal": discord.Color.gold(), "report": discord.Color.orange(), "bot_issue": discord.Color.blurple()}.get(kind, discord.Color.blurple())
+        embed = self._staff_log_embed(
+            guild,
+            f"{self._submission_label(kind)} {self._submission_code(kind, submission_id)}",
+            f"<@{user_id}> submitted a {self._submission_label(kind).casefold()}",
+            color,
+        )
+        embed.add_field(name="Submitter", value=f"<@{user_id}>\n`{user_id}`", inline=True)
+        embed.add_field(name="Status", value="Pending staff response", inline=True)
+        embed.add_field(name="Help ID", value=f"`{self._submission_code(kind, submission_id)}`", inline=True)
+        if kind == "appeal":
+            embed.add_field(name="Punishment / What happened", value=self._short_text(data.get("punishment"), 1024), inline=False)
+            embed.add_field(name="Why lift?", value=self._short_text(data.get("reason"), 1024), inline=False)
+        elif kind == "report":
+            embed.add_field(name="Details", value=self._short_text(data.get("report"), 1024), inline=False)
+        elif kind == "bot_issue":
+            embed.add_field(name="Issue", value=self._short_text(data.get("issue"), 1024), inline=False)
+        embed.add_field(name="Attachments", value=self._attachments_text(data), inline=False)
+        embed.set_footer(text="Reply to this message to DM the submitter and mark it responded")
+        return embed
+
+    async def _insert_help_submission(self, guild_id: int, user_id: int, kind: str, data: Dict[str, Any]) -> int:
+        now = int(time.time())
+        await self.bot.db.execute(
+            "INSERT INTO help_submissions(guild_id,kind,user_id,status,created_ts,updated_ts,data_json) VALUES(?,?,?,?,?,?,?)",
+            (guild_id, kind, user_id, "pending", now, now, json.dumps(data, separators=(",", ":"))),
+        )
+        row = await self.bot.db.fetchone(
+            "SELECT id FROM help_submissions WHERE guild_id=? AND user_id=? AND kind=? AND created_ts=? ORDER BY id DESC LIMIT 1",
+            (guild_id, user_id, kind, now),
+        )
+        return int(row["id"]) if row else 0
+
+    async def _submit_help_submission(self, guild: discord.Guild, user_id: int, kind: str, data: Dict[str, Any]) -> tuple[bool, str, str]:
+        if await self._is_duplicate_help_submission(guild.id, user_id, kind, data):
+            return False, "This looks like a duplicate of a recent submission. Add new details or wait before sending it again.", ""
+        channel = await self._submission_log_channel(guild, kind)
+        if channel is None:
+            await log_error(self.bot, f"{kind} submission failed: configured log channel is missing or invalid.")
+            return False, "I couldn't send this to staff because the log channel is not configured correctly.", ""
+
+        submission_id = await self._insert_help_submission(guild.id, user_id, kind, data)
+        if not submission_id:
+            return False, "I couldn't create a help submission ID. Please try again.", ""
+        code = self._submission_code(kind, submission_id)
+        try:
+            msg = await channel.send(
+                embed=self._submission_staff_embed(guild, user_id, kind, submission_id, data),
+                allowed_mentions=no_mentions(),
+            )
+            await self.bot.db.execute(
+                "UPDATE help_submissions SET log_channel_id=?, log_message_id=?, updated_ts=? WHERE id=?",
+                (channel.id, msg.id, int(time.time()), submission_id),
+            )
+        except Exception as e:
+            await log_error(self.bot, f"{kind} submission failed: {repr(e)}")
+            await self.bot.db.execute(
+                "UPDATE help_submissions SET status='failed', updated_ts=? WHERE id=?",
+                (int(time.time()), submission_id),
+            )
+            return False, "I created the submission but couldn't send it to staff. Please contact staff directly.", code
+
+        action = {"appeal": "appeal", "report": "report_user", "bot_issue": "bot_issue"}.get(kind)
+        if action:
+            await self._touch_help_cooldown(guild.id, user_id, action)
+        await self._log_help_action(guild, user_id, f"{kind}_submitted", f"id={code}")
+        return True, f"Sent to staff as `{code}`. You can check it later from **My submissions**.", code
+
     def _help_max_submission_chars(self) -> int:
         try:
             return max(500, min(5000, int(self.bot.config.get("help", "max_submission_chars", default=3000) or 3000)))
@@ -386,53 +944,72 @@ class HelpCog(commands.Cog):
 
         if content.casefold() in {"cancel", "stop", "never mind", "nevermind"}:
             await self._clear_help_session(message.author.id, guild.id)
-            await message.channel.send("Cancelled.")
+            await message.channel.send("Cancelled.", view=HelpMenuView(), allowed_mentions=no_mentions())
+            return True
+
+        if content.casefold() in {"back", "go back"}:
+            await self._handle_typed_back(guild, message)
+            return True
+
+        if content.casefold() in {"start over", "restart help", "home", "dashboard"}:
+            await self._clear_help_session(message.author.id, guild.id)
+            await self._send_dm_dashboard(message.channel, guild, message.author.id)
             return True
 
         if len(content) > self._help_max_submission_chars():
-            await message.channel.send(f"That message is too long. Please keep it under {self._help_max_submission_chars()} characters.")
+            await message.channel.send(
+                f"That message is too long. Please keep it under {self._help_max_submission_chars()} characters.",
+                view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=True),
+                allowed_mentions=no_mentions(),
+            )
+            return True
+
+        if stage == "faq_search":
+            await self._send_faq_search_results(message.channel, content, message.author.id, guild.id)
             return True
 
         if stage == "appeal_punishment":
             data["punishment"] = content
+            self._merge_attachments(data, self._attachment_data(message))
             await self._start_help_session(message.author.id, guild.id, "appeal_reason", data)
-            await message.channel.send("Why should this punishment be lifted? Please explain.\n\nType **cancel** to stop.")
+            embed = self._help_embed(
+                "Appeal punishment",
+                "Why should this punishment be lifted? Add context staff should know. Attach evidence if useful.",
+                "gold",
+            )
+            await message.channel.send(
+                embed=embed,
+                view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=True),
+                allowed_mentions=no_mentions(),
+            )
             return True
 
         if stage == "appeal_reason":
             data["reason"] = content
-            await self._clear_help_session(message.author.id, guild.id)
-            ok = await self._submit_appeal(guild, message.author.id, data)
-            if ok:
-                await message.channel.send("Thanks! We will look into your appeal soon")
-            else:
-                await message.channel.send("I couldn't send your appeal to staff right now. Please contact staff directly.")
+            self._merge_attachments(data, self._attachment_data(message))
+            await self._show_submission_preview(message.channel, message.author.id, guild.id, "appeal", data)
             return True
 
         if stage == "report_details":
             data["report"] = content
-            await self._clear_help_session(message.author.id, guild.id)
-            ok = await self._submit_report(guild, message.author.id, data)
-            if ok:
-                await message.channel.send("Thanks! Your report has been sent to our staff team")
-            else:
-                await message.channel.send("I couldn't send your report to staff right now. Please contact staff directly.")
+            self._merge_attachments(data, self._attachment_data(message))
+            await self._show_submission_preview(message.channel, message.author.id, guild.id, "report", data)
             return True
 
         if stage == "bot_issue_details":
             data["issue"] = content
-            await self._clear_help_session(message.author.id, guild.id)
-            ok = await self._submit_bot_issue(guild, message.author.id, data)
-            if ok:
-                await message.channel.send("Thanks! Your bug report has been sent to our developer team")
-            else:
-                await message.channel.send("I couldn't send your bug report to staff right now. Please contact staff directly.")
+            self._merge_attachments(data, self._attachment_data(message))
+            await self._show_submission_preview(message.channel, message.author.id, guild.id, "bot_issue", data)
             return True
 
         if stage == "transcript_ticket":
             ticket_channel_id, ticket_id = self._parse_ticket_reference(content)
             if ticket_channel_id is None and ticket_id is None:
-                await message.channel.send("Couldn't parse that. Send a ticket channel mention/ID or Ticket ID like `T123`. If not, contact any Admins/Owners directly.")
+                await message.channel.send(
+                    "Couldn't parse that. Send a ticket channel mention/ID or Ticket ID like `T123`.",
+                    view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=False),
+                    allowed_mentions=no_mentions(),
+                )
                 return True
 
             row = None
@@ -448,11 +1025,19 @@ class HelpCog(commands.Cog):
                 )
 
             if not row:
-                await message.channel.send("I couldn't find that ticket :/")
+                await message.channel.send(
+                    "I couldn't find that ticket :/",
+                    view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=False),
+                    allowed_mentions=no_mentions(),
+                )
                 return True
 
             if int(row["creator_id"]) != message.author.id:
-                await message.channel.send("That is not your ticket though")
+                await message.channel.send(
+                    "That is not your ticket though",
+                    view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=False),
+                    allowed_mentions=no_mentions(),
+                )
                 return True
 
             t_id = int(row["ticket_id"]) if row["ticket_id"] is not None else None
@@ -467,13 +1052,139 @@ class HelpCog(commands.Cog):
             await self._clear_help_session(message.author.id, guild.id)
 
             if ok:
+                await self._touch_help_cooldown(guild.id, message.author.id, "transcript")
                 await message.channel.send("Your transcript request has been sent to staff for approval, thanks for your patience!")
             else:
                 await message.channel.send(reason or "Transcript request failed.")
             return True
 
+        if stage.startswith("preview_"):
+            kind = stage.removeprefix("preview_")
+            await message.channel.send(
+                "Use the preview buttons to submit, edit, cancel, or start over.",
+                embed=self._submission_preview_embed(kind, data),
+                view=HelpSubmissionPreviewView(self, message.author.id, guild.id, kind),
+                allowed_mentions=no_mentions(),
+            )
+            return True
+
         await self._clear_help_session(message.author.id, guild.id)
         return False
+
+    async def _handle_typed_back(self, guild: discord.Guild, message: discord.Message) -> None:
+        sess = await self._get_help_session(message.author.id, guild.id)
+        if not sess:
+            await self._send_dm_dashboard(message.channel, guild, message.author.id)
+            return
+        stage = str(sess["stage"])
+        data = sess["data"]
+        if stage == "appeal_reason":
+            await self._start_help_session(message.author.id, guild.id, "appeal_punishment", data)
+            embed = self._help_embed("Appeal punishment", "Back to the first appeal step. Send the punishment and what happened.", "gold")
+            await message.channel.send(embed=embed, view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=False), allowed_mentions=no_mentions())
+            return
+        if stage.startswith("preview_"):
+            kind = stage.removeprefix("preview_")
+            edit_stage = self._edit_stage_for_kind(kind)
+            if edit_stage:
+                await self._start_help_session(message.author.id, guild.id, edit_stage, data)
+                await message.channel.send(
+                    embed=self._edit_prompt_embed(kind),
+                    view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=True),
+                    allowed_mentions=no_mentions(),
+                )
+                return
+        await self._clear_help_session(message.author.id, guild.id)
+        await self._send_dm_dashboard(message.channel, guild, message.author.id)
+
+    def _edit_prompt_embed(self, kind: str) -> discord.Embed:
+        if kind == "appeal":
+            return self._help_embed("Edit appeal", "Send the appeal reason again. It will replace the previous reason.", "gold")
+        if kind == "report":
+            return self._help_embed("Edit report", "Send the full report again. Include message links, user IDs, evidence, and attachments if useful.", "orange")
+        if kind == "bot_issue":
+            return self._help_embed("Edit bot issue", "Send the full bug report again, including steps to reproduce and screenshots if useful.", "blurple")
+        return self._help_embed("Edit submission", "Send the updated text.")
+
+    async def handle_help_session_control(self, interaction: discord.Interaction, guild_id: int, action: str) -> None:
+        guild = self.bot.get_guild(int(guild_id))
+        if guild is None:
+            return await interaction.response.send_message("Guild not found.")
+        if action == "cancel":
+            await self._clear_help_session(interaction.user.id, guild.id)
+            return await interaction.response.send_message("Cancelled.", view=HelpMenuView(), allowed_mentions=no_mentions())
+        if action == "start_over":
+            await self._clear_help_session(interaction.user.id, guild.id)
+            await interaction.response.defer()
+            return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
+        if action == "back":
+            sess = await self._get_help_session(interaction.user.id, guild.id)
+            if not sess:
+                await interaction.response.defer()
+                return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
+            stage = str(sess["stage"])
+            data = sess["data"]
+            if stage == "appeal_reason":
+                await self._start_help_session(interaction.user.id, guild.id, "appeal_punishment", data)
+                embed = self._help_embed("Appeal punishment", "Back to the first appeal step. Send the punishment and what happened.", "gold")
+                return await interaction.response.send_message(
+                    embed=embed,
+                    view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
+                    allowed_mentions=no_mentions(),
+                )
+            if stage.startswith("preview_"):
+                kind = stage.removeprefix("preview_")
+                edit_stage = self._edit_stage_for_kind(kind)
+                if edit_stage:
+                    await self._start_help_session(interaction.user.id, guild.id, edit_stage, data)
+                    return await interaction.response.send_message(
+                        embed=self._edit_prompt_embed(kind),
+                        view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=True),
+                        allowed_mentions=no_mentions(),
+                    )
+            await self._clear_help_session(interaction.user.id, guild.id)
+            await interaction.response.defer()
+            return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
+
+    async def handle_help_submission_preview(self, interaction: discord.Interaction, guild_id: int, kind: str, action: str) -> None:
+        guild = self.bot.get_guild(int(guild_id))
+        if guild is None:
+            return await interaction.response.send_message("Guild not found.")
+        sess = await self._get_help_session(interaction.user.id, guild.id)
+        data = sess["data"] if sess else {}
+        if action == "cancel":
+            await self._clear_help_session(interaction.user.id, guild.id)
+            return await interaction.response.send_message("Cancelled.", view=HelpMenuView(), allowed_mentions=no_mentions())
+        if action == "start_over":
+            await self._clear_help_session(interaction.user.id, guild.id)
+            await interaction.response.defer()
+            return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
+        if action == "edit":
+            edit_stage = self._edit_stage_for_kind(kind)
+            if not edit_stage:
+                return await interaction.response.send_message("I don't know how to edit that submission.")
+            await self._start_help_session(interaction.user.id, guild.id, edit_stage, data)
+            return await interaction.response.send_message(
+                embed=self._edit_prompt_embed(kind),
+                view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=True),
+                allowed_mentions=no_mentions(),
+            )
+        if action != "submit":
+            return await interaction.response.send_message("Unknown action.")
+
+        await interaction.response.defer()
+        ok, message, code = await self._submit_help_submission(guild, interaction.user.id, kind, data)
+        if ok:
+            await self._clear_help_session(interaction.user.id, guild.id)
+            embed = self._help_embed("Submitted", message, "green")
+            embed.add_field(name="Help ID", value=f"`{code}`", inline=True)
+            return await interaction.followup.send(embed=embed, view=HelpMenuView(), allowed_mentions=no_mentions())
+        embed = self._help_embed("Not submitted", message, "orange")
+        return await interaction.followup.send(
+            embed=embed,
+            view=HelpSubmissionPreviewView(self, interaction.user.id, guild.id, kind),
+            allowed_mentions=no_mentions(),
+        )
 
     def _parse_ticket_reference(self, text: str) -> Tuple[Optional[int], Optional[int]]:
         """Return (channel_id, ticket_id). Only one will be non-None."""
@@ -505,81 +1216,126 @@ class HelpCog(commands.Cog):
         embed.set_footer(text="Avenue Guard staff log")
         return embed
 
+    async def _log_help_action(self, guild: discord.Guild, user_id: int, action: str, detail: str = "") -> None:
+        channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            return
+        embed = self._staff_log_embed(
+            guild,
+            "Help Desk Action",
+            str(action).replace("_", " ").title(),
+            discord.Color.blurple(),
+        )
+        if user_id:
+            embed.add_field(name="Actor", value=f"<@{int(user_id)}>\n`{int(user_id)}`", inline=True)
+        else:
+            embed.add_field(name="Actor", value="System", inline=True)
+        embed.add_field(name="Action", value=f"`{str(action)[:120]}`", inline=True)
+        if detail:
+            embed.add_field(name="Details", value=str(detail)[:1024], inline=False)
+        try:
+            await channel.send(embed=embed, allowed_mentions=no_mentions())
+        except Exception as e:
+            await log_error(self.bot, f"Could not log help action {action}: {repr(e)}")
+
     def _ticket_label(self, ticket_id: Optional[int], fallback_channel_id: int) -> str:
         return f"`T{ticket_id}`" if ticket_id is not None else f"`{fallback_channel_id}`"
+
+    async def _handle_staff_help_reply(self, message: discord.Message) -> bool:
+        if message.author.bot or message.guild is None:
+            return False
+        ref = getattr(message, "reference", None)
+        ref_message_id = getattr(ref, "message_id", None)
+        if not ref_message_id:
+            return False
+        row = await self.bot.db.fetchone(
+            "SELECT * FROM help_submissions WHERE guild_id=? AND log_channel_id=? AND log_message_id=?",
+            (message.guild.id, message.channel.id, int(ref_message_id)),
+        )
+        if not row:
+            return False
+
+        member = message.guild.get_member(message.author.id)
+        mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
+        allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
+        if member is None or not is_mod(member, mod_role_id, allow_manage_guild=allow_manage_guild):
+            return False
+
+        response_text = str(message.content or "").strip()
+        attachments = self._attachment_data(message)
+        if not response_text and not attachments:
+            try:
+                await message.reply("Add text or an attachment to relay a response.", allowed_mentions=no_mentions())
+            except Exception:
+                pass
+            return True
+
+        kind = str(row["kind"])
+        submission_id = int(row["id"])
+        code = self._submission_code(kind, submission_id)
+        requester_id = int(row["user_id"])
+        embed = self._help_embed(f"Staff response: {code}", color="blurple")
+        embed.description = f"Staff responded to your {self._submission_label(kind).casefold()}."
+        if response_text:
+            embed.add_field(name="Response", value=self._short_text(response_text, 1024), inline=False)
+        if attachments:
+            embed.add_field(name="Attachments", value=self._attachments_text({"attachments": attachments}), inline=False)
+
+        try:
+            user = await self.bot.fetch_user(requester_id)
+            await user.send(embed=embed, allowed_mentions=no_mentions())
+        except Exception as e:
+            await log_error(self.bot, f"Could not relay staff response for {code}: {repr(e)}")
+            try:
+                await message.reply("I couldn't DM the user. Their DMs may be closed.", allowed_mentions=no_mentions())
+            except Exception:
+                pass
+            return True
+
+        now = int(time.time())
+        await self.bot.db.execute(
+            "UPDATE help_submissions SET status='responded', response_text=?, responded_by=?, responded_ts=?, updated_ts=? WHERE id=?",
+            (response_text[:1500], message.author.id, now, now, submission_id),
+        )
+
+        try:
+            original = await message.channel.fetch_message(int(ref_message_id))
+            if original.embeds:
+                original_embed = original.embeds[0]
+                replaced = False
+                for idx, field in enumerate(original_embed.fields):
+                    if str(field.name).casefold() == "status":
+                        original_embed.set_field_at(idx, name="Status", value=f"Responded by <@{message.author.id}> <t:{now}:R>", inline=True)
+                        replaced = True
+                        break
+                if not replaced:
+                    original_embed.add_field(name="Status", value=f"Responded by <@{message.author.id}> <t:{now}:R>", inline=True)
+                await original.edit(embed=original_embed, allowed_mentions=no_mentions())
+        except Exception as e:
+            await log_error(self.bot, f"Could not update staff submission embed for {code}: {repr(e)}")
+
+        await self._log_help_action(message.guild, message.author.id, "staff_response_relayed", f"id={code} requester={requester_id}")
+        try:
+            await message.reply(f"Relayed to the user and marked `{code}` as responded.", allowed_mentions=no_mentions())
+        except Exception:
+            pass
+        return True
 
     # -----------------------------
     # Staff submissions
     # -----------------------------
     async def _submit_appeal(self, guild: discord.Guild, user_id: int, data: Dict[str, Any]) -> bool:
-        cfg = self.bot.config
-        ch_id = cfg.get_int("channels", "appeals_log_channel_id")
-        channel = guild.get_channel(ch_id) if ch_id else None
-        if not isinstance(channel, discord.TextChannel):
-            await log_error(self.bot, "Appeal submission failed: appeals_log_channel_id is missing or invalid.")
-            return False
-        embed = self._staff_log_embed(
-            guild,
-            "Punishment Appeal",
-            f"<@{user_id}> submitted a punishment appeal",
-            discord.Color.gold(),
-        )
-        embed.add_field(name="User", value=f"<@{user_id}>\n`{user_id}`", inline=True)
-        embed.add_field(name="Status", value="Pending staff review", inline=True)
-        embed.add_field(name="Punishment", value=str(data.get("punishment", ""))[:1024], inline=False)
-        embed.add_field(name="Why lift?", value=str(data.get("reason", ""))[:1024], inline=False)
-        try:
-            await channel.send(embed=embed)
-            return True
-        except Exception as e:
-            await log_error(self.bot, f"Appeal submission failed: {repr(e)}")
-            return False
+        ok, _message, _code = await self._submit_help_submission(guild, user_id, "appeal", data)
+        return ok
 
     async def _submit_report(self, guild: discord.Guild, user_id: int, data: Dict[str, Any]) -> bool:
-        cfg = self.bot.config
-        ch_id = cfg.get_int("channels", "reports_log_channel_id")
-        channel = guild.get_channel(ch_id) if ch_id else None
-        if not isinstance(channel, discord.TextChannel):
-            await log_error(self.bot, "Report submission failed: reports_log_channel_id is missing or invalid.")
-            return False
-        embed = self._staff_log_embed(
-            guild,
-            "User Report",
-            f"<@{user_id}> submitted a user or message report",
-            discord.Color.orange(),
-        )
-        embed.add_field(name="Reporter", value=f"<@{user_id}>\n`{user_id}`", inline=True)
-        embed.add_field(name="Status", value="Pending staff review", inline=True)
-        embed.add_field(name="Details", value=str(data.get("report", ""))[:1024], inline=False)
-        try:
-            await channel.send(embed=embed)
-            return True
-        except Exception as e:
-            await log_error(self.bot, f"Report submission failed: {repr(e)}")
-            return False
+        ok, _message, _code = await self._submit_help_submission(guild, user_id, "report", data)
+        return ok
 
     async def _submit_bot_issue(self, guild: discord.Guild, user_id: int, data: Dict[str, Any]) -> bool:
-        cfg = self.bot.config
-        ch_id = cfg.get_int("channels", "bot_issues_log_channel_id")
-        channel = guild.get_channel(ch_id) if ch_id else None
-        if not isinstance(channel, discord.TextChannel):
-            await log_error(self.bot, "Bot issue submission failed: bot_issues_log_channel_id is missing or invalid.")
-            return False
-        embed = self._staff_log_embed(
-            guild,
-            "Bot Issue Report",
-            f"<@{user_id}> reported a bot issue",
-            discord.Color.blurple(),
-        )
-        embed.add_field(name="Reporter", value=f"<@{user_id}>\n`{user_id}`", inline=True)
-        embed.add_field(name="Status", value="Pending developer review", inline=True)
-        embed.add_field(name="Issue", value=str(data.get("issue", ""))[:1024], inline=False)
-        try:
-            await channel.send(embed=embed)
-            return True
-        except Exception as e:
-            await log_error(self.bot, f"Bot issue submission failed: {repr(e)}")
-            return False
+        ok, _message, _code = await self._submit_help_submission(guild, user_id, "bot_issue", data)
+        return ok
 
     # -----------------------------
     # Transcript requests (staff approval)
@@ -622,7 +1378,7 @@ class HelpCog(commands.Cog):
             embed.add_field(name="Ticket ID", value=f"`T{ticket_id}`", inline=True)
         embed.set_footer(text="Avenue Guard staff log - approve or deny")
 
-        msg = await channel.send(embed=embed, view=TranscriptRequestView())
+        msg = await channel.send(embed=embed, view=TranscriptRequestView(), allowed_mentions=no_mentions())
 
         await self.bot.db.execute(
             "INSERT INTO transcript_requests(guild_id, request_message_id, ticket_channel_id, requester_id, status, created_ts, ticket_id) "
@@ -659,6 +1415,12 @@ class HelpCog(commands.Cog):
 
         if not approved:
             await self.bot.db.execute("UPDATE transcript_requests SET status='denied' WHERE request_message_id=?", (interaction.message.id,))
+            await self._log_help_action(
+                interaction.guild,
+                interaction.user.id,
+                "transcript_request_denied",
+                f"ticket={self._ticket_label(ticket_id, ticket_channel_id)} requester={requester_id}",
+            )
             try:
                 await interaction.message.edit(content="Denied", view=None)
             except Exception:
@@ -675,6 +1437,12 @@ class HelpCog(commands.Cog):
             return
 
         await self.bot.db.execute("UPDATE transcript_requests SET status='approved' WHERE request_message_id=?", (interaction.message.id,))
+        await self._log_help_action(
+            interaction.guild,
+            interaction.user.id,
+            "transcript_request_approved",
+            f"ticket={self._ticket_label(ticket_id, ticket_channel_id)} requester={requester_id}",
+        )
 
         try:
             await interaction.response.send_message("Approved. Sending transcript…", ephemeral=True)
@@ -740,6 +1508,17 @@ class HelpCog(commands.Cog):
     # -----------------------------
     # Ticket creation (mod contact)
     # -----------------------------
+    async def handle_ticket_topic(self, interaction: discord.Interaction, guild_id: int, topic_key: str, topic_label: str):
+        guild = self.bot.get_guild(int(guild_id))
+        if guild is None:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
+        if topic_key == "cancel":
+            return await interaction.response.send_message("Cancelled.", ephemeral=True)
+        if topic_key in {"back", "start_over"}:
+            await interaction.response.defer()
+            return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
+        await self._create_staff_ticket(interaction, guild, topic_key, topic_label)
+
     async def handle_mod_confirm(self, interaction: discord.Interaction, confirmed: bool):
         cfg = self.bot.config
         allowed_guild_id = cfg.get_int("guild", "allowed_guild_id")
@@ -747,12 +1526,17 @@ class HelpCog(commands.Cog):
         if guild is None:
             return await interaction.response.send_message("Guild not found.", ephemeral=True)
 
+        if not confirmed:
+            return await interaction.response.send_message("Cancelled.", ephemeral=True)
+
+        await self._create_staff_ticket(interaction, guild, "staff-contact", "Staff contact")
+
+    async def _create_staff_ticket(self, interaction: discord.Interaction, guild: discord.Guild, topic_key: str, topic_label: str):
+        cfg = self.bot.config
+
         member = guild.get_member(interaction.user.id)
         if member is None:
             return await interaction.response.send_message("You must be in the server to create a ticket", ephemeral=True)
-
-        if not confirmed:
-            return await interaction.response.send_message("Cancelled.", ephemeral=True)
 
         cooldown_h = int(cfg.get("tickets", "ticket_creation_cooldown_hours", default=24) or 24)
         row = await self.bot.db.fetchone(
@@ -762,8 +1546,9 @@ class HelpCog(commands.Cog):
         now = int(time.time())
         if row and now - int(row["last_created_ts"]) < cooldown_h * 3600:
             remaining = cooldown_h * 3600 - (now - int(row["last_created_ts"]))
+            until_ts = now + remaining
             return await interaction.response.send_message(
-                f"You can create another ticket in about {_format_duration(remaining)}.",
+                f"You can create another ticket <t:{until_ts}:R>.",
                 ephemeral=True,
             )
 
@@ -785,10 +1570,11 @@ class HelpCog(commands.Cog):
             overwrites[mod_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
         ticket_id = await self.bot.db.next_ticket_id(guild.id)
-        name = f"ticket-{ticket_id}-{member.name}".lower().replace(" ", "-")[:90]
+        topic_slug = re.sub(r"[^a-z0-9-]+", "-", str(topic_key or "help").casefold()).strip("-") or "help"
+        name = f"ticket-{ticket_id}-{topic_slug}-{member.name}".lower().replace(" ", "-")[:90]
 
         try:
-            channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites, reason="Ticket created")
+            channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites, reason=f"Ticket created: {topic_label}")
         except Exception:
             return await interaction.response.send_message("Failed to create ticket (missing permissions?)", ephemeral=True)
 
@@ -802,15 +1588,17 @@ class HelpCog(commands.Cog):
             (guild.id, channel.id, member.id, now, now, ticket_id),
         )
         self._active_ticket_channels.add(channel.id)
+        await self._log_help_action(guild, member.id, "ticket_created", f"ticket=T{ticket_id} topic={topic_key} channel={channel.id}")
 
         # DM includes Ticket ID
         try:
             dm = await member.create_dm()
-            embed = discord.Embed(
+            embed = self._help_embed(
                 title="Ticket created",
-                description=f"Your ticket has been created -> {channel.mention}\n\nTicket ID: `T{ticket_id}`",
+                description=f"Your ticket has been created: {channel.mention}\n\nTicket ID: `T{ticket_id}`\nTopic: **{topic_label}**",
+                color="green",
             )
-            await dm.send(embed=embed)
+            await dm.send(embed=embed, allowed_mentions=user_mentions())
         except Exception:
             pass
 
@@ -824,7 +1612,7 @@ class HelpCog(commands.Cog):
             staff_role = guild.get_role(staff_role_id) if staff_role_id else None
             staff_ping = staff_role.mention if staff_role else "staff"
             await channel.send(
-                f"Please say what you need {member.mention}, {staff_ping} will be shortly with you ;)",
+                f"Please say what you need {member.mention}. Topic: **{topic_label}**. {staff_ping} will be shortly with you ;)",
                 allowed_mentions=user_and_role_mentions() if staff_role else user_mentions(),
             )
         except Exception:

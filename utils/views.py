@@ -77,6 +77,11 @@ class _HelpMenuSelect(discord.ui.Select):
     def __init__(self):
         options = [
             discord.SelectOption(
+                label="Dashboard",
+                value="dashboard",
+                description="See your active ticket, requests, cooldowns, and help status",
+            ),
+            discord.SelectOption(
                 label="Contact staff",
                 value="mod_contact",
                 description="Creates a private channel for you and staff if you have any problems",
@@ -85,6 +90,11 @@ class _HelpMenuSelect(discord.ui.Select):
                 label="FAQ",
                 value="faq",
                 description="Common questions and answers",
+            ),
+            discord.SelectOption(
+                label="Search FAQ",
+                value="faq_search",
+                description="Search the FAQ by keyword",
             ),
             discord.SelectOption(
                 label="Appeal punishment",
@@ -110,6 +120,11 @@ class _HelpMenuSelect(discord.ui.Select):
                 label="Request transcript",
                 value="transcript",
                 description="Request a transcript of a conversation you had with staff",
+            ),
+            discord.SelectOption(
+                label="My submissions",
+                value="submission_status",
+                description="Check recent appeals, reports, bugs, and transcript requests",
             ),
         ]
         super().__init__(

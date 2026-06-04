@@ -76,40 +76,64 @@
 
 ## 7) Help: DM menu gating
 1. DM the bot.
-   - Expected: help menu embed + select menu.
+   - Expected: help dashboard embed + select menu.
+   - Expected: dashboard shows active ticket status, weekly activity, live request state, recent help submissions, and cooldowns.
 2. If you are currently in weekly request DM flow (pending), DM the bot.
    - Expected: help menu should NOT interrupt.
+3. Start any help flow and press `Cancel`.
+   - Expected: session is cleared and the menu/dashboard controls return.
+4. Start any help flow and press `Start over`.
+   - Expected: session is cleared and the dashboard is shown again.
 
 ---
 
 ## 8) Help: FAQ
 1. DM bot → select `FAQ`
    - Expected: embed with FAQ entries.
+2. DM bot → select `Search FAQ`, then type `request`.
+   - Expected: matching FAQ entries appear with Back/Cancel/Start Over controls.
+3. DM bot outside a flow with `faq collab`.
+   - Expected: matching FAQ entries appear directly.
 
 ---
 
 ## 9) Help: Appeal punishment
 1. DM bot → select `Appeal punishment`
 2. Reply with your punishment details.
+   - Expected: the next appeal step appears with Back/Cancel/Start Over controls.
 3. Reply with why it should be lifted.
-   - Expected: confirmation DM.
-   - Expected: structured staff-log embed posted to `channels.appeals_log_channel_id`.
+   - Expected: preview embed appears with Submit/Edit/Cancel/Start Over buttons.
+4. Press Edit.
+   - Expected: bot lets you rewrite the appeal reason before staff sees it.
+5. Press Submit.
+   - Expected: confirmation DM includes a tracked ID like `A-12`.
+   - Expected: structured staff-log embed posted to `channels.appeals_log_channel_id` with the same ID and attachment links if included.
+6. As staff, reply to the staff-log embed.
+   - Expected: bot DMs the response to the submitter and marks the log as responded.
 
 ---
 
 ## 10) Help: Report user/message
 1. DM bot → select `Report a user/message`
 2. Reply with message link or user ID + reason.
-   - Expected: confirmation DM.
+   - Expected: preview embed appears before staff sees it.
+3. Press Submit.
+   - Expected: confirmation DM includes a tracked ID like `R-12`.
    - Expected: structured staff-log embed posted to `channels.reports_log_channel_id`.
+4. Submit the exact same report again within `help.duplicate_window_hours`.
+   - Expected: bot blocks it as a duplicate.
 
 ---
 
 ## 11) Help: Report bot issue
 1. DM bot → select `Report a bot issue`
-2. Reply with the issue details.
-   - Expected: confirmation DM.
+2. Reply with the issue details and attach a screenshot if useful.
+   - Expected: preview embed appears before staff sees it and includes attachment links.
+3. Press Submit.
+   - Expected: confirmation DM includes a tracked ID like `B-12`.
    - Expected: structured staff-log embed posted to `channels.bot_issues_log_channel_id`.
+4. Submit the exact same bot issue again within `help.duplicate_window_hours`.
+   - Expected: bot blocks it as a duplicate.
 
 ---
 
@@ -121,11 +145,14 @@
 
 ## 13) Tickets: Mod contact + cooldown
 **Setup:** ticket category + mod role + logging channel.
-1. DM bot → select `Mod contact` → confirm Yes
-   - Expected: ticket channel created under category
+1. DM bot → select `Contact staff`
+   - Expected: topic buttons appear for Moderation, Level requests, Server help, Other, and Cancel.
+2. Choose `Level requests`.
+   - Expected: ticket channel created under category with the topic in the channel name/opening message.
    - Expected: perms only requester + mods
-2. Try creating another ticket within 24h
-   - Expected: blocked with cooldown message
+   - Expected: ticket creation is audit-logged.
+3. Try creating another ticket within 24h
+   - Expected: blocked with a Discord timestamp cooldown message.
 
 ---
 
@@ -148,9 +175,11 @@
 4. As a mod, press Approve
    - Expected: user receives transcript file in DM
    - Expected: request message updates to approved
+   - Expected: approval is audit-logged.
 5. Press Deny (on another request)
    - Expected: user receives denial DM
    - Expected: the request message updates without creating duplicate transcript requests.
+   - Expected: denial is audit-logged.
 
 ---
 

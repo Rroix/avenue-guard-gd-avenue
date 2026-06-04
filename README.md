@@ -63,15 +63,19 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Stores request state, request button message ID, wave count, submitted users, and submitted level IDs in SQLite so restarts do not wipe the wave.
 
 ### Help Menu And Staff Tickets
-- DMs members a persistent help menu.
+- DMs members a help dashboard with active tickets, weekly activity, live request state, recent help submissions, and cooldowns.
+- Supports Back, Cancel, and Start Over controls during active DM help flows.
+- Supports FAQ browsing and keyword search from the menu or by typing phrases like `faq request`.
 - Supports FAQ, punishment appeals, user reports, bot issue reports, weekly status checks, transcript requests, and staff contact tickets.
-- Creates private ticket channels for the requester and staff.
+- Appeals, reports, and bot issue reports show a preview before submission, keep attachment links, receive tracked IDs, and can be checked later from My submissions.
+- Staff can reply to a tracked appeal/report/bug log embed to relay a response back to the submitter by DM.
+- Creates routed private ticket channels for the requester and staff, using the selected topic in the ticket name and opening message.
 - Uses atomic ticket IDs to avoid duplicate ticket numbers during simultaneous ticket creation.
 - Caches active ticket channels so normal server messages do not hit the database for ticket checks.
 - Tracks ticket inactivity and prompts staff to close stale tickets.
 - Saves transcripts before deleting tickets.
 - Lets staff approve or deny transcript requests.
-- Posts appeals, reports, bot issues, transcript requests, ticket transcripts, and bot errors as structured staff-log embeds.
+- Posts appeals, reports, bot issues, transcript requests, ticket transcripts, and bot errors as structured staff-log embeds with safe mention behavior and audit logs.
 
 ### Forum And Sticky Automation
 - Posts sticky reminder messages at the bottom of configured text channels.
@@ -185,7 +189,7 @@ Use `off`, `disable`, `none`, or `clear` as the word to disable enforcement for 
 
 - `config.json` controls guild IDs, roles, channels, live request waves, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, and background summaries.
 - `responses.json` controls automatic message responses.
-- `data/bot.db` stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, tickets, cooldowns, transcript pointers, reminders, and daily stats.
+- `data/bot.db` stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, help submissions, tickets, cooldowns, transcript pointers, reminders, and daily stats.
 
 ### Level Request Config
 

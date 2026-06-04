@@ -225,6 +225,9 @@
     },
     "report_warning_enabled": true,
     "max_submission_chars": 3000,
+    "duplicate_window_hours": 24,
+    "flow_start_window_seconds": 60,
+    "max_flow_starts_per_window": 6,
     "_comment_cooldowns": "Help action cooldowns are enforced in code: appeal=48h, report_user=24h, bot_issue=6h, transcript=8h."
   },
   "level_requests": {

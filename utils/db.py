@@ -181,6 +181,21 @@ class Database:
                 last_used_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, user_id, action)
             );""",
+            """CREATE TABLE IF NOT EXISTS help_submissions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL,
+                log_channel_id INTEGER,
+                log_message_id INTEGER,
+                data_json TEXT NOT NULL DEFAULT '{}',
+                response_text TEXT,
+                responded_by INTEGER,
+                responded_ts INTEGER
+            );""",
             """CREATE TABLE IF NOT EXISTS transcript_requests(
                 guild_id INTEGER NOT NULL,
                 request_message_id INTEGER PRIMARY KEY,
@@ -292,6 +307,10 @@ class Database:
                 ON weekly_request_reviews(guild_id, status, week_start);""",
             """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status
                 ON transcript_requests(guild_id, ticket_id, status);""",
+            """CREATE INDEX IF NOT EXISTS idx_help_submissions_user_status
+                ON help_submissions(guild_id, user_id, status, created_ts DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_help_submissions_log_message
+                ON help_submissions(guild_id, log_channel_id, log_message_id);""",
         ]
         for stmt in stmts:
             self._conn.execute(stmt)
@@ -312,6 +331,9 @@ class Database:
         self._ensure_column_sync("weekly_request_reviews", "reviewed_by", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "reviewed_ts", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "data_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column_sync("help_submissions", "response_text", "TEXT")
+        self._ensure_column_sync("help_submissions", "responded_by", "INTEGER")
+        self._ensure_column_sync("help_submissions", "responded_ts", "INTEGER")
         self._ensure_column_sync("level_request_wave_summaries", "channel_id", "INTEGER")
         self._ensure_column_sync("level_request_wave_summaries", "message_id", "INTEGER")
         self._ensure_column_sync("level_request_wave_summaries", "created_ts", "INTEGER")
@@ -506,6 +528,21 @@ class Database:
                 last_used_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, user_id, action)
             );""",
+            """CREATE TABLE IF NOT EXISTS help_submissions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL,
+                log_channel_id INTEGER,
+                log_message_id INTEGER,
+                data_json TEXT NOT NULL DEFAULT '{}',
+                response_text TEXT,
+                responded_by INTEGER,
+                responded_ts INTEGER
+            );""",
             """CREATE TABLE IF NOT EXISTS transcript_requests(
                 guild_id INTEGER NOT NULL,
                 request_message_id INTEGER PRIMARY KEY,
@@ -617,6 +654,10 @@ class Database:
                 ON weekly_request_reviews(guild_id, status, week_start);""",
             """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status
                 ON transcript_requests(guild_id, ticket_id, status);""",
+            """CREATE INDEX IF NOT EXISTS idx_help_submissions_user_status
+                ON help_submissions(guild_id, user_id, status, created_ts DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_help_submissions_log_message
+                ON help_submissions(guild_id, log_channel_id, log_message_id);""",
         ]
         for s in stmts:
             await self.execute(s)
@@ -638,6 +679,9 @@ class Database:
         await self._ensure_column("weekly_request_reviews", "reviewed_by", "INTEGER")
         await self._ensure_column("weekly_request_reviews", "reviewed_ts", "INTEGER")
         await self._ensure_column("weekly_request_reviews", "data_json", "TEXT NOT NULL DEFAULT '{}'")
+        await self._ensure_column("help_submissions", "response_text", "TEXT")
+        await self._ensure_column("help_submissions", "responded_by", "INTEGER")
+        await self._ensure_column("help_submissions", "responded_ts", "INTEGER")
         await self._ensure_column("level_request_wave_summaries", "channel_id", "INTEGER")
         await self._ensure_column("level_request_wave_summaries", "message_id", "INTEGER")
         await self._ensure_column("level_request_wave_summaries", "created_ts", "INTEGER")
