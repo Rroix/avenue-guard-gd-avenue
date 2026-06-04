@@ -34,6 +34,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Admins can open request waves with `/open-requests`.
 - Admins can schedule future request openings with `/open-requests when:<HH:MM> day:<optional>`.
 - Admins can list, edit, delete, refresh, or immediately open scheduled openings from the `/pending-openings` interactive panel.
+- “Open now” asks for confirmation if requests are already open, and automatic scheduled openings will not silently replace an active wave.
 - Admins can close request waves with `/close-requests`.
 - Anyone can check the current state with `/requests-are`.
 - Supports open, closed, limited-count, timed, and indefinite request waves.
@@ -41,6 +42,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Blocks duplicate users and duplicate level IDs inside the same wave.
 - Warns staff when a submitted level ID has appeared in previous waves.
 - Validates level IDs as 7 to 9 digits, validates showcase links as URLs, and checks level existence through GDBrowser plus the direct GD/Boomlings endpoint.
+- Reuses one validation HTTP session, rate-limits validation attempts per user, and temporarily backs off providers that fail repeatedly.
 - Auto-rejects confidently missing level IDs while surfacing uncertain validation warnings to reviewers.
 - Warns reviewers when a level appears rated, when validation sources disagree, or when validation will refresh after the configured cache time.
 - Automatically requires a showcase URL when validation detects a demon or platformer.
@@ -76,6 +78,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Sends first-message reminder embeds in configured forum channels.
 - Supports tag-specific forum reminder embeds.
 - Can enforce a required word in forum post title/body.
+- Required-word matching supports `contains`, `whole_word`, and `regex` modes with basic text normalization.
 - If the required word is missing, Avenue Guard DMs the thread owner and deletes the forum thread.
 - Admins can view or change the required word with `/forum required_word`.
 
@@ -85,10 +88,12 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Supports plain messages or embeds.
 - Supports channel filters and per-user cooldowns.
 - Stops after the first matching rule.
+- Blocks mass mentions from configured auto-responses and caps configured response length.
 
 ### Background Utilities
 - `/bot health` shows database, background task, request, ticket, and weekly workflow status.
-- `/bot config_check` validates configured channels, roles, and request embed template variables.
+- `/bot config_check` validates configured channels, roles, request embed template variables, and `responses.json` rule shape/channel references.
+- `/bot doctor` runs deeper permission diagnostics for channels, ticket category access, managed role hierarchy, and request-button state.
 - `/requests pending` shows and filters pending live-wave and weekly request reviews.
 - Optional rotating bot status with placeholders like `{members}`, `{online}`, `{week_msgs}`, `{week_top}`, `{open_tickets}`, and `{today_msgs}`.
 - Optional daily server summary embeds with highlights, day-over-day movement, active members/channels, moderation signals, command health, voice/presence, and top channels/members/commands.
@@ -111,7 +116,8 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/tracking disable_reward` disables the automatic weekly request reward for the current tracking week.
 - `/tracking enable_reward` re-enables the automatic weekly request reward for the current tracking week.
 - `/bot health` shows a compact live health report.
-- `/bot config_check` checks configured channels, roles, and request template variables.
+- `/bot config_check` checks configured channels, roles, request template variables, and `responses.json`.
+- `/bot doctor` runs deep permission diagnostics.
 - `/requests pending scope:<optional> status:<optional> wave:<optional>` shows filtered live and weekly request reviews.
 - `/requests history message_id:<optional> user_id:<optional> wave:<optional>` shows the edit audit trail for a live-wave request.
 - `/requests repair` runs request-system recovery and message refresh tasks.
@@ -137,6 +143,7 @@ Example:
 {
   "forum_channel_id": "1104487618026143754",
   "required_word": "cubical",
+  "required_word_match_mode": "contains",
   "missing_required_word_dm": "Your thread \"{thread_name}\" was removed because it did not include \"{required_word}\".",
   "required_word_delete_delay_seconds": 5,
   "templates": {
@@ -158,6 +165,12 @@ To change the word without editing files, use:
 
 ```text
 /forum required_word word:cubical
+```
+
+To use stricter matching:
+
+```text
+/forum required_word word:cubical match_mode:whole_word
 ```
 
 If multiple forum channels are configured, provide the forum channel ID:
@@ -190,6 +203,8 @@ Set these before opening requests:
 - `request_post_close_edit_minutes`: how long users may keep editing pending requests after the wave closes.
 - `level_validation.enabled`: enables GDBrowser plus GD/Boomlings existence/rating/showcase checks.
 - `level_validation.cache_seconds`: how long validation warnings stay fresh before repair or the next submission refreshes them.
+- `level_validation.per_user_cooldown_seconds`, `per_user_window_seconds`, and `per_user_max_checks`: protect validation from spam.
+- `level_validation.provider_failure_threshold` and `provider_circuit_breaker_seconds`: pause failing validation providers briefly.
 - `level_validation.auto_reject_missing`: blocks the modal when enabled sources confidently agree that the ID is missing.
 
 The same section controls the request button text, all user-facing messages, request/review/result embed templates, wave summary embed, weekly request embeds, duplicate-history warnings, validation warnings, aging fields, edit-audit counters, and final-result colors.

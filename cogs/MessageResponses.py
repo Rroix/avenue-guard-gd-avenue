@@ -9,12 +9,16 @@ import discord
 from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, basic_color
+from utils.errors import log_error
+from utils.mentions import no_mentions
 
 class MessageResponsesCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
         self._rules: List[Dict[str, Any]] = []
         self._cooldown: Dict[int, float] = {}
+        self._last_rule_error_log: Dict[str, float] = {}
+        self._load_error = ""
         self.load_rules()
 
     def load_rules(self) -> None:
@@ -23,20 +27,56 @@ class MessageResponsesCog(commands.Cog):
         p = Path(path)
         if not p.exists():
             self._rules = []
+            self._load_error = f"{path} does not exist"
             return
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, list):
                 # strip pseudo-comments at rule-level
                 self._rules = [{k: v for k, v in r.items() if not str(k).startswith("_")} for r in data if isinstance(r, dict)]
+                self._load_error = ""
             else:
                 self._rules = []
-        except Exception:
+                self._load_error = f"{path} must contain a list of rules"
+        except Exception as e:
             self._rules = []
+            self._load_error = f"{path} could not be parsed: {type(e).__name__}"
 
     def on_config_reload(self) -> None:
         self.load_rules()
         self._cooldown.clear()
+
+    def _max_response_chars(self) -> int:
+        try:
+            return max(100, min(2000, int(self.bot.config.get("responses", "max_response_chars", default=1600) or 1600)))
+        except Exception:
+            return 1600
+
+    async def _log_rule_error(self, key: str, message: str) -> None:
+        now = time.time()
+        if now - self._last_rule_error_log.get(key, 0.0) < 300:
+            return
+        self._last_rule_error_log[key] = now
+        await log_error(self.bot, message)
+
+    def validate_rules(self) -> list[str]:
+        issues: list[str] = []
+        if self._load_error:
+            issues.append(self._load_error)
+        for idx, rule in enumerate(self._rules, start=1):
+            trigger = str(rule.get("Content", "") or "").strip()
+            if not trigger:
+                issues.append(f"Rule #{idx}: missing trigger content")
+            if bool(rule.get("Embed", False)):
+                embed_text = rule.get("Embed_text", {})
+                if not isinstance(embed_text, dict):
+                    issues.append(f"Rule #{idx}: Embed_text must be an object")
+            if bool(rule.get("Message", False)) and not str(rule.get("Message_text", "") or "").strip():
+                issues.append(f"Rule #{idx}: Message enabled but Message_text is empty")
+            channels = rule.get("Channels", [])
+            if channels and not isinstance(channels, list):
+                issues.append(f"Rule #{idx}: Channels must be a list")
+        return issues
 
     def _cooldown_ok(self, user_id: int) -> bool:
         cfg = self.bot.config
@@ -106,19 +146,20 @@ class MessageResponsesCog(commands.Cog):
                     color = basic_color(str(et.get("color", "") or ""))
                     embed = discord.Embed(title=title or None, description=desc or None, color=color)
                     if respond:
-                        await message.reply(embed=embed, mention_author=False)
+                        await message.reply(embed=embed, mention_author=False, allowed_mentions=no_mentions())
                     else:
-                        await message.channel.send(embed=embed)
+                        await message.channel.send(embed=embed, allowed_mentions=no_mentions())
                 elif use_msg:
-                    text = str(rule.get("Message_text", "") or "")
+                    text = str(rule.get("Message_text", "") or "")[: self._max_response_chars()]
                     if respond:
-                        await message.reply(text, mention_author=False)
+                        await message.reply(text, mention_author=False, allowed_mentions=no_mentions())
                     else:
-                        await message.channel.send(text)
+                        await message.channel.send(text, allowed_mentions=no_mentions())
 
                 # first match only
                 break
-            except Exception:
+            except Exception as e:
+                await self._log_rule_error(str(rule.get("Content", ""))[:80], f"Message response rule failed: {repr(e)}")
                 continue
 
 def setup(bot: discord.Bot):

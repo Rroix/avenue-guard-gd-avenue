@@ -12,12 +12,11 @@ from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, is_mod
 from utils.errors import log_error
+from utils.mentions import user_and_role_mentions, user_mentions
 from utils.views import HelpMenuView, HelpModConfirmView, TicketClosePromptView, TranscriptRequestView
 from utils.transcript import build_text_transcript
 from utils.timeutils import now_madrid, week_start_sunday
 
-
-pinged_role_for_tickets = "<@&1462403598028640296>"
 
 def _format_duration(seconds: int) -> str:
     seconds = max(0, int(seconds))
@@ -370,6 +369,12 @@ class HelpCog(commands.Cog):
             data = {}
         return {"stage": str(row["stage"]), "data": data}
 
+    def _help_max_submission_chars(self) -> int:
+        try:
+            return max(500, min(5000, int(self.bot.config.get("help", "max_submission_chars", default=3000) or 3000)))
+        except Exception:
+            return 3000
+
     async def _handle_help_session_message(self, guild: discord.Guild, message: discord.Message) -> bool:
         sess = await self._get_help_session(message.author.id, guild.id)
         if not sess:
@@ -382,6 +387,10 @@ class HelpCog(commands.Cog):
         if content.casefold() in {"cancel", "stop", "never mind", "nevermind"}:
             await self._clear_help_session(message.author.id, guild.id)
             await message.channel.send("Cancelled.")
+            return True
+
+        if len(content) > self._help_max_submission_chars():
+            await message.channel.send(f"That message is too long. Please keep it under {self._help_max_submission_chars()} characters.")
             return True
 
         if stage == "appeal_punishment":
@@ -630,7 +639,8 @@ class HelpCog(commands.Cog):
 
         mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID") or 0
         member = interaction.guild.get_member(interaction.user.id)
-        if member is None or not is_mod(member, mod_role_id):
+        allow_manage_guild = bool(cfg.get("permissions", "manage_guild_counts_as_mod", default=True))
+        if member is None or not is_mod(member, mod_role_id, allow_manage_guild=allow_manage_guild):
             return await interaction.response.send_message("Only mods can do that.", ephemeral=True)
 
         row = await self.bot.db.fetchone(
@@ -810,7 +820,13 @@ class HelpCog(commands.Cog):
             pass
 
         try:
-            await channel.send(f"Please say what you need {member.mention}, {pinged_role_for_tickets if pinged_role_for_tickets else 'staff'} will be shortly with you ;)")
+            staff_role_id = cfg.get_int("tickets", "staff_ping_role_id", default=0)
+            staff_role = guild.get_role(staff_role_id) if staff_role_id else None
+            staff_ping = staff_role.mention if staff_role else "staff"
+            await channel.send(
+                f"Please say what you need {member.mention}, {staff_ping} will be shortly with you ;)",
+                allowed_mentions=user_and_role_mentions() if staff_role else user_mentions(),
+            )
         except Exception:
             pass
 
@@ -826,7 +842,8 @@ class HelpCog(commands.Cog):
         mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID")
         if mod_role_id:
             member = interaction.guild.get_member(interaction.user.id)
-            if member is None or not is_mod(member, mod_role_id):
+            allow_manage_guild = bool(cfg.get("permissions", "manage_guild_counts_as_mod", default=True))
+            if member is None or not is_mod(member, mod_role_id, allow_manage_guild=allow_manage_guild):
                 return await interaction.response.send_message("Only staff can close tickets", ephemeral=True)
 
         if not confirmed:

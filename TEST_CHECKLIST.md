@@ -59,7 +59,7 @@
 2. Run `/tracking disable_reward` as an admin.
    - Expected: bot confirms the current tracking week reward is disabled.
 3. Run `/tracking force_dm` for the same week after disabling reward.
-   - Expected: bot refuses because weekly reward DMs are disabled for that tracking week.
+   - Expected: bot still sends the manual weekly request DM unless the user already has a claim status.
    - Expected: the weekly request log embed has a clear title, event field, week, member context, and readable details.
 4. Run `/tracking enable_reward` as an admin.
    - Expected: bot confirms the current tracking week reward is enabled again.
@@ -67,6 +67,10 @@
    - Expected: bot allows the manual weekly request DM again unless the user already has a claim status.
 6. Run `/tracking force_dm` for a member with an excluded tracking role.
    - Expected: bot still sends the manual weekly request DM unless that member already has a claim status.
+7. Submit a weekly request DM with an invalid level ID or bad showcase URL.
+   - Expected: bot DMs a validation error and does not post a staff review embed.
+8. Submit a weekly request DM with a missing level ID that both validation providers agree is missing.
+   - Expected: bot DMs a validation error and keeps the weekly claim/session active for correction.
 
 ---
 
@@ -169,6 +173,8 @@
    - Expected: bot DMs the thread owner using `missing_required_word_dm`, then deletes the thread.
 4. Create a post that includes the configured `required_word`.
    - Expected: the thread remains open.
+5. Run `/forum required_word word:<word> match_mode:whole_word` and create a post where the word only appears inside another word.
+   - Expected: bot treats it as missing and deletes after the configured delay.
 
 ---
 
@@ -176,7 +182,11 @@
 1. As admin/owner, edit config FAQ text or `responses.json`.
 2. Run `/resync`
    - Expected: bot picks up changes without restart.
-3. Run `/restart`
+3. Run `/bot doctor`
+   - Expected: bot reports channel permissions, ticket category permissions, managed role hierarchy, and request-button state.
+4. Run `/bot config_check`
+   - Expected: bot checks configured channels, roles, request templates, and `responses.json` rules.
+5. Run `/restart`
    - Expected: bot exits; Render restarts service.
 
 ---
@@ -222,53 +232,57 @@
     - Expected: modal is rejected with the configured showcase-required message.
 13. Submit the same demon or platformer with a valid showcase URL.
     - Expected: request is accepted; staff embed includes a compact GD Info field with difficulty, length, stars/status, detected flags, plus the validation source summary and refresh timing.
-14. Run `/edit-request` while the wave is still open.
+14. Submit several different IDs quickly from the same user.
+    - Expected: validation rate-limit message appears once the configured limit/cooldown is reached.
+15. Run `/edit-request` while the wave is still open.
     - Expected: modal opens and editing updates the original staff embed instead of creating a new request.
-15. Press the request button again while the wave is still open.
+16. Press the request button again while the wave is still open.
     - Expected: the same prefilled edit modal opens instead of starting a second request.
-16. Run `/requests history message_id:<request message id>` as a judge, head judge, mod, or admin after an edit.
+17. Run `/requests history message_id:<request message id>` as a judge, head judge, mod, or admin after an edit.
     - Expected: an ephemeral audit embed shows the changed form fields with old and new values.
-17. Close the wave, then run `/edit-request` or press the request button within 5 minutes.
+18. Close the wave, then run `/edit-request` or press the request button within 5 minutes.
     - Expected: the prefilled edit modal still opens and updates the original staff embed.
-18. Run `/edit-request` or press the request button more than 5 minutes after requests close.
+19. Run `/edit-request` or press the request button more than 5 minutes after requests close.
     - Expected: edit is refused.
-19. Try submitting again in the same wave.
+20. Try submitting again in the same wave.
    - Expected: duplicate-user message; no new staff embed.
-20. Have another user submit the same level ID in the same wave.
+21. Have another user submit the same level ID in the same wave.
     - Expected: duplicate-level message; no new staff embed.
-21. Submit a level ID that was used in an earlier wave but not in the current wave.
+22. Submit a level ID that was used in an earlier wave but not in the current wave.
     - Expected: request is allowed and the staff embed includes a history warning.
-22. Submit enough successful requests to hit the `number` limit.
+23. Submit enough successful requests to hit the `number` limit.
     - Expected: requests close automatically and the request embed changes to closed.
     - Expected: one wave summary embed appears in `level_requested`.
-23. Open requests with only `time:1`.
+24. Open requests with only `time:1`.
     - Expected: requests close automatically after the timer expires.
-24. Open requests without `number` or `time`, then run `/close-requests`.
+25. Open requests without `number` or `time`, then run `/close-requests`.
     - Expected: requests close manually and the embed changes to closed.
-25. Run `/open-requests when:18:30 day:0` as an admin.
+26. Run `/open-requests when:18:30 day:0` as an admin.
     - Expected: bot schedules the opening and replies with Discord absolute and relative timestamps.
     - Expected: command options explain that `when` is Madrid `HH:MM`, `day` is optional, and `time` is the close timer in minutes.
-26. Run `/pending-openings action:list`.
+27. Run `/pending-openings action:list`.
     - Expected: scheduled openings list includes ID, time, limit, close timer, and creator, plus selector/buttons for refresh, edit, delete, and open now.
-27. Use the `/pending-openings` panel `Edit` button.
+28. Use the `/pending-openings` panel `Edit` button.
     - Expected: modal opens with the scheduled time, day, limit, and close timer prefilled.
-28. Run `/pending-openings action:edit opening_id:<id> number:3 time:10 when:19:00`.
+29. Press `Open now` while another request wave is already open.
+    - Expected: bot asks for confirmation before creating a new wave.
+30. Run `/pending-openings action:edit opening_id:<id> number:3 time:10 when:19:00`.
     - Expected: the scheduled opening updates.
-29. Run `/pending-openings action:delete opening_id:<id>`.
+31. Run `/pending-openings action:delete opening_id:<id>`.
     - Expected: the scheduled opening is removed from the pending list.
-30. Run `/requests pending scope:current_wave status:pending` as a judge or head judge.
+32. Run `/requests pending scope:current_wave status:pending` as a judge or head judge.
     - Expected: current-wave unreviewed requests are listed with jump links and submission age.
-31. On a pending staff request embed, press `Send` as a judge/head judge.
+33. On a pending staff request embed, press `Send` as a judge/head judge.
     - Expected: review modal opens; submitted review edits the staff embed, disables all buttons, and posts a pinged result in `sent_channel`.
     - Expected: the wave summary updates reviewed/sent/left-to-review counts, percentages, and reviewer stats.
-32. Press `Send`, `Reject`, or `Other` as someone without a reviewer role.
+34. Press `Send`, `Reject`, or `Other` as someone without a reviewer role.
     - Expected: ephemeral permission denial and no request update.
-33. On another pending staff request embed, press `Reject`.
+35. On another pending staff request embed, press `Reject`.
     - Expected: review modal opens; submitted review edits the staff embed, disables all buttons, and posts a pinged result in `rejected_channel`.
     - Expected: the wave summary updates reviewed/not-sent/left-to-review counts, percentages, and reviewer stats.
-34. On another pending staff request embed, press `Other`.
+36. On another pending staff request embed, press `Other`.
     - Expected: ephemeral options appear for `Level doesn't exist`, `Stolen level`, and `Already rated`.
-35. Choose each `Other` reason on separate requests.
+37. Choose each `Other` reason on separate requests.
     - Expected: staff embed color/result updates, buttons disable, and a pinged result appears in `rejected_channel`.
     - Expected: the wave summary updates the not-sent breakdown.
 

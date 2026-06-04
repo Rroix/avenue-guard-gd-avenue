@@ -10,8 +10,10 @@ def member_has_any_role(member: discord.Member, role_ids: Iterable[int]) -> bool
 def is_admin_or_owner(member: discord.Member, admin_role_ids: List[int]) -> bool:
     return member_has_any_role(member, admin_role_ids) or member.guild_permissions.administrator
 
-def is_mod(member: discord.Member, mod_role_id: int) -> bool:
-    return any(r.id == mod_role_id for r in getattr(member, "roles", [])) or member.guild_permissions.manage_guild
+def is_mod(member: discord.Member, mod_role_id: int, allow_manage_guild: bool = True) -> bool:
+    return any(r.id == mod_role_id for r in getattr(member, "roles", [])) or (
+        allow_manage_guild and member.guild_permissions.manage_guild
+    )
 
 def ensure_allowed_guild_id(guild: Optional[discord.Guild], allowed_guild_id: int) -> bool:
     return guild is not None and guild.id == allowed_guild_id

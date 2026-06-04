@@ -12,6 +12,7 @@ import discord
 from discord.ext import commands
 
 from utils.checks import is_admin_or_owner, is_mod
+from utils.mentions import no_mentions
 from utils.timeutils import now_madrid, week_start_sunday
 from utils.errors import log_error
 
@@ -36,6 +37,7 @@ class CommandsCog(commands.Cog):
         # register commands
         self.bot_group.command(name="health", description="Show bot health and live system status")(self.bot_health)
         self.bot_group.command(name="config_check", description="Check configured channels and roles")(self.bot_config_check)
+        self.bot_group.command(name="doctor", description="Run deep bot permission diagnostics")(self.bot_doctor)
 
         self.tracking_group.command(name="top", description="Show the current week's top 20 active members")(self.tracking_top)
         self.tracking_group.command(name="reset", description="Reset current week's tracking stats")(self.tracking_reset)
@@ -91,6 +93,26 @@ class CommandsCog(commands.Cog):
         except Exception:
             return await ctx.respond(*args, **kwargs)
 
+    async def _log_admin_action(self, guild: discord.Guild, user_id: int, action: str, detail: str = "") -> None:
+        channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            return
+        embed = discord.Embed(
+            title="Admin Action",
+            description=str(action).replace("_", " ").title(),
+            color=discord.Color.blurple(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(name="Admin", value=f"<@{int(user_id)}>\n`{int(user_id)}`", inline=True)
+        embed.add_field(name="Action", value=f"`{str(action)[:120]}`", inline=True)
+        if detail:
+            embed.add_field(name="Details", value=str(detail)[:1024], inline=False)
+        try:
+            await channel.send(embed=embed, allowed_mentions=no_mentions())
+        except Exception as e:
+            await log_error(self.bot, f"Could not log admin action {action}: {repr(e)}")
+
     async def _is_admin_ctx(self, ctx: discord.ApplicationContext) -> bool:
         if ctx.guild is None:
             return False
@@ -103,7 +125,8 @@ class CommandsCog(commands.Cog):
             return False
         member = await self._resolve_member(ctx.guild, ctx.user)
         mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
-        return member is not None and is_mod(member, mod_role_id)
+        allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
+        return member is not None and is_mod(member, mod_role_id, allow_manage_guild=allow_manage_guild)
 
     def _request_reviewer_role_ids(self) -> list[int]:
         configured = self.bot.config.get_int_list("level_requests", "reviewer_role_ids")
@@ -115,7 +138,8 @@ class CommandsCog(commands.Cog):
         member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None:
             return False
-        if is_mod(member, self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0):
+        allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
+        if is_mod(member, self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0, allow_manage_guild=allow_manage_guild):
             return True
         if is_admin_or_owner(member, self.bot.config.get_int_list("roles", "admin_owner_role_ids")):
             return True
@@ -217,6 +241,120 @@ class CommandsCog(commands.Cog):
             ),
             inline=False,
         )
+        await self._send(ctx, embed=embed, ephemeral=True)
+
+    async def bot_doctor(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_admin_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+
+        await self._defer(ctx, ephemeral=True)
+        guild = ctx.guild
+        cfg = self.bot.config
+        me = guild.me or guild.get_member(self.bot.user.id)
+        issues: list[str] = []
+        ok: list[str] = []
+        if me is None:
+            issues.append("bot member: could not resolve bot member in guild")
+
+        def channel_perm_report(label: str, channel_id: int, required: tuple[str, ...]):
+            if me is None:
+                return
+            if not channel_id:
+                issues.append(f"{label}: not configured")
+                return
+            channel = guild.get_channel(int(channel_id))
+            if channel is None:
+                issues.append(f"{label}: channel `{channel_id}` missing")
+                return
+            perms = channel.permissions_for(me)
+            missing = [perm for perm in required if not bool(getattr(perms, perm, False))]
+            if missing:
+                issues.append(f"{label}: missing {', '.join(missing)}")
+            else:
+                ok.append(f"{label}: OK")
+
+        common_text_perms = ("view_channel", "send_messages", "embed_links", "read_message_history")
+        channel_checks = {
+            "general logs": cfg.get_int("channels", "general_logging_channel_id"),
+            "global errors": cfg.get_int("channels", "global_error_log_channel_id"),
+            "weekly requests": cfg.get_int("channels", "weekly_request_channel_ID"),
+            "request button": cfg.get_int("level_requests", "request_channel"),
+            "level requested": cfg.get_int("level_requests", "level_requested"),
+            "sent results": cfg.get_int("level_requests", "sent_channel"),
+            "rejected results": cfg.get_int("level_requests", "rejected_channel"),
+            "appeals logs": cfg.get_int("channels", "appeals_log_channel_id"),
+            "reports logs": cfg.get_int("channels", "reports_log_channel_id"),
+            "bugs logs": cfg.get_int("channels", "bot_issues_log_channel_id"),
+            "transcript requests": cfg.get_int("channels", "transcript_requests_channel_id"),
+        }
+        for label, channel_id in channel_checks.items():
+            channel_perm_report(label, channel_id, common_text_perms)
+
+        category_id = cfg.get_int("tickets", "ticket_category_id")
+        category = guild.get_channel(category_id) if category_id else None
+        if me is None:
+            pass
+        elif isinstance(category, discord.CategoryChannel):
+            perms = category.permissions_for(me)
+            missing = [perm for perm in ("view_channel", "manage_channels") if not bool(getattr(perms, perm, False))]
+            if missing:
+                issues.append(f"ticket category: missing {', '.join(missing)}")
+            else:
+                ok.append("ticket category: OK")
+        else:
+            issues.append("ticket category: missing or wrong type")
+
+        bot_top_role = getattr(me, "top_role", None) if me is not None else None
+        managed_role_ids = [
+            cfg.get_int("roles", "restriction_role_ID"),
+            cfg.get_int("level_requests", "has_requested_role_id"),
+            cfg.get_int("level_requests", "request_banned_role_id"),
+            cfg.get_int("roles", "gambling_reward_role_id"),
+            cfg.get_int("roles", "rps_streak_role_id"),
+        ]
+        for role_id in [role_id for role_id in managed_role_ids if role_id]:
+            role = guild.get_role(int(role_id))
+            if role is None:
+                issues.append(f"managed role `{role_id}`: missing")
+                continue
+            if bot_top_role is None:
+                issues.append(f"{role.name}: bot role hierarchy could not be checked")
+            elif role >= bot_top_role:
+                issues.append(f"{role.name}: bot role is not above this role")
+            else:
+                ok.append(f"{role.name}: role hierarchy OK")
+
+        staff_ping_role_id = cfg.get_int("tickets", "staff_ping_role_id", default=0)
+        if staff_ping_role_id:
+            if guild.get_role(staff_ping_role_id) is None:
+                issues.append(f"ticket staff ping role `{staff_ping_role_id}`: missing")
+            else:
+                ok.append("ticket staff ping role: OK")
+
+        request_cog = self.bot.get_cog("RequestLevelsCog")
+        if request_cog is None:
+            issues.append("RequestLevelsCog: not loaded")
+        else:
+            state = await request_cog._get_state(guild.id)
+            if not state:
+                issues.append("request state: missing database row")
+            elif not state["request_message_id"]:
+                issues.append("request button: no saved message ID; run /refresh-request-button")
+            else:
+                ok.append("request state: OK")
+
+        embed = discord.Embed(
+            title="Bot Doctor",
+            description=f"Deep diagnostics finished. **{len(ok)}** checks OK, **{len(issues)}** issues.",
+            color=discord.Color.green() if not issues else discord.Color.orange(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(name="Issues", value="\n".join(f"- {item}" for item in issues[:12])[:1024] or "No issues found.", inline=False)
+        embed.add_field(name="Healthy Checks", value="\n".join(f"- {item}" for item in ok[:12])[:1024] or "No healthy checks recorded.", inline=False)
+        if len(issues) > 12 or len(ok) > 12:
+            embed.set_footer(text=f"Showing first 12 issues and first 12 healthy checks.")
         await self._send(ctx, embed=embed, ephemeral=True)
 
     def _template_variables(self, text: str) -> tuple[set[str], Optional[str]]:
@@ -454,6 +592,9 @@ class CommandsCog(commands.Cog):
             check_channel(f"channels.{key}", cfg.get_int("channels", key), discord.TextChannel)
 
         check_channel("tickets.ticket_category_id", cfg.get_int("tickets", "ticket_category_id"), discord.CategoryChannel)
+        staff_ping_role_id = cfg.get_int("tickets", "staff_ping_role_id", default=0)
+        if staff_ping_role_id:
+            check_role("tickets.staff_ping_role_id", staff_ping_role_id)
         for key in ("request_channel", "level_requested", "sent_channel", "rejected_channel"):
             check_channel(f"level_requests.{key}", cfg.get_int("level_requests", key), discord.TextChannel)
 
@@ -470,6 +611,32 @@ class CommandsCog(commands.Cog):
         for idx, role_id in enumerate(self._request_reviewer_role_ids(), start=1):
             check_role(f"level_requests.reviewer_role_ids[{idx}]", role_id)
         ok_count += self._validate_request_templates(issues)
+
+        responses_cog = self.bot.get_cog("MessageResponsesCog")
+        if responses_cog is not None and hasattr(responses_cog, "validate_rules"):
+            response_issues = responses_cog.validate_rules()
+            issues.extend(f"responses.json: {item}" for item in response_issues[:10])
+            rules = getattr(responses_cog, "_rules", []) or []
+            for idx, rule in enumerate(rules, start=1):
+                if not isinstance(rule, dict):
+                    continue
+                channels = rule.get("Channels", [])
+                if isinstance(channels, list):
+                    for raw_channel_id in channels:
+                        if not str(raw_channel_id or "").strip():
+                            continue
+                        try:
+                            channel_id = int(str(raw_channel_id).strip())
+                        except Exception:
+                            issues.append(f"responses.json rule #{idx}: invalid channel `{raw_channel_id}`")
+                            continue
+                        if guild.get_channel(channel_id) is None:
+                            issues.append(f"responses.json rule #{idx}: missing channel `<#{channel_id}>`")
+                        else:
+                            ok_count += 1
+            ok_count += max(0, len(rules) - len(response_issues))
+        elif cfg.get_str("responses", "rules_path", default="responses.json"):
+            issues.append("responses.json: MessageResponsesCog is not loaded")
 
         entries = cfg.get("forum_first_message", "entries", default=[]) or []
         if isinstance(entries, list):
@@ -596,6 +763,12 @@ class CommandsCog(commands.Cog):
 
         await self._defer(ctx, ephemeral=True)
         result = await cog.repair_request_system(ctx.guild)
+        await self._log_admin_action(
+            ctx.guild,
+            ctx.user.id,
+            "requests_repair",
+            f"pending_recreated={result.get('pending_messages_recreated', 0)} errors={len(result.get('errors') or [])}",
+        )
         embed = discord.Embed(title="Request System Repair", color=discord.Color.green() if not result.get("errors") else discord.Color.orange())
         embed.add_field(name="Request button", value="refreshed" if result.get("request_button_refreshed") else "not refreshed", inline=True)
         embed.add_field(name="Wave summary", value="refreshed" if result.get("wave_summary_refreshed") else "not refreshed", inline=True)
@@ -820,6 +993,7 @@ class CommandsCog(commands.Cog):
         await self._defer(ctx, ephemeral=True)
         ws = week_start_sunday(now_madrid()).isoformat()
         ok, msg = await tracking.force_dm_for_user(ctx.guild, ws, member.id)
+        await self._log_admin_action(ctx.guild, ctx.user.id, "tracking_force_dm", f"target_user={member.id} ok={ok}")
         await self._send(ctx, msg, ephemeral=True)
 
     async def tracking_reset(self, ctx: discord.ApplicationContext):
@@ -837,6 +1011,7 @@ class CommandsCog(commands.Cog):
 
         await self._defer(ctx, ephemeral=True)
         await tracking.reset_current_week(ctx.guild.id)
+        await self._log_admin_action(ctx.guild, ctx.user.id, "tracking_reset", "current_week=true")
         await self._send(ctx, "Tracking stats for the current week have been reset.", ephemeral=True)
 
     async def tracking_disable_reward(self, ctx: discord.ApplicationContext):
@@ -853,6 +1028,7 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("Tracking cog not loaded.", ephemeral=True)
 
         week_start_iso = await tracking.disable_weekly_reward_for_current_week(ctx.guild, ctx.user.id)
+        await self._log_admin_action(ctx.guild, ctx.user.id, "tracking_weekly_reward_disabled", f"week_start={week_start_iso}")
         await ctx.respond(
             f"Weekly request reward disabled for the current tracking week starting **{week_start_iso}**.",
             ephemeral=True,
@@ -872,6 +1048,12 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("Tracking cog not loaded.", ephemeral=True)
 
         week_start_iso, was_disabled = await tracking.enable_weekly_reward_for_current_week(ctx.guild, ctx.user.id)
+        await self._log_admin_action(
+            ctx.guild,
+            ctx.user.id,
+            "tracking_weekly_reward_enabled",
+            f"week_start={week_start_iso} was_disabled={was_disabled}",
+        )
         if was_disabled:
             msg = f"Weekly request reward re-enabled for the current tracking week starting **{week_start_iso}**."
         else:
@@ -885,7 +1067,8 @@ class CommandsCog(commands.Cog):
 
         member = await self._resolve_member(ctx.guild, ctx.user)
         mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
-        if member is None or not is_mod(member, mod_role_id):
+        allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
+        if member is None or not is_mod(member, mod_role_id, allow_manage_guild=allow_manage_guild):
             return await ctx.respond("Only mods can close tickets.", ephemeral=True)
 
         # ensure this is a ticket channel
@@ -988,6 +1171,7 @@ class CommandsCog(commands.Cog):
         ctx: discord.ApplicationContext,
         word: discord.Option(str, "New required word; leave blank to view, or use off/none/clear to disable", required=False, default=""),
         forum_channel_id: discord.Option(str, "Forum channel ID or mention; needed when more than one forum is configured", required=False, default=""),
+        match_mode: discord.Option(str, "Match mode: contains, whole_word, or regex", required=False, default=""),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -1003,14 +1187,20 @@ class CommandsCog(commands.Cog):
         current = str(entry.get("required_word", "") or "").strip()
         if word is None or not str(word).strip():
             display = current or "disabled"
+            mode = str(entry.get("required_word_match_mode") or "contains")
             target = f"<#{forum_id}>" if forum_id else "the selected forum"
-            return await ctx.respond(f"Current required word for {target}: **{display}**", ephemeral=True)
+            return await ctx.respond(f"Current required word for {target}: **{display}** | mode: **{mode}**", ephemeral=True)
 
         new_word = str(word).strip()
         if new_word.casefold() in {"off", "disable", "disabled", "none", "clear"}:
             new_word = ""
 
         entry["required_word"] = new_word
+        mode = str(match_mode or "").strip().casefold()
+        if mode:
+            if mode not in {"contains", "whole_word", "regex"}:
+                return await ctx.respond("Match mode must be `contains`, `whole_word`, or `regex`.", ephemeral=True)
+            entry["required_word_match_mode"] = mode
         try:
             self.bot.config.save()
         except Exception as e:
@@ -1027,6 +1217,12 @@ class CommandsCog(commands.Cog):
                     await log_error(self.bot, f"Failed to refresh StickyCog after required word update: {repr(e)}")
 
         target = f"<#{forum_id}>" if forum_id else "the selected forum"
+        await self._log_admin_action(
+            ctx.guild,
+            ctx.user.id,
+            "forum_required_word_updated",
+            f"forum_id={forum_id} enabled={bool(new_word)} match_mode={entry.get('required_word_match_mode', 'contains')}",
+        )
         if new_word:
             await ctx.respond(f"Updated required word for {target} to **{new_word}**.", ephemeral=True)
         else:
@@ -1050,15 +1246,16 @@ class CommandsCog(commands.Cog):
             if callable(fn):
                 try:
                     fn()
-                except Exception:
-                    pass
+                except Exception as e:
+                    await log_error(self.bot, f"Config reload hook failed for {cog.__class__.__name__}: {repr(e)}")
 
         # re-register persistent views
         try:
             await self.bot.register_persistent_views()
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(self.bot, f"Persistent view registration failed during resync: {repr(e)}")
 
+        await self._log_admin_action(ctx.guild, ctx.user.id, "bot_resync", "config/views/responses reloaded")
         await ctx.respond("Resynced config, views, and responses.", ephemeral=True)
 
     # --- /restart ---
@@ -1071,6 +1268,7 @@ class CommandsCog(commands.Cog):
         if member is None or not is_admin_or_owner(member, admin_roles):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
+        await self._log_admin_action(ctx.guild, ctx.user.id, "bot_restart", "manual restart command")
         await ctx.respond("Restarting...", ephemeral=True)
         tracking = self.bot.get_cog("TrackingCog")
         if tracking is not None:

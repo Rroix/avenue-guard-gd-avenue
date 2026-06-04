@@ -14,6 +14,7 @@ from discord.ext import commands
 from utils.checks import basic_color, is_admin_or_owner, is_mod, member_has_any_role
 from utils.errors import log_error
 from utils.gd_validation import combine_level_validation, fetch_boomlings_level, fetch_gdbrowser_level, validation_notice
+from utils.mentions import no_mentions, user_mentions
 from utils.timeutils import TZ, now_madrid
 from utils.views import LevelRequestButtonView, LevelRequestReviewView
 
@@ -291,6 +292,39 @@ class ScheduledOpeningsView(discord.ui.View):
         await self.cog.open_scheduled_opening_now(interaction, self.selected_id)
 
 
+class ScheduledOpenNowConfirmView(discord.ui.View):
+    def __init__(self, cog, user_id: int, opening_id: int):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.user_id = int(user_id)
+        self.opening_id = int(opening_id)
+
+    async def _allowed(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This confirmation is not for you.", ephemeral=True)
+            return False
+        if interaction.guild is None:
+            await interaction.response.send_message("Wrong server.", ephemeral=True)
+            return False
+        member = await self.cog._resolve_member(interaction.guild, interaction.user)
+        if member is None or not self.cog._is_admin(member):
+            await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm open now", style=discord.ButtonStyle.danger)
+    async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.open_scheduled_opening_now(interaction, self.opening_id, force=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await interaction.response.edit_message(content="Cancelled. The scheduled opening was not opened.", embed=None, view=None)
+
+
 class RequestLevelsCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
@@ -300,6 +334,10 @@ class RequestLevelsCog(commands.Cog):
         self._scheduled_open_task: Optional[asyncio.Task] = None
         self._submit_lock = asyncio.Lock()
         self._review_lock = asyncio.Lock()
+        self._validation_session: Optional[aiohttp.ClientSession] = None
+        self._validation_session_timeout: int = 0
+        self._validation_attempts: dict[tuple[int, int], list[int]] = {}
+        self._validation_provider_failures: dict[str, list[int]] = {}
 
         guild_ids = [self.allowed_guild_id] if self.allowed_guild_id else None
 
@@ -340,6 +378,19 @@ class RequestLevelsCog(commands.Cog):
             day: discord.Option(int, "Optional day of the month for the new opening time", required=False, default=0),
         ):
             await self.pending_openings(ctx, action, opening_id, number, time, when, day)
+
+    def cog_unload(self) -> None:
+        if self._close_task:
+            self._close_task.cancel()
+        if self._scheduled_open_task:
+            self._scheduled_open_task.cancel()
+        session = self._validation_session
+        self._validation_session = None
+        if session and not session.closed:
+            try:
+                asyncio.create_task(session.close())
+            except Exception:
+                pass
 
     async def start_background(self):
         if self._started:
@@ -525,6 +576,90 @@ class RequestLevelsCog(commands.Cog):
             "boomlings": bool(providers.get("boomlings", True)),
         }
 
+    def _level_validation_rate_limit_message(self, guild_id: int, user_id: int) -> str:
+        cfg = self._level_validation_cfg()
+        try:
+            window = max(10, int(cfg.get("per_user_window_seconds", 60)))
+        except Exception:
+            window = 60
+        try:
+            max_checks = max(1, int(cfg.get("per_user_max_checks", 6)))
+        except Exception:
+            max_checks = 6
+        try:
+            cooldown = max(0, int(cfg.get("per_user_cooldown_seconds", 20)))
+        except Exception:
+            cooldown = 20
+
+        now_ts = int(time_module.time())
+        key = (int(guild_id or 0), int(user_id or 0))
+        if len(self._validation_attempts) > 5000:
+            stale_keys = [
+                attempt_key
+                for attempt_key, timestamps in self._validation_attempts.items()
+                if not timestamps or now_ts - int(timestamps[-1]) >= window
+            ]
+            for attempt_key in stale_keys[:1000]:
+                self._validation_attempts.pop(attempt_key, None)
+        attempts = [ts for ts in self._validation_attempts.get(key, []) if now_ts - int(ts) < window]
+        if cooldown and attempts and now_ts - int(attempts[-1]) < cooldown:
+            wait = cooldown - (now_ts - int(attempts[-1]))
+            self._validation_attempts[key] = attempts
+            return f"Please wait {wait}s before validating another level ID."
+        if len(attempts) >= max_checks:
+            self._validation_attempts[key] = attempts
+            return "You are trying too many level IDs too quickly. Please wait a bit and try again."
+        attempts.append(now_ts)
+        self._validation_attempts[key] = attempts
+        return ""
+
+    def _provider_failure_cfg(self) -> tuple[int, int]:
+        cfg = self._level_validation_cfg()
+        try:
+            threshold = max(1, int(cfg.get("provider_failure_threshold", 5)))
+        except Exception:
+            threshold = 5
+        try:
+            seconds = max(30, int(cfg.get("provider_circuit_breaker_seconds", 300)))
+        except Exception:
+            seconds = 300
+        return threshold, seconds
+
+    def _provider_circuit_open(self, provider: str) -> bool:
+        threshold, seconds = self._provider_failure_cfg()
+        now_ts = int(time_module.time())
+        failures = [ts for ts in self._validation_provider_failures.get(provider, []) if now_ts - int(ts) < seconds]
+        self._validation_provider_failures[provider] = failures
+        return len(failures) >= threshold
+
+    def _record_provider_validation_result(self, provider: str, result: Dict[str, Any]) -> None:
+        now_ts = int(time_module.time())
+        if result.get("ok"):
+            self._validation_provider_failures[provider] = []
+            return
+        failures = self._validation_provider_failures.get(provider, [])
+        failures.append(now_ts)
+        _, seconds = self._provider_failure_cfg()
+        self._validation_provider_failures[provider] = [ts for ts in failures if now_ts - int(ts) < seconds]
+
+    async def _get_level_validation_session(self) -> aiohttp.ClientSession:
+        timeout_seconds = self._level_validation_timeout_seconds()
+        if (
+            self._validation_session is None
+            or self._validation_session.closed
+            or self._validation_session_timeout != timeout_seconds
+        ):
+            old_session = self._validation_session
+            if old_session and not old_session.closed:
+                try:
+                    await old_session.close()
+                except Exception:
+                    pass
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+            self._validation_session = aiohttp.ClientSession(timeout=timeout)
+            self._validation_session_timeout = timeout_seconds
+        return self._validation_session
+
     def _safe_json_loads(self, raw: Any, default: Any = None) -> Any:
         try:
             return json.loads(raw or "{}")
@@ -553,26 +688,32 @@ class RequestLevelsCog(commands.Cog):
                     pass
 
         providers = self._level_validation_providers()
-        timeout = aiohttp.ClientTimeout(total=self._level_validation_timeout_seconds())
         results: dict[str, dict[str, Any]] = {}
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            tasks = []
-            if providers.get("gdbrowser"):
+        session = await self._get_level_validation_session()
+        tasks = []
+        if providers.get("gdbrowser"):
+            if self._provider_circuit_open("gdbrowser"):
+                results["gdbrowser"] = {"provider": "gdbrowser", "ok": False, "exists": None, "error": "Circuit breaker open"}
+            else:
                 tasks.append(("gdbrowser", fetch_gdbrowser_level(session, level_id)))
-            if providers.get("boomlings"):
+        if providers.get("boomlings"):
+            if self._provider_circuit_open("boomlings"):
+                results["boomlings"] = {"provider": "boomlings", "ok": False, "exists": None, "error": "Circuit breaker open"}
+            else:
                 tasks.append(("boomlings", fetch_boomlings_level(session, level_id)))
 
-            if not tasks:
-                return {}
+        if not tasks and not results:
+            return {}
 
-            fetched = await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
-            for (provider, _), result in zip(tasks, fetched):
-                if isinstance(result, Exception):
-                    results[provider] = {"provider": provider, "ok": False, "exists": None, "error": type(result).__name__}
-                elif isinstance(result, dict):
-                    results[provider] = result
-                else:
-                    results[provider] = {"provider": provider, "ok": False, "exists": None, "error": "Unexpected result"}
+        fetched = await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
+        for (provider, _), result in zip(tasks, fetched):
+            if isinstance(result, Exception):
+                results[provider] = {"provider": provider, "ok": False, "exists": None, "error": type(result).__name__}
+            elif isinstance(result, dict):
+                results[provider] = result
+            else:
+                results[provider] = {"provider": provider, "ok": False, "exists": None, "error": "Unexpected result"}
+            self._record_provider_validation_result(provider, results[provider])
 
         expires_ts = now_ts + self._level_validation_cache_seconds()
         combined = combine_level_validation(level_id, results, checked_ts=now_ts, expires_ts=expires_ts)
@@ -668,12 +809,16 @@ class RequestLevelsCog(commands.Cog):
             data["gd_info"] = "GD info could not be confirmed right now."
         return data
 
-    async def _validate_level_external(self, data: Dict[str, str]) -> tuple[list[str], Dict[str, Any]]:
+    async def _validate_level_external(self, data: Dict[str, str], guild_id: int = 0, user_id: int = 0) -> tuple[list[str], Dict[str, Any]]:
         if not self._level_validation_enabled():
             return [], {}
         level_id = self._clean_level_id(data.get("level_id"))
         if not re.fullmatch(r"\d{7,9}", level_id):
             return [], {}
+        if guild_id and user_id:
+            rate_limited = self._level_validation_rate_limit_message(guild_id, user_id)
+            if rate_limited:
+                return [rate_limited], {}
 
         validation = await self._lookup_level_validation(level_id)
         errors: list[str] = []
@@ -742,6 +887,30 @@ class RequestLevelsCog(commands.Cog):
             await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.response.send_message(message, ephemeral=True)
+
+    async def _log_request_admin_action(self, guild: discord.Guild, user_id: int, action: str, detail: str = "") -> None:
+        channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            return
+        embed = discord.Embed(
+            title="Request Admin Action",
+            description=str(action).replace("_", " ").title(),
+            color=discord.Color.blurple(),
+            timestamp=now_madrid(),
+        )
+        if int(user_id or 0):
+            admin_value = f"<@{int(user_id)}>\n`{int(user_id)}`"
+        else:
+            admin_value = "System"
+        embed.add_field(name="Admin", value=admin_value, inline=True)
+        embed.add_field(name="Action", value=f"`{str(action)[:120]}`", inline=True)
+        if detail:
+            embed.add_field(name="Details", value=str(detail)[:1024], inline=False)
+        try:
+            await channel.send(embed=embed, allowed_mentions=no_mentions())
+        except Exception as e:
+            await log_error(self.bot, f"Could not log request admin action {action}: {repr(e)}")
 
     def _state_label(self, state: str) -> str:
         return "Opened" if state == STATE_OPEN else "Closed"
@@ -1038,6 +1207,7 @@ class RequestLevelsCog(commands.Cog):
             "UPDATE level_request_scheduled_openings SET status='deleted' WHERE guild_id=? AND id=? AND status='pending'",
             (interaction.guild.id, opening_id),
         )
+        await self._log_request_admin_action(interaction.guild, interaction.user.id, "scheduled_opening_deleted", f"opening_id={opening_id}")
         rows = await self._scheduled_opening_rows(interaction.guild.id)
         await interaction.response.edit_message(
             content=f"Deleted scheduled opening **#{opening_id}** if it was still pending.",
@@ -1045,10 +1215,17 @@ class RequestLevelsCog(commands.Cog):
             view=ScheduledOpeningsView(self, interaction.user.id, rows),
         )
 
-    async def open_scheduled_opening_now(self, interaction: discord.Interaction, opening_id: int):
+    async def open_scheduled_opening_now(self, interaction: discord.Interaction, opening_id: int, force: bool = False):
         row = await self.get_scheduled_opening(interaction.guild.id, opening_id)
         if not row:
             return await interaction.response.send_message("That opening is no longer pending.", ephemeral=True)
+        state_row = await self._get_state(interaction.guild.id)
+        if not force and state_row and str(state_row["state"]) == STATE_OPEN:
+            return await interaction.response.send_message(
+                "Requests are already open. Opening this now will start a new wave and replace the active opening. Confirm?",
+                view=ScheduledOpenNowConfirmView(self, interaction.user.id, opening_id),
+                ephemeral=True,
+            )
         request_limit = int(row["request_limit"]) if row["request_limit"] is not None else None
         close_minutes = int(row["close_minutes"]) if row["close_minutes"] is not None else None
         wave_id, close_ts = await self._open_requests_now(interaction.guild, request_limit, close_minutes)
@@ -1064,6 +1241,12 @@ class RequestLevelsCog(commands.Cog):
             content=note,
             embed=self._scheduled_openings_embed(rows),
             view=ScheduledOpeningsView(self, interaction.user.id, rows),
+        )
+        await self._log_request_admin_action(
+            interaction.guild,
+            interaction.user.id,
+            "scheduled_opening_opened_now",
+            f"opening_id={opening_id} wave_id={wave_id} force={force}",
         )
 
     async def handle_scheduled_opening_edit_modal(
@@ -1109,6 +1292,12 @@ class RequestLevelsCog(commands.Cog):
         await self.bot.db.execute(
             "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=? WHERE guild_id=? AND id=? AND status='pending'",
             (request_limit, close_value, open_ts, interaction.guild.id, opening_id),
+        )
+        await self._log_request_admin_action(
+            interaction.guild,
+            interaction.user.id,
+            "scheduled_opening_edited",
+            f"opening_id={opening_id} open_ts={open_ts} limit={request_limit} close_minutes={close_value}",
         )
         await interaction.response.send_message(
             f"Updated scheduled opening **#{opening_id}** for <t:{open_ts}:F> (<t:{open_ts}:R>).",
@@ -1289,13 +1478,26 @@ class RequestLevelsCog(commands.Cog):
                     continue
                 now_ts = int(time_module.time())
                 rows = await self.bot.db.fetchall(
-                    "SELECT id, request_limit, close_minutes FROM level_request_scheduled_openings "
+                    "SELECT id, request_limit, close_minutes, created_by FROM level_request_scheduled_openings "
                     "WHERE guild_id=? AND status='pending' AND open_ts<=? ORDER BY open_ts ASC LIMIT 5",
                     (guild.id, now_ts),
                 )
                 for row in rows:
                     opening_id = int(row["id"])
                     try:
+                        state_row = await self._get_state(guild.id)
+                        if state_row and str(state_row["state"]) == STATE_OPEN:
+                            await self.bot.db.execute(
+                                "UPDATE level_request_scheduled_openings SET status='skipped_active' WHERE id=? AND guild_id=? AND status='pending'",
+                                (opening_id, guild.id),
+                            )
+                            await self._log_request_admin_action(
+                                guild,
+                                int(row["created_by"] or 0),
+                                "scheduled_opening_skipped",
+                                f"opening_id={opening_id} reason=requests_already_open",
+                            )
+                            continue
                         request_limit = int(row["request_limit"]) if row["request_limit"] is not None else None
                         close_minutes = int(row["close_minutes"]) if row["close_minutes"] is not None else None
                         wave_id, _ = await self._open_requests_now(guild, request_limit, close_minutes)
@@ -1336,7 +1538,12 @@ class RequestLevelsCog(commands.Cog):
         return is_admin_or_owner(member, self.bot.config.get_int_list("roles", "admin_owner_role_ids"))
 
     def _is_mod(self, member: discord.Member) -> bool:
-        return is_mod(member, self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0)
+        allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
+        return is_mod(
+            member,
+            self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0,
+            allow_manage_guild=allow_manage_guild,
+        )
 
     async def _configured_channel(self, guild: discord.Guild, key: str) -> Optional[discord.TextChannel]:
         channel_id = self._cfg_int(key)
@@ -1397,6 +1604,7 @@ class RequestLevelsCog(commands.Cog):
         msg = await self.refresh_or_create_request_button(ctx.guild)
         if msg is None:
             return await ctx.respond(self._message("not_configured", "The request system is not fully configured yet."), ephemeral=True)
+        await self._log_request_admin_action(ctx.guild, ctx.user.id, "refresh_request_button", f"message_id={msg.id}")
         await ctx.respond(f"Request button refreshed: {msg.jump_url}", ephemeral=True)
 
     async def open_requests(self, ctx: discord.ApplicationContext, number: int = 0, time: int = 0, when: str = "", day: int = 0):
@@ -1424,9 +1632,21 @@ class RequestLevelsCog(commands.Cog):
             if close_minutes:
                 details.append(f"Requests will close after **{close_minutes}** minutes unless the limit is reached first.")
             details.append("Use `/pending-openings` to edit, delete, or open it early.")
+            await self._log_request_admin_action(
+                ctx.guild,
+                ctx.user.id,
+                "scheduled_opening_created",
+                f"open_ts={open_ts} limit={request_limit} close_minutes={close_minutes}",
+            )
             return await ctx.respond(" ".join(details), ephemeral=True)
 
         wave_id, close_ts = await self._open_requests_now(ctx.guild, request_limit, close_minutes)
+        await self._log_request_admin_action(
+            ctx.guild,
+            ctx.user.id,
+            "requests_opened",
+            f"wave_id={wave_id} limit={request_limit} close_ts={close_ts}",
+        )
 
         details = [f"Wave **{wave_id}** opened."]
         if request_limit:
@@ -1461,6 +1681,7 @@ class RequestLevelsCog(commands.Cog):
                 "UPDATE level_request_scheduled_openings SET status='deleted' WHERE guild_id=? AND id=? AND status='pending'",
                 (ctx.guild.id, opening_id),
             )
+            await self._log_request_admin_action(ctx.guild, ctx.user.id, "scheduled_opening_deleted", f"opening_id={opening_id}")
             return await ctx.respond(f"Deleted scheduled opening **#{opening_id}** if it was still pending.", ephemeral=True)
 
         if action in {"edit", "update"}:
@@ -1490,6 +1711,12 @@ class RequestLevelsCog(commands.Cog):
                 "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=? WHERE guild_id=? AND id=? AND status='pending'",
                 (new_limit, new_close, new_open_ts, ctx.guild.id, opening_id),
             )
+            await self._log_request_admin_action(
+                ctx.guild,
+                ctx.user.id,
+                "scheduled_opening_edited",
+                f"opening_id={opening_id} open_ts={new_open_ts} limit={new_limit} close_minutes={new_close}",
+            )
             return await ctx.respond(
                 f"Updated scheduled opening **#{opening_id}** for <t:{new_open_ts}:F> (<t:{new_open_ts}:R>).",
                 ephemeral=True,
@@ -1511,6 +1738,7 @@ class RequestLevelsCog(commands.Cog):
             return await ctx.respond("Requests are already closed.", ephemeral=True)
 
         await self._set_state_closed(ctx.guild, reason=f"manual by {ctx.user.id}")
+        await self._log_request_admin_action(ctx.guild, ctx.user.id, "requests_closed", f"wave_id={int(row['wave_id'])}")
         await ctx.respond("Requests closed.", ephemeral=True)
 
     async def requests_are(self, ctx: discord.ApplicationContext):
@@ -1652,7 +1880,7 @@ class RequestLevelsCog(commands.Cog):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
-        external_errors, level_validation = await self._validate_level_external(data)
+        external_errors, level_validation = await self._validate_level_external(data, interaction.guild.id, interaction.user.id)
         if external_errors:
             return await self._reply_ephemeral(
                 interaction,
@@ -1815,7 +2043,7 @@ class RequestLevelsCog(commands.Cog):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
-        external_errors, level_validation = await self._validate_level_external(data)
+        external_errors, level_validation = await self._validate_level_external(data, interaction.guild.id, interaction.user.id)
         if external_errors:
             return await self._reply_ephemeral(
                 interaction,
@@ -2049,7 +2277,11 @@ class RequestLevelsCog(commands.Cog):
                     variables,
                     default_color=self._color_name(result_key, "red"),
                 )
-                await result_channel.send(content=f"<@{int(self._row_value(row, 'user_id', 0) or 0)}>", embed=result_embed)
+                await result_channel.send(
+                    content=f"<@{int(self._row_value(row, 'user_id', 0) or 0)}>",
+                    embed=result_embed,
+                    allowed_mentions=user_mentions(),
+                )
             except Exception as e:
                 result_warning += " I couldn't send the result notification, so please check the configured result channel permissions."
                 await log_error(self.bot, f"Could not send level request result {message_id}: {repr(e)}")

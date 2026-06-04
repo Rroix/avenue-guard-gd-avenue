@@ -207,12 +207,25 @@ class TrackingCog(commands.Cog):
             missing.append("Creator")
         return missing
 
+    def _weekly_request_max_chars(self) -> int:
+        try:
+            return max(500, min(5000, int(self.bot.config.get("tracking", "weekly_request_max_chars", default=3000) or 3000)))
+        except Exception:
+            return 3000
+
     async def _resolve_member(self, guild: discord.Guild, user_or_id) -> Optional[discord.Member]:
         if isinstance(user_or_id, discord.Member):
             return user_or_id
         user_id = getattr(user_or_id, "id", user_or_id)
         try:
             user_id = int(user_id)
+        except Exception:
+            return None
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(user_id)
         except Exception:
             return None
 
@@ -231,13 +244,63 @@ class TrackingCog(commands.Cog):
             return
         self._last_error_log[key] = now
         await log_error(self.bot, message)
-        member = guild.get_member(user_id)
-        if member is not None:
-            return member
+
+    async def _dm_user(self, user_id: int, message: str) -> None:
         try:
-            return await guild.fetch_member(user_id)
+            user = await self.bot.fetch_user(int(user_id))
+            await user.send(str(message)[:2000])
         except Exception:
-            return None
+            pass
+
+    async def _validate_weekly_request_for_review(
+        self,
+        guild: discord.Guild,
+        user_id: int,
+        week_start_iso: str,
+        review_data: dict[str, str],
+    ) -> tuple[bool, dict[str, str]]:
+        request_cog = self.bot.get_cog("RequestLevelsCog")
+        if request_cog is None:
+            return True, review_data
+
+        data = dict(review_data)
+        if str(data.get("level_showcase") or "").strip().casefold() == "not provided":
+            data["level_showcase"] = ""
+        try:
+            data["level_id"] = str(data.get("level_id") or "").strip()
+            data["level_id_normalized"] = request_cog._normalize_level_id(data.get("level_id"))
+            validation_errors = request_cog._validate_request_data(data)
+        except Exception as e:
+            await log_error(self.bot, f"Weekly request local validation failed for user_id={user_id}: {repr(e)}")
+            return True, review_data
+
+        if validation_errors:
+            reason = " ".join(validation_errors)
+            await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=validation_error detail={reason[:180]}")
+            await self._dm_user(user_id, f"Please fix your weekly request before submitting it: {reason}")
+            return False, review_data
+
+        try:
+            external_errors, level_validation = await request_cog._validate_level_external(data, guild.id, user_id)
+        except Exception as e:
+            await log_error(self.bot, f"Weekly request external validation failed for user_id={user_id}: {repr(e)}")
+            external_errors, level_validation = [], {}
+
+        if external_errors:
+            reason = " ".join(external_errors)
+            await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=external_validation detail={reason[:180]}")
+            await self._dm_user(user_id, f"Please fix your weekly request before submitting it: {reason}")
+            return False, review_data
+
+        try:
+            data = request_cog._apply_level_validation_vars(data, level_validation)
+        except Exception as e:
+            await log_error(self.bot, f"Weekly request validation variables failed for user_id={user_id}: {repr(e)}")
+            return True, review_data
+
+        if not str(data.get("level_showcase") or "").strip():
+            data["level_showcase"] = "Not provided"
+        return True, data
 
     # ----------------------------
     # Startup / schema
@@ -286,8 +349,8 @@ class TrackingCog(commands.Cog):
                     PRIMARY KEY (guild_id, week_start, user_id)
                 );"""
             )
-        except Exception:
-            pass
+        except Exception as e:
+            await self._log_background_error("tracking_schema", f"Tracking schema setup failed: {repr(e)}")
 
         self._weekly_task = asyncio.create_task(self._weekly_loop())
         self._timeout_task = asyncio.create_task(self._timeout_loop())
@@ -568,6 +631,14 @@ class TrackingCog(commands.Cog):
             return
 
         content = (message.content or "").strip()
+        if len(content) > self._weekly_request_max_chars():
+            try:
+                await message.channel.send(
+                    f"That request is too long. Please keep it under {self._weekly_request_max_chars()} characters."
+                )
+            except Exception:
+                pass
+            return
 
         if content.casefold() == "i do not want this request".casefold():
             embed = discord.Embed(
@@ -620,6 +691,9 @@ class TrackingCog(commands.Cog):
         rank = int(row["rank"]) if row else None
 
         review_data = self._weekly_request_review_data(content)
+        ok, review_data = await self._validate_weekly_request_for_review(guild, user_id, week_start_iso, review_data)
+        if not ok:
+            return
         created_ts = int(time.time())
         variables = {
             **review_data,

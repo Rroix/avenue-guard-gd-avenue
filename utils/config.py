@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,10 +22,10 @@ class Config:
         self.data = json.loads(raw)
 
     def save(self) -> None:
-        self.path.write_text(
-            json.dumps(self.data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        payload = json.dumps(self.data, indent=2, ensure_ascii=False) + "\n"
+        tmp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, self.path)
 
     def get(self, *path: str, default: Any = None) -> Any:
         cur: Any = self.data

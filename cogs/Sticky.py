@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Dict, Optional, Any, List
 
 import discord
@@ -8,6 +9,7 @@ from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, basic_color
 from utils.errors import log_error
+from utils.mentions import no_mentions
 
 
 class StickyCog(commands.Cog):
@@ -91,11 +93,20 @@ class StickyCog(commands.Cog):
             delay = float(source.get("required_word_delete_delay_seconds", fallback.get("delete_delay_seconds", 10)) or 10)
         except Exception:
             delay = 10.0
+        match_mode = str(
+            source.get("required_word_match_mode")
+            or fallback.get("match_mode")
+            or fallback.get("required_word_match_mode")
+            or "contains"
+        ).strip().casefold()
+        if match_mode not in {"contains", "whole_word", "regex"}:
+            match_mode = "contains"
 
         return {
             "word": word,
             "dm_message": dm_message,
             "delete_delay_seconds": max(0.0, delay),
+            "match_mode": match_mode,
         }
 
     def _get_sticky_for_channel(self, channel_id: int) -> Optional[Dict[str, Any]]:
@@ -170,7 +181,7 @@ class StickyCog(commands.Cog):
             return
 
         try:
-            sent = await channel.send(text)
+            sent = await channel.send(text, allowed_mentions=no_mentions())
             await db.execute(
                 "INSERT INTO sticky_state(guild_id, channel_id, last_sticky_message_id) VALUES(?,?,?) "
                 "ON CONFLICT(guild_id, channel_id) DO UPDATE SET last_sticky_message_id=excluded.last_sticky_message_id",
@@ -183,11 +194,22 @@ class StickyCog(commands.Cog):
     # Forum first-message feature
     # ---------------------------
     def _get_thread_lock(self, thread_id: int) -> asyncio.Lock:
+        self._trim_forum_runtime_state()
         lock = self._forum_thread_locks.get(thread_id)
         if lock is None:
             lock = asyncio.Lock()
             self._forum_thread_locks[thread_id] = lock
         return lock
+
+    def _trim_forum_runtime_state(self) -> None:
+        max_items = 5000
+        for runtime_set in (self._forum_sent_threads, self._forum_required_checked_threads):
+            while len(runtime_set) > max_items:
+                runtime_set.pop()
+        if len(self._forum_thread_locks) > max_items:
+            removable = [thread_id for thread_id, lock in self._forum_thread_locks.items() if not lock.locked()]
+            for thread_id in removable[: len(self._forum_thread_locks) - max_items]:
+                self._forum_thread_locks.pop(thread_id, None)
 
     async def _thread_has_bot_message(self, thread: discord.Thread, limit: int = 25) -> bool:
         """Manual check: if the bot has already posted in this thread, we shouldn't send again."""
@@ -246,8 +268,13 @@ class StickyCog(commands.Cog):
         except Exception:
             pass
 
-    async def _thread_contains_required_word(self, thread: discord.Thread, required_word: str) -> bool:
-        needle = required_word.casefold()
+    def _normalize_required_word_text(self, value: Any) -> str:
+        text = str(value or "")
+        text = re.sub(r"[\u200b-\u200f\ufeff]", "", text)
+        return text.casefold()
+
+    async def _thread_contains_required_word(self, thread: discord.Thread, required_word: str, match_mode: str = "contains") -> bool:
+        needle = self._normalize_required_word_text(required_word).strip()
         text_parts = [thread.name or ""]
         try:
             async for msg in thread.history(limit=10, oldest_first=True):
@@ -264,7 +291,18 @@ class StickyCog(commands.Cog):
             # If history cannot be read, avoid deleting a valid thread by mistake.
             return True
 
-        return needle in "\n".join(text_parts).casefold()
+        haystack = self._normalize_required_word_text("\n".join(text_parts))
+        if not needle:
+            return True
+        if match_mode == "whole_word":
+            pattern = rf"(?<![0-9A-Za-z_]){re.escape(needle)}(?![0-9A-Za-z_])"
+            return re.search(pattern, haystack) is not None
+        if match_mode == "regex":
+            try:
+                return re.search(required_word, haystack, re.IGNORECASE) is not None
+            except re.error:
+                return needle in haystack
+        return needle in haystack
 
     async def _find_thread_owner(self, thread: discord.Thread) -> Optional[discord.abc.User]:
         owner_id = getattr(thread, "owner_id", None)
@@ -301,7 +339,7 @@ class StickyCog(commands.Cog):
         if not required_word:
             return
 
-        if await self._thread_contains_required_word(thread, required_word):
+        if await self._thread_contains_required_word(thread, required_word, str(rule.get("match_mode") or "contains")):
             return
 
         owner = await self._find_thread_owner(thread)
@@ -347,40 +385,46 @@ class StickyCog(commands.Cog):
             return
 
         lock = self._get_thread_lock(thread.id)
-        async with lock:
-            # Re-check inside lock.
-            if thread.id in self._forum_sent_threads:
-                self._schedule_required_word_check(thread)
-                return
-
-            # If fallback, give normal path time to send first.
-            if not prefer_normal:
-                try:
-                    await asyncio.sleep(2.0)
-                except Exception:
-                    pass
-
-            # Manual check: if bot already posted in the thread, don't send again.
-            if await self._thread_has_bot_message(thread):
-                self._forum_sent_threads.add(thread.id)
-                self._schedule_required_word_check(thread)
-                return
-
-            # Try to send with retries (attachment posts can race thread readiness)
-            for attempt in range(6):
-                try:
-                    if attempt == 0:
-                        await asyncio.sleep(1.0)
-                    sent = await self._send_forum_first_message(thread)
-                    if sent:
-                        self._forum_sent_threads.add(thread.id)
-                        self._schedule_required_word_check(thread)
+        try:
+            async with lock:
+                # Re-check inside lock.
+                if thread.id in self._forum_sent_threads:
+                    self._schedule_required_word_check(thread)
                     return
-                except Exception:
+
+                # If fallback, give normal path time to send first.
+                if not prefer_normal:
                     try:
-                        await asyncio.sleep(1.0 + attempt * 0.5)
+                        await asyncio.sleep(2.0)
                     except Exception:
+                        pass
+
+                # Manual check: if bot already posted in the thread, don't send again.
+                if await self._thread_has_bot_message(thread):
+                    self._forum_sent_threads.add(thread.id)
+                    self._schedule_required_word_check(thread)
+                    return
+
+                # Try to send with retries (attachment posts can race thread readiness)
+                for attempt in range(6):
+                    try:
+                        if attempt == 0:
+                            await asyncio.sleep(1.0)
+                        sent = await self._send_forum_first_message(thread)
+                        if sent:
+                            self._forum_sent_threads.add(thread.id)
+                            self._schedule_required_word_check(thread)
                         return
+                    except Exception:
+                        try:
+                            await asyncio.sleep(1.0 + attempt * 0.5)
+                        except Exception:
+                            return
+        finally:
+            waiters = getattr(lock, "_waiters", None)
+            has_waiters = bool(waiters)
+            if not lock.locked() and not has_waiters:
+                self._forum_thread_locks.pop(thread.id, None)
 
     @commands.Cog.listener()
     async def on_thread_create(self, thread: discord.Thread):

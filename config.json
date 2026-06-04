@@ -33,6 +33,10 @@
     "_comment_rps": "Role awarded when a user wins 5 rock-paper-scissors games in a row.",
     "rps_streak_role_id": "1455041515398369375"
   },
+  "permissions": {
+    "_comment": "Permission policy toggles.",
+    "manage_guild_counts_as_mod": true
+  },
   "channels": {
     "_comment_core": "Core channels used by features.",
     "autodelete_channel_id": "820590823573815326",
@@ -63,11 +67,13 @@
     "dm_timeout_hours": 24,
     "reminder_after_hours": 12,
     "reminder_repeat_hours": 0,
+    "weekly_request_max_chars": 3000,
     "log_channel_id": 0
   },
   "tickets": {
     "_comment": "Ticket settings.",
     "ticket_category_id": "1239942138838650981",
+    "staff_ping_role_id": "1462403598028640296",
     "ticket_creation_cooldown_hours": 24,
     "ticket_inactivity_hours": 24
   },
@@ -75,6 +81,7 @@
     "_comment": "Message response rules.",
     "rules_path": "responses.json",
     "cooldown_seconds": 10,
+    "max_response_chars": 1600,
     "first_match_only": true
   },
   "sticky": {
@@ -104,6 +111,7 @@
       "forum_channel_id": "1104487618026143754",
       "_comment_required_word": "Threads in this forum must include required_word in the title/body, or the bot will DM the owner and delete the thread. Change required_word to any word you want.",
       "required_word": "cubical",
+      "required_word_match_mode": "contains",
       "missing_required_word_dm": "Your collab thread \"{thread_name}\" in {guild} was removed because it did not follow our format. Please repost it using [our format](https://discord.com/channels/717003826288394271/1452027365755453664/1452027365755453664).",
       "required_word_delete_delay_seconds": 5,
       "templates": {
@@ -216,6 +224,7 @@
       ]
     },
     "report_warning_enabled": true,
+    "max_submission_chars": 3000,
     "_comment_cooldowns": "Help action cooldowns are enforced in code: appeal=48h, report_user=24h, bot_issue=6h, transcript=8h."
   },
   "level_requests": {
@@ -237,6 +246,11 @@
       "enabled": true,
       "cache_seconds": 1800,
       "request_timeout_seconds": 8,
+      "per_user_cooldown_seconds": 20,
+      "per_user_window_seconds": 60,
+      "per_user_max_checks": 6,
+      "provider_failure_threshold": 5,
+      "provider_circuit_breaker_seconds": 300,
       "auto_reject_missing": true,
       "providers": {
         "gdbrowser": true,
@@ -369,7 +383,11 @@
         { "name": "Rank", "value": "{rank}", "inline": true },
         { "name": "Week start", "value": "{week_start}", "inline": true },
         { "name": "Submitted", "value": "{submitted_ago}", "inline": true },
-        { "name": "Request", "value": "{request_content}", "inline": false }
+        { "name": "Level", "value": "**{level_name}** (`{level_id}`)\nCreator(s): **{creators}**", "inline": false },
+        { "name": "GD Info", "value": "{gd_info}", "inline": false },
+        { "name": "Showcase", "value": "{level_showcase}", "inline": false },
+        { "name": "Notes", "value": "{notes}", "inline": false },
+        { "name": "Validation", "value": "{level_validation_warning}", "inline": false }
       ]
     }
   },
