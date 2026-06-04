@@ -408,7 +408,7 @@ class RequestLevelsCog(commands.Cog):
             time: discord.Option(int, "Minutes requests stay open after opening; leave 0 for no timer", required=False, default=0),
             when: discord.Option(str, "Optional scheduled opening time in Madrid time, like 18:30", required=False, default=""),
             day: discord.Option(int, "Optional day of the month for the scheduled opening; leave 0 for next matching time", required=False, default=0),
-            type: discord.Option(str, "Optional wave type: needs showcase, only demons, only plats, only classic, classic non-demons, plats non-demons, or long level", required=False, default=""),
+            type: discord.Option(str, "Optional wave type, like only demons, only plats, needs showcase, or long level", required=False, default=""),
         ):
             await self.open_requests(ctx, number, time, when, day, type)
 
