@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time as dtime
 from typing import Dict, Optional, List, Tuple
 
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 
 from utils.checks import ensure_allowed_guild_id
 from utils.errors import log_error
+from utils.server_icons import ensure_server_icon_config, normalize_server_icon_mode
 from utils.timeutils import TZ, now_madrid, week_start_sunday
 
 def _day_key(dt: Optional[datetime] = None) -> str:
@@ -122,6 +125,13 @@ class BackgroundCog(commands.Cog):
             except Exception:
                 pass
 
+        if self._server_icon_rotation_enabled():
+            try:
+                if not self.rotate_server_icon.is_running():
+                    self.rotate_server_icon.start()
+            except Exception:
+                pass
+
         try:
             if not self.update_snapshot.is_running():
                 self.update_snapshot.start()
@@ -143,6 +153,14 @@ class BackgroundCog(commands.Cog):
                     self.rotate_status.start()
             elif self.rotate_status.is_running():
                 self.rotate_status.cancel()
+        except Exception:
+            pass
+        try:
+            if self._server_icon_rotation_enabled():
+                if not self.rotate_server_icon.is_running():
+                    self.rotate_server_icon.start()
+            elif self.rotate_server_icon.is_running():
+                self.rotate_server_icon.cancel()
         except Exception:
             pass
 
@@ -173,6 +191,87 @@ class BackgroundCog(commands.Cog):
             elif isinstance(it, str) and it.strip():
                 out.append({"type": "playing", "text": it.strip()})
         return out
+
+    def _server_icon_rotation_enabled(self) -> bool:
+        cfg = ensure_server_icon_config(self.bot.config)
+        return normalize_server_icon_mode(cfg.get("mode")) != "disabled" and bool(cfg.get("urls"))
+
+    def _server_icon_interval(self) -> int:
+        cfg = ensure_server_icon_config(self.bot.config)
+        return max(600, int(cfg.get("interval_seconds", 86400) or 86400))
+
+    def _server_icon_urls(self) -> list[str]:
+        cfg = ensure_server_icon_config(self.bot.config)
+        urls = cfg.get("urls", [])
+        return list(urls) if isinstance(urls, list) else []
+
+    def _choose_server_icon_index(self, mode: str, urls: list[str], current_index: int) -> int:
+        if not urls:
+            return -1
+        if mode == "random":
+            if len(urls) == 1:
+                return 0
+            choices = [idx for idx in range(len(urls)) if idx != current_index]
+            return random.choice(choices or list(range(len(urls))))
+        return (current_index + 1) % len(urls)
+
+    async def _download_server_icon(self, url: str) -> bytes:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(f"image URL returned HTTP {resp.status}")
+                data = await resp.read()
+        if not data:
+            raise RuntimeError("image URL returned an empty file")
+        if len(data) > 8 * 1024 * 1024:
+            raise RuntimeError("image is larger than 8 MB")
+        return data
+
+    async def rotate_server_icon_once(
+        self,
+        guild: discord.Guild,
+        *,
+        force: bool = False,
+        actor_id: int = 0,
+    ) -> tuple[bool, str]:
+        cfg = ensure_server_icon_config(self.bot.config)
+        urls = self._server_icon_urls()
+        if not urls:
+            return False, "No server icon URLs are configured."
+
+        mode = normalize_server_icon_mode(cfg.get("mode"))
+        if mode == "disabled" and not force:
+            return False, "Server icon rotation is disabled."
+        if mode == "disabled":
+            mode = "linear"
+
+        current_index = int(cfg.get("current_index", -1) or -1)
+        next_index = self._choose_server_icon_index(mode, urls, current_index)
+        if next_index < 0:
+            return False, "No usable server icon URL was found."
+
+        url = urls[next_index]
+        try:
+            icon_bytes = await self._download_server_icon(url)
+            reason = "Avenue Guard server icon rotation"
+            if actor_id:
+                reason = f"Avenue Guard server icon rotation by {actor_id}"
+            await guild.edit(icon=icon_bytes, reason=reason[:512])
+        except Exception as e:
+            await log_error(self.bot, f"Server icon rotation failed for url={url}: {repr(e)}")
+            return False, f"I couldn't change the server icon: {e}"
+
+        now_ts = int(time.time())
+        cfg["current_index"] = next_index
+        cfg["last_changed_ts"] = now_ts
+        try:
+            self.bot.config.save()
+        except Exception as e:
+            await log_error(self.bot, f"Server icon rotation changed icon but failed to save config: {repr(e)}")
+            return True, f"Changed the server icon to image #{next_index + 1}, but couldn't save the new index."
+
+        return True, f"Changed the server icon to image #{next_index + 1}."
 
     async def _render_status_text(self, guild: discord.Guild, text: str) -> str:
         """Replace supported placeholders inside status rotation text."""
@@ -606,6 +705,34 @@ class BackgroundCog(commands.Cog):
     @rotate_status.error
     async def _rotate_error(self, error: Exception):
         await log_error(self.bot, f"Status rotation task error: {repr(error)}")
+
+    @tasks.loop(seconds=60)
+    async def rotate_server_icon(self):
+        if not self._server_icon_rotation_enabled():
+            return
+        allowed = self.bot.config.get_int("guild", "allowed_guild_id")
+        guild = self.bot.get_guild(allowed) if allowed else None
+        if guild is None:
+            return
+
+        cfg = ensure_server_icon_config(self.bot.config)
+        interval = self._server_icon_interval()
+        now_ts = int(time.time())
+        last_changed = int(cfg.get("last_changed_ts", 0) or 0)
+        if last_changed and now_ts - last_changed < interval:
+            return
+
+        ok, message = await self.rotate_server_icon_once(guild)
+        if not ok:
+            await log_error(self.bot, f"Server icon rotation skipped: {message}")
+
+    @rotate_server_icon.before_loop
+    async def _before_server_icon_rotate(self):
+        await self.bot.wait_until_ready()
+
+    @rotate_server_icon.error
+    async def _server_icon_rotate_error(self, error: Exception):
+        await log_error(self.bot, f"Server icon rotation task error: {repr(error)}")
 
     def _start_daily_report_loop(self):
         hh, mm = _parse_hhmm(str(self.bot.config.get("background", "daily_summary", "time", default="00:00") or "00:00"))

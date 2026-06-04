@@ -102,6 +102,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - `/bot doctor` runs deeper permission diagnostics for channels, ticket category access, managed role hierarchy, and request-button state.
 - `/requests pending` shows and filters pending live-wave and weekly request reviews.
 - Optional rotating bot status with placeholders like `{members}`, `{online}`, `{week_msgs}`, `{week_top}`, `{open_tickets}`, and `{today_msgs}`.
+- Optional server icon rotation from configured image URLs, with `disabled`, `linear`, and `random` modes.
 - Optional daily server summary embeds with highlights, day-over-day movement, active members/channels, moderation signals, command health, voice/presence, and top channels/members/commands.
 - Tracks daily messages, edits, deletes, reactions, joins, leaves, bans, boosts, voice minutes, command usage, and top channels/users.
 - Includes a small keepalive HTTP server for hosted environments.
@@ -124,6 +125,10 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/bot health` shows a compact live health report.
 - `/bot config_check` checks configured channels, roles, request template variables, and `responses.json`.
 - `/bot doctor` runs deep permission diagnostics.
+- `/server_icon status` shows the server icon rotation mode, interval, current image, and configured URLs.
+- `/server_icon mode mode:<random|linear|disabled>` changes automatic server icon rotation mode.
+- `/server_icon add url:<url>`, `/server_icon replace number:<n> url:<url>`, and `/server_icon remove number:<n>` manage configured server icon URLs.
+- `/server_icon next` changes to the next configured server icon immediately.
 - `/requests pending scope:<optional> status:<optional> wave:<optional>` shows filtered live and weekly request reviews.
 - `/requests history message_id:<optional> user_id:<optional> wave:<optional>` shows the edit audit trail for a live-wave request.
 - `/requests repair` runs request-system recovery and message refresh tasks.
@@ -189,9 +194,18 @@ Use `off`, `disable`, `none`, or `clear` as the word to disable enforcement for 
 
 ## Configuration Files
 
-- `config.json` controls guild IDs, roles, channels, live request waves, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, and background summaries.
+- `config.json` controls guild IDs, roles, channels, live request waves, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, server icon rotation, and background summaries.
 - `responses.json` controls automatic message responses.
 - `data/bot.db` stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, help submissions, tickets, cooldowns, transcript pointers, reminders, and daily stats.
+
+### Server Icon Rotation Config
+
+Server icon rotation lives under `background.server_icon_rotation` in `config.json`.
+
+- `mode`: `disabled`, `linear`, or `random`.
+- `interval_seconds`: time between automatic changes, with a minimum of 600 seconds.
+- `urls`: direct image URLs used for the server icon.
+- `current_index` and `last_changed_ts`: saved state used by the rotation loop.
 
 ### Level Request Config
 

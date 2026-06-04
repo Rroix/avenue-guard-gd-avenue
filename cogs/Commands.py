@@ -13,6 +13,7 @@ from discord.ext import commands
 
 from utils.checks import is_admin_or_owner, is_mod
 from utils.mentions import no_mentions
+from utils.server_icons import ensure_server_icon_config, is_valid_icon_url, normalize_server_icon_mode, VALID_SERVER_ICON_MODES
 from utils.timeutils import now_madrid, week_start_sunday
 from utils.errors import log_error
 
@@ -33,6 +34,7 @@ class CommandsCog(commands.Cog):
         self.ticket_group = discord.SlashCommandGroup("ticket", "Ticket commands", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         self.forum_group = discord.SlashCommandGroup("forum", "Forum moderation commands", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         self.requests_group = discord.SlashCommandGroup("requests", "Level request staff tools", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
+        self.server_icon_group = discord.SlashCommandGroup("server_icon", "Server icon rotation tools", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
 
         # register commands
         self.bot_group.command(name="health", description="Show bot health and live system status")(self.bot_health)
@@ -51,12 +53,19 @@ class CommandsCog(commands.Cog):
         self.requests_group.command(name="pending", description="Show and filter pending request reviews")(self.requests_pending)
         self.requests_group.command(name="history", description="Show request edit history")(self.requests_history)
         self.requests_group.command(name="repair", description="Repair request system messages")(self.requests_repair)
+        self.server_icon_group.command(name="status", description="Show server icon rotation status")(self.server_icon_status)
+        self.server_icon_group.command(name="mode", description="Set server icon rotation mode")(self.server_icon_mode)
+        self.server_icon_group.command(name="add", description="Add a server icon URL")(self.server_icon_add)
+        self.server_icon_group.command(name="replace", description="Replace a server icon URL by number")(self.server_icon_replace)
+        self.server_icon_group.command(name="remove", description="Remove a server icon URL by number")(self.server_icon_remove)
+        self.server_icon_group.command(name="next", description="Change to the next configured server icon now")(self.server_icon_next)
 
         bot.add_application_command(self.bot_group)
         bot.add_application_command(self.tracking_group)
         bot.add_application_command(self.ticket_group)
         bot.add_application_command(self.forum_group)
         bot.add_application_command(self.requests_group)
+        bot.add_application_command(self.server_icon_group)
 
         @bot.slash_command(name="resync", description="Reload config, views, and responses without restart", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         async def resync(ctx: discord.ApplicationContext):
@@ -145,6 +154,180 @@ class CommandsCog(commands.Cog):
             return True
         role_ids = set(self._request_reviewer_role_ids())
         return any(role.id in role_ids for role in getattr(member, "roles", []))
+
+    def _server_icon_status_embed(self) -> discord.Embed:
+        cfg = ensure_server_icon_config(self.bot.config)
+        urls = list(cfg.get("urls", []) or [])
+        mode = normalize_server_icon_mode(cfg.get("mode"))
+        current_index = int(cfg.get("current_index", -1) or -1)
+        interval = int(cfg.get("interval_seconds", 86400) or 86400)
+        last_changed = int(cfg.get("last_changed_ts", 0) or 0)
+
+        embed = discord.Embed(
+            title="Server Icon Rotation",
+            description="Configured server profile picture rotation.",
+            color=discord.Color.blurple(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(name="Mode", value=f"`{mode}`", inline=True)
+        embed.add_field(name="Interval", value=f"{interval // 60} minutes", inline=True)
+        if last_changed:
+            embed.add_field(name="Last change", value=f"<t:{last_changed}:R>", inline=True)
+        else:
+            embed.add_field(name="Last change", value="Never", inline=True)
+
+        if mode != "disabled" and urls:
+            next_ts = (last_changed or int(time.time())) + interval
+            embed.add_field(name="Next automatic change", value=f"<t:{next_ts}:R>", inline=False)
+        else:
+            embed.add_field(name="Next automatic change", value="Not scheduled while disabled or empty.", inline=False)
+
+        if urls:
+            lines = []
+            for idx, url in enumerate(urls, start=1):
+                marker = "current" if idx - 1 == current_index else ""
+                suffix = f" - {marker}" if marker else ""
+                lines.append(f"`{idx}` {url[:120]}{suffix}")
+            embed.add_field(name=f"Configured icons ({len(urls)})", value="\n".join(lines)[:1024], inline=False)
+        else:
+            embed.add_field(name="Configured icons", value="No URLs configured.", inline=False)
+        return embed
+
+    def _notify_background_config_reload(self) -> None:
+        background = self.bot.get_cog("BackgroundCog")
+        fn = getattr(background, "on_config_reload", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    async def _save_server_icon_config(self, ctx: discord.ApplicationContext, action: str, detail: str) -> bool:
+        try:
+            self.bot.config.save()
+            self._notify_background_config_reload()
+        except Exception as e:
+            await log_error(self.bot, f"Failed to save server icon config: {repr(e)}")
+            await ctx.respond("I couldn't save the server icon config.", ephemeral=True)
+            return False
+        await self._log_admin_action(ctx.guild, ctx.user.id, action, detail)
+        return True
+
+    async def server_icon_status(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_admin_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+        await ctx.respond(embed=self._server_icon_status_embed(), ephemeral=True, allowed_mentions=no_mentions())
+
+    async def server_icon_mode(
+        self,
+        ctx: discord.ApplicationContext,
+        mode: discord.Option(str, "Mode to use: random, linear, or disabled"),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_admin_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+
+        raw_mode = str(mode or "").strip().casefold()
+        if raw_mode not in VALID_SERVER_ICON_MODES:
+            return await ctx.respond("Mode must be `random`, `linear`, or `disabled`.", ephemeral=True)
+        cfg = ensure_server_icon_config(self.bot.config)
+        cfg["mode"] = raw_mode
+        if not await self._save_server_icon_config(ctx, "server_icon_mode_updated", f"mode={raw_mode}"):
+            return
+        await ctx.respond(f"Server icon rotation mode is now `{raw_mode}`.", ephemeral=True)
+
+    async def server_icon_add(
+        self,
+        ctx: discord.ApplicationContext,
+        url: discord.Option(str, "Direct image URL to add to the rotation list"),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_admin_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+        if not is_valid_icon_url(url):
+            return await ctx.respond("That does not look like a valid HTTP image URL.", ephemeral=True)
+
+        cfg = ensure_server_icon_config(self.bot.config)
+        urls = list(cfg.get("urls", []) or [])
+        cleaned = str(url).strip()
+        if cleaned in urls:
+            return await ctx.respond("That icon URL is already in the list.", ephemeral=True)
+        if len(urls) >= 25:
+            return await ctx.respond("The icon list is full. Remove one before adding another.", ephemeral=True)
+        urls.append(cleaned)
+        cfg["urls"] = urls
+        if not await self._save_server_icon_config(ctx, "server_icon_url_added", f"count={len(urls)}"):
+            return
+        await ctx.respond(f"Added server icon URL as image #{len(urls)}.", ephemeral=True)
+
+    async def server_icon_replace(
+        self,
+        ctx: discord.ApplicationContext,
+        number: discord.Option(int, "One-based icon number to replace from /server_icon status"),
+        url: discord.Option(str, "New direct image URL"),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_admin_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+        if not is_valid_icon_url(url):
+            return await ctx.respond("That does not look like a valid HTTP image URL.", ephemeral=True)
+
+        cfg = ensure_server_icon_config(self.bot.config)
+        urls = list(cfg.get("urls", []) or [])
+        idx = int(number) - 1
+        if idx < 0 or idx >= len(urls):
+            return await ctx.respond("That icon number does not exist.", ephemeral=True)
+        urls[idx] = str(url).strip()
+        cfg["urls"] = urls
+        if not await self._save_server_icon_config(ctx, "server_icon_url_replaced", f"number={number}"):
+            return
+        await ctx.respond(f"Replaced server icon image #{number}.", ephemeral=True)
+
+    async def server_icon_remove(
+        self,
+        ctx: discord.ApplicationContext,
+        number: discord.Option(int, "One-based icon number to remove from /server_icon status"),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_admin_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+
+        cfg = ensure_server_icon_config(self.bot.config)
+        urls = list(cfg.get("urls", []) or [])
+        idx = int(number) - 1
+        if idx < 0 or idx >= len(urls):
+            return await ctx.respond("That icon number does not exist.", ephemeral=True)
+        removed = urls.pop(idx)
+        current_index = int(cfg.get("current_index", -1) or -1)
+        if current_index == idx:
+            cfg["current_index"] = -1
+        elif current_index > idx:
+            cfg["current_index"] = current_index - 1
+        cfg["urls"] = urls
+        if not await self._save_server_icon_config(ctx, "server_icon_url_removed", f"number={number} url={removed[:120]}"):
+            return
+        await ctx.respond(f"Removed server icon image #{number}.", ephemeral=True)
+
+    async def server_icon_next(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_admin_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        background = self.bot.get_cog("BackgroundCog")
+        rotate = getattr(background, "rotate_server_icon_once", None)
+        if not callable(rotate):
+            return await self._send(ctx, "Server icon rotation is not available right now.", ephemeral=True)
+        ok, message = await rotate(ctx.guild, force=True, actor_id=ctx.user.id)
+        if ok:
+            await self._log_admin_action(ctx.guild, ctx.user.id, "server_icon_changed_now", message)
+        await self._send(ctx, message, ephemeral=True)
 
     async def _resolve_member(self, guild: discord.Guild, user) -> Optional[discord.Member]:
         if isinstance(user, discord.Member):
@@ -237,7 +420,8 @@ class CommandsCog(commands.Cog):
                 f"Activity flush: `{_task_state('TrackingCog', '_activity_flush_task')}`\n"
                 f"Ticket scan: `{_task_state('HelpCog', '_ticket_scan_task')}`\n"
                 f"Daily snapshot: `{_task_state('BackgroundCog', 'update_snapshot')}`\n"
-                f"Status rotation: `{_task_state('BackgroundCog', 'rotate_status')}`"
+                f"Status rotation: `{_task_state('BackgroundCog', 'rotate_status')}`\n"
+                f"Server icon rotation: `{_task_state('BackgroundCog', 'rotate_server_icon')}`"
             ),
             inline=False,
         )
@@ -332,6 +516,13 @@ class CommandsCog(commands.Cog):
                 issues.append(f"ticket staff ping role `{staff_ping_role_id}`: missing")
             else:
                 ok.append("ticket staff ping role: OK")
+
+        if me is not None:
+            guild_perms = getattr(me, "guild_permissions", None)
+            if guild_perms is not None and bool(getattr(guild_perms, "manage_guild", False)):
+                ok.append("server icon rotation permission: OK")
+            else:
+                issues.append("server icon rotation: bot needs Manage Server to edit the server icon")
 
         request_cog = self.bot.get_cog("RequestLevelsCog")
         if request_cog is None:
@@ -611,6 +802,24 @@ class CommandsCog(commands.Cog):
         for idx, role_id in enumerate(self._request_reviewer_role_ids(), start=1):
             check_role(f"level_requests.reviewer_role_ids[{idx}]", role_id)
         ok_count += self._validate_request_templates(issues)
+
+        raw_server_icon_cfg = cfg.get("background", "server_icon_rotation", default={}) or {}
+        raw_server_icon_mode = str(raw_server_icon_cfg.get("mode", "disabled") if isinstance(raw_server_icon_cfg, dict) else "disabled").strip().casefold()
+        server_icon_cfg = ensure_server_icon_config(cfg)
+        server_icon_mode = normalize_server_icon_mode(server_icon_cfg.get("mode"))
+        server_icon_urls = list(server_icon_cfg.get("urls", []) or [])
+        if raw_server_icon_mode not in VALID_SERVER_ICON_MODES:
+            issues.append("background.server_icon_rotation.mode: must be random, linear, or disabled")
+        else:
+            ok_count += 1
+        if server_icon_mode != "disabled" and not server_icon_urls:
+            issues.append("background.server_icon_rotation.urls: at least one URL is needed unless mode is disabled")
+        else:
+            ok_count += len(server_icon_urls)
+        if int(server_icon_cfg.get("interval_seconds", 0) or 0) < 600:
+            issues.append("background.server_icon_rotation.interval_seconds: must be at least 600")
+        else:
+            ok_count += 1
 
         responses_cog = self.bot.get_cog("MessageResponsesCog")
         if responses_cog is not None and hasattr(responses_cog, "validate_rules"):

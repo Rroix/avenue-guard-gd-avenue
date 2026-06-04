@@ -349,14 +349,33 @@
 
 ---
 
-## 23) Bot diagnostics and performance safety
+## 23) Server icon rotation
+**Setup:** use an admin/owner account and make sure the bot has Manage Server.
+
+1. Run `/server_icon status`.
+   - Expected: status shows mode, interval, current image, last change, next automatic change, and configured URLs.
+2. Run `/server_icon mode mode:linear`.
+   - Expected: mode changes to `linear` and the background rotation task is enabled after config reload.
+3. Run `/server_icon next`.
+   - Expected: the server icon changes to the next configured image and `current_index`/`last_changed_ts` are saved.
+4. Run `/server_icon mode mode:random`, then `/server_icon next`.
+   - Expected: the server icon changes to a configured image without repeating the current image when more than one URL exists.
+5. Run `/server_icon add url:<direct image URL>`, then `/server_icon replace number:<n> url:<direct image URL>`, then `/server_icon remove number:<n>`.
+   - Expected: each command updates `config.json` and `/server_icon status` reflects the new list.
+6. Run `/server_icon mode mode:disabled`.
+   - Expected: automatic changes stop, but `/server_icon next` can still force a manual change.
+
+---
+
+## 24) Bot diagnostics and performance safety
 **Setup:** use an admin/owner account for `/bot` commands and a mod, judge, or head judge account for `/requests pending`.
 
 1. Run `/bot health`.
-   - Expected: an ephemeral health embed shows database status, latency, loaded cogs, background task states, open tickets, weekly sessions, pending requests, and request state.
+   - Expected: an ephemeral health embed shows database status, latency, loaded cogs, background task states, server icon rotation state, open tickets, weekly sessions, pending requests, and request state.
 2. Run `/bot config_check`.
    - Expected: configured channels and roles are reported as OK or listed as issues.
    - Expected: request embed template variables, field shapes, and suspicious color values are reported as OK or listed as issues.
+   - Expected: server icon rotation mode, interval, and configured URLs are reported as OK or listed as issues.
 3. Temporarily add an invalid request template variable such as `{bad_variable}` to a request embed template, run `/bot config_check`, then revert it.
    - Expected: config check reports the unknown template variable.
 4. Run `/requests pending scope:all status:pending`.
