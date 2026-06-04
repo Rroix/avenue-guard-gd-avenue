@@ -21,6 +21,10 @@ from utils.checks import ensure_allowed_guild_id
 
 DB_PATH = "data/bot.db"
 
+
+def startup_log(message: str) -> None:
+    print(f"[Avenue Guard startup] {message}", flush=True)
+
 def create_bot() -> discord.Bot:
     intents = discord.Intents.default()
     for intent_name in (
@@ -69,9 +73,15 @@ def create_bot() -> discord.Bot:
         if allowed:
             g = bot.get_guild(allowed)
             if g is None:
-                await log_error(bot, f"Bot is not in allowed guild_id={allowed}. Shutting down.")
-                await bot.close()
-                return
+                try:
+                    g = await bot.fetch_guild(allowed)
+                    startup_log(f"Allowed guild {allowed} was not cached, but fetch succeeded.")
+                except Exception as e:
+                    message = f"Bot is not in allowed guild_id={allowed}, or cannot fetch it: {type(e).__name__}: {e}. Shutting down."
+                    startup_log(message)
+                    await log_error(bot, message)
+                    await bot.close()
+                    return
 
         # Start keepalive server
         try:
@@ -102,7 +112,7 @@ def create_bot() -> discord.Bot:
         # Register persistent views (for interactions to survive restarts)
         await bot.register_persistent_views()
 
-        print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+        startup_log(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
     async def register_persistent_views():
         # It's okay to add multiple times; discord.py ignores duplicates by custom_id mapping.
@@ -121,7 +131,7 @@ def create_bot() -> discord.Bot:
             await _load_cogs()
         except Exception as e:
             details = f"Cog load failed: {repr(e)}\n{traceback.format_exc()}"
-            print(details)
+            startup_log(details)
             try:
                 await log_error(bot, details)
             except Exception:
@@ -134,6 +144,11 @@ def create_bot() -> discord.Bot:
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
+        startup_log("DISCORD_TOKEN environment variable is missing.")
         raise SystemExit("DISCORD_TOKEN environment variable is missing.")
     bot = create_bot()
-    bot.run(token)
+    try:
+        bot.run(token)
+    except Exception:
+        startup_log(f"Bot crashed during run:\n{traceback.format_exc()}")
+        raise

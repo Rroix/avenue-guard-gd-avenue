@@ -6,6 +6,10 @@ import discord
 
 async def log_error(bot: discord.Client, message: str) -> None:
     try:
+        print(f"[Avenue Guard error] {message}", flush=True)
+    except Exception:
+        pass
+    try:
         cfg = getattr(bot, "config", None)
         if cfg is None:
             return
