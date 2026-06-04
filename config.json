@@ -441,8 +441,8 @@
     },
     "server_icon_rotation": {
       "_comment": "Rotates the server icon from configured image URLs. mode is disabled, linear, or random.",
-      "mode": "disabled",
-      "interval_seconds": 86400,
+      "mode": "linear",
+      "interval_seconds": 300,
       "current_index": -1,
       "last_changed_ts": 0,
       "urls": [
