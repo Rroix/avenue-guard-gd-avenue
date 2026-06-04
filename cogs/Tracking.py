@@ -52,6 +52,8 @@ class TrackingCog(commands.Cog):
         self._pending_last_counted: dict[tuple[int, int], int] = {}
         self._last_counted_cache: dict[tuple[int, int], int] = {}
         self._last_error_log: dict[str, float] = {}
+        self._anti_farm_cache: dict[tuple[int, int], list[tuple[int, str]]] = {}
+        self._anti_farm_last_log: dict[tuple[int, int, str], int] = {}
 
     # ----------------------------
     # Config helpers (robust)
@@ -508,6 +510,97 @@ class TrackingCog(commands.Cog):
             except Exception:
                 pass
 
+    def _anti_farm_cfg(self) -> dict:
+        cfg = self.bot.config.get("tracking", "anti_farm", default={}) or {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _anti_farm_enabled(self) -> bool:
+        return bool(self._anti_farm_cfg().get("enabled", False))
+
+    def _message_signature(self, content: str) -> str:
+        text = re.sub(r"https?://\S+", "", str(content or "").casefold())
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    async def _anti_farm_reason(self, message: discord.Message, now: int) -> str:
+        if not self._anti_farm_enabled():
+            return ""
+        cfg = self._anti_farm_cfg()
+        try:
+            min_unique = max(1, int(cfg.get("min_unique_chars", 3)))
+        except Exception:
+            min_unique = 3
+        try:
+            min_words = max(1, int(cfg.get("min_words", 2)))
+        except Exception:
+            min_words = 2
+        try:
+            window = max(10, int(cfg.get("repeat_window_seconds", 120)))
+        except Exception:
+            window = 120
+        try:
+            threshold = max(2, int(cfg.get("repeat_threshold", 3)))
+        except Exception:
+            threshold = 3
+
+        signature = self._message_signature(message.content or "")
+        if not signature:
+            return ""
+        compact = signature.replace(" ", "")
+        words = [word for word in signature.split() if word]
+        low_effort = len(set(compact)) < min_unique or len(words) < min_words
+
+        key = (message.guild.id, message.author.id)
+        history = [(ts, sig) for ts, sig in self._anti_farm_cache.get(key, []) if now - int(ts) <= window]
+        repeat_count = 1 + sum(1 for _ts, sig in history if sig == signature)
+        history.append((now, signature))
+        self._anti_farm_cache[key] = history[-25:]
+
+        if low_effort and repeat_count >= threshold:
+            return "repeated_low_effort"
+        return ""
+
+    async def _record_anti_farm_event(self, message: discord.Message, reason: str, now: int) -> None:
+        sample = str(message.content or "").strip().replace("\n", " ")[:180]
+        log_key = (message.guild.id, message.author.id, reason)
+        last_log = self._anti_farm_last_log.get(log_key, 0)
+        if last_log and now - last_log < 300:
+            return
+        self._anti_farm_last_log[log_key] = now
+        try:
+            await self.bot.db.execute(
+                "INSERT INTO anti_farm_events(guild_id,user_id,channel_id,reason,sample,ts) VALUES(?,?,?,?,?,?)",
+                (message.guild.id, message.author.id, message.channel.id, reason, sample, now),
+            )
+        except Exception:
+            pass
+
+        cfg = self._anti_farm_cfg()
+        try:
+            channel_id = int(cfg.get("log_channel_id") or 0)
+        except Exception:
+            channel_id = 0
+        if not channel_id:
+            channel_id = self._cfg_int("channels", "general_logging_channel_id", 0)
+        channel = message.guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            return
+        embed = discord.Embed(
+            title="Anti-Farm Detection",
+            description="A repeated low-effort message pattern was skipped from weekly tracking.",
+            color=discord.Color.orange(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(name="Member", value=f"{message.author.mention}\n`{message.author.id}`", inline=True)
+        embed.add_field(name="Channel", value=getattr(message.channel, "mention", str(message.channel.id)), inline=True)
+        embed.add_field(name="Reason", value=reason.replace("_", " ").title(), inline=True)
+        if sample:
+            embed.add_field(name="Sample", value=sample[:1024], inline=False)
+        try:
+            await channel.send(embed=embed)
+        except Exception:
+            pass
+
     # ----------------------------
     # Activity counting
     # ----------------------------
@@ -539,8 +632,13 @@ class TrackingCog(commands.Cog):
         if message.channel.id in excluded_channels:
             return
 
-        cd = self._cfg_int("tracking", "count_cooldown_seconds", 10)
         now = int(time.time())
+        anti_farm_reason = await self._anti_farm_reason(message, now)
+        if anti_farm_reason:
+            await self._record_anti_farm_event(message, anti_farm_reason, now)
+            return
+
+        cd = self._cfg_int("tracking", "count_cooldown_seconds", 10)
         cache_key = (message.guild.id, message.author.id)
 
         last_counted = self._last_counted_cache.get(cache_key)
@@ -929,6 +1027,149 @@ class TrackingCog(commands.Cog):
 
             await self._contact_next_eligible(guild, week_start_iso)
 
+    async def _update_weekly_streaks(self, guild: discord.Guild, week_start_iso: str, ranked: list[int]) -> None:
+        try:
+            top_rank = max(1, int(self.bot.config.get("tracking", "streak_top_rank", default=5) or 5))
+        except Exception:
+            top_rank = 5
+        top_users = [int(uid) for uid in ranked[:top_rank]]
+        now_ts = int(time.time())
+        try:
+            week_dt = datetime.fromisoformat(week_start_iso)
+            prev_week = (week_dt - timedelta(days=7)).date().isoformat()
+        except Exception:
+            prev_week = ""
+
+        for uid in top_users:
+            row = await self.bot.db.fetchone(
+                "SELECT streak, best_streak, last_week_start FROM weekly_streaks WHERE guild_id=? AND user_id=?",
+                (guild.id, uid),
+            )
+            if row and str(row["last_week_start"] or "") == week_start_iso:
+                streak = max(1, int(row["streak"] or 1))
+                best = max(streak, int(row["best_streak"] or 0))
+            elif row and prev_week and str(row["last_week_start"] or "") == prev_week:
+                streak = int(row["streak"] or 0) + 1
+                best = max(streak, int(row["best_streak"] or 0))
+            else:
+                streak = 1
+                best = max(1, int(row["best_streak"] or 0)) if row else 1
+            await self.bot.db.execute(
+                "INSERT INTO weekly_streaks(guild_id,user_id,streak,best_streak,last_week_start,updated_ts) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(guild_id,user_id) DO UPDATE SET streak=excluded.streak, best_streak=excluded.best_streak, last_week_start=excluded.last_week_start, updated_ts=excluded.updated_ts",
+                (guild.id, uid, streak, best, week_start_iso, now_ts),
+            )
+
+        if top_users:
+            placeholders = ",".join("?" for _ in top_users)
+            await self.bot.db.execute(
+                f"UPDATE weekly_streaks SET streak=0, last_week_start=?, updated_ts=? WHERE guild_id=? AND user_id NOT IN ({placeholders}) AND streak>0",
+                (week_start_iso, now_ts, guild.id, *top_users),
+            )
+        else:
+            await self.bot.db.execute(
+                "UPDATE weekly_streaks SET streak=0, last_week_start=?, updated_ts=? WHERE guild_id=? AND streak>0",
+                (week_start_iso, now_ts, guild.id),
+            )
+
+    async def _send_weekly_recap(self, guild: discord.Guild, week_start_iso: str, ranked_rows) -> None:
+        recap_cfg = self.bot.config.get("background", "weekly_recap", default={}) or {}
+        if isinstance(recap_cfg, dict) and not bool(recap_cfg.get("enabled", True)):
+            return
+        existing = await self.bot.db.fetchone(
+            "SELECT 1 FROM weekly_recaps WHERE guild_id=? AND week_start=?",
+            (guild.id, week_start_iso),
+        )
+        if existing:
+            return
+
+        channel_id = 0
+        if isinstance(recap_cfg, dict):
+            try:
+                channel_id = int(recap_cfg.get("channel_id") or 0)
+            except Exception:
+                channel_id = 0
+        if not channel_id:
+            try:
+                channel_id = int(self.bot.config.get("background", "daily_summary", "channel_id", default=0) or 0)
+            except Exception:
+                channel_id = 0
+        if not channel_id:
+            channel_id = self._cfg_int("channels", "general_logging_channel_id", 0)
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        try:
+            week_start_ts = int(datetime.fromisoformat(week_start_iso).replace(tzinfo=TZ).timestamp())
+        except Exception:
+            week_start_ts = 0
+        active_row = await self.bot.db.fetchone(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(count), 0) AS total FROM activity_counts WHERE guild_id=? AND week_start=? AND count>0",
+            (guild.id, week_start_iso),
+        )
+        active_count = int(active_row["c"] or 0) if active_row else 0
+        total_messages = int(active_row["total"] or 0) if active_row else sum(int(row["count"]) for row in ranked_rows)
+        claim_rows = await self.bot.db.fetchall(
+            "SELECT status, COUNT(*) AS c FROM weekly_claims WHERE guild_id=? AND week_start=? GROUP BY status",
+            (guild.id, week_start_iso),
+        )
+        claim_counts = {str(row["status"]): int(row["c"]) for row in claim_rows}
+        review_rows = await self.bot.db.fetchall(
+            "SELECT status, result, COUNT(*) AS c FROM weekly_request_reviews WHERE guild_id=? AND week_start=? GROUP BY status, result",
+            (guild.id, week_start_iso),
+        )
+        reviewed = sum(int(row["c"]) for row in review_rows if str(row["status"]) == "reviewed")
+        pending_reviews = sum(int(row["c"]) for row in review_rows if str(row["status"]) == "pending")
+        farm_row = await self.bot.db.fetchone(
+            "SELECT COUNT(*) AS c FROM anti_farm_events WHERE guild_id=? AND ts>=?",
+            (guild.id, week_start_ts),
+        )
+        farm_count = int(farm_row["c"] or 0) if farm_row else 0
+
+        streak_rows = await self.bot.db.fetchall(
+            "SELECT user_id, streak FROM weekly_streaks WHERE guild_id=? AND streak>1",
+            (guild.id,),
+        )
+        streaks = {int(row["user_id"]): int(row["streak"]) for row in streak_rows}
+        emoji = str(self.bot.config.get("tracking", "streak_emoji", default="🔥") or "🔥")
+        top_lines = []
+        for idx, row in enumerate(ranked_rows[:10], start=1):
+            uid = int(row["user_id"])
+            streak = streaks.get(uid, 0)
+            streak_text = f" {emoji}{streak}" if streak > 1 else ""
+            top_lines.append(f"**#{idx}** <@{uid}> - **{int(row['count'])}** messages{streak_text}")
+
+        embed = discord.Embed(
+            title="Weekly Server Recap",
+            description=f"Week starting **{week_start_iso}**",
+            color=discord.Color.blurple(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(name="Activity", value=f"Active members: **{active_count}**\nMessages counted: **{total_messages}**", inline=True)
+        embed.add_field(
+            name="Weekly Requests",
+            value=(
+                f"Contacted: **{sum(claim_counts.values())}**\n"
+                f"Claimed: **{claim_counts.get('claimed', 0)}**\n"
+                f"Pending: **{claim_counts.get('pending', 0)}**\n"
+                f"Declined/timed out: **{claim_counts.get('declined', 0) + claim_counts.get('timed_out', 0)}**"
+            ),
+            inline=True,
+        )
+        embed.add_field(name="Review Queue", value=f"Reviewed: **{reviewed}**\nPending: **{pending_reviews}**", inline=True)
+        embed.add_field(name="Top Members", value="\n".join(top_lines)[:1024] or "No eligible activity.", inline=False)
+        embed.add_field(name="Signals", value=f"Anti-farm skips logged: **{farm_count}**", inline=True)
+        embed.set_footer(text="Private weekly recap")
+        try:
+            msg = await channel.send(embed=embed)
+            await self.bot.db.execute(
+                "INSERT OR REPLACE INTO weekly_recaps(guild_id,week_start,message_id,channel_id,created_ts) VALUES(?,?,?,?,?)",
+                (guild.id, week_start_iso, msg.id, channel.id, int(time.time())),
+            )
+        except Exception as e:
+            await log_error(self.bot, f"Weekly recap send failed for {week_start_iso}: {repr(e)}")
+
     # ----------------------------
     # Weekly job execution
     # ----------------------------
@@ -938,10 +1179,6 @@ class TrackingCog(commands.Cog):
         if guild is None:
             return
         await self.flush_activity_counts()
-
-        if await self.weekly_reward_disabled(guild.id, week_start_iso):
-            await self._log_weekly(guild, week_start_iso, 0, "weekly_reward_skipped", "Reward disabled for this tracking week")
-            return
 
         top_limit = self._cfg_int("tracking", "top_limit", 20)
         winners_to_dm = self._cfg_int("tracking", "winners_to_dm", 1)
@@ -956,6 +1193,7 @@ class TrackingCog(commands.Cog):
         )
 
         ranked: List[int] = []
+        ranked_rows = []
         for r in rows:
             uid = int(r["user_id"])
             member = await self._resolve_member(guild, uid)
@@ -964,6 +1202,21 @@ class TrackingCog(commands.Cog):
             if excluded_role_ids and any(role.id in excluded_role_ids for role in member.roles):
                 continue
             ranked.append(uid)
+            ranked_rows.append(r)
+
+        try:
+            await self._update_weekly_streaks(guild, week_start_iso, ranked)
+        except Exception as e:
+            await self._log_background_error("weekly_streaks", f"Weekly streak update failed: {repr(e)}")
+
+        if await self.weekly_reward_disabled(guild.id, week_start_iso):
+            await self._log_weekly(guild, week_start_iso, 0, "weekly_reward_skipped", "Reward disabled for this tracking week")
+            try:
+                await self._send_weekly_recap(guild, week_start_iso, ranked_rows)
+            except Exception as e:
+                await self._log_background_error("weekly_recap", f"Weekly recap failed: {repr(e)}")
+            await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted=0 eligible_ranked={len(ranked)}")
+            return
 
         contacted = 0
         for idx, uid in enumerate(ranked, start=1):
@@ -974,6 +1227,10 @@ class TrackingCog(commands.Cog):
                 contacted += 1
 
         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted={contacted} eligible_ranked={len(ranked)}")
+        try:
+            await self._send_weekly_recap(guild, week_start_iso, ranked_rows)
+        except Exception as e:
+            await self._log_background_error("weekly_recap", f"Weekly recap failed: {repr(e)}")
 
     async def _contact_user_for_week(self, guild: discord.Guild, week_start_iso: str, user_id: int, rank: int, timeout_hours: int, force: bool = False) -> bool:
         if not force and await self.weekly_reward_disabled(guild.id, week_start_iso):

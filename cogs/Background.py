@@ -199,7 +199,7 @@ class BackgroundCog(commands.Cog):
 
     def _server_icon_interval(self) -> int:
         cfg = ensure_server_icon_config(self.bot.config)
-        return max(600, int(cfg.get("interval_seconds", 86400) or 86400))
+        return max(300, int(cfg.get("interval_seconds", 86400) or 86400))
 
     def _server_icon_urls(self) -> list[str]:
         cfg = ensure_server_icon_config(self.bot.config)

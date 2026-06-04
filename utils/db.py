@@ -116,6 +116,32 @@ class Database:
                 disabled_by INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, week_start)
             );""",
+            """CREATE TABLE IF NOT EXISTS weekly_streaks(
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                streak INTEGER NOT NULL DEFAULT 0,
+                best_streak INTEGER NOT NULL DEFAULT 0,
+                last_week_start TEXT,
+                updated_ts INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            );""",
+            """CREATE TABLE IF NOT EXISTS weekly_recaps(
+                guild_id INTEGER NOT NULL,
+                week_start TEXT NOT NULL,
+                message_id INTEGER,
+                channel_id INTEGER,
+                created_ts INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, week_start)
+            );""",
+            """CREATE TABLE IF NOT EXISTS anti_farm_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                channel_id INTEGER,
+                reason TEXT NOT NULL,
+                sample TEXT NOT NULL DEFAULT '',
+                ts INTEGER NOT NULL
+            );""",
             """CREATE TABLE IF NOT EXISTS weekly_request_reviews(
                 guild_id INTEGER NOT NULL,
                 request_message_id INTEGER PRIMARY KEY,
@@ -138,7 +164,13 @@ class Database:
                 created_ts INTEGER NOT NULL,
                 last_user_activity_ts INTEGER NOT NULL,
                 status TEXT NOT NULL,
-                ticket_id INTEGER
+                ticket_id INTEGER,
+                status_tag TEXT NOT NULL DEFAULT 'waiting_staff',
+                closed_ts INTEGER,
+                satisfaction_score INTEGER,
+                satisfaction_comment TEXT,
+                satisfaction_user_id INTEGER,
+                satisfaction_ts INTEGER
             );""",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_ticket_id
                 ON tickets(guild_id, ticket_id) WHERE ticket_id IS NOT NULL;""",
@@ -222,7 +254,8 @@ class Database:
                 opened_ts INTEGER,
                 closed_ts INTEGER,
                 request_channel_id INTEGER,
-                request_message_id INTEGER
+                request_message_id INTEGER,
+                request_type TEXT
             );""",
             """CREATE TABLE IF NOT EXISTS level_request_submissions(
                 guild_id INTEGER NOT NULL,
@@ -255,6 +288,7 @@ class Database:
                 request_limit INTEGER,
                 close_minutes INTEGER,
                 open_ts INTEGER NOT NULL,
+                request_type TEXT,
                 created_by INTEGER NOT NULL,
                 created_ts INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -305,6 +339,10 @@ class Database:
                 ON gd_level_validation_cache(expires_ts);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_request_reviews_status
                 ON weekly_request_reviews(guild_id, status, week_start);""",
+            """CREATE INDEX IF NOT EXISTS idx_weekly_streaks
+                ON weekly_streaks(guild_id, streak DESC, best_streak DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_anti_farm_events_lookup
+                ON anti_farm_events(guild_id, user_id, ts DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status
                 ON transcript_requests(guild_id, ticket_id, status);""",
             """CREATE INDEX IF NOT EXISTS idx_help_submissions_user_status
@@ -316,9 +354,16 @@ class Database:
             self._conn.execute(stmt)
 
         self._ensure_column_sync("tickets", "ticket_id", "INTEGER")
+        self._ensure_column_sync("tickets", "status_tag", "TEXT NOT NULL DEFAULT 'waiting_staff'")
+        self._ensure_column_sync("tickets", "closed_ts", "INTEGER")
+        self._ensure_column_sync("tickets", "satisfaction_score", "INTEGER")
+        self._ensure_column_sync("tickets", "satisfaction_comment", "TEXT")
+        self._ensure_column_sync("tickets", "satisfaction_user_id", "INTEGER")
+        self._ensure_column_sync("tickets", "satisfaction_ts", "INTEGER")
         self._ensure_column_sync("transcript_requests", "ticket_id", "INTEGER")
         self._ensure_column_sync("level_request_state", "request_channel_id", "INTEGER")
         self._ensure_column_sync("level_request_state", "request_message_id", "INTEGER")
+        self._ensure_column_sync("level_request_state", "request_type", "TEXT")
         self._ensure_column_sync("level_request_submissions", "request_message_id", "INTEGER")
         self._ensure_column_sync("level_request_submissions", "result", "TEXT")
         self._ensure_column_sync("level_request_submissions", "review_text", "TEXT")
@@ -339,6 +384,7 @@ class Database:
         self._ensure_column_sync("level_request_wave_summaries", "created_ts", "INTEGER")
         self._ensure_column_sync("level_request_wave_summaries", "updated_ts", "INTEGER")
         self._ensure_column_sync("level_request_scheduled_openings", "opened_wave_id", "INTEGER")
+        self._ensure_column_sync("level_request_scheduled_openings", "request_type", "TEXT")
         self._normalize_weekly_dm_log_sync()
         self._init_ticket_sequences_sync()
         self._conn.commit()
@@ -463,6 +509,32 @@ class Database:
     disabled_by INTEGER NOT NULL,
     PRIMARY KEY (guild_id, week_start)
 );""",
+"""CREATE TABLE IF NOT EXISTS weekly_streaks(
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    streak INTEGER NOT NULL DEFAULT 0,
+    best_streak INTEGER NOT NULL DEFAULT 0,
+    last_week_start TEXT,
+    updated_ts INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);""",
+"""CREATE TABLE IF NOT EXISTS weekly_recaps(
+    guild_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    message_id INTEGER,
+    channel_id INTEGER,
+    created_ts INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, week_start)
+);""",
+"""CREATE TABLE IF NOT EXISTS anti_farm_events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    channel_id INTEGER,
+    reason TEXT NOT NULL,
+    sample TEXT NOT NULL DEFAULT '',
+    ts INTEGER NOT NULL
+);""",
 """CREATE TABLE IF NOT EXISTS weekly_request_reviews(
     guild_id INTEGER NOT NULL,
     request_message_id INTEGER PRIMARY KEY,
@@ -485,7 +557,13 @@ class Database:
                 created_ts INTEGER NOT NULL,
                 last_user_activity_ts INTEGER NOT NULL,
                 status TEXT NOT NULL,
-                ticket_id INTEGER
+                ticket_id INTEGER,
+                status_tag TEXT NOT NULL DEFAULT 'waiting_staff',
+                closed_ts INTEGER,
+                satisfaction_score INTEGER,
+                satisfaction_comment TEXT,
+                satisfaction_user_id INTEGER,
+                satisfaction_ts INTEGER
             );""",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_ticket_id
                 ON tickets(guild_id, ticket_id) WHERE ticket_id IS NOT NULL;""",
@@ -569,7 +647,8 @@ class Database:
                 opened_ts INTEGER,
                 closed_ts INTEGER,
                 request_channel_id INTEGER,
-                request_message_id INTEGER
+                request_message_id INTEGER,
+                request_type TEXT
             );""",
             """CREATE TABLE IF NOT EXISTS level_request_submissions(
                 guild_id INTEGER NOT NULL,
@@ -602,6 +681,7 @@ class Database:
                 request_limit INTEGER,
                 close_minutes INTEGER,
                 open_ts INTEGER NOT NULL,
+                request_type TEXT,
                 created_by INTEGER NOT NULL,
                 created_ts INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -652,6 +732,10 @@ class Database:
                 ON gd_level_validation_cache(expires_ts);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_request_reviews_status
                 ON weekly_request_reviews(guild_id, status, week_start);""",
+            """CREATE INDEX IF NOT EXISTS idx_weekly_streaks
+                ON weekly_streaks(guild_id, streak DESC, best_streak DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_anti_farm_events_lookup
+                ON anti_farm_events(guild_id, user_id, ts DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status
                 ON transcript_requests(guild_id, ticket_id, status);""",
             """CREATE INDEX IF NOT EXISTS idx_help_submissions_user_status
@@ -664,9 +748,16 @@ class Database:
 
         # Ensure columns exist on older DBs
         await self._ensure_column("tickets", "ticket_id", "INTEGER")
+        await self._ensure_column("tickets", "status_tag", "TEXT NOT NULL DEFAULT 'waiting_staff'")
+        await self._ensure_column("tickets", "closed_ts", "INTEGER")
+        await self._ensure_column("tickets", "satisfaction_score", "INTEGER")
+        await self._ensure_column("tickets", "satisfaction_comment", "TEXT")
+        await self._ensure_column("tickets", "satisfaction_user_id", "INTEGER")
+        await self._ensure_column("tickets", "satisfaction_ts", "INTEGER")
         await self._ensure_column("transcript_requests", "ticket_id", "INTEGER")
         await self._ensure_column("level_request_state", "request_channel_id", "INTEGER")
         await self._ensure_column("level_request_state", "request_message_id", "INTEGER")
+        await self._ensure_column("level_request_state", "request_type", "TEXT")
         await self._ensure_column("level_request_submissions", "request_message_id", "INTEGER")
         await self._ensure_column("level_request_submissions", "result", "TEXT")
         await self._ensure_column("level_request_submissions", "review_text", "TEXT")
@@ -687,6 +778,7 @@ class Database:
         await self._ensure_column("level_request_wave_summaries", "created_ts", "INTEGER")
         await self._ensure_column("level_request_wave_summaries", "updated_ts", "INTEGER")
         await self._ensure_column("level_request_scheduled_openings", "opened_wave_id", "INTEGER")
+        await self._ensure_column("level_request_scheduled_openings", "request_type", "TEXT")
         await self._normalize_weekly_dm_log()
 
         # Ensure sequence exists (set next_ticket_id based on max ticket_id)

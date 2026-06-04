@@ -30,6 +30,51 @@ OTHER_REASONS = {
 
 DEFAULT_REVIEWER_ROLE_IDS = [785212232786640966, 1430214323720163498]
 
+REQUEST_TYPE_LABELS = {
+    "": "Any",
+    "needs_showcase": "Needs showcase video",
+    "only_demons": "Only demons",
+    "only_plats": "Only platformers",
+    "only_classic": "Only classic",
+    "only_classic_non_demons": "Only classic non-demons",
+    "only_plats_non_demons": "Only platformer non-demons",
+    "long_level": "Long or XL levels",
+}
+
+REQUEST_TYPE_ALIASES = {
+    "": "",
+    "any": "",
+    "none": "",
+    "no type": "",
+    "needs showcase": "needs_showcase",
+    "needs showcase video": "needs_showcase",
+    "showcase": "needs_showcase",
+    "only demons": "only_demons",
+    "demons": "only_demons",
+    "demon": "only_demons",
+    "only plats": "only_plats",
+    "only platformers": "only_plats",
+    "platformers": "only_plats",
+    "plats": "only_plats",
+    "only classic": "only_classic",
+    "classic": "only_classic",
+    "only classic non demons": "only_classic_non_demons",
+    "only classic non-demons": "only_classic_non_demons",
+    "classic non demons": "only_classic_non_demons",
+    "classic non-demons": "only_classic_non_demons",
+    "only plats non demons": "only_plats_non_demons",
+    "only plats non-demons": "only_plats_non_demons",
+    "only platformers non demons": "only_plats_non_demons",
+    "only platformers non-demons": "only_plats_non_demons",
+    "plats non demons": "only_plats_non_demons",
+    "plats non-demons": "only_plats_non_demons",
+    "long level": "long_level",
+    "long": "long_level",
+    "long or xl": "long_level",
+    "long xl": "long_level",
+    "xl": "long_level",
+}
+
 
 class _SafeDict(dict):
     def __missing__(self, key):
@@ -187,10 +232,18 @@ class ScheduledOpeningEditModal(discord.ui.Modal):
             value=str(initial.get("time") or "")[:6],
             placeholder="Blank or 0 for no timer",
         )
+        self.request_type = discord.ui.InputText(
+            label="Request type",
+            required=False,
+            max_length=40,
+            value=str(initial.get("request_type") or "")[:40],
+            placeholder="Example: only demons, long level, needs showcase",
+        )
         self.add_item(self.when)
         self.add_item(self.day)
         self.add_item(self.number)
         self.add_item(self.close_minutes)
+        self.add_item(self.request_type)
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
@@ -202,6 +255,7 @@ class ScheduledOpeningEditModal(discord.ui.Modal):
             str(self.day.value or "").strip(),
             str(self.number.value or "").strip(),
             str(self.close_minutes.value or "").strip(),
+            str(self.request_type.value or "").strip(),
         )
 
 
@@ -218,10 +272,11 @@ class ScheduledOpeningsView(discord.ui.View):
             for row in self.rows[:25]:
                 limit = int(row["request_limit"]) if row["request_limit"] is not None else "none"
                 close = f"{int(row['close_minutes'])}m" if row["close_minutes"] is not None else "none"
+                request_type = self.cog._request_type_label(row["request_type"] if "request_type" in row.keys() else "")
                 options.append(
                     discord.SelectOption(
                         label=f"#{int(row['id'])} - {datetime.fromtimestamp(int(row['open_ts']), TZ).strftime('%b %d %H:%M')}",
-                        description=f"Limit {limit} | Close {close}",
+                        description=f"Limit {limit} | Close {close} | {request_type}",
                         value=str(int(row["id"])),
                     )
                 )
@@ -278,6 +333,7 @@ class ScheduledOpeningsView(discord.ui.View):
             "day": str(dt.day),
             "number": "" if row["request_limit"] is None else str(int(row["request_limit"])),
             "time": "" if row["close_minutes"] is None else str(int(row["close_minutes"])),
+            "request_type": self.cog._request_type_label(row["request_type"] if "request_type" in row.keys() else ""),
         }
         await interaction.response.send_modal(ScheduledOpeningEditModal(self.cog, self.user_id, self.selected_id, initial))
 
@@ -352,8 +408,9 @@ class RequestLevelsCog(commands.Cog):
             time: discord.Option(int, "Minutes requests stay open after opening; leave 0 for no timer", required=False, default=0),
             when: discord.Option(str, "Optional scheduled opening time in Madrid time, like 18:30", required=False, default=""),
             day: discord.Option(int, "Optional day of the month for the scheduled opening; leave 0 for next matching time", required=False, default=0),
+            type: discord.Option(str, "Optional wave type: needs showcase, only demons, only plats, only classic, classic non-demons, plats non-demons, or long level", required=False, default=""),
         ):
-            await self.open_requests(ctx, number, time, when, day)
+            await self.open_requests(ctx, number, time, when, day, type)
 
         @bot.slash_command(name="close-requests", description="Close level requests", guild_ids=guild_ids)
         async def close_requests(ctx: discord.ApplicationContext):
@@ -376,8 +433,9 @@ class RequestLevelsCog(commands.Cog):
             time: discord.Option(int, "New close timer in minutes; use 0 for no timer and -1 to keep current value", required=False, default=-1),
             when: discord.Option(str, "New opening time in Madrid time, like 18:30", required=False, default=""),
             day: discord.Option(int, "Optional day of the month for the new opening time", required=False, default=0),
+            type: discord.Option(str, "New request type; leave blank to keep current value, use any to clear", required=False, default=""),
         ):
-            await self.pending_openings(ctx, action, opening_id, number, time, when, day)
+            await self.pending_openings(ctx, action, opening_id, number, time, when, day, type)
 
     def cog_unload(self) -> None:
         if self._close_task:
@@ -500,6 +558,34 @@ class RequestLevelsCog(commands.Cog):
 
     def _request_button_label(self) -> str:
         return str(self._cfg("request_button_label", default="Request your level!") or "Request your level!")
+
+    def _request_type_normalize_text(self, value: Any) -> str:
+        text = str(value or "").strip().casefold()
+        text = re.sub(r"[_/\\-]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _normalize_request_type(self, value: Any) -> Optional[str]:
+        text = self._request_type_normalize_text(value)
+        if text in REQUEST_TYPE_LABELS:
+            return text
+        return REQUEST_TYPE_ALIASES.get(text)
+
+    def _request_type_label(self, value: Any) -> str:
+        key = self._normalize_request_type(value)
+        if key is None:
+            key = ""
+        return REQUEST_TYPE_LABELS.get(key, REQUEST_TYPE_LABELS[""])
+
+    def _request_type_help(self) -> str:
+        return ", ".join(label for key, label in REQUEST_TYPE_LABELS.items() if key)
+
+    def _request_type_from_row(self, row) -> str:
+        if not row:
+            return ""
+        value = self._row_value(row, "request_type", "")
+        normalized = self._normalize_request_type(value)
+        return normalized or ""
 
     def _color_name(self, key: str, default: str = "blurple") -> str:
         return str(self._cfg("colors", key, default=default) or default)
@@ -837,6 +923,39 @@ class RequestLevelsCog(commands.Cog):
 
         return errors, validation
 
+    def _request_type_validation_error(self, request_type: str, data: Dict[str, str], validation: Dict[str, Any]) -> str:
+        request_type = self._normalize_request_type(request_type) or ""
+        if not request_type:
+            return ""
+
+        label = self._request_type_label(request_type)
+        showcase = str(data.get("level_showcase") or "").strip()
+        if request_type == "needs_showcase":
+            if not self._valid_url(showcase):
+                return "This wave needs a showcase video, so the showcase field must be a valid URL."
+            return ""
+
+        if not validation or validation.get("exists") is not True:
+            return f"I couldn't confirm that this level matches the current request type: **{label}**."
+
+        demon = bool(validation.get("demon"))
+        platformer = bool(validation.get("platformer"))
+        length = str(validation.get("length") or "").strip().casefold()
+
+        if request_type == "only_demons" and not demon:
+            return "This wave only accepts demons."
+        if request_type == "only_plats" and not platformer:
+            return "This wave only accepts platformer levels."
+        if request_type == "only_classic" and platformer:
+            return "This wave only accepts classic levels."
+        if request_type == "only_classic_non_demons" and (platformer or demon):
+            return "This wave only accepts classic non-demon levels."
+        if request_type == "only_plats_non_demons" and (not platformer or demon):
+            return "This wave only accepts platformer non-demon levels."
+        if request_type == "long_level" and length not in {"long", "xl"}:
+            return "This wave only accepts Long or XL levels."
+        return ""
+
     def _has_reviewer_role(self, member: discord.Member) -> bool:
         role_ids = self._reviewer_role_ids()
         return member_has_any_role(member, role_ids) or self._is_admin(member)
@@ -938,7 +1057,7 @@ class RequestLevelsCog(commands.Cog):
 
     async def _wave_summary_vars(self, guild_id: int, wave_id: int) -> Dict[str, Any]:
         rows = await self.bot.db.fetchall(
-            "SELECT status, result, reviewed_by FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
+            "SELECT status, result, reviewed_by, data_json FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
             (guild_id, wave_id),
         )
         total = len(rows)
@@ -952,8 +1071,17 @@ class RequestLevelsCog(commands.Cog):
         not_sent = rejected + other
         pending = max(total - reviewed, 0)
         reviewer_stats = await self._reviewer_stats_lines(rows)
+        request_type = ""
+        for row in rows:
+            data = self._safe_json_loads(row["data_json"], {})
+            if isinstance(data, dict):
+                request_type = str(data.get("request_type") or "")
+                if request_type:
+                    break
         return {
             "wave_id": wave_id,
+            "request_type": request_type,
+            "request_type_label": self._request_type_label(request_type),
             "total_requests": total,
             "reviewed_count": reviewed,
             "sent_count": sent,
@@ -1075,14 +1203,28 @@ class RequestLevelsCog(commands.Cog):
 
     def _base_state_vars(self, row) -> Dict[str, Any]:
         if not row:
-            return {"state": "Closed", "wave_id": 0, "submitted_count": 0, "request_limit": "", "close_ts": ""}
+            return {
+                "state": "Closed",
+                "wave_id": 0,
+                "submitted_count": 0,
+                "request_limit": "",
+                "close_ts": "",
+                "request_type": "",
+                "request_type_label": self._request_type_label(""),
+                "request_type_line": "",
+            }
         close_ts = row["close_ts"]
+        request_type = self._request_type_from_row(row) if str(row["state"]) == STATE_OPEN else ""
+        request_type_label = self._request_type_label(request_type)
         return {
             "state": self._state_label(str(row["state"])),
             "wave_id": int(row["wave_id"]),
             "submitted_count": int(row["submitted_count"]),
             "request_limit": "" if row["request_limit"] is None else int(row["request_limit"]),
             "close_ts": "" if close_ts is None else int(close_ts),
+            "request_type": request_type,
+            "request_type_label": request_type_label,
+            "request_type_line": "" if not request_type else f"Type: **{request_type_label}**",
         }
 
     def _row_value(self, row, key: str, default: Any = "") -> Any:
@@ -1162,7 +1304,7 @@ class RequestLevelsCog(commands.Cog):
 
     async def _scheduled_opening_rows(self, guild_id: int, limit: int = 15):
         return await self.bot.db.fetchall(
-            "SELECT id, request_limit, close_minutes, open_ts, created_by, created_ts FROM level_request_scheduled_openings "
+            "SELECT id, request_limit, close_minutes, open_ts, created_by, created_ts, request_type FROM level_request_scheduled_openings "
             "WHERE guild_id=? AND status='pending' ORDER BY open_ts ASC LIMIT ?",
             (guild_id, limit),
         )
@@ -1187,10 +1329,11 @@ class RequestLevelsCog(commands.Cog):
         for row in rows:
             limit = int(row["request_limit"]) if row["request_limit"] is not None else "none"
             close = f"{int(row['close_minutes'])} minutes" if row["close_minutes"] is not None else "none"
+            request_type = self._request_type_label(row["request_type"] if "request_type" in row.keys() else "")
             open_ts = int(row["open_ts"])
             lines.append(
                 f"**#{int(row['id'])}** - <t:{open_ts}:F> (<t:{open_ts}:R>)\n"
-                f"Limit: **{limit}** | Close timer: **{close}** | Created by <@{int(row['created_by'])}>"
+                f"Limit: **{limit}** | Close timer: **{close}** | Type: **{request_type}** | Created by <@{int(row['created_by'])}>"
             )
         embed.add_field(name=f"Openings ({len(rows)} shown)", value="\n\n".join(lines)[:4096], inline=False)
         embed.set_footer(text="Use the selector and buttons below to manage pending openings.")
@@ -1228,13 +1371,16 @@ class RequestLevelsCog(commands.Cog):
             )
         request_limit = int(row["request_limit"]) if row["request_limit"] is not None else None
         close_minutes = int(row["close_minutes"]) if row["close_minutes"] is not None else None
-        wave_id, close_ts = await self._open_requests_now(interaction.guild, request_limit, close_minutes)
+        request_type = self._request_type_from_row(row)
+        wave_id, close_ts = await self._open_requests_now(interaction.guild, request_limit, close_minutes, request_type)
         await self.bot.db.execute(
             "UPDATE level_request_scheduled_openings SET status='opened', opened_wave_id=? WHERE guild_id=? AND id=? AND status='pending'",
             (wave_id, interaction.guild.id, opening_id),
         )
         rows = await self._scheduled_opening_rows(interaction.guild.id)
         note = f"Opened scheduled opening **#{opening_id}** as wave **{wave_id}**."
+        if request_type:
+            note += f" Type: **{self._request_type_label(request_type)}**."
         if close_ts:
             note += f" Closes <t:{close_ts}:R> unless the limit is reached first."
         await interaction.response.edit_message(
@@ -1246,7 +1392,7 @@ class RequestLevelsCog(commands.Cog):
             interaction.guild,
             interaction.user.id,
             "scheduled_opening_opened_now",
-            f"opening_id={opening_id} wave_id={wave_id} force={force}",
+            f"opening_id={opening_id} wave_id={wave_id} force={force} request_type={request_type or 'any'}",
         )
 
     async def handle_scheduled_opening_edit_modal(
@@ -1257,6 +1403,7 @@ class RequestLevelsCog(commands.Cog):
         day: str,
         number: str,
         close_minutes: str,
+        request_type: str,
     ):
         if interaction.guild is None:
             return await interaction.response.send_message("Wrong server.", ephemeral=True)
@@ -1288,16 +1435,22 @@ class RequestLevelsCog(commands.Cog):
         close_value, close_error = optional_positive(close_minutes, "Close timer")
         if close_error:
             return await interaction.response.send_message(close_error, ephemeral=True)
+        normalized_type = self._normalize_request_type(request_type)
+        if normalized_type is None:
+            return await interaction.response.send_message(
+                f"Unknown request type. Use one of: {self._request_type_help()}, or leave it blank.",
+                ephemeral=True,
+            )
 
         await self.bot.db.execute(
-            "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=? WHERE guild_id=? AND id=? AND status='pending'",
-            (request_limit, close_value, open_ts, interaction.guild.id, opening_id),
+            "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=?, request_type=? WHERE guild_id=? AND id=? AND status='pending'",
+            (request_limit, close_value, open_ts, normalized_type or None, interaction.guild.id, opening_id),
         )
         await self._log_request_admin_action(
             interaction.guild,
             interaction.user.id,
             "scheduled_opening_edited",
-            f"opening_id={opening_id} open_ts={open_ts} limit={request_limit} close_minutes={close_value}",
+            f"opening_id={opening_id} open_ts={open_ts} limit={request_limit} close_minutes={close_value} request_type={normalized_type or 'any'}",
         )
         await interaction.response.send_message(
             f"Updated scheduled opening **#{opening_id}** for <t:{open_ts}:F> (<t:{open_ts}:R>).",
@@ -1322,6 +1475,8 @@ class RequestLevelsCog(commands.Cog):
             "level_id": data.get("level_id", ""),
             "level_name": data.get("level_name", ""),
             "creators": data.get("creators", ""),
+            "request_type": str(data.get("request_type") or ""),
+            "request_type_label": str(data.get("request_type_label") or self._request_type_label(data.get("request_type"))),
             "level_showcase": level_showcase,
             "showcase": level_showcase,
             "notes": notes,
@@ -1439,13 +1594,20 @@ class RequestLevelsCog(commands.Cog):
             except Exception as e:
                 await log_error(self.bot, f"Could not update wave {wave_id} summary: {repr(e)}")
 
-    async def _open_requests_now(self, guild: discord.Guild, request_limit: Optional[int], close_minutes: Optional[int]) -> tuple[int, Optional[int]]:
+    async def _open_requests_now(
+        self,
+        guild: discord.Guild,
+        request_limit: Optional[int],
+        close_minutes: Optional[int],
+        request_type: str = "",
+    ) -> tuple[int, Optional[int]]:
         current = await self._get_state(guild.id)
         wave_id = int(current["wave_id"]) + 1
         close_ts = int(time_module.time()) + int(close_minutes) * 60 if close_minutes and int(close_minutes) > 0 else None
+        normalized_type = self._normalize_request_type(request_type) or ""
         await self.bot.db.execute(
-            "UPDATE level_request_state SET state=?, wave_id=?, request_limit=?, close_ts=?, submitted_count=0, opened_ts=?, closed_ts=NULL WHERE guild_id=?",
-            (STATE_OPEN, wave_id, request_limit, close_ts, int(time_module.time()), guild.id),
+            "UPDATE level_request_state SET state=?, wave_id=?, request_limit=?, close_ts=?, submitted_count=0, opened_ts=?, closed_ts=NULL, request_type=? WHERE guild_id=?",
+            (STATE_OPEN, wave_id, request_limit, close_ts, int(time_module.time()), normalized_type or None, guild.id),
         )
         await self.refresh_or_create_request_button(guild)
         return wave_id, close_ts
@@ -1478,7 +1640,7 @@ class RequestLevelsCog(commands.Cog):
                     continue
                 now_ts = int(time_module.time())
                 rows = await self.bot.db.fetchall(
-                    "SELECT id, request_limit, close_minutes, created_by FROM level_request_scheduled_openings "
+                    "SELECT id, request_limit, close_minutes, created_by, request_type FROM level_request_scheduled_openings "
                     "WHERE guild_id=? AND status='pending' AND open_ts<=? ORDER BY open_ts ASC LIMIT 5",
                     (guild.id, now_ts),
                 )
@@ -1500,7 +1662,8 @@ class RequestLevelsCog(commands.Cog):
                             continue
                         request_limit = int(row["request_limit"]) if row["request_limit"] is not None else None
                         close_minutes = int(row["close_minutes"]) if row["close_minutes"] is not None else None
-                        wave_id, _ = await self._open_requests_now(guild, request_limit, close_minutes)
+                        request_type = self._request_type_from_row(row)
+                        wave_id, _ = await self._open_requests_now(guild, request_limit, close_minutes, request_type)
                         await self.bot.db.execute(
                             "UPDATE level_request_scheduled_openings SET status='opened', opened_wave_id=? WHERE id=? AND guild_id=?",
                             (wave_id, opening_id, guild.id),
@@ -1607,7 +1770,15 @@ class RequestLevelsCog(commands.Cog):
         await self._log_request_admin_action(ctx.guild, ctx.user.id, "refresh_request_button", f"message_id={msg.id}")
         await ctx.respond(f"Request button refreshed: {msg.jump_url}", ephemeral=True)
 
-    async def open_requests(self, ctx: discord.ApplicationContext, number: int = 0, time: int = 0, when: str = "", day: int = 0):
+    async def open_requests(
+        self,
+        ctx: discord.ApplicationContext,
+        number: int = 0,
+        time: int = 0,
+        when: str = "",
+        day: int = 0,
+        request_type: str = "",
+    ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
@@ -1616,17 +1787,23 @@ class RequestLevelsCog(commands.Cog):
 
         request_limit = int(number) if number and int(number) > 0 else None
         close_minutes = int(time) if time and int(time) > 0 else None
+        normalized_type = self._normalize_request_type(request_type)
+        if normalized_type is None:
+            return await ctx.respond(f"Unknown request type. Use one of: {self._request_type_help()}, or leave it blank.", ephemeral=True)
+        type_label = self._request_type_label(normalized_type)
 
         if str(when or "").strip():
             open_ts, error = self._parse_scheduled_open_ts(when, day)
             if open_ts is None:
                 return await ctx.respond(error or "I couldn't parse that opening time.", ephemeral=True)
             await self.bot.db.execute(
-                "INSERT INTO level_request_scheduled_openings(guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,status) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (ctx.guild.id, request_limit, close_minutes, open_ts, ctx.user.id, int(time_module.time()), "pending"),
+                "INSERT INTO level_request_scheduled_openings(guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,status,request_type) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (ctx.guild.id, request_limit, close_minutes, open_ts, ctx.user.id, int(time_module.time()), "pending", normalized_type or None),
             )
             details = [f"Request opening scheduled for <t:{open_ts}:F> (<t:{open_ts}:R>)."]
+            if normalized_type:
+                details.append(f"Type: **{type_label}**.")
             if request_limit:
                 details.append(f"Limit: **{request_limit}** successful requests.")
             if close_minutes:
@@ -1636,19 +1813,21 @@ class RequestLevelsCog(commands.Cog):
                 ctx.guild,
                 ctx.user.id,
                 "scheduled_opening_created",
-                f"open_ts={open_ts} limit={request_limit} close_minutes={close_minutes}",
+                f"open_ts={open_ts} limit={request_limit} close_minutes={close_minutes} request_type={normalized_type or 'any'}",
             )
             return await ctx.respond(" ".join(details), ephemeral=True)
 
-        wave_id, close_ts = await self._open_requests_now(ctx.guild, request_limit, close_minutes)
+        wave_id, close_ts = await self._open_requests_now(ctx.guild, request_limit, close_minutes, normalized_type or "")
         await self._log_request_admin_action(
             ctx.guild,
             ctx.user.id,
             "requests_opened",
-            f"wave_id={wave_id} limit={request_limit} close_ts={close_ts}",
+            f"wave_id={wave_id} limit={request_limit} close_ts={close_ts} request_type={normalized_type or 'any'}",
         )
 
         details = [f"Wave **{wave_id}** opened."]
+        if normalized_type:
+            details.append(f"Type: **{type_label}**.")
         if request_limit:
             details.append(f"Limit: **{request_limit}** successful requests.")
         if close_ts:
@@ -1666,6 +1845,7 @@ class RequestLevelsCog(commands.Cog):
         time: int = -1,
         when: str = "",
         day: int = 0,
+        request_type: str = "",
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -1697,10 +1877,19 @@ class RequestLevelsCog(commands.Cog):
             new_limit = row["request_limit"]
             new_close = row["close_minutes"]
             new_open_ts = int(row["open_ts"])
+            new_type = row["request_type"] if "request_type" in row.keys() else None
             if number >= 0:
                 new_limit = int(number) if int(number) > 0 else None
             if time >= 0:
                 new_close = int(time) if int(time) > 0 else None
+            if str(request_type or "").strip():
+                parsed_type = self._normalize_request_type(request_type)
+                if parsed_type is None:
+                    return await ctx.respond(
+                        f"Unknown request type. Use one of: {self._request_type_help()}, or use `any` to clear it.",
+                        ephemeral=True,
+                    )
+                new_type = parsed_type or None
             if str(when or "").strip():
                 parsed_ts, error = self._parse_scheduled_open_ts(when, day)
                 if parsed_ts is None:
@@ -1708,17 +1897,17 @@ class RequestLevelsCog(commands.Cog):
                 new_open_ts = parsed_ts
 
             await self.bot.db.execute(
-                "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=? WHERE guild_id=? AND id=? AND status='pending'",
-                (new_limit, new_close, new_open_ts, ctx.guild.id, opening_id),
+                "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=?, request_type=? WHERE guild_id=? AND id=? AND status='pending'",
+                (new_limit, new_close, new_open_ts, new_type, ctx.guild.id, opening_id),
             )
             await self._log_request_admin_action(
                 ctx.guild,
                 ctx.user.id,
                 "scheduled_opening_edited",
-                f"opening_id={opening_id} open_ts={new_open_ts} limit={new_limit} close_minutes={new_close}",
+                f"opening_id={opening_id} open_ts={new_open_ts} limit={new_limit} close_minutes={new_close} request_type={new_type or 'any'}",
             )
             return await ctx.respond(
-                f"Updated scheduled opening **#{opening_id}** for <t:{new_open_ts}:F> (<t:{new_open_ts}:R>).",
+                f"Updated scheduled opening **#{opening_id}** for <t:{new_open_ts}:F> (<t:{new_open_ts}:R>). Type: **{self._request_type_label(new_type)}**.",
                 ephemeral=True,
             )
 
@@ -1749,6 +1938,9 @@ class RequestLevelsCog(commands.Cog):
         parts = [f"Requests are **{state_label}**.", f"Wave: **{int(row['wave_id'])}**.", f"Submitted: **{int(row['submitted_count'])}**."]
         if row["request_limit"] is not None:
             parts.append(f"Limit: **{int(row['request_limit'])}**.")
+        request_type = self._request_type_from_row(row) if str(row["state"]) == STATE_OPEN else ""
+        if request_type:
+            parts.append(f"Type: **{self._request_type_label(request_type)}**.")
         if row["close_ts"] is not None and str(row["state"]) == STATE_OPEN:
             parts.append(f"Closes <t:{int(row['close_ts'])}:R>.")
         await ctx.respond(" ".join(parts), ephemeral=True)
@@ -1910,6 +2102,10 @@ class RequestLevelsCog(commands.Cog):
                 wave_id = int(row["wave_id"])
                 user_id = interaction.user.id
                 normalized_level_id = self._normalize_level_id(data["level_id"])
+                request_type = self._request_type_from_row(row)
+                type_error = self._request_type_validation_error(request_type, data, level_validation)
+                if type_error:
+                    return await self._reply_ephemeral(interaction, type_error)
 
                 existing_user = await self.bot.db.fetchone(
                     "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
@@ -1932,6 +2128,8 @@ class RequestLevelsCog(commands.Cog):
                 data = dict(data)
                 data["level_id"] = str(data["level_id"]).strip()
                 data["level_id_normalized"] = normalized_level_id
+                data["request_type"] = request_type
+                data["request_type_label"] = self._request_type_label(request_type)
                 data["edit_deadline_ts"] = self._edit_deadline_ts_for_state(row)
                 data["edit_count"] = 0
                 data["duplicate_history_warning"] = await self._duplicate_history_warning(
@@ -2073,6 +2271,11 @@ class RequestLevelsCog(commands.Cog):
                 return await self._reply_ephemeral(interaction, self._message("edit_window_expired", "Your request can no longer be edited."))
 
             normalized_level_id = self._normalize_level_id(data["level_id"])
+            request_type = self._request_type_from_row(state_row)
+            type_error = self._request_type_validation_error(request_type, data, level_validation)
+            if type_error:
+                return await self._reply_ephemeral(interaction, type_error)
+
             existing_level = await self.bot.db.fetchone(
                 "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND level_id=? AND user_id<>?",
                 (interaction.guild.id, wave_id, normalized_level_id, interaction.user.id),
@@ -2100,6 +2303,8 @@ class RequestLevelsCog(commands.Cog):
             data = dict(data)
             data["level_id"] = self._clean_level_id(data["level_id"])
             data["level_id_normalized"] = normalized_level_id
+            data["request_type"] = request_type
+            data["request_type_label"] = self._request_type_label(request_type)
             data["edit_deadline_ts"] = self._edit_deadline_ts_for_state(state_row)
             data["edit_count"] = edit_count
             data["duplicate_history_warning"] = await self._duplicate_history_warning(

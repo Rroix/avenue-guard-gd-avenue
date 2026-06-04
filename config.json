@@ -68,14 +68,27 @@
     "reminder_after_hours": 12,
     "reminder_repeat_hours": 0,
     "weekly_request_max_chars": 3000,
-    "log_channel_id": 0
+    "log_channel_id": 0,
+    "streak_top_rank": 5,
+    "streak_emoji": "🔥",
+    "anti_farm": {
+      "_comment": "Skips repeated low-effort messages from weekly activity counts and logs suspicious patterns.",
+      "enabled": true,
+      "min_unique_chars": 3,
+      "min_words": 2,
+      "repeat_window_seconds": 120,
+      "repeat_threshold": 3,
+      "log_channel_id": "1445502925081284729"
+    }
   },
   "tickets": {
     "_comment": "Ticket settings.",
     "ticket_category_id": "1239942138838650981",
     "staff_ping_role_id": "1462403598028640296",
     "ticket_creation_cooldown_hours": 24,
-    "ticket_inactivity_hours": 24
+    "ticket_inactivity_hours": 24,
+    "satisfaction_enabled": true,
+    "satisfaction_prompt": "How was your staff ticket experience?"
   },
   "responses": {
     "_comment": "Message response rules.",
@@ -289,7 +302,7 @@
     },
     "request_button_embed": {
       "title": "Level Requests",
-      "description_open": "Requests are currently **open**. Press the button below to request your level :D",
+      "description_open": "Requests are currently **open**. Press the button below to request your level :D\n{request_type_line}",
       "description_closed": "Requests are currently **closed**. Please wait for the next request wave...",
       "footer": "GD Avenue Level Requests, don't break any rules!"
     },
@@ -298,6 +311,7 @@
       "description": "Live review progress for this request wave.",
       "color": "{summary_color}",
       "fields": [
+        { "name": "Type", "value": "{request_type_label}", "inline": true },
         { "name": "Requested", "value": "{total_requests}", "inline": true },
         { "name": "Reviewed", "value": "{reviewed_count} / {total_requests} ({reviewed_percent})", "inline": true },
         { "name": "Left to review", "value": "{pending_count} ({pending_percent})", "inline": true },
@@ -317,6 +331,7 @@
         { "name": "Level ID", "value": "{level_id}", "inline": true },
         { "name": "Level Info", "value": "[Level](https://gdbrowser.com/{level_id})", "inline": true },
         { "name": "Submitted", "value": "{submitted_ago}", "inline": true },
+        { "name": "Wave Type", "value": "{request_type_label}", "inline": true },
         { "name": "GD Info", "value": "{gd_info}", "inline": false },
         { "name": "Showcase", "value": "{level_showcase}", "inline": false },
         { "name": "Notes", "value": "{notes}", "inline": false },
@@ -404,6 +419,12 @@
       "channel_id": "1445502925081284729",
       "reset_after_report": true
     },
+    "weekly_recap": {
+      "_comment": "Optional weekly recap embed. If channel_id is empty, falls back to the daily summary channel.",
+      "enabled": true,
+      "time": "00:10",
+      "channel_id": "1445502925081284729"
+    },
     "status_rotation": {
       "_comment": "Optional rotating presence. Each entry is an object: {type,text}. Types: playing, watching, listening, competing.",
       "enabled": true,
@@ -442,7 +463,7 @@
     "server_icon_rotation": {
       "_comment": "Rotates the server icon from configured image URLs. mode is disabled, linear, or random.",
       "mode": "linear",
-      "interval_seconds": 600,
+      "interval_seconds": 300,
       "current_index": -1,
       "current_url": "",
       "last_changed_ts": 0,

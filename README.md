@@ -16,8 +16,10 @@ The bot is intentionally built around one configured server. Most behavior is co
 ### Weekly Activity Requests
 - Counts eligible member messages per Madrid-time week.
 - Skips configured roles and channels.
+- Skips and logs repeated low-effort message farming patterns before they count.
 - Buffers activity writes briefly with `tracking.activity_flush_seconds` so busy chat does less SQLite work.
 - Provides `/tracking top`, `/tracking me`, `/tracking reset`, `/tracking force_dm`, `/tracking disable_reward`, and `/tracking enable_reward`.
+- Tracks top-5 weekly streaks and shows streak markers in tracking embeds.
 - DMs weekly winners with a configurable request embed.
 - Supports claim, decline confirmation, timeout, reminders, and automatic offer to the next eligible member.
 - Posts weekly request submissions as configurable embeds with `Send`, `Reject`, and `Other` review buttons.
@@ -27,11 +29,13 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Logs weekly request events, including manual `/tracking force_dm` outcomes, to SQLite and optionally to a log channel.
 - Logs weekly request recording failures instead of silently closing a claim when the staff request channel cannot be used.
 - Weekly request log embeds use readable event names, colors, member context, and structured details.
+- Posts a private weekly recap embed to the daily-summary/log channel with activity, weekly request, review, streak, and anti-farm signals.
 
 ### Live Level Request Waves
 - Posts a persistent request embed/button in `level_requests.request_channel`.
 - Mods can recreate or refresh the request button with `/refresh-request-button`.
 - Admins can open request waves with `/open-requests`.
+- Request waves can optionally be limited by type, including needs showcase, only demons, only platformers, only classic, non-demon variants, and Long/XL levels.
 - Admins can schedule future request openings with `/open-requests when:<HH:MM> day:<optional>`.
 - Admins can list, edit, delete, refresh, or immediately open scheduled openings from the `/pending-openings` interactive panel.
 - “Open now” asks for confirmation if requests are already open, and automatic scheduled openings will not silently replace an active wave.
@@ -42,6 +46,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Blocks duplicate users and duplicate level IDs inside the same wave.
 - Warns staff when a submitted level ID has appeared in previous waves.
 - Validates level IDs as 7 to 9 digits, validates showcase links as URLs, and checks level existence through GDBrowser plus the direct GD/Boomlings endpoint.
+- Enforces the active wave type after GD validation and before the request counts toward the wave.
 - Reuses one validation HTTP session, rate-limits validation attempts per user, and temporarily backs off providers that fail repeatedly.
 - Auto-rejects confidently missing level IDs while surfacing uncertain validation warnings to reviewers.
 - Warns reviewers when a level appears rated, when validation sources disagree, or when validation will refresh after the configured cache time.
@@ -68,6 +73,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Cleans up the previous DM help screen when members select a new option, press a flow button, cancel, or start over.
 - Hides the current help screen from the menu so members are not offered the same page they are already viewing.
 - Supports FAQ browsing and keyword search from the menu or by typing phrases like `faq request`.
+- Suggests relevant FAQ entries before opening a staff ticket.
 - Supports FAQ, punishment appeals, user reports, bot issue reports, weekly status checks, transcript requests, and staff contact tickets.
 - Appeals, reports, and bot issue reports show a preview before submission, keep attachment links, receive tracked IDs, and can be checked later from My submissions.
 - Staff can reply to a tracked appeal/report/bug log embed to relay a response back to the submitter by DM.
@@ -75,7 +81,10 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Uses atomic ticket IDs to avoid duplicate ticket numbers during simultaneous ticket creation.
 - Caches active ticket channels so normal server messages do not hit the database for ticket checks.
 - Tracks ticket inactivity and prompts staff to close stale tickets.
+- Tracks ticket statuses: Waiting for user, Waiting for staff, and Resolved.
 - Saves transcripts before deleting tickets.
+- Lets staff search saved ticket transcripts by user or ticket ID.
+- Sends a configurable satisfaction prompt after a ticket closes.
 - Lets staff approve or deny transcript requests.
 - Posts appeals, reports, bot issues, transcript requests, ticket transcripts, and bot errors as structured staff-log embeds with safe mention behavior and audit logs.
 
@@ -86,6 +95,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Can enforce a required word in forum post title/body.
 - Required-word matching supports `contains`, `whole_word`, and `regex` modes with basic text normalization.
 - If the required word is missing, Avenue Guard DMs the thread owner and deletes the forum thread.
+- Logs required-word forum deletions with the deleted thread and author.
 - Admins can view or change the required word with `/forum required_word`.
 
 ### Configurable Auto-Responses
@@ -97,6 +107,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Blocks mass mentions from configured auto-responses and caps configured response length.
 
 ### Background Utilities
+- `/bot dashboard` opens a button-driven admin dashboard with system health, request state, tracking state, icon rotation, config issues, and repair tips.
 - `/bot health` shows database, background task, request, ticket, and weekly workflow status.
 - `/bot config_check` validates configured channels, roles, request embed template variables, and `responses.json` rule shape/channel references.
 - `/bot doctor` runs deeper permission diagnostics for channels, ticket category access, managed role hierarchy, and request-button state.
@@ -134,12 +145,14 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/requests history message_id:<optional> user_id:<optional> wave:<optional>` shows the edit audit trail for a live-wave request.
 - `/requests repair` runs request-system recovery and message refresh tasks.
 - `/refresh-request-button` refreshes or recreates the live request button.
-- `/open-requests number:<optional> time:<optional> when:<optional> day:<optional>` opens or schedules a request wave.
+- `/open-requests number:<optional> time:<optional> when:<optional> day:<optional> type:<optional>` opens or schedules a request wave.
 - `/pending-openings action:<list|edit|delete> opening_id:<optional>` manages scheduled request openings and shows an interactive management panel by default.
 - `/edit-request` lets a user edit their current pending live-wave request during the edit window.
 - `/close-requests` closes the active request wave.
 - `/requests-are` shows whether requests are currently open or closed.
 - `/ticket close` closes the current ticket channel.
+- `/ticket status status:<waiting_user|waiting_staff|resolved>` updates the current ticket status.
+- `/ticket transcripts user:<optional> ticket_id:<optional>` searches saved ticket transcripts.
 - `/forum required_word` views or changes the forum required word. Discord administrators only.
 - `/resync` reloads config and response rules without restarting.
 - `/restart` flushes buffered tracking/daily stats, then exits the bot so the host can restart it.
@@ -204,7 +217,7 @@ Use `off`, `disable`, `none`, or `clear` as the word to disable enforcement for 
 Server icon rotation lives under `background.server_icon_rotation` in `config.json`.
 
 - `mode`: `disabled`, `linear`, or `random`.
-- `interval_seconds`: time between automatic changes, with a minimum of 600 seconds.
+- `interval_seconds`: time between automatic changes, with a minimum of 300 seconds.
 - `urls`: direct image URLs used for the server icon.
 - `current_index`, `current_url`, and `last_changed_ts`: saved state used by the rotation loop.
 - `last_error` and `last_error_ts`: the most recent rotation failure shown in `/server_icon status`.

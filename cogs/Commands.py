@@ -25,6 +25,74 @@ from utils.errors import log_error
 
 DEFAULT_REQUEST_REVIEWER_ROLE_IDS = [785212232786640966, 1430214323720163498]
 
+TICKET_STATUS_LABELS = {
+    "waiting_user": "Waiting for user",
+    "waiting_staff": "Waiting for staff",
+    "resolved": "Resolved",
+}
+
+
+def _ticket_status_key(value) -> str:
+    text = re.sub(r"[_\-/]+", " ", str(value or "").strip().casefold())
+    text = re.sub(r"\s+", " ", text).strip()
+    if text in {"waiting user", "waiting for user", "user", "wfu"}:
+        return "waiting_user"
+    if text in {"waiting staff", "waiting for staff", "staff", "wfs"}:
+        return "waiting_staff"
+    if text in {"resolved", "resolve", "done", "closed"}:
+        return "resolved"
+    return ""
+
+
+def _ticket_status_label(value) -> str:
+    return TICKET_STATUS_LABELS.get(_ticket_status_key(value), "Waiting for staff")
+
+
+class AdminDashboardView(discord.ui.View):
+    def __init__(self, cog, user_id: int, page: str = "overview"):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.user_id = int(user_id)
+        self.page = page
+
+    async def _allowed(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This dashboard belongs to another admin.", ephemeral=True)
+            return False
+        if interaction.guild is None:
+            await interaction.response.send_message("Wrong server.", ephemeral=True)
+            return False
+        member = await self.cog._resolve_member(interaction.guild, interaction.user)
+        admin_roles = self.cog.bot.config.get_int_list("roles", "admin_owner_role_ids")
+        if member is None or not is_admin_or_owner(member, admin_roles):
+            await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+            return False
+        return True
+
+    async def _show(self, interaction: discord.Interaction, page: str):
+        if not await self._allowed(interaction):
+            return
+        self.page = page
+        embed = await self.cog._admin_dashboard_embed(interaction.guild, page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Overview", style=discord.ButtonStyle.primary)
+    async def overview(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show(interaction, "overview")
+
+    @discord.ui.button(label="Config", style=discord.ButtonStyle.secondary)
+    async def config(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show(interaction, "config")
+
+    @discord.ui.button(label="Repair Tips", style=discord.ButtonStyle.secondary)
+    async def repairs(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show(interaction, "repairs")
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.success)
+    async def refresh(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show(interaction, self.page)
+
+
 class CommandsCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
@@ -46,6 +114,7 @@ class CommandsCog(commands.Cog):
         self.bot_group.command(name="health", description="Show bot health and live system status")(self.bot_health)
         self.bot_group.command(name="config_check", description="Check configured channels and roles")(self.bot_config_check)
         self.bot_group.command(name="doctor", description="Run deep bot permission diagnostics")(self.bot_doctor)
+        self.bot_group.command(name="dashboard", description="Open the admin system dashboard")(self.bot_dashboard)
 
         self.tracking_group.command(name="top", description="Show the current week's top 20 active members")(self.tracking_top)
         self.tracking_group.command(name="reset", description="Reset current week's tracking stats")(self.tracking_reset)
@@ -55,6 +124,8 @@ class CommandsCog(commands.Cog):
         self.tracking_group.command(name="enable_reward", description="Re-enable this week's automatic weekly request reward")(self.tracking_enable_reward)
 
         self.ticket_group.command(name="close", description="Close the current ticket channel")(self.ticket_close)
+        self.ticket_group.command(name="status", description="Set the current ticket status")(self.ticket_status)
+        self.ticket_group.command(name="transcripts", description="Search saved ticket transcripts")(self.ticket_transcripts)
         self.forum_group.command(name="required_word", description="View or update a forum required word")(self.forum_required_word)
         self.requests_group.command(name="pending", description="Show and filter pending request reviews")(self.requests_pending)
         self.requests_group.command(name="history", description="Show request edit history")(self.requests_history)
@@ -388,6 +459,190 @@ class CommandsCog(commands.Cog):
         except Exception:
             return None
 
+    def _task_state(self, cog_name: str, attr: str) -> str:
+        cog = self.bot.get_cog(cog_name)
+        task = getattr(cog, attr, None) if cog else None
+        if task is None:
+            return "missing"
+        if hasattr(task, "is_running"):
+            try:
+                return "running" if task.is_running() else "stopped"
+            except Exception:
+                return "unknown"
+        if hasattr(task, "done"):
+            return "done" if task.done() else "running"
+        return "unknown"
+
+    async def _count_db(self, sql: str, params: tuple) -> int:
+        try:
+            row = await self.bot.db.fetchone(sql, params)
+            return int(row["c"]) if row and row["c"] is not None else 0
+        except Exception:
+            return 0
+
+    async def _dashboard_issues(self, guild: discord.Guild) -> tuple[list[str], list[str]]:
+        cfg = self.bot.config
+        issues: list[str] = []
+        repairs: list[str] = []
+        me = guild.me or guild.get_member(self.bot.user.id)
+
+        channel_checks = {
+            "general logs": cfg.get_int("channels", "general_logging_channel_id"),
+            "weekly requests": cfg.get_int("channels", "weekly_request_channel_ID"),
+            "request button": cfg.get_int("level_requests", "request_channel"),
+            "level requested": cfg.get_int("level_requests", "level_requested"),
+            "sent results": cfg.get_int("level_requests", "sent_channel"),
+            "rejected results": cfg.get_int("level_requests", "rejected_channel"),
+            "ticket transcripts": cfg.get_int("channels", "general_logging_channel_id"),
+            "transcript requests": cfg.get_int("channels", "transcript_requests_channel_id"),
+        }
+        for label, channel_id in channel_checks.items():
+            if not channel_id or guild.get_channel(int(channel_id)) is None:
+                issues.append(f"{label}: missing channel `{channel_id or 'not set'}`")
+                repairs.append(f"Update the `{label}` channel ID in `config.json`")
+
+        if me is not None:
+            guild_perms = getattr(me, "guild_permissions", None)
+            if guild_perms is not None and not bool(getattr(guild_perms, "manage_guild", False)):
+                icon_cfg = ensure_server_icon_config(cfg)
+                if normalize_server_icon_mode(icon_cfg.get("mode")) != "disabled":
+                    issues.append("server icon rotation: bot needs Manage Server")
+                    repairs.append("Grant the bot Manage Server, or set server icon rotation mode to disabled")
+
+        category_id = cfg.get_int("tickets", "ticket_category_id")
+        category = guild.get_channel(category_id) if category_id else None
+        if not isinstance(category, discord.CategoryChannel):
+            issues.append("ticket category: missing or invalid")
+            repairs.append("Set `tickets.ticket_category_id` to the ticket category")
+        elif me is not None and not category.permissions_for(me).manage_channels:
+            issues.append("ticket category: bot cannot manage channels")
+            repairs.append("Give the bot Manage Channels in the ticket category")
+
+        request_cog = self.bot.get_cog("RequestLevelsCog")
+        if request_cog is None:
+            issues.append("request system: cog not loaded")
+            repairs.append("Check startup logs for RequestLevelsCog import errors")
+        else:
+            try:
+                state = await request_cog._get_state(guild.id)
+                if not state or not state["request_message_id"]:
+                    issues.append("request button: no saved message")
+                    repairs.append("Run `/refresh-request-button`")
+            except Exception as e:
+                issues.append(f"request state: {type(e).__name__}")
+                repairs.append("Run `/requests repair`, then check the error log")
+
+        template_issues: list[str] = []
+        self._validate_request_templates(template_issues)
+        if template_issues:
+            issues.extend(template_issues[:4])
+            repairs.append("Fix the listed request template variable or color entries in `config.json`")
+
+        return issues, repairs
+
+    async def _admin_dashboard_embed(self, guild: discord.Guild, page: str = "overview") -> discord.Embed:
+        page = str(page or "overview").casefold()
+        issues, repairs = await self._dashboard_issues(guild)
+        db_ok = True
+        db_note = "Connected"
+        try:
+            await self.bot.db.fetchone("SELECT 1 AS c")
+        except Exception as e:
+            db_ok = False
+            db_note = type(e).__name__
+
+        request_row = await self.bot.db.fetchone("SELECT state, wave_id, submitted_count, request_limit, close_ts, request_type FROM level_request_state WHERE guild_id=?", (guild.id,))
+        request_state = "Not initialized"
+        if request_row:
+            limit = "none" if request_row["request_limit"] is None else str(int(request_row["request_limit"]))
+            request_state = f"{str(request_row['state']).title()} wave **{int(request_row['wave_id'])}**\nSubmitted: **{int(request_row['submitted_count'])}** / **{limit}**"
+            if request_row["request_type"]:
+                request_state += f"\nType: **{str(request_row['request_type']).replace('_', ' ').title()}**"
+            if request_row["close_ts"] and str(request_row["state"]) == "open":
+                request_state += f"\nCloses <t:{int(request_row['close_ts'])}:R>"
+
+        icon_cfg = ensure_server_icon_config(self.bot.config)
+        icon_mode = normalize_server_icon_mode(icon_cfg.get("mode"))
+        icon_interval = int(icon_cfg.get("interval_seconds", 0) or 0)
+        icon_current = parse_server_icon_index(icon_cfg.get("current_index", -1), len(icon_cfg.get("urls", []) or []))
+        icon_text = f"Mode: **{icon_mode}**\nInterval: **{icon_interval}s**\nCurrent: **{icon_current + 1 if icon_current >= 0 else 'unknown'}** / **{len(icon_cfg.get('urls', []) or [])}**"
+
+        if page == "config":
+            embed = discord.Embed(
+                title="Admin Dashboard - Config",
+                description=f"Configuration scan found **{len(issues)}** issue(s).",
+                color=discord.Color.green() if not issues else discord.Color.orange(),
+                timestamp=now_madrid(),
+            )
+            embed.add_field(name="Issues", value="\n".join(f"- {item}" for item in issues[:12])[:1024] or "No obvious config issues found.", inline=False)
+            embed.add_field(
+                name="Key State",
+                value=(
+                    f"Database: **{db_note}**\n"
+                    f"Request state: {request_state.splitlines()[0]}\n"
+                    f"Icon rotation: **{icon_mode}**"
+                ),
+                inline=False,
+            )
+            return embed
+
+        if page == "repairs":
+            embed = discord.Embed(
+                title="Admin Dashboard - Repair Tips",
+                description="Suggested next actions based on the current scan.",
+                color=discord.Color.green() if not issues else discord.Color.gold(),
+                timestamp=now_madrid(),
+            )
+            deduped_repairs = []
+            for item in repairs:
+                if item not in deduped_repairs:
+                    deduped_repairs.append(item)
+            embed.add_field(name="Suggestions", value="\n".join(f"- {item}" for item in deduped_repairs[:12])[:1024] or "No repairs suggested right now.", inline=False)
+            embed.add_field(name="Fast Repairs", value="`/requests repair`\n`/refresh-request-button`\n`/resync`", inline=True)
+            embed.add_field(name="Remaining Issues", value=str(len(issues)), inline=True)
+            return embed
+
+        open_tickets = await self._count_db("SELECT COUNT(*) AS c FROM tickets WHERE guild_id=? AND status IN ('open','closing_prompted')", (guild.id,))
+        pending_live = await self._count_db("SELECT COUNT(*) AS c FROM level_request_submissions WHERE guild_id=? AND status='pending'", (guild.id,))
+        pending_weekly = await self._count_db("SELECT COUNT(*) AS c FROM weekly_request_reviews WHERE guild_id=? AND status='pending'", (guild.id,))
+        active_weekly = await self._count_db("SELECT COUNT(*) AS c FROM weekly_sessions WHERE guild_id=? AND active=1", (guild.id,))
+        farm_events = await self._count_db("SELECT COUNT(*) AS c FROM anti_farm_events WHERE guild_id=? AND ts>=?", (guild.id, int(time.time()) - 7 * 86400))
+
+        embed = discord.Embed(
+            title="Avenue Guard Admin Dashboard",
+            description="Live system overview for staff.",
+            color=discord.Color.green() if db_ok and not issues else discord.Color.orange(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(name="Core", value=f"Database: **{db_note}**\nLatency: **{round(self.bot.latency * 1000)} ms**\nLoaded cogs: **{len(self.bot.cogs)}**", inline=True)
+        embed.add_field(name="Requests", value=f"{request_state}\nPending reviews: **{pending_live}** live / **{pending_weekly}** weekly", inline=True)
+        embed.add_field(name="Tracking", value=f"Active weekly sessions: **{active_weekly}**\nAnti-farm events, 7d: **{farm_events}**", inline=True)
+        embed.add_field(name="Tickets", value=f"Open tickets: **{open_tickets}**", inline=True)
+        embed.add_field(name="Icon Rotation", value=icon_text, inline=True)
+        embed.add_field(
+            name="Background Tasks",
+            value=(
+                f"Weekly scan: `{self._task_state('TrackingCog', '_weekly_task')}`\n"
+                f"Activity flush: `{self._task_state('TrackingCog', '_activity_flush_task')}`\n"
+                f"Ticket scan: `{self._task_state('HelpCog', '_ticket_scan_task')}`\n"
+                f"Daily summary: `{self._task_state('BackgroundCog', 'daily_report')}`\n"
+                f"Icon rotation: `{self._task_state('BackgroundCog', 'rotate_server_icon')}`"
+            ),
+            inline=False,
+        )
+        if issues:
+            embed.add_field(name="Needs Attention", value="\n".join(f"- {item}" for item in issues[:5])[:1024], inline=False)
+        return embed
+
+    async def bot_dashboard(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_admin_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        embed = await self._admin_dashboard_embed(ctx.guild, "overview")
+        await self._send(ctx, embed=embed, view=AdminDashboardView(self, ctx.user.id), ephemeral=True)
+
     # --- /bot diagnostics ---
 
     async def bot_health(self, ctx: discord.ApplicationContext):
@@ -611,6 +866,9 @@ class CommandsCog(commands.Cog):
             "submitted_count",
             "request_limit",
             "close_ts",
+            "request_type",
+            "request_type_label",
+            "request_type_line",
             "total_requests",
             "reviewed_count",
             "sent_count",
@@ -859,8 +1117,8 @@ class CommandsCog(commands.Cog):
             issues.append("background.server_icon_rotation.urls: at least one URL is needed unless mode is disabled")
         else:
             ok_count += len(server_icon_urls)
-        if int(server_icon_cfg.get("interval_seconds", 0) or 0) < 600:
-            issues.append("background.server_icon_rotation.interval_seconds: must be at least 600")
+        if int(server_icon_cfg.get("interval_seconds", 0) or 0) < 300:
+            issues.append("background.server_icon_rotation.interval_seconds: must be at least 300")
         else:
             ok_count += 1
 
@@ -1168,9 +1426,17 @@ class CommandsCog(commands.Cog):
         if not top:
             return await self._send(ctx, "No eligible members tracked yet this week.")
 
+        streak_rows = await self.bot.db.fetchall(
+            "SELECT user_id, streak FROM weekly_streaks WHERE guild_id=? AND streak>1",
+            (ctx.guild.id,),
+        )
+        streaks = {int(row["user_id"]): int(row["streak"]) for row in streak_rows}
+        streak_emoji = str(self.bot.config.get("tracking", "streak_emoji", default="🔥") or "🔥")
         lines = []
         for i, (uid, cnt) in enumerate(top, start=1):
-            lines.append(f"**#{i:02d}** <@{uid}> - **{cnt}** messages")
+            streak = streaks.get(int(uid), 0)
+            streak_text = f" {streak_emoji}{streak}" if streak > 1 else ""
+            lines.append(f"**#{i:02d}** <@{uid}> - **{cnt}** messages{streak_text}")
 
         week_label = week_start_sunday(now_madrid()).strftime("%Y-%m-%d")
         embed = discord.Embed(
@@ -1214,6 +1480,17 @@ class CommandsCog(commands.Cog):
         )
         embed.add_field(name="Messages counted", value=f"**{count}**", inline=True)
         embed.add_field(name="Rank", value=f"**#{rank}** of **{eligible_total}**", inline=True)
+        streak_row = await self.bot.db.fetchone(
+            "SELECT streak, best_streak FROM weekly_streaks WHERE guild_id=? AND user_id=?",
+            (ctx.guild.id, ctx.user.id),
+        )
+        if streak_row and int(streak_row["streak"] or 0) > 1:
+            streak_emoji = str(self.bot.config.get("tracking", "streak_emoji", default="🔥") or "🔥")
+            embed.add_field(
+                name="Top 5 Streak",
+                value=f"{streak_emoji} **{int(streak_row['streak'])}** weeks\nBest: **{int(streak_row['best_streak'] or 0)}**",
+                inline=True,
+            )
         embed.add_field(name="Status", value="Eligible for weekly tracking", inline=False)
         try:
             member = await self._resolve_member(ctx.guild, ctx.user)
@@ -1339,6 +1616,106 @@ class CommandsCog(commands.Cog):
                 await ctx.followup.send("I couldn't close the ticket safely. Check the ticket channel for details.", ephemeral=True)
             except Exception:
                 pass
+
+    async def ticket_status(
+        self,
+        ctx: discord.ApplicationContext,
+        status: discord.Option(str, "Status to set: waiting_user, waiting_staff, or resolved"),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+
+        member = await self._resolve_member(ctx.guild, ctx.user)
+        mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
+        allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
+        if member is None or not is_mod(member, mod_role_id, allow_manage_guild=allow_manage_guild):
+            return await ctx.respond("Only mods can update tickets.", ephemeral=True)
+
+        status_key = _ticket_status_key(status)
+        if not status_key:
+            return await ctx.respond("Use `waiting_user`, `waiting_staff`, or `resolved`.", ephemeral=True)
+
+        row = await self.bot.db.fetchone(
+            "SELECT ticket_id, creator_id, status FROM tickets WHERE channel_id=? AND status IN ('open','closing_prompted')",
+            (ctx.channel_id,),
+        )
+        if not row:
+            return await ctx.respond("This isn't an active ticket channel.", ephemeral=True)
+
+        await self.bot.db.execute(
+            "UPDATE tickets SET status='open', status_tag=? WHERE channel_id=?",
+            (status_key, ctx.channel_id),
+        )
+        ticket_label = f"`T{int(row['ticket_id'])}`" if row["ticket_id"] is not None else "this ticket"
+        embed = discord.Embed(
+            title="Ticket Status Updated",
+            description=f"{ticket_label} is now **{_ticket_status_label(status_key)}**.",
+            color=discord.Color.blurple() if status_key != "resolved" else discord.Color.green(),
+            timestamp=now_madrid(),
+        )
+        if row["creator_id"] is not None:
+            embed.add_field(name="User", value=f"<@{int(row['creator_id'])}>", inline=True)
+        embed.add_field(name="Updated by", value=ctx.user.mention, inline=True)
+        await ctx.respond(embed=embed, allowed_mentions=no_mentions())
+        await self._log_admin_action(ctx.guild, ctx.user.id, "ticket_status_updated", f"channel={ctx.channel_id} status={status_key}")
+
+    async def ticket_transcripts(
+        self,
+        ctx: discord.ApplicationContext,
+        user: discord.Option(discord.Member, "User whose ticket transcripts to search", required=False, default=None),
+        ticket_id: discord.Option(int, "Ticket ID number, for example 21 for T21", required=False, default=0),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+
+        member = await self._resolve_member(ctx.guild, ctx.user)
+        mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
+        allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
+        if member is None or not is_mod(member, mod_role_id, allow_manage_guild=allow_manage_guild):
+            return await ctx.respond("Only mods can search transcripts.", ephemeral=True)
+
+        if not user and not ticket_id:
+            return await ctx.respond("Provide a user or a ticket ID.", ephemeral=True)
+
+        params: list = [ctx.guild.id]
+        where = ["t.guild_id=?"]
+        if ticket_id:
+            where.append("t.ticket_id=?")
+            params.append(int(ticket_id))
+        if user:
+            where.append("t.creator_id=?")
+            params.append(int(user.id))
+
+        rows = await self.bot.db.fetchall(
+            "SELECT t.ticket_id, t.channel_id, t.creator_id, t.created_ts, t.closed_ts, t.status, t.status_tag, "
+            "tt.log_channel_id, tt.log_message_id, tt.created_ts AS transcript_ts "
+            "FROM tickets t "
+            "LEFT JOIN ticket_transcripts tt ON tt.guild_id=t.guild_id AND tt.ticket_id=t.ticket_id "
+            f"WHERE {' AND '.join(where)} ORDER BY COALESCE(t.closed_ts, t.created_ts) DESC LIMIT 10",
+            tuple(params),
+        )
+
+        title = "Transcript Search"
+        if ticket_id:
+            title += f" T{int(ticket_id)}"
+        elif user:
+            title += f" - {user.display_name}"
+        embed = discord.Embed(title=title, color=discord.Color.blurple(), timestamp=now_madrid())
+        if not rows:
+            embed.description = "No matching tickets were found."
+        for row in rows:
+            tid = int(row["ticket_id"]) if row["ticket_id"] is not None else 0
+            label = f"T{tid}" if tid else str(row["channel_id"])
+            creator = f"<@{int(row['creator_id'])}>" if row["creator_id"] is not None else "Unknown"
+            created = f"<t:{int(row['created_ts'])}:R>" if row["created_ts"] is not None else "Unknown"
+            status = _ticket_status_label(row["status_tag"])
+            transcript = "Not indexed yet"
+            if row["log_channel_id"] and row["log_message_id"]:
+                url = f"https://discord.com/channels/{ctx.guild.id}/{int(row['log_channel_id'])}/{int(row['log_message_id'])}"
+                transcript = f"[Open transcript]({url})"
+            value = f"User: {creator}\nCreated: {created}\nStatus: **{status}**\nTranscript: {transcript}"
+            embed.add_field(name=label, value=value[:1024], inline=False)
+        await ctx.respond(embed=embed, ephemeral=True, allowed_mentions=no_mentions())
 
     # --- /forum required_word ---
     def _parse_channel_id(self, value: Optional[str]) -> Optional[int]:

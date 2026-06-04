@@ -323,6 +323,34 @@ class StickyCog(commands.Cog):
             return None
         return None
 
+    async def _log_required_word_deletion(self, thread: discord.Thread, owner, required_word: str, match_mode: str) -> None:
+        guild = thread.guild
+        if guild is None:
+            return
+        channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        embed = discord.Embed(
+            title="Forum Post Removed",
+            description="A forum post was deleted because it did not include the required word.",
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="Thread", value=f"{thread.name}\n`{thread.id}`", inline=False)
+        embed.add_field(name="Forum", value=f"<#{thread.parent_id}>\n`{thread.parent_id}`", inline=True)
+        if owner:
+            embed.add_field(name="Author", value=f"{owner.mention if hasattr(owner, 'mention') else owner}\n`{owner.id}`", inline=True)
+        else:
+            owner_id = getattr(thread, "owner_id", None)
+            embed.add_field(name="Author", value=(f"`{owner_id}`" if owner_id else "Unknown"), inline=True)
+        embed.add_field(name="Required Word", value=f"`{required_word}`", inline=True)
+        embed.add_field(name="Match Mode", value=f"`{match_mode}`", inline=True)
+        try:
+            await channel.send(embed=embed, allowed_mentions=no_mentions())
+        except Exception as e:
+            await log_error(self.bot, f"Could not log required-word deletion for thread {thread.id}: {repr(e)}")
+
     async def _enforce_required_word(self, thread: discord.Thread) -> None:
         rule = self._forum_required_rules.get(thread.parent_id)
         if not rule:
@@ -339,7 +367,8 @@ class StickyCog(commands.Cog):
         if not required_word:
             return
 
-        if await self._thread_contains_required_word(thread, required_word, str(rule.get("match_mode") or "contains")):
+        match_mode = str(rule.get("match_mode") or "contains")
+        if await self._thread_contains_required_word(thread, required_word, match_mode):
             return
 
         owner = await self._find_thread_owner(thread)
@@ -357,6 +386,8 @@ class StickyCog(commands.Cog):
                 await owner.send(dm_text)
             except Exception:
                 pass
+
+        await self._log_required_word_deletion(thread, owner, required_word, match_mode)
 
         try:
             try:

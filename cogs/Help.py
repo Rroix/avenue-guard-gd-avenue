@@ -32,6 +32,29 @@ def _format_duration(seconds: int) -> str:
     return f"{days}d"
 
 
+TICKET_STATUS_LABELS = {
+    "waiting_user": "Waiting for user",
+    "waiting_staff": "Waiting for staff",
+    "resolved": "Resolved",
+}
+
+
+def _ticket_status_key(value: Any) -> str:
+    text = re.sub(r"[_\-/]+", " ", str(value or "").strip().casefold())
+    text = re.sub(r"\s+", " ", text).strip()
+    if text in {"waiting user", "waiting for user", "user", "wfu"}:
+        return "waiting_user"
+    if text in {"waiting staff", "waiting for staff", "staff", "wfs"}:
+        return "waiting_staff"
+    if text in {"resolved", "resolve", "done", "closed"}:
+        return "resolved"
+    return ""
+
+
+def _ticket_status_label(value: Any) -> str:
+    return TICKET_STATUS_LABELS.get(_ticket_status_key(value), "Waiting for staff")
+
+
 class HelpSessionControlView(discord.ui.View):
     def __init__(self, cog, user_id: int, guild_id: int, allow_back: bool = True):
         super().__init__(timeout=900)
@@ -159,6 +182,27 @@ class HelpTicketTopicView(discord.ui.View):
         if not await self._allowed(interaction):
             return
         await self.cog.handle_ticket_topic(interaction, self.guild_id, "start_over", "Start over")
+
+
+class TicketSatisfactionView(discord.ui.View):
+    def __init__(self, cog, guild_id: int, ticket_id: int, user_id: int):
+        super().__init__(timeout=7 * 24 * 3600)
+        self.cog = cog
+        self.guild_id = int(guild_id)
+        self.ticket_id = int(ticket_id)
+        self.user_id = int(user_id)
+
+        for score in range(1, 6):
+            button = discord.ui.Button(label=str(score), style=discord.ButtonStyle.secondary)
+            button.callback = self._make_callback(score)
+            self.add_item(button)
+
+    def _make_callback(self, score: int):
+        async def _callback(interaction: discord.Interaction):
+            if interaction.user.id != self.user_id:
+                return await interaction.response.send_message("This rating prompt is not for you.", ephemeral=True)
+            await self.cog.handle_ticket_satisfaction(interaction, self.guild_id, self.ticket_id, score)
+        return _callback
 
 
 class HelpCog(commands.Cog):
@@ -378,11 +422,12 @@ class HelpCog(commands.Cog):
                 await self._load_active_ticket_channels()
             if message.channel.id not in self._active_ticket_channels:
                 return
-            row = await self.bot.db.fetchone("SELECT status FROM tickets WHERE channel_id=?", (message.channel.id,))
+            row = await self.bot.db.fetchone("SELECT status, creator_id FROM tickets WHERE channel_id=?", (message.channel.id,))
             if row and row["status"] in ("open", "closing_prompted"):
+                status_tag = "waiting_staff" if int(row["creator_id"] or 0) == message.author.id else "waiting_user"
                 await self.bot.db.execute(
-                    "UPDATE tickets SET last_user_activity_ts=?, status='open' WHERE channel_id=?",
-                    (int(time.time()), message.channel.id),
+                    "UPDATE tickets SET last_user_activity_ts=?, status='open', status_tag=? WHERE channel_id=?",
+                    (int(time.time()), status_tag, message.channel.id),
                 )
             else:
                 self._active_ticket_channels.discard(message.channel.id)
@@ -518,7 +563,7 @@ class HelpCog(commands.Cog):
 
     async def _active_ticket_text(self, guild: discord.Guild, user_id: int) -> str:
         rows = await self.bot.db.fetchall(
-            "SELECT channel_id, ticket_id, status, created_ts FROM tickets WHERE guild_id=? AND creator_id=? AND status IN ('open','closing_prompted') ORDER BY created_ts DESC LIMIT 3",
+            "SELECT channel_id, ticket_id, status, status_tag, created_ts FROM tickets WHERE guild_id=? AND creator_id=? AND status IN ('open','closing_prompted') ORDER BY created_ts DESC LIMIT 3",
             (guild.id, user_id),
         )
         if not rows:
@@ -526,7 +571,7 @@ class HelpCog(commands.Cog):
         lines = []
         for row in rows:
             ticket = self._ticket_label(int(row["ticket_id"]) if row["ticket_id"] is not None else None, int(row["channel_id"]))
-            lines.append(f"{ticket} - <#{int(row['channel_id'])}> - `{row['status']}`")
+            lines.append(f"{ticket} - <#{int(row['channel_id'])}> - **{_ticket_status_label(row['status_tag'])}**")
         return "\n".join(lines)
 
     async def _recent_help_status_text(self, guild_id: int, user_id: int) -> str:
@@ -599,6 +644,34 @@ class HelpCog(commands.Cog):
             embed.add_field(name="Matches", value="I couldn't find a matching FAQ entry. Try a simpler keyword like `request`, `collab`, `appeal`, or `ticket`.", inline=False)
         view = HelpSessionControlView(self, user_id, guild_id, allow_back=False) if user_id and guild_id else HelpMenuView(exclude_values={"faq_search"})
         await channel.send(embed=embed, view=view, allowed_mentions=no_mentions())
+
+    async def _send_ticket_faq_suggestions(self, channel, user_id: int, guild_id: int) -> None:
+        queries = ("ticket staff help", "request rules", "appeal report")
+        suggestions: list[str] = []
+        seen: set[str] = set()
+        for query in queries:
+            for entry in self._faq_matches(query):
+                key = entry.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                suggestions.append(entry)
+                if len(suggestions) >= 3:
+                    break
+            if len(suggestions) >= 3:
+                break
+
+        embed = self._help_embed(
+            "Before Opening A Ticket",
+            "These FAQ entries might answer it faster. If not, choose a ticket topic below.",
+            "blurple",
+        )
+        if suggestions:
+            for idx, item in enumerate(suggestions, start=1):
+                embed.add_field(name=f"FAQ {idx}", value=self._short_text(item, 700), inline=False)
+        else:
+            embed.add_field(name="FAQ", value="No matching FAQ entries are configured right now.", inline=False)
+        await channel.send(embed=embed, view=HelpTicketTopicView(self, user_id, guild_id), allowed_mentions=no_mentions())
 
     # -----------------------------
     # Menu handler (DM only)
@@ -726,11 +799,7 @@ class HelpCog(commands.Cog):
             )
 
         if value == "mod_contact":
-            return await interaction.channel.send(
-                "What do you need staff for? Pick the closest topic so the ticket starts in the right lane.",
-                view=HelpTicketTopicView(self, interaction.user.id, guild.id),
-                allowed_mentions=no_mentions(),
-            )
+            return await self._send_ticket_faq_suggestions(interaction.channel, interaction.user.id, guild.id)
 
         return await interaction.channel.send("That option isn't available yet.", allowed_mentions=no_mentions())
 
@@ -1637,8 +1706,8 @@ class HelpCog(commands.Cog):
             (guild.id, member.id, now),
         )
         await self.bot.db.execute(
-            "INSERT OR REPLACE INTO tickets(guild_id, channel_id, creator_id, created_ts, last_user_activity_ts, status, ticket_id) "
-            "VALUES(?,?,?,?,?, 'open', ?)",
+            "INSERT OR REPLACE INTO tickets(guild_id, channel_id, creator_id, created_ts, last_user_activity_ts, status, ticket_id, status_tag) "
+            "VALUES(?,?,?,?,?, 'open', ?, 'waiting_staff')",
             (guild.id, channel.id, member.id, now, now, ticket_id),
         )
         self._active_ticket_channels.add(channel.id)
@@ -1666,7 +1735,7 @@ class HelpCog(commands.Cog):
             staff_role = guild.get_role(staff_role_id) if staff_role_id else None
             staff_ping = staff_role.mention if staff_role else "staff"
             await channel.send(
-                f"Please say what you need {member.mention}. Topic: **{topic_label}**. {staff_ping} will be shortly with you ;)",
+                f"Please say what you need {member.mention}. Topic: **{topic_label}**. Status: **Waiting for staff**. {staff_ping} will be shortly with you ;)",
                 allowed_mentions=user_and_role_mentions() if staff_role else user_mentions(),
             )
         except Exception:
@@ -1700,6 +1769,47 @@ class HelpCog(commands.Cog):
                 await interaction.followup.send("I couldn't close the ticket safely. Check the ticket channel for details.", ephemeral=True)
             except Exception:
                 pass
+
+    async def _send_ticket_satisfaction_prompt(self, guild: discord.Guild, creator_id: int, ticket_id: Optional[int]) -> None:
+        if not creator_id or ticket_id is None:
+            return
+        if not bool(self.bot.config.get("tickets", "satisfaction_enabled", default=True)):
+            return
+        prompt = str(self.bot.config.get("tickets", "satisfaction_prompt", default="How was your staff ticket experience?") or "How was your staff ticket experience?")
+        user = guild.get_member(creator_id) or self.bot.get_user(creator_id)
+        if user is None:
+            try:
+                user = await self.bot.fetch_user(creator_id)
+            except Exception:
+                user = None
+        if user is None:
+            return
+        embed = self._help_embed(
+            "Ticket Feedback",
+            f"{prompt}\n\nTicket: `T{int(ticket_id)}`\nChoose a score from **1** to **5**.",
+            "blurple",
+        )
+        try:
+            await user.send(embed=embed, view=TicketSatisfactionView(self, guild.id, int(ticket_id), creator_id), allowed_mentions=no_mentions())
+        except Exception:
+            pass
+
+    async def handle_ticket_satisfaction(self, interaction: discord.Interaction, guild_id: int, ticket_id: int, score: int):
+        score = max(1, min(5, int(score)))
+        await self.bot.db.execute(
+            "UPDATE tickets SET satisfaction_score=?, satisfaction_user_id=?, satisfaction_ts=? "
+            "WHERE guild_id=? AND ticket_id=? AND creator_id=?",
+            (score, interaction.user.id, int(time.time()), int(guild_id), int(ticket_id), interaction.user.id),
+        )
+        embed = self._help_embed(
+            "Feedback Saved",
+            f"Thanks. Your **{score}/5** rating for ticket `T{int(ticket_id)}` was saved.",
+            "green",
+        )
+        try:
+            await interaction.response.edit_message(embed=embed, view=None)
+        except Exception:
+            await interaction.response.send_message("Feedback saved, thank you!", ephemeral=True)
 
     async def close_ticket_channel(self, guild: discord.Guild, channel_id: int) -> bool:
         cfg = self.bot.config
@@ -1767,10 +1877,17 @@ class HelpCog(commands.Cog):
         try:
             await channel.delete(reason="Ticket closed")
             try:
-                await self.bot.db.execute("UPDATE tickets SET status='closed' WHERE channel_id=?", (channel_id,))
+                await self.bot.db.execute(
+                    "UPDATE tickets SET status='closed', status_tag='resolved', closed_ts=? WHERE channel_id=?",
+                    (int(time.time()), channel_id),
+                )
                 self._active_ticket_channels.discard(channel_id)
             except Exception as e:
                 await log_error(self.bot, f"Ticket status update failed after deletion for channel_id={channel_id}: {repr(e)}")
+            try:
+                await self._send_ticket_satisfaction_prompt(guild, creator_id, ticket_id)
+            except Exception as e:
+                await log_error(self.bot, f"Ticket satisfaction prompt failed for ticket_id={ticket_id}: {repr(e)}")
             return True
         except Exception as e:
             await log_error(self.bot, f"Ticket delete failed for channel_id={channel_id}: {repr(e)}")

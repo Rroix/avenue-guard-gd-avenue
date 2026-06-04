@@ -148,12 +148,14 @@
 ## 13) Tickets: Mod contact + cooldown
 **Setup:** ticket category + mod role + logging channel.
 1. DM bot → select `Contact staff`
-   - Expected: topic buttons appear for Moderation, Level requests, Server help, Other, and Cancel.
+   - Expected: a compact FAQ suggestion embed appears with topic buttons for Moderation, Level requests, Server help, Other, and Cancel.
 2. Choose `Level requests`.
    - Expected: ticket channel created under category with the topic in the channel name/opening message.
    - Expected: perms only requester + mods
    - Expected: ticket creation is audit-logged.
-3. Try creating another ticket within 24h
+3. Run `/ticket status status:waiting_user`, then `/ticket status status:waiting_staff`.
+   - Expected: the current ticket status updates and the channel receives a clean status embed.
+4. Try creating another ticket within 24h
    - Expected: blocked with a Discord timestamp cooldown message.
 
 ---
@@ -166,6 +168,9 @@
 4. Press Yes
    - Expected: transcript file and structured ticket transcript embed posted to `channels.general_logging_channel_id`
    - Expected: channel deleted
+   - Expected: ticket creator receives a 1-5 satisfaction prompt by DM if DMs are open.
+5. Run `/ticket transcripts ticket_id:<id>` and `/ticket transcripts user:<creator>`.
+   - Expected: staff get an ephemeral transcript search embed with jump links to saved transcript messages.
 
 ---
 
@@ -291,29 +296,33 @@
 26. Run `/open-requests when:18:30 day:0` as an admin.
     - Expected: bot schedules the opening and replies with Discord absolute and relative timestamps.
     - Expected: command options explain that `when` is Madrid `HH:MM`, `day` is optional, and `time` is the close timer in minutes.
-27. Run `/pending-openings action:list`.
+27. Run `/open-requests type:only demons` as an admin, then submit a known non-demon.
+    - Expected: the modal is rejected before the request counts, and `/requests-are` shows the active type.
+28. Submit a known demon during that wave.
+    - Expected: the request is accepted and the staff embed shows the wave type.
+29. Run `/pending-openings action:list`.
     - Expected: scheduled openings list includes ID, time, limit, close timer, and creator, plus selector/buttons for refresh, edit, delete, and open now.
-28. Use the `/pending-openings` panel `Edit` button.
-    - Expected: modal opens with the scheduled time, day, limit, and close timer prefilled.
-29. Press `Open now` while another request wave is already open.
+30. Use the `/pending-openings` panel `Edit` button.
+    - Expected: modal opens with the scheduled time, day, limit, close timer, and request type prefilled.
+31. Press `Open now` while another request wave is already open.
     - Expected: bot asks for confirmation before creating a new wave.
-30. Run `/pending-openings action:edit opening_id:<id> number:3 time:10 when:19:00`.
+32. Run `/pending-openings action:edit opening_id:<id> number:3 time:10 when:19:00 type:long level`.
     - Expected: the scheduled opening updates.
-31. Run `/pending-openings action:delete opening_id:<id>`.
+33. Run `/pending-openings action:delete opening_id:<id>`.
     - Expected: the scheduled opening is removed from the pending list.
-32. Run `/requests pending scope:current_wave status:pending` as a judge or head judge.
+34. Run `/requests pending scope:current_wave status:pending` as a judge or head judge.
     - Expected: current-wave unreviewed requests are listed with jump links and submission age.
-33. On a pending staff request embed, press `Send` as a judge/head judge.
+35. On a pending staff request embed, press `Send` as a judge/head judge.
     - Expected: review modal opens; submitted review edits the staff embed, disables all buttons, and posts a pinged result in `sent_channel`.
     - Expected: the wave summary updates reviewed/sent/left-to-review counts, percentages, and reviewer stats.
-34. Press `Send`, `Reject`, or `Other` as someone without a reviewer role.
+36. Press `Send`, `Reject`, or `Other` as someone without a reviewer role.
     - Expected: ephemeral permission denial and no request update.
-35. On another pending staff request embed, press `Reject`.
+37. On another pending staff request embed, press `Reject`.
     - Expected: review modal opens; submitted review edits the staff embed, disables all buttons, and posts a pinged result in `rejected_channel`.
     - Expected: the wave summary updates reviewed/not-sent/left-to-review counts, percentages, and reviewer stats.
-36. On another pending staff request embed, press `Other`.
+38. On another pending staff request embed, press `Other`.
     - Expected: ephemeral options appear for `Level doesn't exist`, `Stolen level`, and `Already rated`.
-37. Choose each `Other` reason on separate requests.
+39. Choose each `Other` reason on separate requests.
     - Expected: staff embed color/result updates, buttons disable, and a pinged result appears in `rejected_channel`.
     - Expected: the wave summary updates the not-sent breakdown.
 
@@ -374,15 +383,18 @@
 ## 24) Bot diagnostics and performance safety
 **Setup:** use an admin/owner account for `/bot` commands and a mod, judge, or head judge account for `/requests pending`.
 
-1. Run `/bot health`.
-   - Expected: an ephemeral health embed shows database status, latency, loaded cogs, background task states, server icon rotation state, open tickets, weekly sessions, pending requests, and request state.
-2. Run `/bot config_check`.
+1. Run `/bot dashboard`.
+   - Expected: an ephemeral dashboard embed shows database status, latency, loaded cogs, request state, tracking state, ticket count, server icon rotation, and background tasks.
+   - Expected: Config, Repair Tips, and Refresh buttons update the same dashboard message.
+2. Run `/bot health`.
+   - Expected: an ephemeral health embed still works for backwards compatibility.
+3. Run `/bot config_check`.
    - Expected: configured channels and roles are reported as OK or listed as issues.
    - Expected: request embed template variables, field shapes, and suspicious color values are reported as OK or listed as issues.
    - Expected: server icon rotation mode, interval, and configured URLs are reported as OK or listed as issues.
-3. Temporarily add an invalid request template variable such as `{bad_variable}` to a request embed template, run `/bot config_check`, then revert it.
+4. Temporarily add an invalid request template variable such as `{bad_variable}` to a request embed template, run `/bot config_check`, then revert it.
    - Expected: config check reports the unknown template variable.
-4. Run `/requests pending scope:all status:pending`.
+5. Run `/requests pending scope:all status:pending`.
    - Expected: pending live request reviews and weekly request reviews are listed separately with jump links when message IDs are available.
 5. Run `/requests repair` as an admin.
    - Expected: recovery embed reports the request button refresh, wave summary refresh, recreated/refreshed pending messages, stale validations refreshed, and reviewed messages relocked.

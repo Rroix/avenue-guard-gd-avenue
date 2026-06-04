@@ -51,7 +51,7 @@ def ensure_server_icon_config(config) -> dict:
     )
     rotation["mode"] = normalize_server_icon_mode(rotation.get("mode", "disabled"))
     try:
-        rotation["interval_seconds"] = max(600, int(rotation.get("interval_seconds", 86400) or 86400))
+        rotation["interval_seconds"] = max(300, int(rotation.get("interval_seconds", 86400) or 86400))
     except Exception:
         rotation["interval_seconds"] = 86400
     rotation["urls"] = clean_icon_urls(rotation.get("urls", []))
