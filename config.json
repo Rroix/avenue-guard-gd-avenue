@@ -306,6 +306,13 @@
       "description_closed": "Requests are currently **closed**. Please wait for the next request wave...",
       "footer": "GD Avenue Level Requests, don't break any rules!"
     },
+    "open_announcement": {
+      "_comment": "Sent in request_channel whenever a wave opens. Leave message blank to use the default role ping.",
+      "enabled": true,
+      "channel_id": "",
+      "default_role_id": "786245470636605440",
+      "message": ""
+    },
     "wave_summary_embed": {
       "title": "Wave {wave_id} Summary",
       "description": "Live review progress for this request wave.",

@@ -429,6 +429,7 @@ class HelpCog(commands.Cog):
                     "UPDATE tickets SET last_user_activity_ts=?, status='open', status_tag=? WHERE channel_id=?",
                     (int(time.time()), status_tag, message.channel.id),
                 )
+                await self.update_ticket_opening_status(message.guild, message.channel.id, status_tag)
             else:
                 self._active_ticket_channels.discard(message.channel.id)
             return
@@ -1654,6 +1655,37 @@ class HelpCog(commands.Cog):
 
         await self._create_staff_ticket(interaction, guild, "staff-contact", "Staff contact")
 
+    async def update_ticket_opening_status(self, guild: discord.Guild, channel_id: int, status_tag: str) -> None:
+        row = await self.bot.db.fetchone(
+            "SELECT opening_message_id FROM tickets WHERE guild_id=? AND channel_id=?",
+            (guild.id, channel_id),
+        )
+        if not row or row["opening_message_id"] is None:
+            return
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        try:
+            msg = await channel.fetch_message(int(row["opening_message_id"]))
+        except Exception:
+            return
+
+        label = _ticket_status_label(status_tag)
+        content = str(msg.content or "")
+        status_text = f"Status: **{label}**"
+        if re.search(r"Status:\s*\*\*[^*]+\*\*", content):
+            updated = re.sub(r"Status:\s*\*\*[^*]+\*\*", status_text, content, count=1)
+        elif content:
+            updated = f"{content}\n{status_text}"
+        else:
+            updated = status_text
+        if updated == content:
+            return
+        try:
+            await msg.edit(content=updated, allowed_mentions=no_mentions())
+        except Exception as e:
+            await log_error(self.bot, f"Could not update ticket opening status channel_id={channel_id}: {repr(e)}")
+
     async def _create_staff_ticket(self, interaction: discord.Interaction, guild: discord.Guild, topic_key: str, topic_label: str):
         cfg = self.bot.config
 
@@ -1734,9 +1766,13 @@ class HelpCog(commands.Cog):
             staff_role_id = cfg.get_int("tickets", "staff_ping_role_id", default=0)
             staff_role = guild.get_role(staff_role_id) if staff_role_id else None
             staff_ping = staff_role.mention if staff_role else "staff"
-            await channel.send(
+            opening_msg = await channel.send(
                 f"Please say what you need {member.mention}. Topic: **{topic_label}**. Status: **Waiting for staff**. {staff_ping} will be shortly with you ;)",
                 allowed_mentions=user_and_role_mentions() if staff_role else user_mentions(),
+            )
+            await self.bot.db.execute(
+                "UPDATE tickets SET opening_message_id=? WHERE guild_id=? AND channel_id=?",
+                (opening_msg.id, guild.id, channel.id),
             )
         except Exception:
             pass
@@ -1820,10 +1856,21 @@ class HelpCog(commands.Cog):
         if not isinstance(channel, discord.TextChannel):
             return False
 
-        row = await self.bot.db.fetchone("SELECT ticket_id, creator_id, created_ts FROM tickets WHERE channel_id=?", (channel_id,))
+        row = await self.bot.db.fetchone("SELECT ticket_id, creator_id, created_ts, status_tag FROM tickets WHERE channel_id=?", (channel_id,))
         ticket_id = int(row["ticket_id"]) if row and row["ticket_id"] is not None else None
         creator_id = int(row["creator_id"]) if row and row["creator_id"] is not None else 0
         created_ts = int(row["created_ts"]) if row and row["created_ts"] is not None else 0
+        previous_status_tag = str(row["status_tag"] or "waiting_staff") if row else "waiting_staff"
+
+        async def _restore_open_status() -> None:
+            try:
+                await self.bot.db.execute(
+                    "UPDATE tickets SET status_tag=?, closed_ts=NULL WHERE channel_id=? AND status<>'closed'",
+                    (previous_status_tag, channel_id),
+                )
+                await self.update_ticket_opening_status(guild, channel_id, previous_status_tag)
+            except Exception as restore_error:
+                await log_error(self.bot, f"Ticket status restore failed channel_id={channel_id}: {repr(restore_error)}")
 
         if not isinstance(log_channel, discord.TextChannel):
             try:
@@ -1833,6 +1880,15 @@ class HelpCog(commands.Cog):
             return False
 
         try:
+            try:
+                await self.bot.db.execute(
+                    "UPDATE tickets SET status_tag='resolved', closed_ts=? WHERE channel_id=?",
+                    (int(time.time()), channel_id),
+                )
+                await self.update_ticket_opening_status(guild, channel_id, "resolved")
+            except Exception as status_error:
+                await log_error(self.bot, f"Ticket resolved status update before transcript failed channel_id={channel_id}: {repr(status_error)}")
+
             transcript_path = await build_text_transcript(channel)
             embed = self._staff_log_embed(
                 guild,
@@ -1852,6 +1908,7 @@ class HelpCog(commands.Cog):
                 file=discord.File(transcript_path, filename=f"transcript-{ticket_id or channel.id}.txt"),
             )
         except Exception as e:
+            await _restore_open_status()
             await log_error(self.bot, f"Ticket close failed before deletion for channel_id={channel_id}: {repr(e)}")
             try:
                 await channel.send("I couldn't save the transcript, so I did not delete this ticket.")
@@ -1867,6 +1924,7 @@ class HelpCog(commands.Cog):
                     (guild.id, ticket_id, sent.channel.id, sent.id, int(time.time())),
                 )
             except Exception as e:
+                await _restore_open_status()
                 await log_error(self.bot, f"Ticket transcript index failed for ticket_id={ticket_id}: {repr(e)}")
                 try:
                     await channel.send("I saved the transcript, but couldn't index it. I did not delete this ticket.")
@@ -1890,6 +1948,7 @@ class HelpCog(commands.Cog):
                 await log_error(self.bot, f"Ticket satisfaction prompt failed for ticket_id={ticket_id}: {repr(e)}")
             return True
         except Exception as e:
+            await _restore_open_status()
             await log_error(self.bot, f"Ticket delete failed for channel_id={channel_id}: {repr(e)}")
             return False
 

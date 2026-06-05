@@ -170,7 +170,8 @@ class Database:
                 satisfaction_score INTEGER,
                 satisfaction_comment TEXT,
                 satisfaction_user_id INTEGER,
-                satisfaction_ts INTEGER
+                satisfaction_ts INTEGER,
+                opening_message_id INTEGER
             );""",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_ticket_id
                 ON tickets(guild_id, ticket_id) WHERE ticket_id IS NOT NULL;""",
@@ -289,6 +290,7 @@ class Database:
                 close_minutes INTEGER,
                 open_ts INTEGER NOT NULL,
                 request_type TEXT,
+                open_message TEXT,
                 created_by INTEGER NOT NULL,
                 created_ts INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -360,6 +362,7 @@ class Database:
         self._ensure_column_sync("tickets", "satisfaction_comment", "TEXT")
         self._ensure_column_sync("tickets", "satisfaction_user_id", "INTEGER")
         self._ensure_column_sync("tickets", "satisfaction_ts", "INTEGER")
+        self._ensure_column_sync("tickets", "opening_message_id", "INTEGER")
         self._ensure_column_sync("transcript_requests", "ticket_id", "INTEGER")
         self._ensure_column_sync("level_request_state", "request_channel_id", "INTEGER")
         self._ensure_column_sync("level_request_state", "request_message_id", "INTEGER")
@@ -385,6 +388,7 @@ class Database:
         self._ensure_column_sync("level_request_wave_summaries", "updated_ts", "INTEGER")
         self._ensure_column_sync("level_request_scheduled_openings", "opened_wave_id", "INTEGER")
         self._ensure_column_sync("level_request_scheduled_openings", "request_type", "TEXT")
+        self._ensure_column_sync("level_request_scheduled_openings", "open_message", "TEXT")
         self._normalize_weekly_dm_log_sync()
         self._init_ticket_sequences_sync()
         self._conn.commit()
@@ -563,7 +567,8 @@ class Database:
                 satisfaction_score INTEGER,
                 satisfaction_comment TEXT,
                 satisfaction_user_id INTEGER,
-                satisfaction_ts INTEGER
+                satisfaction_ts INTEGER,
+                opening_message_id INTEGER
             );""",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_ticket_id
                 ON tickets(guild_id, ticket_id) WHERE ticket_id IS NOT NULL;""",
@@ -682,6 +687,7 @@ class Database:
                 close_minutes INTEGER,
                 open_ts INTEGER NOT NULL,
                 request_type TEXT,
+                open_message TEXT,
                 created_by INTEGER NOT NULL,
                 created_ts INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -754,6 +760,7 @@ class Database:
         await self._ensure_column("tickets", "satisfaction_comment", "TEXT")
         await self._ensure_column("tickets", "satisfaction_user_id", "INTEGER")
         await self._ensure_column("tickets", "satisfaction_ts", "INTEGER")
+        await self._ensure_column("tickets", "opening_message_id", "INTEGER")
         await self._ensure_column("transcript_requests", "ticket_id", "INTEGER")
         await self._ensure_column("level_request_state", "request_channel_id", "INTEGER")
         await self._ensure_column("level_request_state", "request_message_id", "INTEGER")
@@ -779,6 +786,7 @@ class Database:
         await self._ensure_column("level_request_wave_summaries", "updated_ts", "INTEGER")
         await self._ensure_column("level_request_scheduled_openings", "opened_wave_id", "INTEGER")
         await self._ensure_column("level_request_scheduled_openings", "request_type", "TEXT")
+        await self._ensure_column("level_request_scheduled_openings", "open_message", "TEXT")
         await self._normalize_weekly_dm_log()
 
         # Ensure sequence exists (set next_ticket_id based on max ticket_id)

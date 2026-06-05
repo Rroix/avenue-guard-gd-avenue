@@ -37,6 +37,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Admins can open request waves with `/open-requests`.
 - Request waves can optionally be limited by type, including needs showcase, only demons, only platformers, only classic, non-demon variants, and Long/XL levels.
 - Admins can schedule future request openings with `/open-requests when:<HH:MM> day:<optional>`.
+- Sends a configurable opening announcement when a wave opens, with a default ping to the configured request role.
 - Admins can list, edit, delete, refresh, or immediately open scheduled openings from the `/pending-openings` interactive panel.
 - “Open now” asks for confirmation if requests are already open, and automatic scheduled openings will not silently replace an active wave.
 - Admins can close request waves with `/close-requests`.
@@ -82,6 +83,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Caches active ticket channels so normal server messages do not hit the database for ticket checks.
 - Tracks ticket inactivity and prompts staff to close stale tickets.
 - Tracks ticket statuses: Waiting for user, Waiting for staff, and Resolved.
+- Keeps the ticket opening message status in sync when users or staff reply, when staff changes status, and before closure transcripts are saved.
 - Saves transcripts before deleting tickets.
 - Lets staff search saved ticket transcripts by user or ticket ID.
 - Sends a configurable satisfaction prompt after a ticket closes.
@@ -145,8 +147,8 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/requests history message_id:<optional> user_id:<optional> wave:<optional>` shows the edit audit trail for a live-wave request.
 - `/requests repair` runs request-system recovery and message refresh tasks.
 - `/refresh-request-button` refreshes or recreates the live request button.
-- `/open-requests number:<optional> time:<optional> when:<optional> day:<optional> type:<optional>` opens or schedules a request wave.
-- `/pending-openings action:<list|edit|delete> opening_id:<optional>` manages scheduled request openings and shows an interactive management panel by default.
+- `/open-requests number:<optional> time:<optional> when:<optional> day:<optional> type:<optional> message:<optional>` opens or schedules a request wave.
+- `/pending-openings action:<list|edit|delete> opening_id:<optional> message:<optional>` manages scheduled request openings and shows an interactive management panel by default.
 - `/edit-request` lets a user edit their current pending live-wave request during the edit window.
 - `/close-requests` closes the active request wave.
 - `/requests-are` shows whether requests are currently open or closed.
@@ -236,6 +238,7 @@ Set these before opening requests:
 - `request_banned_role_id`: role assigned by the `I will` choice and blocked from requesting.
 - `reviewer_role_ids`: roles allowed to use request review controls and reviewer filters.
 - `request_post_close_edit_minutes`: how long users may keep editing pending requests after the wave closes.
+- `open_announcement`: controls the message sent when waves open. Blank `message` uses the default `<@&role>, requests have been opened for {condition_text}`.
 - `level_validation.enabled`: enables GDBrowser plus GD/Boomlings existence/rating/showcase checks.
 - `level_validation.cache_seconds`: how long validation warnings stay fresh before repair or the next submission refreshes them.
 - `level_validation.per_user_cooldown_seconds`, `per_user_window_seconds`, and `per_user_max_checks`: protect validation from spam.

@@ -1646,6 +1646,10 @@ class CommandsCog(commands.Cog):
             "UPDATE tickets SET status='open', status_tag=? WHERE channel_id=?",
             (status_key, ctx.channel_id),
         )
+        helpcog = self.bot.get_cog("HelpCog")
+        update_status = getattr(helpcog, "update_ticket_opening_status", None) if helpcog else None
+        if callable(update_status):
+            await update_status(ctx.guild, ctx.channel_id, status_key)
         ticket_label = f"`T{int(row['ticket_id'])}`" if row["ticket_id"] is not None else "this ticket"
         embed = discord.Embed(
             title="Ticket Status Updated",

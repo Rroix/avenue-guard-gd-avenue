@@ -14,7 +14,7 @@ from discord.ext import commands
 from utils.checks import basic_color, is_admin_or_owner, is_mod, member_has_any_role
 from utils.errors import log_error
 from utils.gd_validation import combine_level_validation, fetch_boomlings_level, fetch_gdbrowser_level, validation_notice
-from utils.mentions import no_mentions, user_mentions
+from utils.mentions import no_mentions, user_and_role_mentions, user_mentions
 from utils.timeutils import TZ, now_madrid
 from utils.views import LevelRequestButtonView, LevelRequestReviewView
 
@@ -276,7 +276,7 @@ class ScheduledOpeningsView(discord.ui.View):
                 options.append(
                     discord.SelectOption(
                         label=f"#{int(row['id'])} - {datetime.fromtimestamp(int(row['open_ts']), TZ).strftime('%b %d %H:%M')}",
-                        description=f"Limit {limit} | Close {close} | {request_type}",
+                        description=f"Limit {limit} | Close {close} | {request_type}"[:100],
                         value=str(int(row["id"])),
                     )
                 )
@@ -409,8 +409,9 @@ class RequestLevelsCog(commands.Cog):
             when: discord.Option(str, "Optional scheduled opening time in Madrid time, like 18:30", required=False, default=""),
             day: discord.Option(int, "Optional day of the month for the scheduled opening; leave 0 for next matching time", required=False, default=0),
             type: discord.Option(str, "Optional wave type, like only demons, only plats, needs showcase, or long level", required=False, default=""),
+            message: discord.Option(str, "Custom opening announcement; leave blank for the default role ping", required=False, default=""),
         ):
-            await self.open_requests(ctx, number, time, when, day, type)
+            await self.open_requests(ctx, number, time, when, day, type, message)
 
         @bot.slash_command(name="close-requests", description="Close level requests", guild_ids=guild_ids)
         async def close_requests(ctx: discord.ApplicationContext):
@@ -434,8 +435,9 @@ class RequestLevelsCog(commands.Cog):
             when: discord.Option(str, "New opening time in Madrid time, like 18:30", required=False, default=""),
             day: discord.Option(int, "Optional day of the month for the new opening time", required=False, default=0),
             type: discord.Option(str, "New request type; leave blank to keep current value, use any to clear", required=False, default=""),
+            message: discord.Option(str, "New announcement; blank keeps current, default resets it", required=False, default=""),
         ):
-            await self.pending_openings(ctx, action, opening_id, number, time, when, day, type)
+            await self.pending_openings(ctx, action, opening_id, number, time, when, day, type, message)
 
     def cog_unload(self) -> None:
         if self._close_task:
@@ -586,6 +588,82 @@ class RequestLevelsCog(commands.Cog):
         value = self._row_value(row, "request_type", "")
         normalized = self._normalize_request_type(value)
         return normalized or ""
+
+    def _clean_open_message(self, value: Any) -> Optional[str]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.casefold() == "default":
+            return None
+        return text[:1500]
+
+    def _request_open_condition_text(self, request_limit: Optional[int], close_minutes: Optional[int]) -> str:
+        parts = []
+        if request_limit:
+            amount = int(request_limit)
+            parts.append(f"{amount} request{'s' if amount != 1 else ''}")
+        if close_minutes:
+            minutes = int(close_minutes)
+            parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+        if not parts:
+            return "an indefinite wave"
+        return " or ".join(parts)
+
+    async def _send_open_announcement(
+        self,
+        guild: discord.Guild,
+        wave_id: int,
+        request_limit: Optional[int],
+        close_minutes: Optional[int],
+        close_ts: Optional[int],
+        request_type: str,
+        open_message: Optional[str] = None,
+    ) -> None:
+        cfg = self._cfg("open_announcement", default={}) or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        custom_message = self._clean_open_message(open_message)
+        disabled_words = {"off", "disable", "disabled", "none", "no"}
+        if custom_message and custom_message.casefold() in disabled_words:
+            return
+        if not custom_message and not bool(cfg.get("enabled", True)):
+            return
+
+        channel_id = 0
+        try:
+            channel_id = int(cfg.get("channel_id") or 0)
+        except Exception:
+            channel_id = 0
+        channel = await self._channel_by_id(guild, channel_id) if channel_id else await self._configured_channel(guild, "request_channel")
+        if channel is None:
+            return
+
+        try:
+            role_id = int(cfg.get("default_role_id") or 786245470636605440)
+        except Exception:
+            role_id = 786245470636605440
+        condition_text = self._request_open_condition_text(request_limit, close_minutes)
+        variables = {
+            "wave_id": wave_id,
+            "request_limit": "" if request_limit is None else int(request_limit),
+            "close_minutes": "" if close_minutes is None else int(close_minutes),
+            "close_ts": "" if close_ts is None else int(close_ts),
+            "condition_text": condition_text,
+            "request_type": request_type or "",
+            "request_type_label": self._request_type_label(request_type),
+            "role_id": role_id,
+            "role_mention": f"<@&{role_id}>" if role_id else "",
+        }
+        template = custom_message or str(cfg.get("message") or "").strip()
+        if not template:
+            template = "{role_mention}, requests have been opened for {condition_text}"
+        content = self._format(template, variables).strip()
+        if not content:
+            return
+        try:
+            await channel.send(content=content[:2000], allowed_mentions=user_and_role_mentions())
+        except Exception as e:
+            await log_error(self.bot, f"Could not send request open announcement wave_id={wave_id}: {repr(e)}")
 
     def _color_name(self, key: str, default: str = "blurple") -> str:
         return str(self._cfg("colors", key, default=default) or default)
@@ -1304,7 +1382,7 @@ class RequestLevelsCog(commands.Cog):
 
     async def _scheduled_opening_rows(self, guild_id: int, limit: int = 15):
         return await self.bot.db.fetchall(
-            "SELECT id, request_limit, close_minutes, open_ts, created_by, created_ts, request_type FROM level_request_scheduled_openings "
+            "SELECT id, request_limit, close_minutes, open_ts, created_by, created_ts, request_type, open_message FROM level_request_scheduled_openings "
             "WHERE guild_id=? AND status='pending' ORDER BY open_ts ASC LIMIT ?",
             (guild_id, limit),
         )
@@ -1330,10 +1408,11 @@ class RequestLevelsCog(commands.Cog):
             limit = int(row["request_limit"]) if row["request_limit"] is not None else "none"
             close = f"{int(row['close_minutes'])} minutes" if row["close_minutes"] is not None else "none"
             request_type = self._request_type_label(row["request_type"] if "request_type" in row.keys() else "")
+            announcement = "Custom" if self._row_value(row, "open_message", None) else "Default"
             open_ts = int(row["open_ts"])
             lines.append(
                 f"**#{int(row['id'])}** - <t:{open_ts}:F> (<t:{open_ts}:R>)\n"
-                f"Limit: **{limit}** | Close timer: **{close}** | Type: **{request_type}** | Created by <@{int(row['created_by'])}>"
+                f"Limit: **{limit}** | Close timer: **{close}** | Type: **{request_type}** | Announcement: **{announcement}** | Created by <@{int(row['created_by'])}>"
             )
         embed.add_field(name=f"Openings ({len(rows)} shown)", value="\n\n".join(lines)[:4096], inline=False)
         embed.set_footer(text="Use the selector and buttons below to manage pending openings.")
@@ -1372,7 +1451,13 @@ class RequestLevelsCog(commands.Cog):
         request_limit = int(row["request_limit"]) if row["request_limit"] is not None else None
         close_minutes = int(row["close_minutes"]) if row["close_minutes"] is not None else None
         request_type = self._request_type_from_row(row)
-        wave_id, close_ts = await self._open_requests_now(interaction.guild, request_limit, close_minutes, request_type)
+        wave_id, close_ts = await self._open_requests_now(
+            interaction.guild,
+            request_limit,
+            close_minutes,
+            request_type,
+            self._row_value(row, "open_message", None),
+        )
         await self.bot.db.execute(
             "UPDATE level_request_scheduled_openings SET status='opened', opened_wave_id=? WHERE guild_id=? AND id=? AND status='pending'",
             (wave_id, interaction.guild.id, opening_id),
@@ -1381,6 +1466,7 @@ class RequestLevelsCog(commands.Cog):
         note = f"Opened scheduled opening **#{opening_id}** as wave **{wave_id}**."
         if request_type:
             note += f" Type: **{self._request_type_label(request_type)}**."
+        note += " Announcement sent."
         if close_ts:
             note += f" Closes <t:{close_ts}:R> unless the limit is reached first."
         await interaction.response.edit_message(
@@ -1600,6 +1686,7 @@ class RequestLevelsCog(commands.Cog):
         request_limit: Optional[int],
         close_minutes: Optional[int],
         request_type: str = "",
+        open_message: Optional[str] = None,
     ) -> tuple[int, Optional[int]]:
         current = await self._get_state(guild.id)
         wave_id = int(current["wave_id"]) + 1
@@ -1610,6 +1697,15 @@ class RequestLevelsCog(commands.Cog):
             (STATE_OPEN, wave_id, request_limit, close_ts, int(time_module.time()), normalized_type or None, guild.id),
         )
         await self.refresh_or_create_request_button(guild)
+        await self._send_open_announcement(
+            guild,
+            wave_id,
+            request_limit,
+            close_minutes,
+            close_ts,
+            normalized_type,
+            open_message,
+        )
         return wave_id, close_ts
 
     async def _auto_close_loop(self):
@@ -1640,7 +1736,7 @@ class RequestLevelsCog(commands.Cog):
                     continue
                 now_ts = int(time_module.time())
                 rows = await self.bot.db.fetchall(
-                    "SELECT id, request_limit, close_minutes, created_by, request_type FROM level_request_scheduled_openings "
+                    "SELECT id, request_limit, close_minutes, created_by, request_type, open_message FROM level_request_scheduled_openings "
                     "WHERE guild_id=? AND status='pending' AND open_ts<=? ORDER BY open_ts ASC LIMIT 5",
                     (guild.id, now_ts),
                 )
@@ -1663,7 +1759,13 @@ class RequestLevelsCog(commands.Cog):
                         request_limit = int(row["request_limit"]) if row["request_limit"] is not None else None
                         close_minutes = int(row["close_minutes"]) if row["close_minutes"] is not None else None
                         request_type = self._request_type_from_row(row)
-                        wave_id, _ = await self._open_requests_now(guild, request_limit, close_minutes, request_type)
+                        wave_id, _ = await self._open_requests_now(
+                            guild,
+                            request_limit,
+                            close_minutes,
+                            request_type,
+                            self._row_value(row, "open_message", None),
+                        )
                         await self.bot.db.execute(
                             "UPDATE level_request_scheduled_openings SET status='opened', opened_wave_id=? WHERE id=? AND guild_id=?",
                             (wave_id, opening_id, guild.id),
@@ -1778,6 +1880,7 @@ class RequestLevelsCog(commands.Cog):
         when: str = "",
         day: int = 0,
         request_type: str = "",
+        open_message: str = "",
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -1791,19 +1894,21 @@ class RequestLevelsCog(commands.Cog):
         if normalized_type is None:
             return await ctx.respond(f"Unknown request type. Use one of: {self._request_type_help()}, or leave it blank.", ephemeral=True)
         type_label = self._request_type_label(normalized_type)
+        cleaned_open_message = self._clean_open_message(open_message)
 
         if str(when or "").strip():
             open_ts, error = self._parse_scheduled_open_ts(when, day)
             if open_ts is None:
                 return await ctx.respond(error or "I couldn't parse that opening time.", ephemeral=True)
             await self.bot.db.execute(
-                "INSERT INTO level_request_scheduled_openings(guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,status,request_type) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (ctx.guild.id, request_limit, close_minutes, open_ts, ctx.user.id, int(time_module.time()), "pending", normalized_type or None),
+                "INSERT INTO level_request_scheduled_openings(guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,status,request_type,open_message) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (ctx.guild.id, request_limit, close_minutes, open_ts, ctx.user.id, int(time_module.time()), "pending", normalized_type or None, cleaned_open_message),
             )
             details = [f"Request opening scheduled for <t:{open_ts}:F> (<t:{open_ts}:R>)."]
             if normalized_type:
                 details.append(f"Type: **{type_label}**.")
+            details.append("Announcement: **custom**." if cleaned_open_message else "Announcement: **default role ping**.")
             if request_limit:
                 details.append(f"Limit: **{request_limit}** successful requests.")
             if close_minutes:
@@ -1813,21 +1918,22 @@ class RequestLevelsCog(commands.Cog):
                 ctx.guild,
                 ctx.user.id,
                 "scheduled_opening_created",
-                f"open_ts={open_ts} limit={request_limit} close_minutes={close_minutes} request_type={normalized_type or 'any'}",
+                f"open_ts={open_ts} limit={request_limit} close_minutes={close_minutes} request_type={normalized_type or 'any'} announcement={'custom' if cleaned_open_message else 'default'}",
             )
             return await ctx.respond(" ".join(details), ephemeral=True)
 
-        wave_id, close_ts = await self._open_requests_now(ctx.guild, request_limit, close_minutes, normalized_type or "")
+        wave_id, close_ts = await self._open_requests_now(ctx.guild, request_limit, close_minutes, normalized_type or "", cleaned_open_message)
         await self._log_request_admin_action(
             ctx.guild,
             ctx.user.id,
             "requests_opened",
-            f"wave_id={wave_id} limit={request_limit} close_ts={close_ts} request_type={normalized_type or 'any'}",
+            f"wave_id={wave_id} limit={request_limit} close_ts={close_ts} request_type={normalized_type or 'any'} announcement={'custom' if cleaned_open_message else 'default'}",
         )
 
         details = [f"Wave **{wave_id}** opened."]
         if normalized_type:
             details.append(f"Type: **{type_label}**.")
+        details.append("Announcement sent.")
         if request_limit:
             details.append(f"Limit: **{request_limit}** successful requests.")
         if close_ts:
@@ -1846,6 +1952,7 @@ class RequestLevelsCog(commands.Cog):
         when: str = "",
         day: int = 0,
         request_type: str = "",
+        open_message: str = "",
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -1878,6 +1985,7 @@ class RequestLevelsCog(commands.Cog):
             new_close = row["close_minutes"]
             new_open_ts = int(row["open_ts"])
             new_type = row["request_type"] if "request_type" in row.keys() else None
+            new_message = self._row_value(row, "open_message", None)
             if number >= 0:
                 new_limit = int(number) if int(number) > 0 else None
             if time >= 0:
@@ -1890,6 +1998,8 @@ class RequestLevelsCog(commands.Cog):
                         ephemeral=True,
                     )
                 new_type = parsed_type or None
+            if str(open_message or "").strip():
+                new_message = self._clean_open_message(open_message)
             if str(when or "").strip():
                 parsed_ts, error = self._parse_scheduled_open_ts(when, day)
                 if parsed_ts is None:
@@ -1897,17 +2007,17 @@ class RequestLevelsCog(commands.Cog):
                 new_open_ts = parsed_ts
 
             await self.bot.db.execute(
-                "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=?, request_type=? WHERE guild_id=? AND id=? AND status='pending'",
-                (new_limit, new_close, new_open_ts, new_type, ctx.guild.id, opening_id),
+                "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=?, request_type=?, open_message=? WHERE guild_id=? AND id=? AND status='pending'",
+                (new_limit, new_close, new_open_ts, new_type, new_message, ctx.guild.id, opening_id),
             )
             await self._log_request_admin_action(
                 ctx.guild,
                 ctx.user.id,
                 "scheduled_opening_edited",
-                f"opening_id={opening_id} open_ts={new_open_ts} limit={new_limit} close_minutes={new_close} request_type={new_type or 'any'}",
+                f"opening_id={opening_id} open_ts={new_open_ts} limit={new_limit} close_minutes={new_close} request_type={new_type or 'any'} announcement={'custom' if new_message else 'default'}",
             )
             return await ctx.respond(
-                f"Updated scheduled opening **#{opening_id}** for <t:{new_open_ts}:F> (<t:{new_open_ts}:R>). Type: **{self._request_type_label(new_type)}**.",
+                f"Updated scheduled opening **#{opening_id}** for <t:{new_open_ts}:F> (<t:{new_open_ts}:R>). Type: **{self._request_type_label(new_type)}**. Announcement: **{'custom' if new_message else 'default'}**.",
                 ephemeral=True,
             )
 

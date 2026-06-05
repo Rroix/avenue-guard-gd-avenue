@@ -151,11 +151,15 @@
    - Expected: a compact FAQ suggestion embed appears with topic buttons for Moderation, Level requests, Server help, Other, and Cancel.
 2. Choose `Level requests`.
    - Expected: ticket channel created under category with the topic in the channel name/opening message.
+   - Expected: the opening message shows `Status: Waiting for staff`.
    - Expected: perms only requester + mods
    - Expected: ticket creation is audit-logged.
 3. Run `/ticket status status:waiting_user`, then `/ticket status status:waiting_staff`.
    - Expected: the current ticket status updates and the channel receives a clean status embed.
-4. Try creating another ticket within 24h
+   - Expected: the original ticket opening message edits to the new status.
+4. Send a staff message, then send a requester message.
+   - Expected: staff message changes the opening message to `Waiting for user`; requester message changes it to `Waiting for staff`.
+5. Try creating another ticket within 24h
    - Expected: blocked with a Discord timestamp cooldown message.
 
 ---
@@ -167,6 +171,7 @@
    - Expected: ticket remains open
 4. Press Yes
    - Expected: transcript file and structured ticket transcript embed posted to `channels.general_logging_channel_id`
+   - Expected: the ticket opening message is marked `Resolved` before the transcript is saved.
    - Expected: channel deleted
    - Expected: ticket creator receives a 1-5 satisfaction prompt by DM if DMs are open.
 5. Run `/ticket transcripts ticket_id:<id>` and `/ticket transcripts user:<creator>`.
@@ -246,6 +251,7 @@
    - Expected: ephemeral `Requests are closed :/`.
 3. Run `/open-requests number:2 time:5` as an admin.
    - Expected: new wave opens, request embed updates to open, `/requests-are` shows open state, limit, timer, and count.
+   - Expected: request_channel receives the default opening announcement pinging `<@&786245470636605440>`.
 4. Press the button as a user without required roles.
    - Expected: ephemeral no-requirements message.
 5. Press the button as an eligible user without `has_requested_role_id`.
@@ -296,6 +302,7 @@
 26. Run `/open-requests when:18:30 day:0` as an admin.
     - Expected: bot schedules the opening and replies with Discord absolute and relative timestamps.
     - Expected: command options explain that `when` is Madrid `HH:MM`, `day` is optional, and `time` is the close timer in minutes.
+    - Expected: the scheduled opening uses the default announcement unless `message` is provided.
 27. Run `/open-requests type:only demons` as an admin, then submit a known non-demon.
     - Expected: the modal is rejected before the request counts, and `/requests-are` shows the active type.
 28. Submit a known demon during that wave.
@@ -306,8 +313,8 @@
     - Expected: modal opens with the scheduled time, day, limit, close timer, and request type prefilled.
 31. Press `Open now` while another request wave is already open.
     - Expected: bot asks for confirmation before creating a new wave.
-32. Run `/pending-openings action:edit opening_id:<id> number:3 time:10 when:19:00 type:long level`.
-    - Expected: the scheduled opening updates.
+32. Run `/pending-openings action:edit opening_id:<id> number:3 time:10 when:19:00 type:long level message:Custom open text`.
+    - Expected: the scheduled opening updates and shows a custom announcement.
 33. Run `/pending-openings action:delete opening_id:<id>`.
     - Expected: the scheduled opening is removed from the pending list.
 34. Run `/requests pending scope:current_wave status:pending` as a judge or head judge.
