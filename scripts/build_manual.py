@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import re
 from pathlib import Path
 
 from docx import Document
@@ -30,12 +32,13 @@ DOCX_PATH = DOCS / "Avenue_Guard_Manual.docx"
 MD_PATH = DOCS / "Avenue_Guard_Manual.md"
 PDF_PATH = DOCS / "Avenue_Guard_Manual.pdf"
 
-BLUE = RGBColor(0x2E, 0x74, 0xB5)
-DARK_BLUE = RGBColor(0x1F, 0x4D, 0x78)
+BLUE = RGBColor(0x1D, 0x6B, 0x73)
+DARK_BLUE = RGBColor(0x17, 0x3F, 0x46)
 INK = RGBColor(0x22, 0x22, 0x22)
 MUTED = RGBColor(0x66, 0x66, 0x66)
-TABLE_FILL = "E8EEF5"
-CALLOUT_FILL = "F4F6F9"
+TABLE_FILL = "DCEDEA"
+CALLOUT_FILL = "FFF7E6"
+CODE_FILL = "F6F7F8"
 
 
 def p(text: str) -> tuple:
@@ -70,6 +73,22 @@ def diagram(title: str, steps: list[str], note: str = "") -> tuple:
     return ("diagram", title, steps, note)
 
 
+def code(title: str, language: str, text: str) -> tuple:
+    return ("code", title, language, text.rstrip())
+
+
+def source_code(title: str, rel_path: str, start: int, end: int, language: str = "python") -> tuple:
+    path = ROOT / rel_path
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        selected = lines[max(0, start - 1): max(start - 1, end)]
+        numbered = [f"{idx:>4}: {line}" for idx, line in enumerate(selected, start=start)]
+        text = "\n".join(numbered)
+    except Exception as exc:
+        text = f"# Could not load {rel_path}:{start}-{end}: {type(exc).__name__}"
+    return code(f"{title} ({rel_path}:{start}-{end})", language, text)
+
+
 CHAPTERS = [
     (
         "How To Read This Manual",
@@ -80,9 +99,9 @@ CHAPTERS = [
                 "help flows, forum formatting, staff logs, analytics, and admin diagnostics into one persistent bot."
             ),
             p(
-                "This manual is written for three audiences at once: the server owner who needs to explain the bot, the "
-                "staff member who needs to operate it safely, and the developer who needs to maintain it without guessing. "
-                "It keeps the language readable, but it still names the real modules, tables, commands, and responsibilities."
+                "This manual is private technical documentation for Rodrigo. It is not written as a staff handbook. It explains "
+                "how the bot is built, how the code thinks, which modules own which workflows, and why the implementation choices "
+                "exist. Staff workflows are described only because they are part of the bot's code and state model."
             ),
             callout(
                 "Core idea",
@@ -92,10 +111,10 @@ CHAPTERS = [
             h2("Document Map"),
             bullets(
                 [
-                    "Chapters 1 to 5 explain the architecture, runtime, config, and persistence model.",
-                    "Chapters 6 to 14 explain the major user and staff workflows.",
-                    "Chapters 15 to 18 explain diagnostics, recovery, external services, and impact reporting.",
-                    "The appendix gives quick reference tables for commands, cogs, data, and operating rules.",
+                    "The first chapters give the big mental model: runtime, config, persistence, cogs, permissions, and history.",
+                    "The workflow chapters explain requests, weekly tracking, help/tickets, forums, telemetry, admin tools, and impact reporting.",
+                    "The private deep-dive chapters walk through actual source code excerpts and the less obvious engineering ideas.",
+                    "The appendices give quick lookup tables for commands, database tables, files, and maintenance habits.",
                 ]
             ),
             p(
@@ -898,6 +917,627 @@ CHAPTERS = [
 ]
 
 
+def _source_file_inventory_rows() -> list[list[str]]:
+    files = [
+        "main.py",
+        "cogs/Background.py",
+        "cogs/Commands.py",
+        "cogs/Help.py",
+        "cogs/MessageResponses.py",
+        "cogs/Mod.py",
+        "cogs/RequestLevels.py",
+        "cogs/Sticky.py",
+        "cogs/Tracking.py",
+        "utils/config.py",
+        "utils/db.py",
+        "utils/errors.py",
+        "utils/gd_validation.py",
+        "utils/server_icons.py",
+        "utils/views.py",
+    ]
+    rows: list[list[str]] = []
+    for rel in files:
+        path = ROOT / rel
+        try:
+            text = path.read_text(encoding="utf-8")
+            parsed = ast.parse(text)
+            classes = sum(isinstance(node, ast.ClassDef) for node in ast.walk(parsed))
+            functions = sum(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ast.walk(parsed))
+            listeners = len(re.findall(r"@commands\.Cog\.listener", text))
+            tasks = len(re.findall(r"@tasks\.loop", text))
+            rows.append([rel, str(len(text.splitlines())), f"{classes} classes / {functions} functions", f"{listeners} listeners / {tasks} loops"])
+        except Exception as exc:
+            rows.append([rel, "?", f"Could not parse: {type(exc).__name__}", ""])
+    return rows
+
+
+def _command_inventory_rows() -> list[list[str]]:
+    rows: list[list[str]] = []
+    files = ["cogs/Commands.py", "cogs/RequestLevels.py"]
+    command_re = re.compile(r'(?:slash_command|command)\(name="([^"]+)",\s*description="([^"]*)"', re.M)
+    direct_re = re.compile(r'@bot\.slash_command\(name="([^"]+)",\s*description="([^"]*)"', re.M)
+    for rel in files:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        seen: set[str] = set()
+        for name, desc in command_re.findall(text) + direct_re.findall(text):
+            key = f"{rel}:{name}:{desc}"
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append([f"/{name}", rel, desc])
+    rows.sort(key=lambda row: (row[1], row[0]))
+    return rows
+
+
+def _database_table_rows() -> list[list[str]]:
+    text = (ROOT / "utils/db.py").read_text(encoding="utf-8")
+    names = sorted(set(re.findall(r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z0-9_]+)", text)))
+    purpose = {
+        "activity_counts": "Weekly activity totals.",
+        "activity_last_counted": "Per-user cooldown memory for activity counting.",
+        "weekly_claims": "Weekly reward contact and claim status.",
+        "weekly_sessions": "Active weekly DM claim sessions.",
+        "weekly_dm_log": "Weekly workflow audit events.",
+        "weekly_reminders": "Reminder delivery memory.",
+        "weekly_runs": "Scheduler idempotency for weekly jobs.",
+        "weekly_reward_disabled": "Per-week switch for automatic reward delivery.",
+        "weekly_streaks": "Top-member streak tracking.",
+        "weekly_recaps": "Private weekly recap message history.",
+        "anti_farm_events": "Skipped low-effort activity events.",
+        "weekly_request_reviews": "Weekly request review queue rows.",
+        "tickets": "Ticket channel, owner, status, ID, and satisfaction state.",
+        "ticket_sequences": "Atomic ticket ID counters by guild.",
+        "ticket_transcripts": "Transcript log message pointers.",
+        "ticket_cooldowns": "Ticket creation cooldowns.",
+        "sticky_state": "Last sticky message per channel.",
+        "help_sessions": "Current DM help flow stage.",
+        "help_cooldowns": "Help action rate limits.",
+        "help_submissions": "Appeals, reports, and bot issue records.",
+        "transcript_requests": "Member transcript approval requests.",
+        "rps_streaks": "Rock-paper-scissors win streaks.",
+        "level_request_state": "Current live request wave state.",
+        "level_request_submissions": "Live request submissions and reviews.",
+        "level_request_wave_summaries": "Live wave summary message pointers.",
+        "level_request_scheduled_openings": "Future request openings.",
+        "level_request_edit_audit": "Before/after request edit snapshots.",
+        "gd_level_validation_cache": "Cached GD provider validation payloads.",
+        "daily_stats": "Daily telemetry payloads.",
+        "impact_snapshots": "Owner impact report payload history.",
+        "database_backups": "Posted backup metadata.",
+    }
+    return [[name, purpose.get(name, "Persistent workflow state.")] for name in names]
+
+
+def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
+    return [
+        (
+            "Private Orientation: How To Study The Bot",
+            [
+                p(
+                    "This private section is written for you as the builder-owner of Avenue Guard. The goal is not only to know "
+                    "which commands exist. The goal is to understand how a Discord event becomes code, how code turns into stored "
+                    "state, how that state survives a restart, and how the bot repairs visible Discord messages when they drift."
+                ),
+                p(
+                    "A useful way to study the project is to read it in layers: main.py starts the system, utils provide shared "
+                    "rules, cogs own workflows, config.json controls server-specific behavior, and SQLite remembers anything that "
+                    "matters after a restart. When you get lost, ask: who owns this event, where is the state stored, and what "
+                    "Discord object does the user see?"
+                ),
+                diagram(
+                    "Code Reading Map",
+                    [
+                        "main.py boots",
+                        "utils define shared rules",
+                        "cogs own workflows",
+                        "config shapes behavior",
+                        "SQLite preserves state",
+                        "Discord shows results",
+                    ],
+                    "This is the mental route for almost every feature in the bot.",
+                ),
+                table(
+                    ["Question", "Where To Look First"],
+                    [
+                        ["Why did the bot start or fail?", "main.py and utils/db.py"],
+                        ["Why did a command answer this way?", "cogs/Commands.py or cogs/RequestLevels.py command method"],
+                        ["Why did a button do something after restart?", "utils/views.py custom ID and the owning cog handler"],
+                        ["Why did a request enter or skip the queue?", "RequestLevelsCog validation, requirements, and submission lock"],
+                        ["Why did a weekly winner get contacted?", "TrackingCog weekly loop, weekly_claims, weekly_sessions"],
+                        ["Why did a ticket status change?", "HelpCog on_message and ticket status helpers"],
+                        ["Why did a report number appear in impact data?", "CommandsCog _collect_impact_metrics"],
+                    ],
+                ),
+                callout(
+                    "The important pattern",
+                    "Avenue Guard is event-driven, but its serious workflows are state-driven. The event starts the logic; the database decides what is true.",
+                ),
+            ],
+        ),
+        (
+            "Source Inventory",
+            [
+                p(
+                    "This chapter is generated from the current source files. It gives you a quick structural map before the deeper "
+                    "walkthroughs. Line counts are not a quality metric by themselves, but they reveal where most of the bot's complexity lives."
+                ),
+                table(["File", "Lines", "Shape", "Discord Hooks"], _source_file_inventory_rows()),
+                p(
+                    "The largest files are large because they own full workflows, not because they only hold utility helpers. "
+                    "RequestLevels.py owns a state machine with modals, validation, buttons, scheduled openings, review actions, and repairs. "
+                    "Commands.py owns the command surface and cross-system diagnostics. Help.py owns the DM and ticket state machines."
+                ),
+                h2("How To Use This Inventory"),
+                p(
+                    "When debugging, avoid starting from the biggest file and scrolling randomly. Start from the user action. If it is a "
+                    "slash command, search the command name. If it is a button, search the custom ID in utils/views.py and follow the handler. "
+                    "If it is a background action, search the task loop name or the database table it changes."
+                ),
+            ],
+        ),
+        (
+            "Command Surface Inventory",
+            [
+                p(
+                    "This table is extracted from command registrations. The bot has direct commands and grouped commands. Some legacy or "
+                    "programmatic commands appear by short name here, while their actual Discord path may include a group such as /bot, "
+                    "/tracking, /ticket, /requests, /forum, or /server_icon."
+                ),
+                table(["Command", "Registered In", "Description"], _command_inventory_rows()),
+                callout(
+                    "Descriptions are intentionally clean",
+                    "The code enforces permissions. The command descriptions do not need to carry visual labels like admin-only or owner-only.",
+                ),
+            ],
+        ),
+        (
+            "Database Table Inventory",
+            [
+                p(
+                    "This table is extracted from utils/db.py. It is one of the most useful quick-reference sections because almost every "
+                    "serious Avenue Guard behavior has a table behind it."
+                ),
+                table(["Table", "Purpose"], _database_table_rows()),
+                p(
+                    "The table names are grouped by feature family. activity_* and weekly_* belong to tracking. ticket_* and help_* belong "
+                    "to support. level_request_* and gd_level_validation_cache belong to live requests. daily_stats, impact_snapshots, and "
+                    "database_backups belong to measurement and durability."
+                ),
+            ],
+        ),
+        (
+            "Startup Code Walkthrough",
+            [
+                p(
+                    "main.py is the bot's entry point. The most important design choice here is that startup resolves a usable database path "
+                    "before creating the Database wrapper. That protects production from accidentally using ephemeral source storage when a "
+                    "persistent disk exists."
+                ),
+                source_code("Database path resolution", "main.py", 46, 74),
+                p(
+                    "The path resolver checks sources in priority order: environment variable, config.json, Render persistent disk candidate, "
+                    "then local fallback. The key technical trick is the write probe: the bot does not assume a path works just because it looks "
+                    "right. It tries to create the parent directory, writes a tiny test file, deletes it, and only then accepts the path."
+                ),
+                source_code("Bot creation and startup hooks", "main.py", 76, 138),
+                p(
+                    "create_bot wires the bot object, configuration, database, cogs, and on_ready behavior together. on_ready is where the "
+                    "runtime becomes alive: database connection, guild validation, background loops, and persistent views are all started from there."
+                ),
+                source_code("Persistent view registration", "main.py", 167, 177),
+                p(
+                    "Persistent view registration is easy to underestimate. Discord button messages can outlive the Python process. Without "
+                    "registering the views again after restart, users could click old buttons and Discord would not know which callback should run."
+                ),
+            ],
+        ),
+        (
+            "Database Code Walkthrough",
+            [
+                p(
+                    "The Database wrapper is small because it has one job: make SQLite safe enough for an async Discord bot. SQLite calls are "
+                    "blocking, so the wrapper serializes access with an asyncio.Lock and runs the actual SQLite work inside asyncio.to_thread."
+                ),
+                source_code("Connection, WAL, migration, and backup", "utils/db.py", 14, 66),
+                p(
+                    "WAL mode helps SQLite handle concurrent readers while writes are happening. The lock still serializes bot-side operations, "
+                    "which prevents two coroutine paths from sharing one cursor incorrectly. This is less glamorous than a bigger database, but it "
+                    "fits a single-server bot well and keeps deployment simple."
+                ),
+                source_code("Atomic ticket sequence and query helpers", "utils/db.py", 935, 1003),
+                p(
+                    "The ticket ID function is the cleanest example of an atomic counter in this codebase. It reads and increments under the "
+                    "same database lock, commits before returning, and stores the next value by guild. This prevents two tickets opened at nearly "
+                    "the same time from receiving the same visible ticket number."
+                ),
+                callout(
+                    "Atomic means indivisible",
+                    "In this bot, atomic usually means one protected operation that cannot be interleaved with another coroutine halfway through. "
+                    "The lock plus one database transaction gives that guarantee for counters and state transitions.",
+                ),
+            ],
+        ),
+        (
+            "Config And Template Engine Walkthrough",
+            [
+                p(
+                    "config.json is treated as a practical control plane. The Config class is intentionally simple: load JSON, expose typed "
+                    "getters, and save atomically through a temporary file plus os.replace. This matters because a partially-written config file "
+                    "could break startup."
+                ),
+                source_code("Typed config getters and atomic save", "utils/config.py", 13, 65),
+                p(
+                    "Many embeds use Python format_map with a SafeDict. If a template references a missing variable, the bot inserts an empty "
+                    "string instead of crashing the workflow. That is why template validation is useful: SafeDict keeps the bot alive, while "
+                    "config checks help you notice mistakes before users see blank fields."
+                ),
+                source_code("Request embed template renderer", "cogs/RequestLevels.py", 1024, 1064),
+                p(
+                    "The embed renderer is shared by live request submissions, reviewed request embeds, result notifications, and wave summaries. "
+                    "It reads fields, footer, images, thumbnails, author info, color, title, and description from config. Workflow logic stays in "
+                    "Python; presentation stays in config."
+                ),
+            ],
+        ),
+        (
+            "Persistent Views Walkthrough",
+            [
+                p(
+                    "utils/views.py is the component router. It stores stable custom IDs and very small button/select classes. The view should "
+                    "not implement the business rules. It should only receive the click and call the owning cog."
+                ),
+                source_code("Request button and review button router", "utils/views.py", 149, 205),
+                p(
+                    "This is why a request review button can still work after a restart. The custom ID is stable, the view is registered on "
+                    "startup, and the callback asks the live bot instance for RequestLevelsCog. The cog then reloads the real request state from SQLite."
+                ),
+                diagram(
+                    "Persistent Button Dispatch",
+                    [
+                        "Discord button click",
+                        "Stable custom_id",
+                        "View callback",
+                        "get_cog lookup",
+                        "Database-backed handler",
+                    ],
+                    "The button identifies the action; the database identifies the current truth.",
+                ),
+            ],
+        ),
+        (
+            "Live Request Code Walkthrough",
+            [
+                p(
+                    "The request button is deceptively complex. On click, the bot checks whether the user already has a current-wave request. "
+                    "If they do and the edit window is still open, the same button becomes an edit entry point. If not, it checks open/closed "
+                    "state, required roles, banned role, first-time request role logic, and then opens the modal."
+                ),
+                source_code("Request button state gate", "cogs/RequestLevels.py", 2078, 2164),
+                p(
+                    "The submission handler uses a lock because request limits and duplicate checks must be consistent. Imagine a wave with one "
+                    "slot left and two users submit at the same moment. Without the lock, both could pass the count check. With the lock, one "
+                    "complete submission finishes before the next one evaluates the current state."
+                ),
+                source_code("Request form core transaction", "cogs/RequestLevels.py", 2166, 2296),
+                p(
+                    "Notice the order: validate local fields, defer the interaction, validate externally, enter the submit lock, reload current "
+                    "state, check duplicate user and duplicate level ID, send the review embed, store the Discord message ID, then increment the "
+                    "wave count. The request only counts after the staff queue message exists."
+                ),
+                source_code("Request edit audit trail", "cogs/RequestLevels.py", 2368, 2447),
+                p(
+                    "The edit path writes both the new data and an audit record. That lets reviewers know the request changed and lets you inspect "
+                    "what changed later. The audit table stores old and new JSON snapshots because request form data is template-driven and may "
+                    "gain fields over time."
+                ),
+            ],
+        ),
+        (
+            "Validation Code Walkthrough",
+            [
+                p(
+                    "Validation is split into two files. utils/gd_validation.py knows how to parse provider responses and combine them. "
+                    "RequestLevelsCog decides when to call validation, cache it, rate-limit it, and turn the result into user-facing errors "
+                    "or reviewer warnings."
+                ),
+                source_code("Provider result combiner", "utils/gd_validation.py", 197, 264),
+                p(
+                    "The combiner does not pretend providers are always perfect. It tracks existing results, missing results, failed providers, "
+                    "disagreement, rating status, and whether a showcase appears required. This is why the bot can block confidently missing IDs "
+                    "but only warn when a provider failed or disagreed."
+                ),
+                source_code("Cached provider lookup and circuit breaker use", "cogs/RequestLevels.py", 833, 912),
+                source_code("External validation policy", "cogs/RequestLevels.py", 976, 1012),
+                p(
+                    "The cache is important for both speed and kindness to external services. The circuit breaker is a practical resilience feature: "
+                    "if one provider fails repeatedly, the bot temporarily stops using it instead of letting every submission wait on a broken service."
+                ),
+            ],
+        ),
+        (
+            "Request Review Code Walkthrough",
+            [
+                p(
+                    "Review actions are shared between live wave requests and weekly request submissions. The handler first figures out whether "
+                    "the clicked message belongs to level_request_submissions or weekly_request_reviews, then applies the same result logic."
+                ),
+                source_code("Review target lookup and button gate", "cogs/RequestLevels.py", 2482, 2521),
+                source_code("Final review transaction", "cogs/RequestLevels.py", 2523, 2613),
+                p(
+                    "The review lock has the same purpose as the submit lock: one reviewer should win the state transition. The database status "
+                    "must still be pending when the review is saved. After that, the original buttons are disabled so Discord's visible UI matches "
+                    "the stored result."
+                ),
+                source_code("Wave summary variables and reviewer stats", "cogs/RequestLevels.py", 1138, 1226),
+                p(
+                    "The summary is generated from the database, not from memory. That means it can be rebuilt later and it stays correct even if "
+                    "the bot restarts between reviews."
+                ),
+            ],
+        ),
+        (
+            "Scheduled Openings Walkthrough",
+            [
+                p(
+                    "Scheduled request openings are stored as rows, not just sleeping tasks. This is deliberate. If the bot restarts, a sleeping "
+                    "task disappears, but the row in level_request_scheduled_openings remains. The scheduler loop can pick it up again when the bot is ready."
+                ),
+                source_code("Scheduling command branch", "cogs/RequestLevels.py", 1833, 1879),
+                source_code("Pending opening edit/list branch", "cogs/RequestLevels.py", 1881, 1968),
+                p(
+                    "The command accepts immediate openings and scheduled openings through the same entry point. The when/day options create a "
+                    "future row; leaving when empty opens immediately. This keeps the admin interface compact while the stored state remains explicit."
+                ),
+                callout(
+                    "Why Discord timestamps are used",
+                    "The bot stores Unix timestamps and displays Discord timestamp markup. Discord then renders the time in each viewer's client, "
+                    "which avoids putting a timezone label in the frontend while still keeping scheduling internally consistent.",
+                ),
+            ],
+        ),
+        (
+            "Tracking Code Walkthrough",
+            [
+                p(
+                    "TrackingCog counts activity without writing to SQLite on every message. That would be slow and noisy. Instead, it keeps "
+                    "small in-memory buffers and periodically flushes them with UPSERT statements. If the flush fails, it puts the counts back "
+                    "into the buffer so they can be retried."
+                ),
+                source_code("Message counting gate", "cogs/Tracking.py", 608, 668),
+                source_code("Buffered activity flush", "cogs/Tracking.py", 675, 710),
+                p(
+                    "The ON CONFLICT SQL is doing the increment atomically at database level: if a row already exists for that user and week, "
+                    "count becomes count + excluded.count. That keeps weekly totals correct even though the bot flushes multiple messages together."
+                ),
+                source_code("Weekly job runner", "cogs/Tracking.py", 1176, 1233),
+                p(
+                    "The weekly job flushes pending activity first, ranks users, updates streaks, respects the weekly reward disabled switch, "
+                    "contacts winners, writes the weekly_runs idempotency row, and creates a private recap. The weekly_runs table prevents the "
+                    "same week from being processed repeatedly by the scheduler."
+                ),
+            ],
+        ),
+        (
+            "Weekly Request Workflow Walkthrough",
+            [
+                p(
+                    "Weekly request rewards happen in DMs. A winner receives a formatted request prompt, replies with the required fields, and "
+                    "TrackingCog parses the message into the same shape that RequestLevelsCog understands for review embeds."
+                ),
+                source_code("Weekly DM request parser", "cogs/Tracking.py", 98, 168),
+                source_code("Weekly request recording", "cogs/Tracking.py", 772, 868),
+                p(
+                    "The important bridge is LevelRequestReviewView. Weekly submissions are not part of a live wave, but they still use the same "
+                    "Send, Reject, and Other buttons. The review row lives in weekly_request_reviews, and RequestLevelsCog's review finalizer handles it."
+                ),
+                source_code("Weekly contact state", "cogs/Tracking.py", 1235, 1297),
+                p(
+                    "force_dm is an intentional override path. Normal weekly rewards respect exclusions and the disabled switch; manual force-DM "
+                    "can be used for exceptions and is logged so the override is visible later."
+                ),
+            ],
+        ),
+        (
+            "Help And Ticket Code Walkthrough",
+            [
+                p(
+                    "HelpCog is a state machine for DMs and ticket channels. The user's current help stage is stored in help_sessions. A typed "
+                    "message or button action reads the stage, updates the session, and sends the next prompt."
+                ),
+                source_code("Help session message router", "cogs/Help.py", 1042, 1117),
+                p(
+                    "The preview step exists to prevent accidental submissions. For appeals, reports, and bot issues, the user can review the "
+                    "embed, edit the last answer, cancel, or submit. The staff log only receives the item after the preview is confirmed."
+                ),
+                source_code("Help submission insert and staff log", "cogs/Help.py", 1001, 1040),
+                source_code("Ticket creation", "cogs/Help.py", 1689, 1765),
+                p(
+                    "Ticket IDs come from the database counter, not from Discord channel IDs. That creates short human labels like T123 while "
+                    "still preserving the real channel ID for lookups, transcript indexing, and closure."
+                ),
+                source_code("Ticket closure safety", "cogs/Help.py", 1850, 1949),
+                p(
+                    "Ticket close is cautious. It marks the ticket resolved, builds a transcript, posts the transcript to the log channel, indexes "
+                    "the transcript, deletes the channel, and prompts satisfaction. If a dangerous middle step fails, it restores the previous status "
+                    "instead of deleting the channel blindly."
+                ),
+            ],
+        ),
+        (
+            "Background Telemetry Code Walkthrough",
+            [
+                p(
+                    "BackgroundCog turns many Discord events into a daily payload. The dataclass keeps today's counters in memory, while "
+                    "daily_stats stores snapshots so restart and impact reporting do not wipe the day."
+                ),
+                source_code("DailyStats shape", "cogs/Background.py", 61, 86),
+                source_code("Daily stat persistence", "cogs/Background.py", 473, 515),
+                p(
+                    "The rollover logic is subtle because voice time can span midnight. The bot calculates minutes up to the boundary, persists "
+                    "the old day, then starts a fresh day with current voice sessions carried forward from the guild state."
+                ),
+                source_code("Daily message listener", "cogs/Background.py", 588, 602),
+                source_code("Daily report embed", "cogs/Background.py", 933, 1082),
+                p(
+                    "The summary embed is built from the stored counters plus derived values: net member movement, command success rate, average "
+                    "messages per active member, top channels, top users, and top commands. This is the raw material for later impact reports."
+                ),
+            ],
+        ),
+        (
+            "Forum And Sticky Code Walkthrough",
+            [
+                p(
+                    "StickyCog has two different jobs that both involve keeping instructions visible: channel sticky messages and forum first "
+                    "messages. It also enforces the required-word rule for forum threads."
+                ),
+                source_code("Sticky debounced repost", "cogs/Sticky.py", 120, 181),
+                source_code("Required word detection", "cogs/Sticky.py", 276, 324),
+                source_code("Required word deletion flow", "cogs/Sticky.py", 354, 399),
+                p(
+                    "The required-word delete flow is intentionally conservative. If the bot cannot read history, it avoids deletion to prevent "
+                    "false positives. It DMs the thread owner when possible, logs the deletion with author and forum context, unarchives/unlocks if "
+                    "needed, and then deletes the thread."
+                ),
+            ],
+        ),
+        (
+            "Impact And Backup Code Walkthrough",
+            [
+                p(
+                    "The impact system is a reporting pipeline built on top of the bot's existing persistent tables. It does not invent numbers; "
+                    "it aggregates workflow records the bot already stores."
+                ),
+                source_code("Database backup posting", "cogs/Commands.py", 291, 360),
+                source_code("Impact metric collection entry", "cogs/Commands.py", 564, 642),
+                source_code("Impact report persistence", "cogs/Commands.py", 1106, 1164),
+                p(
+                    "A backup is a zipped SQLite copy posted to Discord and recorded in database_backups. An impact report is a Markdown/CSV/JSON "
+                    "bundle posted to Discord and recorded in impact_snapshots. The two systems serve different purposes: backup is recovery; impact "
+                    "is evidence and forecasting."
+                ),
+                diagram(
+                    "Impact Data Path",
+                    [
+                        "workflow tables",
+                        "metric collector",
+                        "forecast helper",
+                        "Discord attachments",
+                        "impact_snapshots row",
+                    ],
+                    "The report channel gives you durable evidence files; the database row keeps a bot-side history.",
+                ),
+            ],
+        ),
+        (
+            "Server Icon Rotation Code Walkthrough",
+            [
+                p(
+                    "Server icon rotation is a good example of making a visually simple feature reliable. The feature needs config validation, "
+                    "URL cleaning, mode selection, interval enforcement, download checks, state persistence, and commands for manual control."
+                ),
+                source_code("Icon config normalization", "utils/server_icons.py", 8, 57),
+                source_code("Automatic icon rotation loop", "cogs/Background.py", 857, 879),
+                source_code("Server icon command surface", "cogs/Commands.py", 1375, 1465),
+                p(
+                    "The current_index and current_url fields prevent linear rotation from getting stuck and help the bot know what it last tried. "
+                    "The interval is normalized to at least five minutes to respect Discord rate limits and avoid accidental rapid icon changes."
+                ),
+            ],
+        ),
+        (
+            "Engineering Thinking Behind The Bot",
+            [
+                p(
+                    "Avenue Guard's best design choices are about recovering from imperfect reality. Discord is not a database. Messages disappear, "
+                    "permissions change, users close DMs, external APIs fail, and hosted storage can be wiped. The bot works because the important "
+                    "truth lives in SQLite and visible Discord messages are treated as projections that can be refreshed or rebuilt."
+                ),
+                table(
+                    ["Problem", "Design Response"],
+                    [
+                        ["A button can be clicked after restart", "Register persistent views with stable custom IDs."],
+                        ["Two users can submit at the same time", "Use submit locks and database duplicate constraints."],
+                        ["Two reviewers can click the same request", "Use review lock, pending status check, and disabled buttons."],
+                        ["A provider can fail or disagree", "Cache normalized validation, warn on uncertainty, and circuit-break repeated failures."],
+                        ["A ticket close can fail midway", "Save transcript before deletion and restore status on failure."],
+                        ["Render can wipe source storage", "Resolve DB path to persistent disk and post zipped backups."],
+                        ["Config can drift from Discord", "Expose dashboard, config check, doctor, repair, and storage commands."],
+                    ],
+                ),
+                p(
+                    "The bot is not architected as many isolated mini-bots. It is one coherent system where request data can feed impact reports, "
+                    "weekly tracking can feed request reviews, help data can feed support metrics, and background telemetry can feed forecasts."
+                ),
+                callout(
+                    "How we planned it",
+                    "The pattern was usually: identify a manual staff pain, decide what state must survive, store that state, expose a Discord UI, "
+                    "log the outcome, then add a repair or diagnostic path for the ways Discord can drift.",
+                ),
+            ],
+        ),
+        (
+            "Debugging Notebook",
+            [
+                p(
+                    "When something breaks, resist the urge to read everything. Use the failure type to choose the shortest path."
+                ),
+                table(
+                    ["Symptom", "First Places To Check"],
+                    [
+                        ["Bot fails on startup", "Render logs, main.py resolve_db_path, utils/db.py connect/migrate, config.json syntax."],
+                        ["Command says no permission", "CommandsCog permission helper, roles.admin_owner_role_ids, MOD_ROLE_ID, reviewer_role_ids."],
+                        ["Request button wrong state", "level_request_state row, refresh_or_create_request_button, request channel/message IDs."],
+                        ["Request modal rejects valid user", "required_role_ids, request_banned_role_id, _requirements_ok, guild member role cache."],
+                        ["ID validation seems wrong", "gd_level_validation_cache, provider settings, external provider output, circuit breaker state."],
+                        ["Weekly winner not DMed", "weekly_reward_disabled, weekly_runs, weekly_claims, excluded roles, DM failure log."],
+                        ["Ticket status does not update", "tickets.opening_message_id, update_ticket_opening_status, HelpCog on_message."],
+                        ["Impact data missing", "daily_stats persistence, impact.allowed_user_ids, impact report channel, database path persistence."],
+                    ],
+                ),
+                h2("The Five Checks"),
+                numbered(
+                    [
+                        "Check config: is the channel/role/table setting pointing at the right thing?",
+                        "Check database state: does SQLite say the workflow is open, closed, pending, reviewed, or missing?",
+                        "Check Discord object: does the message/channel/thread still exist?",
+                        "Check permissions: can the bot see, send, edit, delete, manage roles, or manage channels there?",
+                        "Check repair path: does /bot dashboard, /bot doctor, /requests repair, /bot storage, or /bot backup explain the issue?",
+                    ]
+                ),
+                p(
+                    "This debugging style matches the code's architecture. Config chooses targets, SQLite stores truth, Discord shows a projection, "
+                    "permissions decide whether the projection can be updated, and repair commands rebuild the projection when it drifts."
+                ),
+            ],
+        ),
+    ]
+
+
+CHAPTERS = [
+    (
+        "Private Manual Notice",
+        [
+            p(
+                "This document is now a private technical manual for Rodrigo. It explains Avenue Guard as a codebase, not as a public "
+                "staff guide. It still describes staff-facing workflows because those workflows exist in the code, but the reader is assumed "
+                "to be the person trying to understand, maintain, explain, and continue building the bot."
+            ),
+            callout(
+                "Reading promise",
+                "The manual uses plain language, diagrams, tables, and real source excerpts. The aim is to make the bot understandable from "
+                "top to bottom without flattening the technical details that make it work.",
+            ),
+            p(
+                "If you only need a quick answer, use the inventory and appendix chapters. If you want a deep read, follow the source "
+                "walkthrough chapters in order. They move from startup to persistence, then into requests, tracking, help, telemetry, "
+                "impact reporting, and debugging."
+            ),
+        ],
+    )
+] + CHAPTERS + _private_deep_dive_chapters()
+
+
 def set_cell_shading(cell, fill: str) -> None:
     tc_pr = cell._tc.get_or_add_tcPr()
     shd = OxmlElement("w:shd")
@@ -1000,6 +1640,31 @@ def add_manual_diagram(doc: Document, title: str, steps: list[str], note: str = 
         doc.add_paragraph()
 
 
+def add_code_block(doc: Document, title: str, language: str, text: str) -> None:
+    add_para(doc, title, bold=True)
+    tbl = doc.add_table(rows=1, cols=1)
+    tbl.autofit = False
+    set_table_widths(tbl, [6.5])
+    cell = tbl.cell(0, 0)
+    set_cell_shading(cell, CODE_FILL)
+    cell.text = ""
+    para = cell.paragraphs[0]
+    para.paragraph_format.space_after = Pt(0)
+    para.paragraph_format.line_spacing = 1.0
+    run = para.add_run(str(text or ""))
+    run.font.name = "Courier New"
+    run.font.size = Pt(7.3)
+    run.font.color.rgb = INK
+    if language:
+        para2 = cell.add_paragraph()
+        para2.paragraph_format.space_after = Pt(0)
+        r2 = para2.add_run(f"language: {language}")
+        r2.font.name = "Calibri"
+        r2.font.size = Pt(7.5)
+        r2.font.color.rgb = MUTED
+    doc.add_paragraph()
+
+
 def set_styles(doc: Document) -> None:
     section = doc.sections[0]
     section.page_width = Inches(8.5)
@@ -1047,7 +1712,7 @@ def add_cover(doc: Document) -> None:
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
     subtitle.paragraph_format.space_after = Pt(24)
-    run = subtitle.add_run("Architecture, Workflow, Operations, And Impact Manual")
+    run = subtitle.add_run("Private Technical Manual: How The Bot Works Internally")
     run.font.name = "Calibri"
     run.font.size = Pt(15)
     run.font.color.rgb = MUTED
@@ -1055,12 +1720,12 @@ def add_cover(doc: Document) -> None:
     add_callout(
         doc,
         "Purpose",
-        "A readable technical handbook for understanding how Avenue Guard works, why its systems exist, and how its features fit together.",
+        "A private, code-aware handbook for understanding how Avenue Guard works, why each system exists, and how the workflows are implemented.",
     )
     meta = doc.add_paragraph()
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
     meta.paragraph_format.space_before = Pt(18)
-    r = meta.add_run("Generated from the current Avenue Guard codebase and configuration.")
+    r = meta.add_run("Generated from the current Avenue Guard codebase and configuration for Rodrigo.")
     r.font.name = "Calibri"
     r.font.size = Pt(10.5)
     r.font.color.rgb = MUTED
@@ -1124,18 +1789,20 @@ def build_docx() -> None:
                 add_manual_table(doc, block[1], block[2])
             elif kind == "diagram":
                 add_manual_diagram(doc, block[1], block[2], block[3])
+            elif kind == "code":
+                add_code_block(doc, block[1], block[2], block[3])
 
     for section in doc.sections:
         section.start_type = WD_SECTION_START.NEW_PAGE
         header = section.header.paragraphs[0]
-        header.text = "Avenue Guard Manual"
+        header.text = "Avenue Guard Private Technical Manual"
         header.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         for run in header.runs:
             run.font.name = "Calibri"
             run.font.size = Pt(9)
             run.font.color.rgb = MUTED
         footer = section.footer.paragraphs[0]
-        footer.text = "GD Avenue operations handbook"
+        footer.text = "Private code architecture handbook"
         footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
         for run in footer.runs:
             run.font.name = "Calibri"
@@ -1149,9 +1816,9 @@ def build_markdown() -> None:
     lines = [
         "# Avenue Guard",
         "",
-        "Architecture, Workflow, Operations, And Impact Manual",
+        "Private Technical Manual: How The Bot Works Internally",
         "",
-        "Generated from the current Avenue Guard codebase and configuration.",
+        "Generated from the current Avenue Guard codebase and configuration for Rodrigo.",
         "",
         "## Contents",
         "",
@@ -1198,6 +1865,11 @@ def build_markdown() -> None:
                 if note:
                     lines.extend(["", f"> {note}"])
                 lines.append("")
+            elif kind == "code":
+                title, language, text = block[1], block[2], block[3]
+                lines.extend([f"#### {title}", "", f"```{language}"])
+                lines.extend(str(text or "").splitlines())
+                lines.extend(["```", ""])
 
     MD_PATH.write_text("\n".join(lines), encoding="utf-8")
 
@@ -1211,7 +1883,7 @@ def _pdf_styles():
             fontName="Helvetica-Bold",
             fontSize=28,
             leading=34,
-            textColor=colors.HexColor("#2E74B5"),
+            textColor=colors.HexColor("#1D6B73"),
             alignment=TA_CENTER,
             spaceAfter=12,
         ),
@@ -1231,7 +1903,7 @@ def _pdf_styles():
             fontName="Helvetica-Bold",
             fontSize=16,
             leading=20,
-            textColor=colors.HexColor("#2E74B5"),
+            textColor=colors.HexColor("#1D6B73"),
             spaceBefore=8,
             spaceAfter=10,
         ),
@@ -1241,7 +1913,7 @@ def _pdf_styles():
             fontName="Helvetica-Bold",
             fontSize=13,
             leading=17,
-            textColor=colors.HexColor("#2E74B5"),
+            textColor=colors.HexColor("#1D6B73"),
             spaceBefore=10,
             spaceAfter=7,
         ),
@@ -1251,7 +1923,7 @@ def _pdf_styles():
             fontName="Helvetica-Bold",
             fontSize=11.5,
             leading=15,
-            textColor=colors.HexColor("#1F4D78"),
+            textColor=colors.HexColor("#173F46"),
             spaceBefore=8,
             spaceAfter=5,
         ),
@@ -1278,7 +1950,7 @@ def _pdf_styles():
             fontName="Helvetica-Bold",
             fontSize=9.8,
             leading=12.2,
-            textColor=colors.HexColor("#1F4D78"),
+            textColor=colors.HexColor("#173F46"),
             spaceAfter=2,
         ),
         "callout_body": ParagraphStyle(
@@ -1287,6 +1959,23 @@ def _pdf_styles():
             fontName="Helvetica",
             fontSize=9.2,
             leading=11.8,
+            textColor=colors.HexColor("#222222"),
+        ),
+        "code_title": ParagraphStyle(
+            "ManualCodeTitle",
+            parent=base["BodyText"],
+            fontName="Helvetica-Bold",
+            fontSize=8.6,
+            leading=10.6,
+            textColor=colors.HexColor("#173F46"),
+            spaceAfter=3,
+        ),
+        "code": ParagraphStyle(
+            "ManualCode",
+            parent=base["BodyText"],
+            fontName="Courier",
+            fontSize=6.2,
+            leading=7.4,
             textColor=colors.HexColor("#222222"),
         ),
     }
@@ -1305,7 +1994,7 @@ def _pdf_header_footer(canvas, doc) -> None:
     canvas.saveState()
     canvas.setFont("Helvetica", 8)
     canvas.setFillColor(colors.HexColor("#666666"))
-    canvas.drawString(doc.leftMargin, doc.height + doc.topMargin + 0.18 * inch, "Avenue Guard Manual")
+    canvas.drawString(doc.leftMargin, doc.height + doc.topMargin + 0.18 * inch, "Avenue Guard Private Technical Manual")
     canvas.drawRightString(doc.leftMargin + doc.width, 0.55 * inch, f"Page {doc.page}")
     canvas.restoreState()
 
@@ -1319,8 +2008,8 @@ def _pdf_callout(styles, title: str, text: str):
     tbl.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F4F6F9")),
-                ("BOX", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9E1EA")),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFF7E6")),
+                ("BOX", (0, 0), (-1, -1), 0.35, colors.HexColor("#E6D6B8")),
                 ("LEFTPADDING", (0, 0), (-1, -1), 8),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 8),
                 ("TOPPADDING", (0, 0), (-1, -1), 6),
@@ -1346,10 +2035,10 @@ def _pdf_table(styles, headers: list[str], rows: list[list[str]]):
     tbl.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8EEF5")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#1F4D78")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DCEDEA")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#173F46")),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#C9D3DF")),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#B8D0CC")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 5),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 5),
@@ -1371,9 +2060,9 @@ def _pdf_diagram(styles, title: str, steps: list[str], note: str = ""):
     tbl.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#E8EEF5")),
-                ("BOX", (0, 0), (-1, -1), 0.55, colors.HexColor("#9CB6D1")),
-                ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#C9D3DF")),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#DCEDEA")),
+                ("BOX", (0, 0), (-1, -1), 0.55, colors.HexColor("#82A9A2")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#B8D0CC")),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 5),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 5),
@@ -1390,6 +2079,37 @@ def _pdf_diagram(styles, title: str, steps: list[str], note: str = ""):
     return story
 
 
+def _pdf_code_block(styles, title: str, language: str, text: str):
+    raw_lines = str(text or "").splitlines() or [""]
+    story = []
+    chunk_size = 46
+    chunks = [raw_lines[idx: idx + chunk_size] for idx in range(0, len(raw_lines), chunk_size)]
+    for chunk_idx, chunk in enumerate(chunks, start=1):
+        chunk_title = title if len(chunks) == 1 else f"{title} - part {chunk_idx}"
+        escaped_lines = [_pdf_safe(line) for line in chunk]
+        code_text = "<br/>".join(escaped_lines)
+        data = [
+            [Paragraph(_pdf_safe(chunk_title), styles["code_title"])],
+            [Paragraph(code_text, styles["code"])],
+        ]
+        tbl = Table(data, colWidths=[6.25 * inch])
+        tbl.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F6F7F8")),
+                    ("BOX", (0, 0), (-1, -1), 0.35, colors.HexColor("#D5D8DC")),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.extend([tbl, Spacer(1, 0.11 * inch)])
+    return story
+
+
 def build_pdf() -> None:
     DOCS.mkdir(parents=True, exist_ok=True)
     styles = _pdf_styles()
@@ -1400,21 +2120,21 @@ def build_pdf() -> None:
         leftMargin=0.8 * inch,
         topMargin=0.8 * inch,
         bottomMargin=0.8 * inch,
-        title="Avenue Guard Manual",
+        title="Avenue Guard Private Technical Manual",
         author="Avenue Guard",
     )
     story = [Spacer(1, 1.1 * inch)]
     story.append(Paragraph("Avenue Guard", styles["title"]))
-    story.append(Paragraph("Architecture, Workflow, Operations, And Impact Manual", styles["subtitle"]))
+    story.append(Paragraph("Private Technical Manual: How The Bot Works Internally", styles["subtitle"]))
     story.append(
         _pdf_callout(
             styles,
             "Purpose",
-            "A readable technical handbook for understanding how Avenue Guard works, why its systems exist, and how its features fit together.",
+            "A private, code-aware handbook for understanding how Avenue Guard works, why each system exists, and how the workflows are implemented.",
         )
     )
     story.append(Spacer(1, 0.25 * inch))
-    story.append(Paragraph("Generated from the current Avenue Guard codebase and configuration.", styles["subtitle"]))
+    story.append(Paragraph("Generated from the current Avenue Guard codebase and configuration for Rodrigo.", styles["subtitle"]))
     story.append(PageBreak())
 
     story.append(Paragraph("Contents", styles["h1"]))
@@ -1446,6 +2166,8 @@ def build_pdf() -> None:
                 story.append(Spacer(1, 0.12 * inch))
             elif kind == "diagram":
                 story.extend(_pdf_diagram(styles, block[1], block[2], block[3]))
+            elif kind == "code":
+                story.extend(_pdf_code_block(styles, block[1], block[2], block[3]))
         story.append(PageBreak())
 
     doc.build(story, onFirstPage=_pdf_header_footer, onLaterPages=_pdf_header_footer)
