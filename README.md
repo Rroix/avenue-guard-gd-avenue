@@ -2,7 +2,7 @@
 
 Avenue Guard is the Discord utility bot for GD Avenue. It handles moderation guardrails, live level request waves, weekly activity rewards, staff tickets, DM help flows, forum reminders, sticky notices, configurable auto-responses, and a few community fun commands.
 
-The bot is intentionally built around one configured server. Most behavior is controlled from `config.json`, with message-trigger responses in `responses.json` and persistent state in the configured SQLite database path, usually `/var/data/avenue-guard/bot.db` on Render Persistent Disk.
+The bot is intentionally built around one configured server. Most behavior is controlled from `config.json`, with message-trigger responses in `responses.json` and persistent state in the configured SQLite database path. On Render, the bot auto-uses `/var/data/avenue-guard/bot.db` when a Persistent Disk is mounted there.
 
 ## Core Features
 
@@ -224,7 +224,7 @@ Use `off`, `disable`, `none`, or `clear` as the word to disable enforcement for 
 
 Database storage lives under `database` in `config.json`.
 
-- `path`: SQLite database path. On Render, use a Persistent Disk path such as `/var/data/avenue-guard/bot.db`.
+- `path`: optional SQLite database path. Leave blank to auto-detect `/var/data/avenue-guard/bot.db` when a Render Persistent Disk is mounted, then fall back to `data/bot.db` if it is not writable.
 - `AVENUE_GUARD_DB_PATH`: optional environment variable that overrides `database.path`.
 - `backups.enabled`: enables scheduled zipped SQLite backups.
 - `backups.channel_id`: where scheduled and manual `/bot backup` files are posted.
@@ -318,7 +318,7 @@ Useful bot permissions:
 
 ## Persistence Notes
 
-SQLite must live outside Render's clearable cache/project filesystem. The current config points to `/var/data/avenue-guard/bot.db`; mount a Render Persistent Disk at `/var/data`, or set `AVENUE_GUARD_DB_PATH` to another durable path. Automatic zipped backups also post to Discord as a second safety net.
+SQLite must live outside Render's clearable cache/project filesystem for true persistence. Mount a Render Persistent Disk at `/var/data`, or set `AVENUE_GUARD_DB_PATH` to another durable path. If no durable path is writable, the bot falls back to `data/bot.db` so it can start, but `/bot storage` will warn that data may be lost after cache clears. Automatic zipped backups also post to Discord as a second safety net.
 
 ## Local Testing
 

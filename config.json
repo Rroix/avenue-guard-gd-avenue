@@ -483,8 +483,8 @@
     }
   },
   "database": {
-    "_comment": "Persistent SQLite storage. On Render, mount a Persistent Disk at /var/data or override with AVENUE_GUARD_DB_PATH.",
-    "path": "/var/data/avenue-guard/bot.db",
+    "_comment": "Persistent SQLite storage. Leave path blank to auto-detect /var/data/avenue-guard/bot.db when a Render Persistent Disk is mounted, or set AVENUE_GUARD_DB_PATH.",
+    "path": "",
     "backups": {
       "_comment": "Posts zipped database backups to Discord so bot memory survives even if host storage is misconfigured.",
       "enabled": true,

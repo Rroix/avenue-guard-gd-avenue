@@ -254,12 +254,15 @@ class CommandsCog(commands.Cog):
         path = self._database_path()
         text = str(path)
         env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
-        if env_path:
-            source = "environment variable"
-        elif str(self.bot.config.get("database", "path", default="") or "").strip():
-            source = "config.json"
-        else:
-            source = "default"
+        source = str(getattr(self.bot, "db_path_source", "") or "")
+        if not source:
+            if env_path:
+                source = "environment variable"
+            elif str(self.bot.config.get("database", "path", default="") or "").strip():
+                source = "config.json"
+            else:
+                source = "default"
+        startup_warning = str(getattr(self.bot, "db_path_warning", "") or "").strip()
 
         lowered = text.casefold()
         likely_ephemeral = (
@@ -270,11 +273,12 @@ class CommandsCog(commands.Cog):
             or "/opt/render/project/src" in lowered
         )
         likely_persistent = lowered.startswith("/var/data") or bool(env_path and not likely_ephemeral)
+        suffix = f"\nWarning: {startup_warning}" if startup_warning else ""
         if likely_persistent:
-            return f"`{text}` from {source} looks persistent.", True
+            return f"`{text}` from {source} looks persistent.{suffix}", True
         if likely_ephemeral:
-            return f"`{text}` from {source} may be wiped by Render cache clears.", False
-        return f"`{text}` from {source}; confirm this path is on persistent storage.", False
+            return f"`{text}` from {source} may be wiped by Render cache clears.{suffix}", False
+        return f"`{text}` from {source}; confirm this path is on persistent storage.{suffix}", False
 
     def _zip_backup_file(self, source_path: Path, slug: str) -> Path:
         backup_dir = self._backup_local_dir()

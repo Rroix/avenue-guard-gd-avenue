@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import traceback
+from pathlib import Path
 import discord
 
 from utils.config import Config
@@ -20,18 +21,57 @@ from utils.views import (
 from utils.checks import ensure_allowed_guild_id
 
 DEFAULT_DB_PATH = "data/bot.db"
-
-
-def resolve_db_path(config: Config) -> str:
-    env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
-    if env_path:
-        return env_path
-    config_path = str(config.get("database", "path", default="") or "").strip()
-    return config_path or DEFAULT_DB_PATH
+RENDER_DISK_DB_PATH = "/var/data/avenue-guard/bot.db"
 
 
 def startup_log(message: str) -> None:
     print(f"[Avenue Guard startup] {message}", flush=True)
+
+
+def _database_path_usable(path: str) -> tuple[bool, str]:
+    try:
+        candidate = Path(path)
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        probe = candidate.parent / ".avenue_guard_write_test"
+        probe.write_text("ok", encoding="utf-8")
+        try:
+            probe.unlink()
+        except Exception:
+            pass
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def resolve_db_path(config: Config) -> tuple[str, str, str]:
+    warnings: list[str] = []
+    env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
+    candidates: list[tuple[str, str, bool]] = []
+    if env_path:
+        candidates.append(("AVENUE_GUARD_DB_PATH", env_path, True))
+    config_path = str(config.get("database", "path", default="") or "").strip()
+    if config_path:
+        candidates.append(("config.json database.path", config_path, False))
+    candidates.append(("Render Persistent Disk auto-detect", RENDER_DISK_DB_PATH, False))
+    candidates.append(("local fallback", DEFAULT_DB_PATH, False))
+
+    for source, path, explicit in candidates:
+        ok, error = _database_path_usable(path)
+        if ok:
+            warning = " | ".join(warnings)
+            if warning:
+                startup_log(warning)
+            if source == "local fallback":
+                warning = (
+                    f"{warning} | " if warning else ""
+                ) + "Using local fallback database; data can be lost if Render clears cache and no Persistent Disk is mounted."
+            return path, source, warning
+        message = f"Database path from {source} is not writable: {path} ({error})"
+        if explicit:
+            message += "; falling back so the bot can start"
+        warnings.append(message)
+
+    return DEFAULT_DB_PATH, "local fallback", "All configured database paths failed; using local fallback."
 
 def create_bot() -> discord.Bot:
     intents = discord.Intents.default()
@@ -53,8 +93,8 @@ def create_bot() -> discord.Bot:
     bot = discord.Bot(intents=intents)
 
     bot.config = Config("config.json")
-    bot.db_path = resolve_db_path(bot.config)
-    startup_log(f"Using database path: {bot.db_path}")
+    bot.db_path, bot.db_path_source, bot.db_path_warning = resolve_db_path(bot.config)
+    startup_log(f"Using database path: {bot.db_path} ({bot.db_path_source})")
     bot.db = Database(bot.db_path)
 
     setup_global_error_handlers(bot)
