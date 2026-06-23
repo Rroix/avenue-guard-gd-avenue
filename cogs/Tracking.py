@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 
 import discord
@@ -1349,9 +1349,7 @@ class TrackingCog(commands.Cog):
     # Reminder messages
     # ----------------------------
     def _format_deadline(self, expires_ts: int) -> str:
-        dt_utc = datetime.fromtimestamp(expires_ts, tz=timezone.utc)
-        dt_madrid = dt_utc.astimezone(TZ)
-        return dt_madrid.strftime("%Y-%m-%d %H:%M %Z")
+        return f"<t:{int(expires_ts)}:F>"
 
     def _build_request_dm_text(self, timeout_hours: int, expires_ts: int) -> str:
         deadline = self._format_deadline(expires_ts)

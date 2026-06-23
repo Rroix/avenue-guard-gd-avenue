@@ -2,7 +2,7 @@
 
 Avenue Guard is the Discord utility bot for GD Avenue. It handles moderation guardrails, live level request waves, weekly activity rewards, staff tickets, DM help flows, forum reminders, sticky notices, configurable auto-responses, and a few community fun commands.
 
-The bot is intentionally built around one configured server. Most behavior is controlled from `config.json`, with message-trigger responses in `responses.json` and persistent state in `data/bot.db`.
+The bot is intentionally built around one configured server. Most behavior is controlled from `config.json`, with message-trigger responses in `responses.json` and persistent state in the configured SQLite database path, usually `/var/data/avenue-guard/bot.db` on Render Persistent Disk.
 
 ## Core Features
 
@@ -14,7 +14,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Sends configurable DMs when users gain watched roles.
 
 ### Weekly Activity Requests
-- Counts eligible member messages per Madrid-time week.
+- Counts eligible member messages per configured server week.
 - Skips configured roles and channels.
 - Skips and logs repeated low-effort message farming patterns before they count.
 - Buffers activity writes briefly with `tracking.activity_flush_seconds` so busy chat does less SQLite work.
@@ -110,6 +110,9 @@ The bot is intentionally built around one configured server. Most behavior is co
 
 ### Background Utilities
 - `/bot dashboard` opens a button-driven admin dashboard with system health, request state, tracking state, icon rotation, config issues, and repair tips.
+- `/bot impact` generates an owner-only community impact and forecast report, stores a database snapshot, and posts Markdown, CSV, trend CSV, breakdown CSV, and JSON exports to the configured impact/log channel.
+- `/bot backup` creates a zipped database backup and posts it to the configured backup/log channel.
+- `/bot storage` shows the active database path, whether it looks persistent, automatic backup status, and the latest backup record.
 - `/bot health` shows database, background task, request, ticket, and weekly workflow status.
 - `/bot config_check` validates configured channels, roles, request embed template variables, and `responses.json` rule shape/channel references.
 - `/bot doctor` runs deeper permission diagnostics for channels, ticket category access, managed role hierarchy, and request-button state.
@@ -138,6 +141,9 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/bot health` shows a compact live health report.
 - `/bot config_check` checks configured channels, roles, request template variables, and `responses.json`.
 - `/bot doctor` runs deep permission diagnostics.
+- `/bot impact` generates an owner-only community impact and forecast report with Markdown, CSV, trend CSV, breakdown CSV, and JSON exports.
+- `/bot backup` creates a zipped database backup in the configured backup channel.
+- `/bot storage` shows database storage and backup status.
 - `/server_icon status` shows the server icon rotation mode, interval, current image, and configured URLs.
 - `/server_icon mode mode:<random|linear|disabled>` changes automatic server icon rotation mode.
 - `/server_icon add url:<url>`, `/server_icon replace number:<n> url:<url>`, and `/server_icon remove number:<n>` manage configured server icon URLs.
@@ -210,9 +216,29 @@ Use `off`, `disable`, `none`, or `clear` as the word to disable enforcement for 
 
 ## Configuration Files
 
-- `config.json` controls guild IDs, roles, channels, live request waves, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, server icon rotation, and background summaries.
+- `config.json` controls guild IDs, roles, channels, live request waves, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, server icon rotation, persistent database storage, automatic database backups, background summaries, and impact report exports.
 - `responses.json` controls automatic message responses.
-- `data/bot.db` stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, help submissions, tickets, cooldowns, transcript pointers, reminders, and daily stats.
+- The configured SQLite path stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, help submissions, tickets, cooldowns, transcript pointers, reminders, daily stats, impact snapshots, and database backup records.
+
+### Database And Backup Config
+
+Database storage lives under `database` in `config.json`.
+
+- `path`: SQLite database path. On Render, use a Persistent Disk path such as `/var/data/avenue-guard/bot.db`.
+- `AVENUE_GUARD_DB_PATH`: optional environment variable that overrides `database.path`.
+- `backups.enabled`: enables scheduled zipped SQLite backups.
+- `backups.channel_id`: where scheduled and manual `/bot backup` files are posted.
+- `backups.interval_hours`: how often automatic backups are posted.
+- `/bot storage` is the fastest way to verify whether the running bot is using the expected path.
+
+### Impact Report Config
+
+Impact reports live under `impact` in `config.json`.
+
+- `report_channel_id`: where `/bot impact` posts the persistent Markdown, CSV, trend CSV, breakdown CSV, and JSON attachments. If empty, the bot falls back to `channels.general_logging_channel_id`.
+- `allowed_user_ids`: the only users allowed to run `/bot impact`, `/bot backup`, and `/bot storage`. If empty, the bot falls back to admin/owner role checks.
+- `/bot impact` stores the same report payload in `impact_snapshots`, so the bot keeps a database copy even after posting the files.
+- The CSV exports are designed for direct import into Google Sheets.
 
 ### Server Icon Rotation Config
 
@@ -292,7 +318,7 @@ Useful bot permissions:
 
 ## Persistence Notes
 
-SQLite is stored at `data/bot.db`. If the bot is hosted somewhere with ephemeral storage, mount persistent storage or move the database path to a persistent disk.
+SQLite must live outside Render's clearable cache/project filesystem. The current config points to `/var/data/avenue-guard/bot.db`; mount a Render Persistent Disk at `/var/data`, or set `AVENUE_GUARD_DB_PATH` to another durable path. Automatic zipped backups also post to Discord as a second safety net.
 
 ## Local Testing
 

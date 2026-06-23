@@ -420,7 +420,7 @@
     "_comment": "Background telemetry and scheduled tasks. Safe to disable completely.",
     "exclude_channel_ids": [],
     "daily_summary": {
-      "_comment": "Optional daily summary embed (Madrid time). If channel_id is empty, falls back to general_logging_channel_id.",
+      "_comment": "Optional daily summary embed. If channel_id is empty, falls back to general_logging_channel_id.",
       "enabled": true,
       "time": "00:00",
       "channel_id": "1445502925081284729",
@@ -481,5 +481,23 @@
         "https://i.ibb.co/mVQRJ1Kz/Adobe-Express-file-1.png"
       ]
     }
+  },
+  "database": {
+    "_comment": "Persistent SQLite storage. On Render, mount a Persistent Disk at /var/data or override with AVENUE_GUARD_DB_PATH.",
+    "path": "/var/data/avenue-guard/bot.db",
+    "backups": {
+      "_comment": "Posts zipped database backups to Discord so bot memory survives even if host storage is misconfigured.",
+      "enabled": true,
+      "channel_id": "1445502925081284729",
+      "interval_hours": 12,
+      "local_dir": "backups"
+    }
+  },
+  "impact": {
+    "_comment": "Persistent CV/community impact reports. /bot impact posts Markdown, CSV, trend CSV, breakdown CSV, and JSON attachments here and stores a DB snapshot.",
+    "report_channel_id": "1445502925081284729",
+    "allowed_user_ids": [
+      "1102884420207255653"
+    ]
   }
 }

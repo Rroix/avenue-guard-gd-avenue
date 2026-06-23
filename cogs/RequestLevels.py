@@ -205,7 +205,7 @@ class ScheduledOpeningEditModal(discord.ui.Modal):
         initial = initial or {}
 
         self.when = discord.ui.InputText(
-            label="Open time (HH:MM, Madrid)",
+            label="Open time (HH:MM)",
             required=True,
             max_length=5,
             value=str(initial.get("when") or "")[:5],
@@ -406,7 +406,7 @@ class RequestLevelsCog(commands.Cog):
             ctx: discord.ApplicationContext,
             number: discord.Option(int, "Maximum successful requests to accept; leave 0 for no limit", required=False, default=0),
             time: discord.Option(int, "Minutes requests stay open after opening; leave 0 for no timer", required=False, default=0),
-            when: discord.Option(str, "Optional scheduled opening time in Madrid time, like 18:30", required=False, default=""),
+            when: discord.Option(str, "Optional scheduled opening time, like 18:30", required=False, default=""),
             day: discord.Option(int, "Optional day of the month for the scheduled opening; leave 0 for next matching time", required=False, default=0),
             type: discord.Option(str, "Optional wave type, like only demons, only plats, needs showcase, or long level", required=False, default=""),
             message: discord.Option(str, "Custom opening announcement; leave blank for the default role ping", required=False, default=""),
@@ -432,7 +432,7 @@ class RequestLevelsCog(commands.Cog):
             opening_id: discord.Option(int, "Scheduled opening ID to edit or delete", required=False, default=0),
             number: discord.Option(int, "New request limit; use 0 for no limit and -1 to keep current value", required=False, default=-1),
             time: discord.Option(int, "New close timer in minutes; use 0 for no timer and -1 to keep current value", required=False, default=-1),
-            when: discord.Option(str, "New opening time in Madrid time, like 18:30", required=False, default=""),
+            when: discord.Option(str, "New opening time, like 18:30", required=False, default=""),
             day: discord.Option(int, "Optional day of the month for the new opening time", required=False, default=0),
             type: discord.Option(str, "New request type; leave blank to keep current value, use any to clear", required=False, default=""),
             message: discord.Option(str, "New announcement; blank keeps current, default resets it", required=False, default=""),
@@ -1354,7 +1354,7 @@ class RequestLevelsCog(commands.Cog):
             return None, ""
         match = re.fullmatch(r"\s*(\d{1,2})(?::?(\d{2}))?\s*", when_text)
         if not match:
-            return None, "Use `HH:MM` in Madrid time, for example `18:30`."
+            return None, "Use `HH:MM`, for example `18:30`."
 
         hour = int(match.group(1))
         minute = int(match.group(2) or 0)
@@ -1396,7 +1396,7 @@ class RequestLevelsCog(commands.Cog):
     def _scheduled_openings_embed(self, rows) -> discord.Embed:
         embed = discord.Embed(
             title="Pending Request Openings",
-            description="Scheduled openings use Madrid time and show Discord timestamps so staff can read them locally.",
+            description="Scheduled openings use the server schedule and show Discord timestamps so staff can read them locally.",
             color=discord.Color.blurple(),
         )
         if not rows:

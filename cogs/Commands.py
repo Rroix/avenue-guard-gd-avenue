@@ -1,4 +1,6 @@
 import os
+import csv
+import io
 import json
 import random
 import secrets
@@ -6,6 +8,8 @@ import asyncio
 import time
 import re
 import string
+import zipfile
+from pathlib import Path
 from typing import Optional
 
 import discord
@@ -30,6 +34,23 @@ TICKET_STATUS_LABELS = {
     "waiting_staff": "Waiting for staff",
     "resolved": "Resolved",
 }
+
+
+def _fmt_num(value) -> str:
+    try:
+        return f"{int(value or 0):,}"
+    except Exception:
+        return "0"
+
+
+def _fmt_percent(numerator, denominator) -> str:
+    try:
+        total = int(denominator or 0)
+        if total <= 0:
+            return "0%"
+        return f"{(int(numerator or 0) / total) * 100:.1f}%"
+    except Exception:
+        return "0%"
 
 
 def _ticket_status_key(value) -> str:
@@ -115,6 +136,9 @@ class CommandsCog(commands.Cog):
         self.bot_group.command(name="config_check", description="Check configured channels and roles")(self.bot_config_check)
         self.bot_group.command(name="doctor", description="Run deep bot permission diagnostics")(self.bot_doctor)
         self.bot_group.command(name="dashboard", description="Open the admin system dashboard")(self.bot_dashboard)
+        self.bot_group.command(name="impact", description="Generate a persistent community impact report")(self.bot_impact)
+        self.bot_group.command(name="backup", description="Create a durable database backup")(self.bot_backup)
+        self.bot_group.command(name="storage", description="Show database storage and backup status")(self.bot_storage)
 
         self.tracking_group.command(name="top", description="Show the current week's top 20 active members")(self.tracking_top)
         self.tracking_group.command(name="reset", description="Reset current week's tracking stats")(self.tracking_reset)
@@ -199,6 +223,1024 @@ class CommandsCog(commands.Cog):
             await channel.send(embed=embed, allowed_mentions=no_mentions())
         except Exception as e:
             await log_error(self.bot, f"Could not log admin action {action}: {repr(e)}")
+
+    def _impact_owner_ids(self) -> list[int]:
+        return self.bot.config.get_int_list("impact", "allowed_user_ids")
+
+    async def _is_impact_owner_ctx(self, ctx: discord.ApplicationContext) -> bool:
+        if ctx.guild is None:
+            return False
+        owner_ids = self._impact_owner_ids()
+        if owner_ids:
+            return int(ctx.user.id) in owner_ids
+        return await self._is_admin_ctx(ctx)
+
+    def _backup_channel_id(self) -> int:
+        channel_id = self.bot.config.get_int("database", "backups", "channel_id", default=0)
+        if not channel_id:
+            channel_id = self.bot.config.get_int("impact", "report_channel_id", default=0)
+        if not channel_id:
+            channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
+        return int(channel_id or 0)
+
+    def _backup_local_dir(self) -> Path:
+        raw = str(self.bot.config.get("database", "backups", "local_dir", default="backups") or "backups").strip()
+        return Path(raw or "backups")
+
+    def _database_path(self) -> Path:
+        return Path(str(getattr(self.bot, "db_path", getattr(self.bot.db, "path", "data/bot.db"))))
+
+    def _database_storage_note(self) -> tuple[str, bool]:
+        path = self._database_path()
+        text = str(path)
+        env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
+        if env_path:
+            source = "environment variable"
+        elif str(self.bot.config.get("database", "path", default="") or "").strip():
+            source = "config.json"
+        else:
+            source = "default"
+
+        lowered = text.casefold()
+        likely_ephemeral = (
+            lowered.startswith("data/")
+            or "/data/" in lowered and "var/data" not in lowered
+            or lowered.startswith("/tmp")
+            or lowered.startswith("/private/tmp")
+            or "/opt/render/project/src" in lowered
+        )
+        likely_persistent = lowered.startswith("/var/data") or bool(env_path and not likely_ephemeral)
+        if likely_persistent:
+            return f"`{text}` from {source} looks persistent.", True
+        if likely_ephemeral:
+            return f"`{text}` from {source} may be wiped by Render cache clears.", False
+        return f"`{text}` from {source}; confirm this path is on persistent storage.", False
+
+    def _zip_backup_file(self, source_path: Path, slug: str) -> Path:
+        backup_dir = self._backup_local_dir()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = backup_dir / f"avenue-guard-db-{slug}.sqlite3.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(source_path, arcname=f"avenue-guard-db-{slug}.sqlite3")
+        return zip_path
+
+    async def _post_database_backup(self, guild: discord.Guild, reason: str = "manual", requested_by: int = 0) -> discord.Message | None:
+        backup_dir = self._backup_local_dir()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        slug = now_madrid().strftime("%Y%m%d-%H%M%S")
+        raw_path = backup_dir / f"avenue-guard-db-{slug}.sqlite3"
+        size_bytes = await self.bot.db.backup_to(raw_path)
+        zip_path = self._zip_backup_file(raw_path, slug)
+        channel_id = self._backup_channel_id()
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            await log_error(self.bot, f"Database backup created locally but backup channel is missing: {zip_path}")
+            return None
+
+        zipped_size = int(zip_path.stat().st_size)
+        storage_note, storage_ok = self._database_storage_note()
+        embed = discord.Embed(
+            title="Database Backup",
+            description="A zipped copy of the bot database is attached.",
+            color=discord.Color.green() if storage_ok else discord.Color.gold(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(name="Reason", value=str(reason).replace("_", " ").title(), inline=True)
+        embed.add_field(name="Raw Size", value=f"{_fmt_num(size_bytes)} bytes", inline=True)
+        embed.add_field(name="Zip Size", value=f"{_fmt_num(zipped_size)} bytes", inline=True)
+        embed.add_field(name="Storage", value=storage_note[:1024], inline=False)
+        if requested_by:
+            embed.add_field(name="Requested By", value=f"<@{int(requested_by)}>\n`{int(requested_by)}`", inline=True)
+
+        if zipped_size > 24 * 1024 * 1024:
+            await channel.send(
+                "Database backup was created locally, but the compressed file is too large for a Discord attachment.",
+                embed=embed,
+                allowed_mentions=no_mentions(),
+            )
+            await log_error(self.bot, f"Database backup too large for Discord attachment: {zip_path} ({zipped_size} bytes)")
+            return None
+
+        sent = await channel.send(
+            embed=embed,
+            file=discord.File(str(zip_path), filename=zip_path.name),
+            allowed_mentions=no_mentions(),
+        )
+        await self.bot.db.execute(
+            "INSERT OR REPLACE INTO database_backups(guild_id,backup_ts,channel_id,message_id,size_bytes,reason,requested_by,filename) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                int(guild.id),
+                ts,
+                int(channel.id),
+                int(sent.id),
+                int(zipped_size),
+                str(reason),
+                int(requested_by or 0),
+                str(zip_path.name),
+            ),
+        )
+        return sent
+
+    async def _impact_scalar(self, sql: str, params: tuple = ()) -> int:
+        row = await self.bot.db.fetchone(sql, params)
+        if not row:
+            return 0
+        try:
+            return int(row["value"] or 0)
+        except Exception:
+            try:
+                return int(row[0] or 0)
+            except Exception:
+                return 0
+
+    async def _impact_float(self, sql: str, params: tuple = ()) -> float:
+        row = await self.bot.db.fetchone(sql, params)
+        if not row:
+            return 0.0
+        try:
+            return round(float(row["value"] or 0), 2)
+        except Exception:
+            try:
+                return round(float(row[0] or 0), 2)
+            except Exception:
+                return 0.0
+
+    async def _impact_group_counts(self, table: str, column: str, guild_id: int, extra_where: str = "") -> dict[str, int]:
+        sql = (
+            f"SELECT COALESCE({column}, 'unknown') AS key, COUNT(*) AS value "
+            f"FROM {table} WHERE guild_id=? {extra_where} "
+            f"GROUP BY COALESCE({column}, 'unknown') ORDER BY value DESC"
+        )
+        rows = await self.bot.db.fetchall(sql, (guild_id,))
+        return {str(row["key"] or "unknown"): int(row["value"] or 0) for row in rows}
+
+    async def _impact_daily_totals(self, guild_id: int) -> dict:
+        rows = await self.bot.db.fetchall(
+            "SELECT day_key, payload_json FROM daily_stats WHERE guild_id=? ORDER BY day_key ASC",
+            (guild_id,),
+        )
+        totals = {
+            "days": len(rows),
+            "messages": 0,
+            "edits": 0,
+            "deletes": 0,
+            "reactions": 0,
+            "joins": 0,
+            "leaves": 0,
+            "bans": 0,
+            "unbans": 0,
+            "boosts": 0,
+            "unboosts": 0,
+            "voice_minutes": 0,
+            "commands": 0,
+            "command_errors": 0,
+            "latest_day": "",
+            "top_command": "",
+            "top_command_count": 0,
+            "series": [],
+            "command_totals": {},
+        }
+        command_totals: dict[str, int] = {}
+        for row in rows:
+            day_key = str(row["day_key"] or totals["latest_day"])
+            totals["latest_day"] = day_key
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except Exception:
+                payload = {}
+            day_record = {
+                "day": day_key,
+                "messages": 0,
+                "edits": 0,
+                "deletes": 0,
+                "reactions": 0,
+                "joins": 0,
+                "leaves": 0,
+                "bans": 0,
+                "unbans": 0,
+                "boosts": 0,
+                "unboosts": 0,
+                "voice_minutes": 0,
+                "peak_voice_users": int(payload.get("peak_voice_users", 0) or 0),
+                "peak_online_members": int(payload.get("peak_online_members", 0) or 0),
+                "commands": 0,
+                "command_errors": 0,
+                "active_members": len(payload.get("by_user") or {}),
+                "active_channels": len(payload.get("by_channel") or {}),
+                "top_command": "",
+                "top_command_count": 0,
+            }
+            for key in (
+                "messages",
+                "edits",
+                "deletes",
+                "reactions",
+                "joins",
+                "leaves",
+                "bans",
+                "unbans",
+                "boosts",
+                "unboosts",
+                "voice_minutes",
+                "commands",
+                "command_errors",
+            ):
+                try:
+                    value = int(payload.get(key, 0) or 0)
+                    totals[key] += value
+                    day_record[key] = value
+                except Exception:
+                    pass
+            day_commands: dict[str, int] = {}
+            for name, count in (payload.get("commands_by_name") or {}).items():
+                try:
+                    value = int(count or 0)
+                    command_totals[str(name)] = command_totals.get(str(name), 0) + value
+                    day_commands[str(name)] = day_commands.get(str(name), 0) + value
+                except Exception:
+                    continue
+            if day_commands:
+                name, count = max(day_commands.items(), key=lambda item: item[1])
+                day_record["top_command"] = name
+                day_record["top_command_count"] = int(count or 0)
+            totals["series"].append(day_record)
+        if command_totals:
+            name, count = max(command_totals.items(), key=lambda item: item[1])
+            totals["top_command"] = name
+            totals["top_command_count"] = int(count or 0)
+            totals["command_totals"] = dict(sorted(command_totals.items(), key=lambda item: item[1], reverse=True))
+        return totals
+
+    def _impact_window_sum(self, series: list[dict], key: str, days: int, offset_days: int = 0) -> int:
+        if not series or days <= 0:
+            return 0
+        end = len(series) - max(0, offset_days)
+        start = max(0, end - days)
+        if end <= 0 or start >= end:
+            return 0
+        return int(sum(int(row.get(key, 0) or 0) for row in series[start:end]))
+
+    def _impact_window_average(self, series: list[dict], key: str, days: int, offset_days: int = 0) -> float:
+        if not series or days <= 0:
+            return 0.0
+        end = len(series) - max(0, offset_days)
+        start = max(0, end - days)
+        window = series[start:end] if end > start else []
+        if not window:
+            return 0.0
+        return round(sum(float(row.get(key, 0) or 0) for row in window) / len(window), 2)
+
+    def _impact_percent_change(self, current: int | float, previous: int | float) -> float:
+        try:
+            previous = float(previous or 0)
+            current = float(current or 0)
+            if previous <= 0:
+                return 100.0 if current > 0 else 0.0
+            return round(((current - previous) / previous) * 100, 1)
+        except Exception:
+            return 0.0
+
+    def _impact_forecast(self, series: list[dict], review_backlog: int) -> dict:
+        days_recorded = len(series or [])
+        last_7_messages = self._impact_window_sum(series, "messages", 7)
+        previous_7_messages = self._impact_window_sum(series, "messages", 7, 7)
+        last_7_commands = self._impact_window_sum(series, "commands", 7)
+        previous_7_commands = self._impact_window_sum(series, "commands", 7, 7)
+        last_30_commands = self._impact_window_sum(series, "commands", 30)
+        last_30_errors = self._impact_window_sum(series, "command_errors", 30)
+        message_change = self._impact_percent_change(last_7_messages, previous_7_messages)
+        command_change = self._impact_percent_change(last_7_commands, previous_7_commands)
+
+        projected_messages = int(max(0, round(last_7_messages + ((last_7_messages - previous_7_messages) * 0.5))))
+        if days_recorded < 7:
+            projected_messages = int(round(self._impact_window_average(series, "messages", 7) * 7))
+        projected_commands = int(max(0, round(last_7_commands + ((last_7_commands - previous_7_commands) * 0.5))))
+        if days_recorded < 7:
+            projected_commands = int(round(self._impact_window_average(series, "commands", 7) * 7))
+
+        if days_recorded < 7:
+            signal = "Limited data"
+        elif message_change >= 15 or command_change >= 15:
+            signal = "Growing"
+        elif message_change <= -15 and command_change <= -10:
+            signal = "Declining"
+        else:
+            signal = "Stable"
+
+        command_error_rate = _fmt_percent(last_30_errors, last_30_commands)
+        recommendations: list[str] = []
+        if review_backlog >= 10:
+            recommendations.append("Review backlog is high; schedule a staff review pass.")
+        if last_30_commands and (last_30_errors / max(last_30_commands, 1)) >= 0.05:
+            recommendations.append("Command error rate is elevated; check recent error logs.")
+        if signal == "Declining":
+            recommendations.append("Recent activity is down; compare daily summaries with recent events or request openings.")
+        if not recommendations:
+            recommendations.append("No urgent trend warning from the tracked data.")
+
+        return {
+            "days_recorded": days_recorded,
+            "last_7_messages": int(last_7_messages),
+            "previous_7_messages": int(previous_7_messages),
+            "message_growth_percent": message_change,
+            "projected_next_7_messages": int(projected_messages),
+            "last_7_commands": int(last_7_commands),
+            "previous_7_commands": int(previous_7_commands),
+            "command_growth_percent": command_change,
+            "projected_next_7_commands": int(projected_commands),
+            "avg_daily_active_members_7d": self._impact_window_average(series, "active_members", 7),
+            "avg_daily_active_channels_7d": self._impact_window_average(series, "active_channels", 7),
+            "command_error_rate_30d": command_error_rate,
+            "review_backlog": int(review_backlog),
+            "engagement_signal": signal,
+            "recommendations": recommendations,
+        }
+
+    async def _collect_impact_metrics(self, guild: discord.Guild, generated_by_id: int) -> dict:
+        guild_id = int(guild.id)
+        snapshot_ts = int(time.time())
+        daily = await self._impact_daily_totals(guild_id)
+
+        unique_touched = await self._impact_scalar(
+            """
+            SELECT COUNT(DISTINCT user_id) AS value FROM (
+                SELECT user_id FROM activity_counts WHERE guild_id=?
+                UNION SELECT user_id FROM weekly_claims WHERE guild_id=?
+                UNION SELECT user_id FROM weekly_sessions WHERE guild_id=?
+                UNION SELECT user_id FROM weekly_dm_log WHERE guild_id=?
+                UNION SELECT user_id FROM weekly_request_reviews WHERE guild_id=?
+                UNION SELECT creator_id AS user_id FROM tickets WHERE guild_id=?
+                UNION SELECT user_id FROM help_submissions WHERE guild_id=?
+                UNION SELECT requester_id AS user_id FROM transcript_requests WHERE guild_id=?
+                UNION SELECT user_id FROM level_request_submissions WHERE guild_id=?
+                UNION SELECT user_id FROM anti_farm_events WHERE guild_id=?
+            ) WHERE user_id IS NOT NULL AND user_id>0
+            """,
+            (guild_id,) * 10,
+        )
+        activity_messages = await self._impact_scalar(
+            "SELECT COALESCE(SUM(count), 0) AS value FROM activity_counts WHERE guild_id=?",
+            (guild_id,),
+        )
+        active_members = await self._impact_scalar(
+            "SELECT COUNT(DISTINCT user_id) AS value FROM activity_counts WHERE guild_id=?",
+            (guild_id,),
+        )
+        tracked_weeks = await self._impact_scalar(
+            "SELECT COUNT(DISTINCT week_start) AS value FROM activity_counts WHERE guild_id=?",
+            (guild_id,),
+        )
+
+        live_requests = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=?",
+            (guild_id,),
+        )
+        live_reviewed = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=? AND status='reviewed'",
+            (guild_id,),
+        )
+        live_pending = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=? AND status='pending'",
+            (guild_id,),
+        )
+        live_avg_review_hours = await self._impact_float(
+            "SELECT AVG(reviewed_ts - created_ts) / 3600.0 AS value FROM level_request_submissions "
+            "WHERE guild_id=? AND status='reviewed' AND reviewed_ts IS NOT NULL AND reviewed_ts>=created_ts",
+            (guild_id,),
+        )
+        live_waves = await self._impact_scalar(
+            "SELECT COUNT(DISTINCT wave_id) AS value FROM level_request_submissions WHERE guild_id=?",
+            (guild_id,),
+        )
+        request_edits = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM level_request_edit_audit WHERE guild_id=?",
+            (guild_id,),
+        )
+        request_level_ids = await self._impact_scalar(
+            "SELECT COUNT(DISTINCT level_id) AS value FROM level_request_submissions WHERE guild_id=?",
+            (guild_id,),
+        )
+        wave_summaries = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM level_request_wave_summaries WHERE guild_id=?",
+            (guild_id,),
+        )
+        pending_openings = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM level_request_scheduled_openings WHERE guild_id=? AND status='pending'",
+            (guild_id,),
+        )
+
+        weekly_claims = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM weekly_claims WHERE guild_id=?",
+            (guild_id,),
+        )
+        weekly_dm_logs = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM weekly_dm_log WHERE guild_id=?",
+            (guild_id,),
+        )
+        weekly_reviews = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM weekly_request_reviews WHERE guild_id=?",
+            (guild_id,),
+        )
+        weekly_reviewed = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM weekly_request_reviews WHERE guild_id=? AND status='reviewed'",
+            (guild_id,),
+        )
+        weekly_pending = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM weekly_request_reviews WHERE guild_id=? AND status='pending'",
+            (guild_id,),
+        )
+        weekly_avg_review_hours = await self._impact_float(
+            "SELECT AVG(reviewed_ts - created_ts) / 3600.0 AS value FROM weekly_request_reviews "
+            "WHERE guild_id=? AND status='reviewed' AND reviewed_ts IS NOT NULL AND reviewed_ts>=created_ts",
+            (guild_id,),
+        )
+        best_streak = await self._impact_scalar(
+            "SELECT COALESCE(MAX(best_streak), 0) AS value FROM weekly_streaks WHERE guild_id=?",
+            (guild_id,),
+        )
+        streak_members = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM weekly_streaks WHERE guild_id=? AND best_streak>=2",
+            (guild_id,),
+        )
+
+        tickets = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM tickets WHERE guild_id=?",
+            (guild_id,),
+        )
+        tickets_open = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM tickets WHERE guild_id=? AND status IN ('open','closing_prompted')",
+            (guild_id,),
+        )
+        tickets_closed = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM tickets WHERE guild_id=? AND (closed_ts IS NOT NULL OR status='closed')",
+            (guild_id,),
+        )
+        avg_ticket_close_hours = await self._impact_float(
+            "SELECT AVG(closed_ts - created_ts) / 3600.0 AS value FROM tickets "
+            "WHERE guild_id=? AND closed_ts IS NOT NULL AND closed_ts>=created_ts",
+            (guild_id,),
+        )
+        transcripts_saved = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM ticket_transcripts WHERE guild_id=?",
+            (guild_id,),
+        )
+        satisfaction_row = await self.bot.db.fetchone(
+            "SELECT COUNT(satisfaction_score) AS responses, AVG(satisfaction_score) AS average "
+            "FROM tickets WHERE guild_id=? AND satisfaction_score IS NOT NULL",
+            (guild_id,),
+        )
+        satisfaction_responses = int(satisfaction_row["responses"] or 0) if satisfaction_row else 0
+        try:
+            satisfaction_average = round(float(satisfaction_row["average"] or 0), 2) if satisfaction_row else 0
+        except Exception:
+            satisfaction_average = 0
+
+        help_submissions = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM help_submissions WHERE guild_id=?",
+            (guild_id,),
+        )
+        transcript_requests = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM transcript_requests WHERE guild_id=?",
+            (guild_id,),
+        )
+        anti_farm_events = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM anti_farm_events WHERE guild_id=?",
+            (guild_id,),
+        )
+        daily_recaps = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM daily_stats WHERE guild_id=?",
+            (guild_id,),
+        )
+        weekly_recaps = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM weekly_recaps WHERE guild_id=?",
+            (guild_id,),
+        )
+
+        request_state = await self.bot.db.fetchone(
+            "SELECT state, wave_id, submitted_count, request_limit, close_ts, request_type FROM level_request_state WHERE guild_id=?",
+            (guild_id,),
+        )
+        state_payload = {
+            "state": str(request_state["state"] if request_state else "closed"),
+            "wave_id": int(request_state["wave_id"] or 0) if request_state else 0,
+            "submitted_count": int(request_state["submitted_count"] or 0) if request_state else 0,
+            "request_limit": int(request_state["request_limit"]) if request_state and request_state["request_limit"] is not None else 0,
+            "close_ts": int(request_state["close_ts"]) if request_state and request_state["close_ts"] is not None else 0,
+            "request_type": str(request_state["request_type"] or "") if request_state else "",
+        }
+
+        message_events = max(int(activity_messages), int(daily.get("messages", 0) or 0))
+        review_events = int(live_reviewed) + int(weekly_reviewed)
+        tracked_event_total = (
+            message_events
+            + int(daily.get("reactions", 0) or 0)
+            + int(daily.get("commands", 0) or 0)
+            + int(live_requests)
+            + int(weekly_reviews)
+            + int(weekly_claims)
+            + int(weekly_dm_logs)
+            + int(tickets)
+            + int(help_submissions)
+            + int(transcript_requests)
+            + int(transcripts_saved)
+            + int(request_edits)
+            + int(review_events)
+            + int(anti_farm_events)
+        )
+
+        support_items = int(tickets) + int(help_submissions) + int(transcript_requests)
+        level_requests_total = int(live_requests) + int(weekly_reviews)
+        current_members = int(getattr(guild, "member_count", 0) or 0)
+        cached_members = len(getattr(guild, "members", []) or [])
+        forecast = self._impact_forecast(daily.get("series", []), int(live_pending) + int(weekly_pending))
+
+        return {
+            "report": {
+                "guild_id": guild_id,
+                "guild_name": str(guild.name),
+                "snapshot_ts": snapshot_ts,
+                "snapshot_label": now_madrid().strftime("%Y-%m-%d %H:%M"),
+                "generated_by_user_id": int(generated_by_id),
+            },
+            "headline": {
+                "current_members": current_members,
+                "unique_members_touched": int(unique_touched),
+                "tracked_event_total": int(tracked_event_total),
+                "support_items": int(support_items),
+                "level_requests_total": int(level_requests_total),
+            },
+            "community": {
+                "current_members": current_members,
+                "cached_members": int(cached_members),
+                "unique_members_touched": int(unique_touched),
+                "tracked_active_members": int(active_members),
+                "tracked_weeks": int(tracked_weeks),
+            },
+            "activity": {
+                "tracked_messages": int(message_events),
+                "eligible_weekly_messages": int(activity_messages),
+                "daily_messages": int(daily.get("messages", 0) or 0),
+                "reactions": int(daily.get("reactions", 0) or 0),
+                "voice_minutes": int(daily.get("voice_minutes", 0) or 0),
+                "commands": int(daily.get("commands", 0) or 0),
+                "command_errors": int(daily.get("command_errors", 0) or 0),
+                "top_command": str(daily.get("top_command") or ""),
+                "top_command_count": int(daily.get("top_command_count", 0) or 0),
+            },
+            "requests": {
+                "current_state": state_payload,
+                "live_total": int(live_requests),
+                "live_reviewed": int(live_reviewed),
+                "live_pending": int(live_pending),
+                "live_review_rate": _fmt_percent(live_reviewed, live_requests),
+                "live_avg_review_hours": live_avg_review_hours,
+                "live_waves": int(live_waves),
+                "unique_live_level_ids": int(request_level_ids),
+                "wave_summaries": int(wave_summaries),
+                "pending_openings": int(pending_openings),
+                "edit_audit_entries": int(request_edits),
+                "live_results": await self._impact_group_counts("level_request_submissions", "result", guild_id, "AND status='reviewed'"),
+                "weekly_total": int(weekly_reviews),
+                "weekly_reviewed": int(weekly_reviewed),
+                "weekly_pending": int(weekly_pending),
+                "weekly_review_rate": _fmt_percent(weekly_reviewed, weekly_reviews),
+                "weekly_avg_review_hours": weekly_avg_review_hours,
+                "weekly_results": await self._impact_group_counts("weekly_request_reviews", "result", guild_id, "AND status='reviewed'"),
+            },
+            "weekly": {
+                "claims": int(weekly_claims),
+                "dm_log_events": int(weekly_dm_logs),
+                "claim_statuses": await self._impact_group_counts("weekly_claims", "status", guild_id),
+                "members_with_streaks": int(streak_members),
+                "best_top5_streak": int(best_streak),
+            },
+            "support": {
+                "tickets_total": int(tickets),
+                "tickets_open": int(tickets_open),
+                "tickets_closed": int(tickets_closed),
+                "avg_ticket_close_hours": avg_ticket_close_hours,
+                "ticket_statuses": await self._impact_group_counts("tickets", "status_tag", guild_id),
+                "ticket_transcripts_saved": int(transcripts_saved),
+                "satisfaction_responses": int(satisfaction_responses),
+                "satisfaction_average": satisfaction_average,
+                "help_submissions_total": int(help_submissions),
+                "help_kinds": await self._impact_group_counts("help_submissions", "kind", guild_id),
+                "help_statuses": await self._impact_group_counts("help_submissions", "status", guild_id),
+                "transcript_requests_total": int(transcript_requests),
+                "transcript_request_statuses": await self._impact_group_counts("transcript_requests", "status", guild_id),
+            },
+            "operations": {
+                "daily_summary_snapshots": int(daily_recaps),
+                "weekly_recap_snapshots": int(weekly_recaps),
+                "anti_farm_events": int(anti_farm_events),
+                "joins": int(daily.get("joins", 0) or 0),
+                "leaves": int(daily.get("leaves", 0) or 0),
+                "bans": int(daily.get("bans", 0) or 0),
+                "unbans": int(daily.get("unbans", 0) or 0),
+                "latest_daily_summary_day": str(daily.get("latest_day") or ""),
+            },
+            "forecast": forecast,
+            "daily_series": daily.get("series", []),
+            "command_breakdown": daily.get("command_totals", {}),
+        }
+
+    def _impact_metric_rows(self, metrics: dict) -> list[tuple[str, str, str]]:
+        rows: list[tuple[str, str, str]] = []
+
+        def add(section: str, name: str, value) -> None:
+            rows.append((section, name, str(value if value is not None else "")))
+
+        add("Report", "Guild", metrics["report"]["guild_name"])
+        add("Report", "Generated at", metrics["report"]["snapshot_label"])
+        add("Headline", "Current server members", metrics["headline"]["current_members"])
+        add("Headline", "Unique members touched by tracked workflows", metrics["headline"]["unique_members_touched"])
+        add("Headline", "Tracked interaction events", metrics["headline"]["tracked_event_total"])
+        add("Headline", "Support/help items handled", metrics["headline"]["support_items"])
+        add("Headline", "Level requests coordinated", metrics["headline"]["level_requests_total"])
+
+        for key, value in metrics["community"].items():
+            add("Community", key.replace("_", " ").title(), value)
+        for key, value in metrics["activity"].items():
+            add("Activity", key.replace("_", " ").title(), value)
+        for key, value in metrics["requests"].items():
+            if isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    add("Requests", f"{key}.{sub_key}", sub_value)
+            else:
+                add("Requests", key.replace("_", " ").title(), value)
+        for key, value in metrics["weekly"].items():
+            if isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    add("Weekly", f"{key}.{sub_key}", sub_value)
+            else:
+                add("Weekly", key.replace("_", " ").title(), value)
+        for key, value in metrics["support"].items():
+            if isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    add("Support", f"{key}.{sub_key}", sub_value)
+            else:
+                add("Support", key.replace("_", " ").title(), value)
+        for key, value in metrics["operations"].items():
+            add("Operations", key.replace("_", " ").title(), value)
+        for key, value in metrics.get("forecast", {}).items():
+            if isinstance(value, list):
+                add("Forecast", key.replace("_", " ").title(), " | ".join(str(item) for item in value))
+            else:
+                add("Forecast", key.replace("_", " ").title(), value)
+        for name, count in list((metrics.get("command_breakdown") or {}).items())[:20]:
+            add("Top Commands", f"/{name}", count)
+        return rows
+
+    def _impact_csv(self, metrics: dict) -> str:
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["section", "metric", "value"])
+        writer.writerows(self._impact_metric_rows(metrics))
+        return output.getvalue()
+
+    def _impact_daily_csv(self, metrics: dict) -> str:
+        output = io.StringIO()
+        columns = [
+            "day",
+            "messages",
+            "active_members",
+            "active_channels",
+            "commands",
+            "command_errors",
+            "reactions",
+            "voice_minutes",
+            "joins",
+            "leaves",
+            "peak_voice_users",
+            "peak_online_members",
+            "top_command",
+            "top_command_count",
+        ]
+        writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in metrics.get("daily_series", []) or []:
+            writer.writerow({key: row.get(key, "") for key in columns})
+        return output.getvalue()
+
+    def _impact_breakdown_csv(self, metrics: dict) -> str:
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["section", "key", "value"])
+        sections = {
+            "live_results": metrics.get("requests", {}).get("live_results", {}),
+            "weekly_results": metrics.get("requests", {}).get("weekly_results", {}),
+            "weekly_claim_statuses": metrics.get("weekly", {}).get("claim_statuses", {}),
+            "ticket_statuses": metrics.get("support", {}).get("ticket_statuses", {}),
+            "help_kinds": metrics.get("support", {}).get("help_kinds", {}),
+            "help_statuses": metrics.get("support", {}).get("help_statuses", {}),
+            "transcript_request_statuses": metrics.get("support", {}).get("transcript_request_statuses", {}),
+            "commands": metrics.get("command_breakdown", {}),
+        }
+        for section, values in sections.items():
+            for key, value in (values or {}).items():
+                writer.writerow([section, key, value])
+        return output.getvalue()
+
+    def _impact_markdown(self, metrics: dict) -> str:
+        headline = metrics["headline"]
+        requests = metrics["requests"]
+        support = metrics["support"]
+        activity = metrics["activity"]
+        weekly = metrics["weekly"]
+        operations = metrics["operations"]
+        forecast = metrics.get("forecast", {})
+        live_state = requests["current_state"]
+        recommendations = forecast.get("recommendations") or []
+
+        return "\n".join(
+            [
+                f"# Avenue Guard Impact Report",
+                "",
+                f"Generated for **{metrics['report']['guild_name']}** on **{metrics['report']['snapshot_label']}**.",
+                "",
+                "## CV-Ready Summary",
+                "",
+                (
+                    f"Avenue Guard supports a community of **{_fmt_num(headline['current_members'])} members**, "
+                    f"has touched **{_fmt_num(headline['unique_members_touched'])} unique members** through tracked workflows, "
+                    f"has recorded **{_fmt_num(headline['tracked_event_total'])} tracked interaction events**, "
+                    f"has handled **{_fmt_num(headline['support_items'])} support/help items**, and has coordinated "
+                    f"**{_fmt_num(headline['level_requests_total'])} level requests**."
+                ),
+                "",
+                "## Engagement Forecast",
+                "",
+                f"- Engagement signal: **{forecast.get('engagement_signal', 'Unknown')}**",
+                f"- Last 7 days: **{_fmt_num(forecast.get('last_7_messages', 0))} messages** and **{_fmt_num(forecast.get('last_7_commands', 0))} commands**",
+                f"- Previous 7 days: **{_fmt_num(forecast.get('previous_7_messages', 0))} messages** and **{_fmt_num(forecast.get('previous_7_commands', 0))} commands**",
+                f"- Projected next 7 days: **{_fmt_num(forecast.get('projected_next_7_messages', 0))} messages** and **{_fmt_num(forecast.get('projected_next_7_commands', 0))} commands**",
+                f"- Average daily active members, 7d: **{forecast.get('avg_daily_active_members_7d', 0)}**",
+                f"- Average daily active channels, 7d: **{forecast.get('avg_daily_active_channels_7d', 0)}**",
+                f"- 30-day command error rate: **{forecast.get('command_error_rate_30d', '0%')}**",
+                f"- Current review backlog: **{_fmt_num(forecast.get('review_backlog', 0))}** pending requests",
+                "",
+                "### Suggested Actions",
+                "",
+                *[f"- {item}" for item in recommendations],
+                "",
+                "## Community Reach",
+                "",
+                f"- Current server size: **{_fmt_num(metrics['community']['current_members'])}** members",
+                f"- Unique members touched by tracked workflows: **{_fmt_num(metrics['community']['unique_members_touched'])}**",
+                f"- Members with tracked weekly activity: **{_fmt_num(metrics['community']['tracked_active_members'])}**",
+                f"- Weeks with activity history: **{_fmt_num(metrics['community']['tracked_weeks'])}**",
+                "",
+                "## Activity And Commands",
+                "",
+                f"- Tracked messages: **{_fmt_num(activity['tracked_messages'])}**",
+                f"- Reactions recorded in daily summaries: **{_fmt_num(activity['reactions'])}**",
+                f"- Slash commands recorded in daily summaries: **{_fmt_num(activity['commands'])}**",
+                f"- Command errors recorded: **{_fmt_num(activity['command_errors'])}**",
+                f"- Voice time recorded: **{_fmt_num(activity['voice_minutes'])} minutes**",
+                f"- Top command: **/{activity['top_command'] or 'none'}** ({_fmt_num(activity['top_command_count'])} uses)",
+                "",
+                "## Level Requests",
+                "",
+                f"- Current request state: **{live_state['state']}**, wave **{live_state['wave_id']}**",
+                f"- Live wave requests: **{_fmt_num(requests['live_total'])}** total, **{_fmt_num(requests['live_reviewed'])}** reviewed, **{_fmt_num(requests['live_pending'])}** pending ({requests['live_review_rate']} reviewed)",
+                f"- Average live request review time: **{requests['live_avg_review_hours']} hours**",
+                f"- Weekly request submissions: **{_fmt_num(requests['weekly_total'])}** total, **{_fmt_num(requests['weekly_reviewed'])}** reviewed, **{_fmt_num(requests['weekly_pending'])}** pending ({requests['weekly_review_rate']} reviewed)",
+                f"- Average weekly request review time: **{requests['weekly_avg_review_hours']} hours**",
+                f"- Request waves handled: **{_fmt_num(requests['live_waves'])}**",
+                f"- Unique live level IDs submitted: **{_fmt_num(requests['unique_live_level_ids'])}**",
+                f"- Request edit audit entries: **{_fmt_num(requests['edit_audit_entries'])}**",
+                f"- Scheduled openings currently pending: **{_fmt_num(requests['pending_openings'])}**",
+                "",
+                "## Tickets And Help",
+                "",
+                f"- Tickets opened: **{_fmt_num(support['tickets_total'])}**",
+                f"- Tickets closed/resolved: **{_fmt_num(support['tickets_closed'])}**",
+                f"- Average ticket close time: **{support['avg_ticket_close_hours']} hours**",
+                f"- Ticket transcripts saved: **{_fmt_num(support['ticket_transcripts_saved'])}**",
+                f"- Satisfaction responses: **{_fmt_num(support['satisfaction_responses'])}** with average **{support['satisfaction_average']}**",
+                f"- Help submissions: **{_fmt_num(support['help_submissions_total'])}**",
+                f"- Transcript requests: **{_fmt_num(support['transcript_requests_total'])}**",
+                "",
+                "## Weekly Rewards And Safety",
+                "",
+                f"- Weekly reward claim records: **{_fmt_num(weekly['claims'])}**",
+                f"- Weekly DM log events: **{_fmt_num(weekly['dm_log_events'])}**",
+                f"- Members with repeated top-5 streaks: **{_fmt_num(weekly['members_with_streaks'])}**",
+                f"- Best top-5 streak: **{_fmt_num(weekly['best_top5_streak'])} weeks**",
+                f"- Anti-farm events logged: **{_fmt_num(operations['anti_farm_events'])}**",
+                "",
+                "## Persistence Notes",
+                "",
+                "This report was saved into the bot database and posted as Markdown, CSV, trend CSV, breakdown CSV, and raw JSON attachments. The CSV files can be imported directly into Google Sheets for charts, CV evidence, forecasting, or future portfolio reporting.",
+                "",
+            ]
+        )
+
+    def _impact_report_embed(self, metrics: dict) -> discord.Embed:
+        headline = metrics["headline"]
+        requests = metrics["requests"]
+        support = metrics["support"]
+        activity = metrics["activity"]
+        forecast = metrics.get("forecast", {})
+        embed = discord.Embed(
+            title="Avenue Guard Impact And Forecast Report",
+            description=(
+                f"Generated <t:{int(metrics['report']['snapshot_ts'])}:R>. "
+                "Files are attached for long-term records, spreadsheet import, and trend tracking."
+            ),
+            color=discord.Color.blurple(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(
+            name="CV Headline",
+            value=(
+                f"Community: **{_fmt_num(headline['current_members'])}** members\n"
+                f"Unique members touched: **{_fmt_num(headline['unique_members_touched'])}**\n"
+                f"Tracked events: **{_fmt_num(headline['tracked_event_total'])}**"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Requests",
+            value=(
+                f"Live: **{_fmt_num(requests['live_total'])}** ({requests['live_review_rate']} reviewed)\n"
+                f"Weekly: **{_fmt_num(requests['weekly_total'])}** ({requests['weekly_review_rate']} reviewed)\n"
+                f"Waves: **{_fmt_num(requests['live_waves'])}**"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Support",
+            value=(
+                f"Tickets: **{_fmt_num(support['tickets_total'])}**\n"
+                f"Help submissions: **{_fmt_num(support['help_submissions_total'])}**\n"
+                f"Transcripts: **{_fmt_num(support['ticket_transcripts_saved'])}**"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Activity",
+            value=(
+                f"Messages: **{_fmt_num(activity['tracked_messages'])}**\n"
+                f"Commands: **{_fmt_num(activity['commands'])}**\n"
+                f"Voice minutes: **{_fmt_num(activity['voice_minutes'])}**"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Forecast",
+            value=(
+                f"Signal: **{forecast.get('engagement_signal', 'Unknown')}**\n"
+                f"Next 7d messages: **{_fmt_num(forecast.get('projected_next_7_messages', 0))}**\n"
+                f"Review backlog: **{_fmt_num(forecast.get('review_backlog', 0))}**"
+            ),
+            inline=True,
+        )
+        return embed
+
+    def _impact_files(self, metrics: dict) -> list[discord.File]:
+        slug = now_madrid().strftime("%Y%m%d-%H%M%S")
+        md_bytes = self._impact_markdown(metrics).encode("utf-8")
+        summary_csv = self._impact_csv(metrics).encode("utf-8")
+        daily_csv = self._impact_daily_csv(metrics).encode("utf-8")
+        breakdown_csv = self._impact_breakdown_csv(metrics).encode("utf-8")
+        json_bytes = json.dumps(metrics, indent=2, ensure_ascii=False).encode("utf-8")
+        return [
+            discord.File(io.BytesIO(md_bytes), filename=f"avenue-guard-impact-{slug}.md"),
+            discord.File(io.BytesIO(summary_csv), filename=f"avenue-guard-impact-summary-{slug}.csv"),
+            discord.File(io.BytesIO(daily_csv), filename=f"avenue-guard-impact-daily-trends-{slug}.csv"),
+            discord.File(io.BytesIO(breakdown_csv), filename=f"avenue-guard-impact-breakdowns-{slug}.csv"),
+            discord.File(io.BytesIO(json_bytes), filename=f"avenue-guard-impact-raw-{slug}.json"),
+        ]
+
+    async def bot_impact(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+
+        if not await self._is_impact_owner_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+
+        await self._defer(ctx, ephemeral=True)
+        metrics = await self._collect_impact_metrics(ctx.guild, ctx.user.id)
+        embed = self._impact_report_embed(metrics)
+        channel_id = self.bot.config.get_int("impact", "report_channel_id", default=0)
+        if not channel_id:
+            channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
+        channel = ctx.guild.get_channel(channel_id) if channel_id else None
+
+        sent = None
+        if isinstance(channel, discord.TextChannel):
+            try:
+                sent = await channel.send(
+                    content="Avenue Guard impact report generated. The CSV exports can be imported into Google Sheets.",
+                    embed=embed,
+                    files=self._impact_files(metrics),
+                    allowed_mentions=no_mentions(),
+                )
+            except Exception as e:
+                await log_error(self.bot, f"Could not send impact report attachments: {repr(e)}")
+
+        if sent is None:
+            try:
+                await self._send(
+                    ctx,
+                    "Impact report generated, but no valid report channel was available. Here are the files directly.",
+                    embed=embed,
+                    files=self._impact_files(metrics),
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await log_error(self.bot, f"Could not send fallback impact report attachments: {repr(e)}")
+                await self._send(ctx, "Impact report generated, but I could not attach the files. Check the error log.", embed=embed, ephemeral=True)
+
+        metrics["report"]["report_channel_id"] = int(getattr(getattr(sent, "channel", None), "id", 0) or 0)
+        metrics["report"]["report_message_id"] = int(getattr(sent, "id", 0) or 0)
+        await self.bot.db.execute(
+            "INSERT OR REPLACE INTO impact_snapshots(guild_id,snapshot_ts,report_channel_id,report_message_id,payload_json) VALUES(?,?,?,?,?)",
+            (
+                int(ctx.guild.id),
+                int(metrics["report"]["snapshot_ts"]),
+                int(metrics["report"]["report_channel_id"]),
+                int(metrics["report"]["report_message_id"]),
+                json.dumps(metrics, separators=(",", ":")),
+            ),
+        )
+
+        if sent is not None:
+            link = f"https://discord.com/channels/{ctx.guild.id}/{sent.channel.id}/{sent.id}"
+            msg = f"Impact report saved and posted: {link}"
+        else:
+            msg = "Impact report snapshot saved in the database. Configure `impact.report_channel_id` for persistent Discord attachments."
+        await self._log_admin_action(ctx.guild, ctx.user.id, "impact_report_generated", f"message_id={int(getattr(sent, 'id', 0) or 0)}")
+        await self._send(ctx, msg, ephemeral=True)
+
+    async def bot_backup(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_impact_owner_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+
+        await self._defer(ctx, ephemeral=True)
+        try:
+            sent = await self._post_database_backup(ctx.guild, reason="manual", requested_by=ctx.user.id)
+        except Exception as e:
+            await log_error(self.bot, f"Manual database backup failed: {repr(e)}")
+            return await self._send(ctx, "I couldn't create the database backup. Check the error log.", ephemeral=True)
+
+        if sent is None:
+            return await self._send(ctx, "Backup created locally, but I could not post it to a valid backup channel.", ephemeral=True)
+        link = f"https://discord.com/channels/{ctx.guild.id}/{sent.channel.id}/{sent.id}"
+        await self._log_admin_action(ctx.guild, ctx.user.id, "database_backup_created", f"message_id={sent.id}")
+        await self._send(ctx, f"Database backup posted: {link}", ephemeral=True)
+
+    async def bot_storage(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_impact_owner_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+
+        await self._defer(ctx, ephemeral=True)
+        storage_note, storage_ok = self._database_storage_note()
+        channel_id = self._backup_channel_id()
+        backup_row = await self.bot.db.fetchone(
+            "SELECT backup_ts, channel_id, message_id, size_bytes, reason, filename FROM database_backups WHERE guild_id=? ORDER BY backup_ts DESC LIMIT 1",
+            (int(ctx.guild.id),),
+        )
+        backup_text = "No backup record yet."
+        if backup_row:
+            backup_text = (
+                f"Last backup: <t:{int(backup_row['backup_ts'])}:R>\n"
+                f"Size: **{_fmt_num(backup_row['size_bytes'])} bytes**\n"
+                f"Reason: `{str(backup_row['reason'] or 'unknown')}`\n"
+                f"File: `{str(backup_row['filename'] or '')[:80]}`"
+            )
+        backup_enabled = bool(self.bot.config.get("database", "backups", "enabled", default=True))
+        interval_hours = int(self.bot.config.get("database", "backups", "interval_hours", default=12) or 12)
+        embed = discord.Embed(
+            title="Avenue Guard Storage",
+            description="Database persistence and backup status.",
+            color=discord.Color.green() if storage_ok and channel_id else discord.Color.gold(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(name="Database Path", value=storage_note[:1024], inline=False)
+        embed.add_field(
+            name="Automatic Backups",
+            value=(
+                f"Enabled: **{'yes' if backup_enabled else 'no'}**\n"
+                f"Interval: **{interval_hours}h**\n"
+                f"Channel: <#{channel_id}>"
+            ),
+            inline=True,
+        )
+        embed.add_field(name="Latest Backup", value=backup_text[:1024], inline=True)
+        if not storage_ok:
+            embed.add_field(
+                name="Recommended Fix",
+                value="Set `AVENUE_GUARD_DB_PATH` or `database.path` to a Render Persistent Disk path such as `/var/data/avenue-guard/bot.db`.",
+                inline=False,
+            )
+        await self._send(ctx, embed=embed, ephemeral=True)
 
     async def _is_admin_ctx(self, ctx: discord.ApplicationContext) -> bool:
         if ctx.guild is None:
@@ -493,6 +1535,8 @@ class CommandsCog(commands.Cog):
             "level requested": cfg.get_int("level_requests", "level_requested"),
             "sent results": cfg.get_int("level_requests", "sent_channel"),
             "rejected results": cfg.get_int("level_requests", "rejected_channel"),
+            "impact reports": cfg.get_int("impact", "report_channel_id", default=0) or cfg.get_int("channels", "general_logging_channel_id"),
+            "database backups": self._backup_channel_id(),
             "ticket transcripts": cfg.get_int("channels", "general_logging_channel_id"),
             "transcript requests": cfg.get_int("channels", "transcript_requests_channel_id"),
         }
@@ -508,6 +1552,11 @@ class CommandsCog(commands.Cog):
                 if normalize_server_icon_mode(icon_cfg.get("mode")) != "disabled":
                     issues.append("server icon rotation: bot needs Manage Server")
                     repairs.append("Grant the bot Manage Server, or set server icon rotation mode to disabled")
+
+        storage_note, storage_ok = self._database_storage_note()
+        if not storage_ok:
+            issues.append("database storage: path may not be persistent")
+            repairs.append("Set `AVENUE_GUARD_DB_PATH` or `database.path` to a Render Persistent Disk path")
 
         category_id = cfg.get_int("tickets", "ticket_category_id")
         category = guild.get_channel(category_id) if category_id else None
@@ -550,6 +1599,7 @@ class CommandsCog(commands.Cog):
         except Exception as e:
             db_ok = False
             db_note = type(e).__name__
+        storage_note, storage_ok = self._database_storage_note()
 
         request_row = await self.bot.db.fetchone("SELECT state, wave_id, submitted_count, request_limit, close_ts, request_type FROM level_request_state WHERE guild_id=?", (guild.id,))
         request_state = "Not initialized"
@@ -579,6 +1629,7 @@ class CommandsCog(commands.Cog):
                 name="Key State",
                 value=(
                     f"Database: **{db_note}**\n"
+                    f"Storage: {'persistent-looking' if storage_ok else 'needs review'}\n"
                     f"Request state: {request_state.splitlines()[0]}\n"
                     f"Icon rotation: **{icon_mode}**"
                 ),
@@ -626,7 +1677,8 @@ class CommandsCog(commands.Cog):
                 f"Activity flush: `{self._task_state('TrackingCog', '_activity_flush_task')}`\n"
                 f"Ticket scan: `{self._task_state('HelpCog', '_ticket_scan_task')}`\n"
                 f"Daily summary: `{self._task_state('BackgroundCog', 'daily_report')}`\n"
-                f"Icon rotation: `{self._task_state('BackgroundCog', 'rotate_server_icon')}`"
+                f"Icon rotation: `{self._task_state('BackgroundCog', 'rotate_server_icon')}`\n"
+                f"DB backups: `{self._task_state('BackgroundCog', 'database_backup')}`"
             ),
             inline=False,
         )
@@ -698,6 +1750,7 @@ class CommandsCog(commands.Cog):
 
         embed = discord.Embed(title="Avenue Guard Health", color=discord.Color.green() if db_ok else discord.Color.red())
         embed.add_field(name="Database", value=db_note, inline=True)
+        embed.add_field(name="Storage", value="Persistent-looking" if storage_ok else "Needs review", inline=True)
         embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)} ms", inline=True)
         embed.add_field(name="Loaded cogs", value=str(len(self.bot.cogs)), inline=True)
         embed.add_field(
@@ -719,10 +1772,13 @@ class CommandsCog(commands.Cog):
                 f"Ticket scan: `{_task_state('HelpCog', '_ticket_scan_task')}`\n"
                 f"Daily snapshot: `{_task_state('BackgroundCog', 'update_snapshot')}`\n"
                 f"Status rotation: `{_task_state('BackgroundCog', 'rotate_status')}`\n"
-                f"Server icon rotation: `{_task_state('BackgroundCog', 'rotate_server_icon')}`"
+                f"Server icon rotation: `{_task_state('BackgroundCog', 'rotate_server_icon')}`\n"
+                f"DB backups: `{_task_state('BackgroundCog', 'database_backup')}`"
             ),
             inline=False,
         )
+        if not storage_ok:
+            embed.add_field(name="Storage Warning", value=storage_note[:1024], inline=False)
         await self._send(ctx, embed=embed, ephemeral=True)
 
     async def bot_doctor(self, ctx: discord.ApplicationContext):
@@ -770,9 +1826,17 @@ class CommandsCog(commands.Cog):
             "reports logs": cfg.get_int("channels", "reports_log_channel_id"),
             "bugs logs": cfg.get_int("channels", "bot_issues_log_channel_id"),
             "transcript requests": cfg.get_int("channels", "transcript_requests_channel_id"),
+            "impact reports": cfg.get_int("impact", "report_channel_id", default=0) or cfg.get_int("channels", "general_logging_channel_id"),
+            "database backups": self._backup_channel_id(),
         }
         for label, channel_id in channel_checks.items():
             channel_perm_report(label, channel_id, common_text_perms)
+
+        storage_note, storage_ok = self._database_storage_note()
+        if storage_ok:
+            ok.append("database storage: persistent-looking")
+        else:
+            issues.append(f"database storage: {storage_note}")
 
         category_id = cfg.get_int("tickets", "ticket_category_id")
         category = guild.get_channel(category_id) if category_id else None
@@ -1089,6 +2153,17 @@ class CommandsCog(commands.Cog):
             check_role("tickets.staff_ping_role_id", staff_ping_role_id)
         for key in ("request_channel", "level_requested", "sent_channel", "rejected_channel"):
             check_channel(f"level_requests.{key}", cfg.get_int("level_requests", key), discord.TextChannel)
+        check_channel(
+            "impact.report_channel_id",
+            cfg.get_int("impact", "report_channel_id", default=0) or cfg.get_int("channels", "general_logging_channel_id"),
+            discord.TextChannel,
+        )
+        check_channel("database.backups.channel_id", self._backup_channel_id(), discord.TextChannel)
+        storage_note, storage_ok = self._database_storage_note()
+        if storage_ok:
+            ok_count += 1
+        else:
+            issues.append(f"database.path: {storage_note}")
 
         for key in ("MOD_ROLE_ID", "restriction_role_ID", "gambling_reward_role_id", "rps_streak_role_id"):
             check_role(f"roles.{key}", cfg.get_int("roles", key))
@@ -1453,7 +2528,7 @@ class CommandsCog(commands.Cog):
         except Exception:
             pass
 
-        embed.set_footer(text="Madrid-time weekly tracking")
+        embed.set_footer(text="Weekly tracking")
         await self._send(ctx, embed=embed)
 
 
@@ -1499,7 +2574,7 @@ class CommandsCog(commands.Cog):
                 embed.set_thumbnail(url=avatar.url)
         except Exception:
             pass
-        embed.set_footer(text="Madrid-time weekly tracking")
+        embed.set_footer(text="Weekly tracking")
         await self._send(ctx, embed=embed, ephemeral=True)
 
     async def tracking_force_dm(

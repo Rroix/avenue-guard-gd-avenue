@@ -54,6 +54,22 @@ class Database:
             self._conn = None
             self._ready = False
 
+    async def backup_to(self, target_path: str | Path) -> int:
+        await self.connect()
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        async with self._lock:
+            assert self._conn is not None
+
+            def _backup() -> int:
+                assert self._conn is not None
+                self._conn.execute("PRAGMA wal_checkpoint(FULL);")
+                with sqlite3.connect(str(target)) as dest:
+                    self._conn.backup(dest)
+                return int(target.stat().st_size)
+
+            return await asyncio.to_thread(_backup)
+
     def _migrate_sync(self) -> None:
         assert self._conn is not None
         stmts = [
@@ -321,6 +337,25 @@ class Database:
                 created_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, day_key)
             );""",
+            """CREATE TABLE IF NOT EXISTS impact_snapshots(
+                guild_id INTEGER NOT NULL,
+                snapshot_ts INTEGER NOT NULL,
+                report_channel_id INTEGER,
+                report_message_id INTEGER,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (guild_id, snapshot_ts)
+            );""",
+            """CREATE TABLE IF NOT EXISTS database_backups(
+                guild_id INTEGER NOT NULL,
+                backup_ts INTEGER NOT NULL,
+                channel_id INTEGER,
+                message_id INTEGER,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT '',
+                requested_by INTEGER,
+                filename TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (guild_id, backup_ts)
+            );""",
             """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
                 ON activity_counts(guild_id, week_start, count DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry
@@ -351,6 +386,10 @@ class Database:
                 ON help_submissions(guild_id, user_id, status, created_ts DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_help_submissions_log_message
                 ON help_submissions(guild_id, log_channel_id, log_message_id);""",
+            """CREATE INDEX IF NOT EXISTS idx_impact_snapshots_guild
+                ON impact_snapshots(guild_id, snapshot_ts DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_database_backups_guild
+                ON database_backups(guild_id, backup_ts DESC);""",
         ]
         for stmt in stmts:
             self._conn.execute(stmt)
@@ -718,6 +757,25 @@ class Database:
                 created_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, day_key)
             );""",
+            """CREATE TABLE IF NOT EXISTS impact_snapshots(
+                guild_id INTEGER NOT NULL,
+                snapshot_ts INTEGER NOT NULL,
+                report_channel_id INTEGER,
+                report_message_id INTEGER,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (guild_id, snapshot_ts)
+            );""",
+            """CREATE TABLE IF NOT EXISTS database_backups(
+                guild_id INTEGER NOT NULL,
+                backup_ts INTEGER NOT NULL,
+                channel_id INTEGER,
+                message_id INTEGER,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT '',
+                requested_by INTEGER,
+                filename TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (guild_id, backup_ts)
+            );""",
             """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
                 ON activity_counts(guild_id, week_start, count DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry
@@ -748,6 +806,10 @@ class Database:
                 ON help_submissions(guild_id, user_id, status, created_ts DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_help_submissions_log_message
                 ON help_submissions(guild_id, log_channel_id, log_message_id);""",
+            """CREATE INDEX IF NOT EXISTS idx_impact_snapshots_guild
+                ON impact_snapshots(guild_id, snapshot_ts DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_database_backups_guild
+                ON database_backups(guild_id, backup_ts DESC);""",
         ]
         for s in stmts:
             await self.execute(s)

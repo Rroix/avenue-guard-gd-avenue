@@ -19,7 +19,15 @@ from utils.views import (
 )
 from utils.checks import ensure_allowed_guild_id
 
-DB_PATH = "data/bot.db"
+DEFAULT_DB_PATH = "data/bot.db"
+
+
+def resolve_db_path(config: Config) -> str:
+    env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
+    if env_path:
+        return env_path
+    config_path = str(config.get("database", "path", default="") or "").strip()
+    return config_path or DEFAULT_DB_PATH
 
 
 def startup_log(message: str) -> None:
@@ -45,7 +53,9 @@ def create_bot() -> discord.Bot:
     bot = discord.Bot(intents=intents)
 
     bot.config = Config("config.json")
-    bot.db = Database(DB_PATH)
+    bot.db_path = resolve_db_path(bot.config)
+    startup_log(f"Using database path: {bot.db_path}")
+    bot.db = Database(bot.db_path)
 
     setup_global_error_handlers(bot)
 

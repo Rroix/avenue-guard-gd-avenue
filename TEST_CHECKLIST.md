@@ -301,7 +301,7 @@
     - Expected: requests close manually and the embed changes to closed.
 26. Run `/open-requests when:18:30 day:0` as an admin.
     - Expected: bot schedules the opening and replies with Discord absolute and relative timestamps.
-    - Expected: command options explain that `when` is Madrid `HH:MM`, `day` is optional, and `time` is the close timer in minutes.
+    - Expected: command options explain that `when` is `HH:MM`, `day` is optional, and `time` is the close timer in minutes.
     - Expected: the scheduled opening uses the default announcement unless `message` is provided.
 27. Run `/open-requests type:only demons` as an admin, then submit a known non-demon.
     - Expected: the modal is rejected before the request counts, and `/requests-are` shows the active type.
@@ -358,7 +358,7 @@
 ## 22) Daily server summary
 **Setup:** `background.daily_summary.enabled` is true and `background.daily_summary.channel_id` points to a staff-visible channel.
 
-1. Let the daily summary run, or temporarily set `background.daily_summary.time` to a near-future Madrid time and restart.
+1. Let the daily summary run, or temporarily set `background.daily_summary.time` to a near-future configured server time and restart.
    - Expected: summary embed includes activity, community, voice/presence, commands, highlights, top channels, top members, and top commands.
 2. Compare with the previous day if data exists.
    - Expected: message and command lines show day-over-day change.
@@ -391,31 +391,42 @@
 **Setup:** use an admin/owner account for `/bot` commands and a mod, judge, or head judge account for `/requests pending`.
 
 1. Run `/bot dashboard`.
-   - Expected: an ephemeral dashboard embed shows database status, latency, loaded cogs, request state, tracking state, ticket count, server icon rotation, and background tasks.
+   - Expected: an ephemeral dashboard embed shows database status, storage status, latency, loaded cogs, request state, tracking state, ticket count, server icon rotation, DB backup task, and background tasks.
    - Expected: Config, Repair Tips, and Refresh buttons update the same dashboard message.
 2. Run `/bot health`.
-   - Expected: an ephemeral health embed still works for backwards compatibility.
+   - Expected: an ephemeral health embed still works for backwards compatibility and shows storage/backup task status.
 3. Run `/bot config_check`.
    - Expected: configured channels and roles are reported as OK or listed as issues.
    - Expected: request embed template variables, field shapes, and suspicious color values are reported as OK or listed as issues.
    - Expected: server icon rotation mode, interval, and configured URLs are reported as OK or listed as issues.
+   - Expected: database path and backup channel are reported as OK or listed as issues.
 4. Temporarily add an invalid request template variable such as `{bad_variable}` to a request embed template, run `/bot config_check`, then revert it.
    - Expected: config check reports the unknown template variable.
-5. Run `/requests pending scope:all status:pending`.
+5. Run `/bot storage` as the configured impact owner.
+   - Expected: an ephemeral embed shows the running database path, whether it looks persistent, backup interval, backup channel, and latest backup record.
+6. Run `/bot backup` as the configured impact owner.
+   - Expected: the configured backup/log channel receives a database backup embed with a zipped SQLite attachment.
+   - Expected: `database_backups` stores the backup channel, message ID, size, reason, and filename.
+7. Run `/bot impact` as the configured impact owner.
+   - Expected: the configured impact/log channel receives an impact report embed with Markdown, summary CSV, daily trend CSV, breakdown CSV, and JSON attachments.
+   - Expected: `impact_snapshots` stores a database copy of the same report payload.
+   - Expected: the summary CSV opens cleanly in a spreadsheet with `section`, `metric`, and `value` columns.
+   - Expected: the daily trend CSV includes daily rows useful for charts and forecasting.
+8. Run `/requests pending scope:all status:pending`.
    - Expected: pending live request reviews and weekly request reviews are listed separately with jump links when message IDs are available.
-5. Run `/requests repair` as an admin.
+9. Run `/requests repair` as an admin.
    - Expected: recovery embed reports the request button refresh, wave summary refresh, recreated/refreshed pending messages, stale validations refreshed, and reviewed messages relocked.
-6. Send several normal chat messages.
+10. Send several normal chat messages.
    - Expected: tracking still counts activity, but writes are flushed according to `tracking.activity_flush_seconds`.
-7. Run `/restart` after sending a counted message.
+11. Run `/restart` after sending a counted message.
    - Expected: buffered tracking counts and current daily stats are flushed before the bot exits.
-8. Create two tickets quickly with two users.
+12. Create two tickets quickly with two users.
    - Expected: ticket IDs do not duplicate.
-9. Temporarily misconfigure `channels.weekly_request_channel_ID`, restart or resync, then submit a weekly request in DM.
+13. Temporarily misconfigure `channels.weekly_request_channel_ID`, restart or resync, then submit a weekly request in DM.
    - Expected: the user is told the request could not be recorded, the weekly log records `request_record_failed`, and the claim is not silently closed as successfully claimed.
-10. Reply to a weekly request DM with text missing the actual level ID field.
+14. Reply to a weekly request DM with text missing the actual level ID field.
    - Expected: the request is not recorded, and the bot tells the user which required field is missing.
-11. Disable this week's reward with `/tracking disable_reward`, then run `/tracking force_dm`.
+15. Disable this week's reward with `/tracking disable_reward`, then run `/tracking force_dm`.
    - Expected: the manual force DM still sends if the user has no active/past non-resettable claim, and the override is logged.
-12. Temporarily misconfigure an appeal/report/bot-issue log channel, then complete that DM flow.
+14. Temporarily misconfigure an appeal/report/bot-issue log channel, then complete that DM flow.
    - Expected: the user is told the submission could not be sent instead of receiving a false success message.

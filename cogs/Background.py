@@ -93,6 +93,7 @@ class BackgroundCog(commands.Cog):
         self.voice_sessions: Dict[int, int] = {}  # user_id -> unix_ts join
         self._status_index = -1  # start at -1 so first rotation shows the first status
         self._last_status_swap = 0.0
+        self._last_db_backup_ts = 0
 
     async def start_background(self):
         if self._started:
@@ -139,6 +140,12 @@ class BackgroundCog(commands.Cog):
         except Exception:
             pass
 
+        try:
+            if not self.database_backup.is_running():
+                self.database_backup.start()
+        except Exception:
+            pass
+
     def on_config_reload(self) -> None:
         # Restart daily loop if time changed
         try:
@@ -162,6 +169,14 @@ class BackgroundCog(commands.Cog):
                     self.rotate_server_icon.start()
             elif self.rotate_server_icon.is_running():
                 self.rotate_server_icon.cancel()
+        except Exception:
+            pass
+        try:
+            if self._database_backup_enabled():
+                if not self.database_backup.is_running():
+                    self.database_backup.start()
+            elif self.database_backup.is_running():
+                self.database_backup.cancel()
         except Exception:
             pass
 
@@ -205,6 +220,13 @@ class BackgroundCog(commands.Cog):
         cfg = ensure_server_icon_config(self.bot.config)
         urls = cfg.get("urls", [])
         return list(urls) if isinstance(urls, list) else []
+
+    def _database_backup_enabled(self) -> bool:
+        return bool(self.bot.config.get("database", "backups", "enabled", default=True))
+
+    def _database_backup_interval_seconds(self) -> int:
+        hours = int(self.bot.config.get("database", "backups", "interval_hours", default=12) or 12)
+        return max(3600, hours * 3600)
 
     def _server_icon_current_index(self, cfg: dict, urls: list[str]) -> int:
         current_index = parse_server_icon_index(cfg.get("current_index", -1), len(urls))
@@ -743,6 +765,49 @@ class BackgroundCog(commands.Cog):
     async def _snapshot_error(self, error: Exception):
         await log_error(self.bot, f"Daily snapshot task error: {repr(error)}")
 
+    @tasks.loop(minutes=5)
+    async def database_backup(self):
+        if not self._database_backup_enabled():
+            return
+        allowed = self.bot.config.get_int("guild", "allowed_guild_id")
+        guild = self.bot.get_guild(allowed) if allowed else None
+        if guild is None:
+            return
+
+        now_ts = int(time.time())
+        interval = self._database_backup_interval_seconds()
+        try:
+            row = await self.bot.db.fetchone(
+                "SELECT backup_ts FROM database_backups WHERE guild_id=? ORDER BY backup_ts DESC LIMIT 1",
+                (int(guild.id),),
+            )
+            if row and row["backup_ts"] is not None:
+                self._last_db_backup_ts = max(self._last_db_backup_ts, int(row["backup_ts"]))
+        except Exception:
+            pass
+
+        if self._last_db_backup_ts and now_ts - self._last_db_backup_ts < interval:
+            return
+
+        commands_cog = self.bot.get_cog("CommandsCog")
+        if commands_cog is None or not hasattr(commands_cog, "_post_database_backup"):
+            await log_error(self.bot, "Database backup task could not find CommandsCog backup helper.")
+            return
+        try:
+            sent = await commands_cog._post_database_backup(guild, reason="scheduled", requested_by=0)
+            if sent is not None:
+                self._last_db_backup_ts = now_ts
+        except Exception as e:
+            await log_error(self.bot, f"Scheduled database backup failed: {repr(e)}")
+
+    @database_backup.before_loop
+    async def _before_database_backup(self):
+        await self.bot.wait_until_ready()
+
+    @database_backup.error
+    async def _database_backup_error(self, error: Exception):
+        await log_error(self.bot, f"Database backup task error: {repr(error)}")
+
     @tasks.loop(seconds=10)
     async def rotate_status(self):
         if not self._status_rotation_enabled():
@@ -986,7 +1051,7 @@ class BackgroundCog(commands.Cog):
         embed.add_field(name="Top Channels", value=self._top_channel_lines(top_channels, snapshot.messages), inline=False)
         embed.add_field(name="Top Members", value=self._top_member_lines(top_users, snapshot.messages), inline=False)
         embed.add_field(name="Top Commands", value=self._top_command_lines(top_cmds, snapshot.commands), inline=False)
-        embed.set_footer(text="Madrid-time daily report")
+        embed.set_footer(text="Daily server report")
 
         ch_id = self._daily_summary_channel_id()
         channel = guild.get_channel(ch_id) if ch_id else None
