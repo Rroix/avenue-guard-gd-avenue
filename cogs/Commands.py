@@ -4,7 +4,9 @@ import io
 import json
 import random
 import secrets
+import shutil
 import asyncio
+import sqlite3
 import time
 import re
 import string
@@ -28,6 +30,23 @@ from utils.timeutils import now_madrid, week_start_sunday
 from utils.errors import log_error
 
 DEFAULT_REQUEST_REVIEWER_ROLE_IDS = [785212232786640966, 1430214323720163498]
+SQLITE_RESTORE_EXTENSIONS = {".sqlite3", ".sqlite", ".db", ".db3"}
+SQLITE_ARCHIVE_EXTENSIONS = {".zip"}
+SQLITE_RESTORE_MAX_BYTES = 100 * 1024 * 1024
+AVENUE_GUARD_CORE_TABLES = {
+    "activity_counts",
+    "weekly_claims",
+    "weekly_dm_log",
+    "tickets",
+    "ticket_transcripts",
+    "help_submissions",
+    "level_request_state",
+    "level_request_submissions",
+    "weekly_request_reviews",
+    "daily_stats",
+    "impact_snapshots",
+    "database_backups",
+}
 
 TICKET_STATUS_LABELS = {
     "waiting_user": "Waiting for user",
@@ -138,6 +157,7 @@ class CommandsCog(commands.Cog):
         self.bot_group.command(name="dashboard", description="Open the admin system dashboard")(self.bot_dashboard)
         self.bot_group.command(name="impact", description="Generate a persistent community impact report")(self.bot_impact)
         self.bot_group.command(name="backup", description="Create a durable database backup")(self.bot_backup)
+        self.bot_group.command(name="restore", description="Restore the database from an uploaded SQLite backup")(self.bot_restore)
         self.bot_group.command(name="storage", description="Show database storage and backup status")(self.bot_storage)
 
         self.tracking_group.command(name="top", description="Show the current week's top 20 active members")(self.tracking_top)
@@ -247,6 +267,11 @@ class CommandsCog(commands.Cog):
         raw = str(self.bot.config.get("database", "backups", "local_dir", default="backups") or "backups").strip()
         return Path(raw or "backups")
 
+    def _restore_upload_dir(self) -> Path:
+        path = self._backup_local_dir() / "restore_uploads"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def _database_path(self) -> Path:
         return Path(str(getattr(self.bot, "db_path", getattr(self.bot.db, "path", "data/bot.db"))))
 
@@ -345,6 +370,78 @@ class CommandsCog(commands.Cog):
             ),
         )
         return sent
+
+    def _restore_safe_filename(self, filename: str) -> str:
+        name = Path(str(filename or "uploaded.sqlite3")).name
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+        return safe or "uploaded.sqlite3"
+
+    async def _save_restore_attachment(self, attachment: discord.Attachment) -> tuple[Path, str]:
+        size = int(getattr(attachment, "size", 0) or 0)
+        if size <= 0:
+            raise ValueError("The uploaded backup is empty.")
+        if size > SQLITE_RESTORE_MAX_BYTES:
+            raise ValueError(f"The uploaded backup is too large. Maximum supported size is {SQLITE_RESTORE_MAX_BYTES // (1024 * 1024)} MB.")
+
+        original_name = self._restore_safe_filename(str(getattr(attachment, "filename", "uploaded.sqlite3") or "uploaded.sqlite3"))
+        suffix = Path(original_name).suffix.casefold()
+        if suffix not in SQLITE_RESTORE_EXTENSIONS | SQLITE_ARCHIVE_EXTENSIONS:
+            raise ValueError("Upload a `.sqlite3`, `.sqlite`, `.db`, `.db3`, or `.zip` backup file.")
+
+        upload_dir = self._restore_upload_dir()
+        slug = f"{int(time.time())}-{secrets.token_hex(4)}"
+        uploaded_path = upload_dir / f"{slug}-{original_name}"
+        await attachment.save(str(uploaded_path))
+        return uploaded_path, original_name
+
+    def _extract_sqlite_restore_file(self, uploaded_path: Path) -> Path:
+        suffix = uploaded_path.suffix.casefold()
+        if suffix in SQLITE_RESTORE_EXTENSIONS:
+            return uploaded_path
+        if suffix not in SQLITE_ARCHIVE_EXTENSIONS:
+            raise ValueError("Unsupported backup file type.")
+
+        with zipfile.ZipFile(uploaded_path, "r") as zf:
+            members = [info for info in zf.infolist() if not info.is_dir()]
+            sqlite_members = []
+            for info in members:
+                member_path = Path(info.filename)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise ValueError("The zip archive contains an unsafe file path.")
+                if member_path.suffix.casefold() in SQLITE_RESTORE_EXTENSIONS:
+                    sqlite_members.append(info)
+            if len(sqlite_members) != 1:
+                raise ValueError("The zip archive must contain exactly one SQLite database file.")
+
+            selected = sqlite_members[0]
+            if int(selected.file_size or 0) > SQLITE_RESTORE_MAX_BYTES:
+                raise ValueError("The SQLite file inside the zip is too large.")
+            extracted_path = uploaded_path.with_suffix("").with_name(f"{uploaded_path.stem}-extracted{Path(selected.filename).suffix}")
+            with zf.open(selected, "r") as src, extracted_path.open("wb") as dest:
+                shutil.copyfileobj(src, dest)
+        return extracted_path
+
+    async def _validate_restore_database(self, db_path: Path) -> dict:
+        def _run() -> dict:
+            if not db_path.exists() or not db_path.is_file():
+                raise ValueError("The uploaded database file could not be found after upload.")
+            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+                integrity_row = conn.execute("PRAGMA integrity_check;").fetchone()
+                integrity = str(integrity_row[0] if integrity_row else "")
+                if integrity.casefold() != "ok":
+                    raise ValueError(f"SQLite integrity check failed: {integrity}")
+                table_rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                tables = {str(row[0]) for row in table_rows}
+                known_tables = sorted(tables & AVENUE_GUARD_CORE_TABLES)
+                if not known_tables:
+                    raise ValueError("This SQLite file does not look like an Avenue Guard database.")
+            return {
+                "size_bytes": int(db_path.stat().st_size),
+                "tables_count": len(tables),
+                "known_tables": known_tables,
+            }
+
+        return await asyncio.to_thread(_run)
 
     async def _impact_scalar(self, sql: str, params: tuple = ()) -> int:
         row = await self.bot.db.fetchone(sql, params)
@@ -720,6 +817,14 @@ class CommandsCog(commands.Cog):
             "SELECT COUNT(*) AS value FROM weekly_recaps WHERE guild_id=?",
             (guild_id,),
         )
+        database_backups = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM database_backups WHERE guild_id=?",
+            (guild_id,),
+        )
+        database_restores = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM database_restore_log WHERE guild_id=?",
+            (guild_id,),
+        )
 
         request_state = await self.bot.db.fetchone(
             "SELECT state, wave_id, submitted_count, request_limit, close_ts, request_type FROM level_request_state WHERE guild_id=?",
@@ -751,6 +856,8 @@ class CommandsCog(commands.Cog):
             + int(request_edits)
             + int(review_events)
             + int(anti_farm_events)
+            + int(database_backups)
+            + int(database_restores)
         )
 
         support_items = int(tickets) + int(help_submissions) + int(transcript_requests)
@@ -837,6 +944,8 @@ class CommandsCog(commands.Cog):
             "operations": {
                 "daily_summary_snapshots": int(daily_recaps),
                 "weekly_recap_snapshots": int(weekly_recaps),
+                "database_backups": int(database_backups),
+                "database_restores": int(database_restores),
                 "anti_farm_events": int(anti_farm_events),
                 "joins": int(daily.get("joins", 0) or 0),
                 "leaves": int(daily.get("leaves", 0) or 0),
@@ -1036,6 +1145,8 @@ class CommandsCog(commands.Cog):
                 "",
                 "## Persistence Notes",
                 "",
+                f"- Database backups recorded: **{_fmt_num(operations['database_backups'])}**",
+                f"- Database restores recorded: **{_fmt_num(operations['database_restores'])}**",
                 "This report was saved into the bot database and posted as Markdown, CSV, trend CSV, breakdown CSV, and raw JSON attachments. The CSV files can be imported directly into Google Sheets for charts, CV evidence, forecasting, or future portfolio reporting.",
                 "",
             ]
@@ -1198,6 +1309,101 @@ class CommandsCog(commands.Cog):
         await self._log_admin_action(ctx.guild, ctx.user.id, "database_backup_created", f"message_id={sent.id}")
         await self._send(ctx, f"Database backup posted: {link}", ephemeral=True)
 
+    async def bot_restore(
+        self,
+        ctx: discord.ApplicationContext,
+        archive: discord.Option(discord.Attachment, "Upload a .sqlite3/.db backup or a .zip created by /bot backup"),
+        confirm: discord.Option(str, "Type RESTORE to confirm replacing the live database"),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        if not await self._is_impact_owner_ctx(ctx):
+            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+        if str(confirm or "").strip() != "RESTORE":
+            return await ctx.respond("Type `RESTORE` in the confirm option to replace the live database.", ephemeral=True)
+
+        await self._defer(ctx, ephemeral=True)
+        uploaded_path: Path | None = None
+        restore_path: Path | None = None
+        original_name = str(getattr(archive, "filename", "uploaded.sqlite3") or "uploaded.sqlite3")
+        try:
+            uploaded_path, original_name = await self._save_restore_attachment(archive)
+            restore_path = self._extract_sqlite_restore_file(uploaded_path)
+            validation = await self._validate_restore_database(restore_path)
+        except Exception as e:
+            await log_error(self.bot, f"Database restore upload validation failed: {repr(e)}")
+            return await self._send(ctx, f"I couldn't use that backup: {e}", ephemeral=True)
+
+        pre_backup = None
+        try:
+            pre_backup = await self._post_database_backup(ctx.guild, reason="pre_restore", requested_by=ctx.user.id)
+        except Exception as e:
+            await log_error(self.bot, f"Pre-restore database backup failed: {repr(e)}")
+
+        try:
+            restored_size = await self.bot.db.restore_from(restore_path)
+        except Exception as e:
+            await log_error(self.bot, f"Database restore failed after validation: {repr(e)}")
+            return await self._send(ctx, "The uploaded database passed validation, but restoring it failed. The previous database was kept when possible; check the error log.", ephemeral=True)
+
+        restore_ts = int(time.time())
+        pre_channel_id = int(getattr(getattr(pre_backup, "channel", None), "id", 0) or 0)
+        pre_message_id = int(getattr(pre_backup, "id", 0) or 0)
+        pre_filename = ""
+        if pre_backup is not None:
+            try:
+                attachments = list(getattr(pre_backup, "attachments", []) or [])
+                if attachments:
+                    pre_filename = str(getattr(attachments[0], "filename", "") or "")
+            except Exception:
+                pre_filename = ""
+        await self.bot.db.execute(
+            """
+            INSERT OR REPLACE INTO database_restore_log(
+                guild_id, restore_ts, uploaded_by, source_filename, size_bytes,
+                pre_restore_backup_channel_id, pre_restore_backup_message_id,
+                pre_restore_backup_filename, tables_count, known_tables_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(ctx.guild.id),
+                restore_ts,
+                int(ctx.user.id),
+                str(original_name)[:240],
+                int(restored_size or validation.get("size_bytes") or 0),
+                pre_channel_id,
+                pre_message_id,
+                pre_filename[:240],
+                int(validation.get("tables_count") or 0),
+                json.dumps(validation.get("known_tables") or [], separators=(",", ":"))[:4000],
+            ),
+        )
+
+        await self._log_admin_action(
+            ctx.guild,
+            ctx.user.id,
+            "database_restored",
+            f"source={original_name} size={restored_size} pre_backup_message_id={pre_message_id}",
+        )
+        embed = discord.Embed(
+            title="Database Restored",
+            description="The uploaded SQLite backup was validated, migrated, and swapped into the live database path.",
+            color=discord.Color.green(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(name="Source File", value=f"`{str(original_name)[:120]}`", inline=False)
+        embed.add_field(name="Restored Size", value=f"{_fmt_num(restored_size)} bytes", inline=True)
+        embed.add_field(name="Tables Found", value=f"{_fmt_num(validation.get('tables_count'))}", inline=True)
+        known = ", ".join(validation.get("known_tables") or [])
+        embed.add_field(name="Recognized Tables", value=(known[:1024] or "None"), inline=False)
+        if pre_backup is not None:
+            link = f"https://discord.com/channels/{ctx.guild.id}/{pre_backup.channel.id}/{pre_backup.id}"
+            embed.add_field(name="Pre-Restore Backup", value=f"Created before restore: {link}", inline=False)
+        else:
+            embed.add_field(name="Pre-Restore Backup", value="Could not post a backup before restore. The restore still completed.", inline=False)
+        embed.set_footer(text="Recommended: run /bot storage and /bot dashboard after restore.")
+        await self._send(ctx, embed=embed, ephemeral=True)
+
     async def bot_storage(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -1219,6 +1425,18 @@ class CommandsCog(commands.Cog):
                 f"Reason: `{str(backup_row['reason'] or 'unknown')}`\n"
                 f"File: `{str(backup_row['filename'] or '')[:80]}`"
             )
+        restore_row = await self.bot.db.fetchone(
+            "SELECT restore_ts, uploaded_by, source_filename, size_bytes, pre_restore_backup_message_id FROM database_restore_log WHERE guild_id=? ORDER BY restore_ts DESC LIMIT 1",
+            (int(ctx.guild.id),),
+        )
+        restore_text = "No restore record yet."
+        if restore_row:
+            restore_text = (
+                f"Last restore: <t:{int(restore_row['restore_ts'])}:R>\n"
+                f"Uploaded by: <@{int(restore_row['uploaded_by'] or 0)}>\n"
+                f"Size: **{_fmt_num(restore_row['size_bytes'])} bytes**\n"
+                f"File: `{str(restore_row['source_filename'] or '')[:80]}`"
+            )
         backup_enabled = bool(self.bot.config.get("database", "backups", "enabled", default=True))
         interval_hours = int(self.bot.config.get("database", "backups", "interval_hours", default=12) or 12)
         embed = discord.Embed(
@@ -1238,6 +1456,7 @@ class CommandsCog(commands.Cog):
             inline=True,
         )
         embed.add_field(name="Latest Backup", value=backup_text[:1024], inline=True)
+        embed.add_field(name="Latest Restore", value=restore_text[:1024], inline=True)
         if not storage_ok:
             embed.add_field(
                 name="Recommended Fix",

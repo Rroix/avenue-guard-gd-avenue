@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence
 
@@ -69,6 +72,93 @@ class Database:
                 return int(target.stat().st_size)
 
             return await asyncio.to_thread(_backup)
+
+    async def restore_from(self, source_path: str | Path) -> int:
+        """Replace the live SQLite file with a validated backup and migrate it.
+
+        The uploaded database is copied to a temporary file in the target DB
+        directory, migrated there first, and only then atomically swapped into
+        place. That keeps the current database intact if migration fails.
+        """
+        source = Path(source_path)
+        if not source.exists() or not source.is_file():
+            raise FileNotFoundError(str(source))
+
+        async with self._lock:
+            def _unlink_sidecars(base: Path) -> None:
+                for suffix in ("-wal", "-shm", "-journal"):
+                    try:
+                        (base.parent / f"{base.name}{suffix}").unlink()
+                    except FileNotFoundError:
+                        pass
+
+            def _connect_current() -> None:
+                conn = sqlite3.connect(str(self.path), check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA foreign_keys=ON;")
+                conn.commit()
+                self._conn = conn
+                self._migrate_sync()
+                self._ready = True
+
+            def _restore() -> int:
+                if self._conn is not None:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(FULL);")
+                        self._conn.commit()
+                    finally:
+                        self._conn.close()
+                self._conn = None
+                self._ready = False
+
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                stamp = f"{int(time.time())}-{os.getpid()}"
+                tmp_target = self.path.parent / f".{self.path.name}.restore-{stamp}.tmp"
+                _unlink_sidecars(tmp_target)
+                shutil.copy2(source, tmp_target)
+
+                try:
+                    temp_conn = sqlite3.connect(str(tmp_target), check_same_thread=False)
+                    temp_conn.row_factory = sqlite3.Row
+                    temp_conn.execute("PRAGMA foreign_keys=ON;")
+                    temp_conn.execute("PRAGMA journal_mode=WAL;")
+                    temp_conn.commit()
+                    self._conn = temp_conn
+                    self._migrate_sync()
+                    integrity_row = temp_conn.execute("PRAGMA integrity_check;").fetchone()
+                    integrity = str(integrity_row[0] if integrity_row else "")
+                    if integrity.casefold() != "ok":
+                        raise sqlite3.DatabaseError(f"integrity_check returned {integrity!r}")
+                    temp_conn.execute("PRAGMA wal_checkpoint(FULL);")
+                    temp_conn.commit()
+                    temp_conn.close()
+                    self._conn = None
+                    self._ready = False
+
+                    _unlink_sidecars(self.path)
+                    os.replace(tmp_target, self.path)
+                    _unlink_sidecars(tmp_target)
+                    _connect_current()
+                    return int(self.path.stat().st_size)
+                except Exception:
+                    try:
+                        if self._conn is not None:
+                            self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+                    self._ready = False
+                    try:
+                        tmp_target.unlink()
+                    except FileNotFoundError:
+                        pass
+                    _unlink_sidecars(tmp_target)
+                    if self.path.exists():
+                        _connect_current()
+                    raise
+
+            return await asyncio.to_thread(_restore)
 
     def _migrate_sync(self) -> None:
         assert self._conn is not None
@@ -356,6 +446,19 @@ class Database:
                 filename TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (guild_id, backup_ts)
             );""",
+            """CREATE TABLE IF NOT EXISTS database_restore_log(
+                guild_id INTEGER NOT NULL,
+                restore_ts INTEGER NOT NULL,
+                uploaded_by INTEGER NOT NULL,
+                source_filename TEXT NOT NULL DEFAULT '',
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                pre_restore_backup_channel_id INTEGER,
+                pre_restore_backup_message_id INTEGER,
+                pre_restore_backup_filename TEXT NOT NULL DEFAULT '',
+                tables_count INTEGER NOT NULL DEFAULT 0,
+                known_tables_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (guild_id, restore_ts)
+            );""",
             """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
                 ON activity_counts(guild_id, week_start, count DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry
@@ -390,6 +493,8 @@ class Database:
                 ON impact_snapshots(guild_id, snapshot_ts DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_database_backups_guild
                 ON database_backups(guild_id, backup_ts DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_database_restore_log_guild
+                ON database_restore_log(guild_id, restore_ts DESC);""",
         ]
         for stmt in stmts:
             self._conn.execute(stmt)
@@ -776,6 +881,19 @@ class Database:
                 filename TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (guild_id, backup_ts)
             );""",
+            """CREATE TABLE IF NOT EXISTS database_restore_log(
+                guild_id INTEGER NOT NULL,
+                restore_ts INTEGER NOT NULL,
+                uploaded_by INTEGER NOT NULL,
+                source_filename TEXT NOT NULL DEFAULT '',
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                pre_restore_backup_channel_id INTEGER,
+                pre_restore_backup_message_id INTEGER,
+                pre_restore_backup_filename TEXT NOT NULL DEFAULT '',
+                tables_count INTEGER NOT NULL DEFAULT 0,
+                known_tables_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (guild_id, restore_ts)
+            );""",
             """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
                 ON activity_counts(guild_id, week_start, count DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry
@@ -810,6 +928,8 @@ class Database:
                 ON impact_snapshots(guild_id, snapshot_ts DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_database_backups_guild
                 ON database_backups(guild_id, backup_ts DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_database_restore_log_guild
+                ON database_restore_log(guild_id, restore_ts DESC);""",
         ]
         for s in stmts:
             await self.execute(s)
