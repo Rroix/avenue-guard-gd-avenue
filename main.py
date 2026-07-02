@@ -21,6 +21,7 @@ from utils.views import (
 from utils.checks import ensure_allowed_guild_id
 
 DEFAULT_DB_PATH = "data/bot.db"
+TURSO_REPLICA_PATH = "data/turso-replica.db"
 RENDER_DISK_DB_PATH = "/var/data/avenue-guard/bot.db"
 
 
@@ -43,8 +44,30 @@ def _database_path_usable(path: str) -> tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
 
 
-def resolve_db_path(config: Config) -> tuple[str, str, str]:
+def resolve_db_path(config: Config) -> tuple[str, str, str, str, str]:
     warnings: list[str] = []
+    turso_url = (
+        os.getenv("TURSO_DATABASE_URL", "")
+        or os.getenv("LIBSQL_URL", "")
+        or str(config.get("database", "turso_url", default="") or "")
+    ).strip()
+    turso_token = (os.getenv("TURSO_AUTH_TOKEN", "") or os.getenv("LIBSQL_AUTH_TOKEN", "")).strip()
+    if turso_url:
+        if turso_token:
+            replica_path = (
+                os.getenv("TURSO_REPLICA_PATH", "").strip()
+                or str(config.get("database", "turso_replica_path", default="") or "").strip()
+                or TURSO_REPLICA_PATH
+            )
+            ok, error = _database_path_usable(replica_path)
+            if ok:
+                return replica_path, "Turso/libSQL embedded replica", "", turso_url, turso_token
+            warnings.append(
+                f"Turso replica path is not writable: {replica_path} ({error}); falling back to local SQLite"
+            )
+        else:
+            warnings.append("A Turso/libSQL database URL is set but TURSO_AUTH_TOKEN is missing; falling back to local SQLite")
+
     env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
     candidates: list[tuple[str, str, bool]] = []
     if env_path:
@@ -65,13 +88,13 @@ def resolve_db_path(config: Config) -> tuple[str, str, str]:
                 warning = (
                     f"{warning} | " if warning else ""
                 ) + "Using local fallback database; data can be lost if Render clears cache and no Persistent Disk is mounted."
-            return path, source, warning
+            return path, source, warning, "", ""
         message = f"Database path from {source} is not writable: {path} ({error})"
         if explicit:
             message += "; falling back so the bot can start"
         warnings.append(message)
 
-    return DEFAULT_DB_PATH, "local fallback", "All configured database paths failed; using local fallback."
+    return DEFAULT_DB_PATH, "local fallback", "All configured database paths failed; using local fallback.", "", ""
 
 def create_bot() -> discord.Bot:
     intents = discord.Intents.default()
@@ -93,9 +116,9 @@ def create_bot() -> discord.Bot:
     bot = discord.Bot(intents=intents)
 
     bot.config = Config("config.json")
-    bot.db_path, bot.db_path_source, bot.db_path_warning = resolve_db_path(bot.config)
+    bot.db_path, bot.db_path_source, bot.db_path_warning, bot.db_remote_url, bot.db_remote_token = resolve_db_path(bot.config)
     startup_log(f"Using database path: {bot.db_path} ({bot.db_path_source})")
-    bot.db = Database(bot.db_path)
+    bot.db = Database(bot.db_path, remote_url=bot.db_remote_url, auth_token=bot.db_remote_token)
 
     setup_global_error_handlers(bot)
 

@@ -8,6 +8,57 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence
 
+try:
+    import libsql
+except Exception:
+    libsql = None
+
+
+class DictRow(dict):
+    """sqlite3.Row-like fallback for drivers that return tuples."""
+
+    def __init__(self, keys: Sequence[str], values: Sequence[Any]):
+        super().__init__((str(key), values[index] if index < len(values) else None) for index, key in enumerate(keys))
+        self._values = tuple(values)
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, int):
+            return self._values[key]
+        return super().__getitem__(key)
+
+
+def _row_get(row: Any, key: str, *, index: int = 0, default: Any = None) -> Any:
+    if row is None:
+        return default
+    try:
+        return row[key]
+    except Exception:
+        pass
+    try:
+        return row[index]
+    except Exception:
+        return default
+
+
+def _normalize_row(cursor: Any, row: Any) -> Any:
+    if row is None:
+        return None
+    try:
+        _ = row["__avenue_guard_missing_column__"]
+    except KeyError:
+        return row
+    except Exception:
+        pass
+    description = getattr(cursor, "description", None) or []
+    keys = [str(col[0]) for col in description if col]
+    if keys:
+        return DictRow(keys, tuple(row))
+    return row
+
+
+def _normalize_rows(cursor: Any, rows: Iterable[Any]) -> list[Any]:
+    return [_normalize_row(cursor, row) for row in rows]
+
 
 class Database:
     """Small SQLite wrapper safe to use from an async bot.
@@ -17,12 +68,42 @@ class Database:
     - Executes each query fully inside one to_thread call to avoid cursor/thread mismatches
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, remote_url: str = "", auth_token: str = ""):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.remote_url = str(remote_url or "").strip()
+        self.auth_token = str(auth_token or "").strip()
+        self.uses_remote = bool(self.remote_url)
         self._lock = asyncio.Lock()
-        self._conn: Optional[sqlite3.Connection] = None
+        self._conn: Optional[Any] = None
         self._ready = False
+
+    def _open_connection_sync(self) -> Any:
+        if self.uses_remote:
+            if libsql is None:
+                raise RuntimeError("TURSO_DATABASE_URL is configured, but the libsql Python package is not installed.")
+            conn = libsql.connect(str(self.path), sync_url=self.remote_url, auth_token=self.auth_token)
+        else:
+            conn = sqlite3.connect(str(self.path), check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+        try:
+            conn.row_factory = sqlite3.Row
+        except Exception:
+            pass
+        try:
+            conn.execute("PRAGMA foreign_keys=ON;")
+        except Exception:
+            pass
+        conn.commit()
+        return conn
+
+    def _sync_remote_sync(self) -> None:
+        if not self.uses_remote or self._conn is None:
+            return
+        sync = getattr(self._conn, "sync", None)
+        if callable(sync):
+            sync()
 
     async def connect(self) -> None:
         async with self._lock:
@@ -31,15 +112,11 @@ class Database:
 
             def _connect_and_migrate():
                 if self._conn is None:
-                    conn = sqlite3.connect(str(self.path), check_same_thread=False)
-                    conn.row_factory = sqlite3.Row
-                    conn.execute("PRAGMA journal_mode=WAL;")
-                    conn.execute("PRAGMA foreign_keys=ON;")
-                    conn.commit()
-                    self._conn = conn
+                    self._conn = self._open_connection_sync()
 
                 assert self._conn is not None
                 self._migrate_sync()
+                self._sync_remote_sync()
 
             await asyncio.to_thread(_connect_and_migrate)
             self._ready = True
@@ -66,6 +143,12 @@ class Database:
 
             def _backup() -> int:
                 assert self._conn is not None
+                if self.uses_remote:
+                    self._sync_remote_sync()
+                    if not self.path.exists():
+                        raise RuntimeError("The local Turso replica file does not exist yet, so no backup file can be created.")
+                    shutil.copy2(self.path, target)
+                    return int(target.stat().st_size)
                 self._conn.execute("PRAGMA wal_checkpoint(FULL);")
                 with sqlite3.connect(str(target)) as dest:
                     self._conn.backup(dest)
@@ -83,6 +166,11 @@ class Database:
         source = Path(source_path)
         if not source.exists() or not source.is_file():
             raise FileNotFoundError(str(source))
+        if self.uses_remote:
+            raise RuntimeError(
+                "SQLite upload restore is only supported for local SQLite storage. "
+                "For Turso/libSQL, restore through Turso backups/import tooling so the remote primary stays consistent."
+            )
 
         async with self._lock:
             def _unlink_sidecars(base: Path) -> None:
@@ -536,11 +624,12 @@ class Database:
         self._normalize_weekly_dm_log_sync()
         self._init_ticket_sequences_sync()
         self._conn.commit()
+        self._sync_remote_sync()
 
     def _ensure_column_sync(self, table: str, column: str, coltype: str) -> None:
         assert self._conn is not None
         info = list(self._conn.execute(f"PRAGMA table_info({table})"))
-        cols = {r["name"] for r in info}
+        cols = {_row_get(r, "name", index=1) for r in info}
         if column in cols:
             return
         try:
@@ -551,7 +640,7 @@ class Database:
     def _normalize_weekly_dm_log_sync(self) -> None:
         assert self._conn is not None
         info = list(self._conn.execute("PRAGMA table_info(weekly_dm_log)"))
-        cols = {r["name"] for r in info}
+        cols = {_row_get(r, "name", index=1) for r in info}
         if "event" in cols and "action" not in cols:
             return
 
@@ -585,9 +674,10 @@ class Database:
         assert self._conn is not None
         cur = self._conn.execute("SELECT MAX(ticket_id) AS m FROM tickets")
         row = cur.fetchone()
-        max_id = int(row["m"]) if row and row["m"] is not None else 0
+        max_value = _row_get(row, "m", index=0)
+        max_id = int(max_value) if max_value is not None else 0
         for gid_row in self._conn.execute("SELECT DISTINCT guild_id FROM tickets"):
-            gid = int(gid_row["guild_id"])
+            gid = int(_row_get(gid_row, "guild_id", index=0, default=0) or 0)
             cur2 = self._conn.execute("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (gid,))
             if cur2.fetchone() is None:
                 self._conn.execute(
@@ -978,10 +1068,11 @@ class Database:
             def _init_seq():
                 cur = self._conn.execute("SELECT MAX(ticket_id) AS m FROM tickets")
                 row = cur.fetchone()
-                max_id = int(row["m"]) if row and row["m"] is not None else 0
+                max_value = _row_get(row, "m", index=0)
+                max_id = int(max_value) if max_value is not None else 0
                 # if sequence row missing, create it
                 for gid_row in self._conn.execute("SELECT DISTINCT guild_id FROM tickets"):
-                    gid = int(gid_row["guild_id"])
+                    gid = int(_row_get(gid_row, "guild_id", index=0, default=0) or 0)
                     cur2 = self._conn.execute("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (gid,))
                     if cur2.fetchone() is None:
                         self._conn.execute(
@@ -989,6 +1080,7 @@ class Database:
                             (gid, max_id + 1 if max_id > 0 else 1)
                         )
                 self._conn.commit()
+                self._sync_remote_sync()
 
             await asyncio.to_thread(_init_seq)
 
@@ -999,7 +1091,7 @@ class Database:
             def _run():
                 assert self._conn is not None
                 info = list(self._conn.execute("PRAGMA table_info(weekly_dm_log)"))
-                cols = {r["name"] for r in info}
+                cols = {_row_get(r, "name", index=1) for r in info}
                 if "event" in cols and "action" not in cols:
                     return
 
@@ -1029,6 +1121,7 @@ class Database:
                 self._conn.execute("DROP TABLE weekly_dm_log")
                 self._conn.execute("ALTER TABLE weekly_dm_log_new RENAME TO weekly_dm_log")
                 self._conn.commit()
+                self._sync_remote_sync()
 
             await asyncio.to_thread(_run)
 
@@ -1040,12 +1133,13 @@ class Database:
             def _run():
                 assert self._conn is not None
                 info = list(self._conn.execute(f"PRAGMA table_info({table})"))
-                cols = {r["name"] for r in info}
+                cols = {_row_get(r, "name", index=1) for r in info}
                 if column in cols:
                     return
                 try:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
                     self._conn.commit()
+                    self._sync_remote_sync()
                 except Exception:
                     # ignore if cannot alter
                     pass
@@ -1065,10 +1159,12 @@ class Database:
                     next_id = 1
                     self._conn.execute("INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)", (guild_id, 2))
                     self._conn.commit()
+                    self._sync_remote_sync()
                     return next_id
-                next_id = int(row["next_ticket_id"])
+                next_id = int(_row_get(row, "next_ticket_id", index=0, default=1) or 1)
                 self._conn.execute("UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?", (next_id + 1, guild_id))
                 self._conn.commit()
+                self._sync_remote_sync()
                 return next_id
 
             return await asyncio.to_thread(_run)
@@ -1082,6 +1178,7 @@ class Database:
                 assert self._conn is not None
                 self._conn.execute(sql, params)
                 self._conn.commit()
+                self._sync_remote_sync()
 
             await asyncio.to_thread(_run)
 
@@ -1095,10 +1192,11 @@ class Database:
                 assert self._conn is not None
                 self._conn.executemany(sql, items)
                 self._conn.commit()
+                self._sync_remote_sync()
 
             await asyncio.to_thread(_run)
 
-    async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[sqlite3.Row]:
+    async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[Any]:
         await self.connect()
         async with self._lock:
             assert self._conn is not None
@@ -1106,11 +1204,11 @@ class Database:
             def _run():
                 assert self._conn is not None
                 cur = self._conn.execute(sql, params)
-                return cur.fetchone()
+                return _normalize_row(cur, cur.fetchone())
 
             return await asyncio.to_thread(_run)
 
-    async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[sqlite3.Row]:
+    async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[Any]:
         await self.connect()
         async with self._lock:
             assert self._conn is not None
@@ -1118,6 +1216,6 @@ class Database:
             def _run():
                 assert self._conn is not None
                 cur = self._conn.execute(sql, params)
-                return list(cur.fetchall())
+                return _normalize_rows(cur, cur.fetchall())
 
             return await asyncio.to_thread(_run)

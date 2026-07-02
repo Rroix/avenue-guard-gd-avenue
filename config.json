@@ -483,7 +483,9 @@
     }
   },
   "database": {
-    "_comment": "Persistent SQLite storage. Leave path blank to auto-detect /var/data/avenue-guard/bot.db when a Render Persistent Disk is mounted, or set AVENUE_GUARD_DB_PATH.",
+    "_comment": "Persistent storage. Turso/libSQL is preferred when turso_url plus TURSO_AUTH_TOKEN are configured. Otherwise leave path blank to auto-detect /var/data/avenue-guard/bot.db when a Render Persistent Disk is mounted, or set AVENUE_GUARD_DB_PATH.",
+    "turso_url": "libsql://avenue-guard-johnreree.aws-us-east-2.turso.io",
+    "turso_replica_path": "data/turso-replica.db",
     "path": "",
     "backups": {
       "_comment": "Posts zipped database backups to Discord so bot memory survives even if host storage is misconfigured.",

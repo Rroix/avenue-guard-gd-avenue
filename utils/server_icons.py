@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 VALID_SERVER_ICON_MODES = {"random", "linear", "disabled"}
 
@@ -17,6 +17,24 @@ def is_valid_icon_url(value: Any) -> bool:
         return False
     parsed = urlparse(url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def is_expiring_discord_attachment_url(value: Any) -> bool:
+    url = str(value or "").strip()
+    parsed = urlparse(url)
+    host = parsed.netloc.casefold()
+    if not (host.endswith("discordapp.net") or host.endswith("discordapp.com")):
+        return False
+    if "/attachments/" not in parsed.path:
+        return False
+    query = parse_qs(parsed.query)
+    return bool({"ex", "is", "hm"} & set(query))
+
+
+def server_icon_url_warning(value: Any) -> str:
+    if is_expiring_discord_attachment_url(value):
+        return "Discord attachment URLs expire and eventually return 404. Use a permanent image URL instead."
+    return ""
 
 
 def clean_icon_urls(value: Any) -> list[str]:

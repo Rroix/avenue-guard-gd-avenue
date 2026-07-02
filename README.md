@@ -2,7 +2,7 @@
 
 Avenue Guard is the Discord utility bot for GD Avenue. It handles moderation guardrails, live level request waves, weekly activity rewards, staff tickets, DM help flows, forum reminders, sticky notices, configurable auto-responses, and a few community fun commands.
 
-The bot is intentionally built around one configured server. Most behavior is controlled from `config.json`, with message-trigger responses in `responses.json` and persistent state in the configured SQLite database path. On Render, the bot auto-uses `/var/data/avenue-guard/bot.db` when a Persistent Disk is mounted there.
+The bot is intentionally built around one configured server. Most behavior is controlled from `config.json`, with message-trigger responses in `responses.json` and persistent state in SQLite-compatible storage. Turso/libSQL can be used for free remote persistence, while local SQLite remains available for development and fallback deployments.
 
 ## Core Features
 
@@ -224,7 +224,11 @@ Use `off`, `disable`, `none`, or `clear` as the word to disable enforcement for 
 
 Database storage lives under `database` in `config.json`.
 
-- `path`: optional SQLite database path. Leave blank to auto-detect `/var/data/avenue-guard/bot.db` when a Render Persistent Disk is mounted, then fall back to `data/bot.db` if it is not writable.
+- `turso_url`: optional Turso/libSQL database URL. When this is set and `TURSO_AUTH_TOKEN` exists in the environment, the bot uses a local embedded replica synced to Turso.
+- `turso_replica_path`: optional local replica file used by Turso/libSQL. This can stay in `data/` because Turso is the durable source.
+- `TURSO_AUTH_TOKEN`: required environment variable for Turso/libSQL. Keep this secret in Render's environment settings, never in `config.json`.
+- `TURSO_DATABASE_URL`: optional environment variable that overrides `database.turso_url`.
+- `path`: optional local SQLite database path used when Turso is not configured. Leave blank to auto-detect `/var/data/avenue-guard/bot.db` when a Render Persistent Disk is mounted, then fall back to `data/bot.db` if it is not writable.
 - `AVENUE_GUARD_DB_PATH`: optional environment variable that overrides `database.path`.
 - `backups.enabled`: enables scheduled zipped SQLite backups.
 - `backups.channel_id`: where scheduled and manual `/bot backup` files are posted.
@@ -318,7 +322,7 @@ Useful bot permissions:
 
 ## Persistence Notes
 
-SQLite must live outside Render's clearable cache/project filesystem for true persistence. Mount a Render Persistent Disk at `/var/data`, or set `AVENUE_GUARD_DB_PATH` to another durable path. If no durable path is writable, the bot falls back to `data/bot.db` so it can start, but `/bot storage` will warn that data may be lost after cache clears. Automatic zipped backups also post to Discord as a second safety net.
+For free Render deployments, use Turso/libSQL by setting `database.turso_url` or `TURSO_DATABASE_URL`, plus the secret `TURSO_AUTH_TOKEN`. The bot keeps a local embedded replica for speed, but the durable source of truth is the Turso database, so Render cache clears do not wipe bot history. If Turso is not configured, SQLite must live outside Render's clearable cache/project filesystem for true persistence. Automatic zipped backups also post to Discord as a second safety net.
 
 ## Local Testing
 

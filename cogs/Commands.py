@@ -13,6 +13,7 @@ import string
 import zipfile
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import discord
 from discord.ext import commands
@@ -24,6 +25,7 @@ from utils.server_icons import (
     is_valid_icon_url,
     normalize_server_icon_mode,
     parse_server_icon_index,
+    server_icon_url_warning,
     VALID_SERVER_ICON_MODES,
 )
 from utils.timeutils import now_madrid, week_start_sunday
@@ -278,6 +280,12 @@ class CommandsCog(commands.Cog):
     def _database_storage_note(self) -> tuple[str, bool]:
         path = self._database_path()
         text = str(path)
+        remote_url = str(getattr(getattr(self.bot, "db", None), "remote_url", "") or getattr(self.bot, "db_remote_url", "") or "").strip()
+        if remote_url:
+            parsed = urlparse(remote_url)
+            host = parsed.netloc or remote_url.replace("libsql://", "").split("/", 1)[0]
+            return f"Turso/libSQL remote persistence is active on `{host}` with local replica `{text}`.", True
+
         env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
         source = str(getattr(self.bot, "db_path_source", "") or "")
         if not source:
@@ -1321,6 +1329,12 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
         if str(confirm or "").strip() != "RESTORE":
             return await ctx.respond("Type `RESTORE` in the confirm option to replace the live database.", ephemeral=True)
+        if bool(getattr(self.bot.db, "uses_remote", False)):
+            return await ctx.respond(
+                "Turso/libSQL remote storage is active, so uploaded SQLite restore is disabled to protect the remote primary. "
+                "Use Turso backup/import tools for a full remote restore.",
+                ephemeral=True,
+            )
 
         await self._defer(ctx, ephemeral=True)
         uploaded_path: Path | None = None
@@ -1460,7 +1474,7 @@ class CommandsCog(commands.Cog):
         if not storage_ok:
             embed.add_field(
                 name="Recommended Fix",
-                value="Set `AVENUE_GUARD_DB_PATH` or `database.path` to a Render Persistent Disk path such as `/var/data/avenue-guard/bot.db`.",
+                value="Configure `TURSO_AUTH_TOKEN` with `database.turso_url`, or set `AVENUE_GUARD_DB_PATH`/`database.path` to durable storage.",
                 inline=False,
             )
         await self._send(ctx, embed=embed, ephemeral=True)
@@ -1531,11 +1545,16 @@ class CommandsCog(commands.Cog):
             lines = []
             for idx, url in enumerate(urls, start=1):
                 marker = "current" if idx - 1 == current_index else ""
-                suffix = f" - {marker}" if marker else ""
+                warning = server_icon_url_warning(url)
+                warning_suffix = " - expires" if warning else ""
+                suffix = f" - {marker}{warning_suffix}" if marker else warning_suffix
                 lines.append(f"`{idx}` {url[:120]}{suffix}")
             embed.add_field(name=f"Configured icons ({len(urls)})", value="\n".join(lines)[:1024], inline=False)
         else:
             embed.add_field(name="Configured icons", value="No URLs configured.", inline=False)
+        warnings = [f"`{idx}` {server_icon_url_warning(url)}" for idx, url in enumerate(urls, start=1) if server_icon_url_warning(url)]
+        if warnings:
+            embed.add_field(name="Icon URL Warnings", value="\n".join(warnings)[:1024], inline=False)
         if last_error:
             when = f" <t:{last_error_ts}:R>" if last_error_ts else ""
             embed.add_field(name="Last error", value=f"{last_error[:900]}{when}", inline=False)
@@ -1552,6 +1571,10 @@ class CommandsCog(commands.Cog):
 
     async def _save_server_icon_config(self, ctx: discord.ApplicationContext, action: str, detail: str) -> bool:
         try:
+            if str(action or "").startswith("server_icon_"):
+                cfg = ensure_server_icon_config(self.bot.config)
+                cfg["last_error"] = ""
+                cfg["last_error_ts"] = 0
             self.bot.config.save()
             self._notify_background_config_reload()
         except Exception as e:
@@ -1598,6 +1621,9 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
         if not is_valid_icon_url(url):
             return await ctx.respond("That does not look like a valid HTTP image URL.", ephemeral=True)
+        warning = server_icon_url_warning(url)
+        if warning:
+            return await ctx.respond(f"I can't use that URL for rotation: {warning}", ephemeral=True)
 
         cfg = ensure_server_icon_config(self.bot.config)
         urls = list(cfg.get("urls", []) or [])
@@ -1624,6 +1650,9 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
         if not is_valid_icon_url(url):
             return await ctx.respond("That does not look like a valid HTTP image URL.", ephemeral=True)
+        warning = server_icon_url_warning(url)
+        if warning:
+            return await ctx.respond(f"I can't use that URL for rotation: {warning}", ephemeral=True)
 
         cfg = ensure_server_icon_config(self.bot.config)
         urls = list(cfg.get("urls", []) or [])
@@ -1779,7 +1808,7 @@ class CommandsCog(commands.Cog):
         storage_note, storage_ok = self._database_storage_note()
         if not storage_ok:
             issues.append("database storage: path may not be persistent")
-            repairs.append("Set `AVENUE_GUARD_DB_PATH` or `database.path` to a Render Persistent Disk path")
+            repairs.append("Configure Turso/libSQL with `TURSO_AUTH_TOKEN`, or set `AVENUE_GUARD_DB_PATH`/`database.path` to durable storage")
 
         category_id = cfg.get_int("tickets", "ticket_category_id")
         category = guild.get_channel(category_id) if category_id else None
@@ -2415,6 +2444,10 @@ class CommandsCog(commands.Cog):
             issues.append("background.server_icon_rotation.urls: at least one URL is needed unless mode is disabled")
         else:
             ok_count += len(server_icon_urls)
+        for idx, url in enumerate(server_icon_urls, start=1):
+            warning = server_icon_url_warning(url)
+            if warning:
+                issues.append(f"background.server_icon_rotation.urls[{idx}]: {warning}")
         if int(server_icon_cfg.get("interval_seconds", 0) or 0) < 300:
             issues.append("background.server_icon_rotation.interval_seconds: must be at least 300")
         else:

@@ -14,7 +14,12 @@ from discord.ext import commands, tasks
 
 from utils.checks import ensure_allowed_guild_id
 from utils.errors import log_error
-from utils.server_icons import ensure_server_icon_config, normalize_server_icon_mode, parse_server_icon_index
+from utils.server_icons import (
+    ensure_server_icon_config,
+    normalize_server_icon_mode,
+    parse_server_icon_index,
+    server_icon_url_warning,
+)
 from utils.timeutils import TZ, now_madrid, week_start_sunday
 
 def _day_key(dt: Optional[datetime] = None) -> str:
@@ -264,16 +269,27 @@ class BackgroundCog(commands.Cog):
         return False
 
     async def _download_server_icon(self, url: str) -> bytes:
+        warning = server_icon_url_warning(url)
+        if warning:
+            raise RuntimeError(warning)
         timeout = aiohttp.ClientTimeout(total=20)
+        max_bytes = 8 * 1024 * 1024
+        headers = {"User-Agent": "AvenueGuard/1.0"}
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
+            async with session.get(url, headers=headers) as resp:
                 if resp.status >= 400:
                     raise RuntimeError(f"image URL returned HTTP {resp.status}")
-                data = await resp.read()
+                content_type = str(resp.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().casefold()
+                if content_type and not (content_type.startswith("image/") or content_type == "application/octet-stream"):
+                    raise RuntimeError(f"image URL returned `{content_type}` instead of an image")
+                data = await resp.content.read(max_bytes + 1)
         if not data:
             raise RuntimeError("image URL returned an empty file")
-        if len(data) > 8 * 1024 * 1024:
+        if len(data) > max_bytes:
             raise RuntimeError("image is larger than 8 MB")
+        sample = data[:4096].casefold()
+        if b"<html" in sample or b"cloudflare" in sample:
+            raise RuntimeError("image URL returned an HTML/Cloudflare page instead of an image")
         if not self._looks_like_server_icon_image(data):
             raise RuntimeError("image URL did not return a supported image file")
         return data
@@ -356,7 +372,6 @@ class BackgroundCog(commands.Cog):
                 break
             except Exception as e:
                 failures.append(f"#{candidate_index + 1}: {type(e).__name__}: {e}")
-                await log_error(self.bot, f"Server icon rotation failed for url={url}: {repr(e)}")
 
         if changed_index < 0:
             detail = "; ".join(failures[:3]) or "all configured images failed"
@@ -868,6 +883,11 @@ class BackgroundCog(commands.Cog):
         last_changed = int(cfg.get("last_changed_ts", 0) or 0)
         if last_changed and now_ts - last_changed < interval:
             return
+        last_error_ts = int(cfg.get("last_error_ts", 0) or 0)
+        if last_error_ts:
+            failure_backoff = max(900, min(interval, 3600))
+            if now_ts - last_error_ts < failure_backoff:
+                return
 
         ok, message = await self.rotate_server_icon_once(guild)
         if not ok:
