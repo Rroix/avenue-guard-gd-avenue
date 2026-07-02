@@ -88,10 +88,6 @@ class Database:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL;")
         try:
-            conn.row_factory = sqlite3.Row
-        except Exception:
-            pass
-        try:
             conn.execute("PRAGMA foreign_keys=ON;")
         except Exception:
             pass
