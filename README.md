@@ -305,7 +305,7 @@ export DISCORD_LOGIN_RETRY_SECONDS="900"
 
 This controls how long the bot waits before retrying when Discord/Cloudflare temporarily rate-limits startup login. The default is 15 minutes.
 
-On Render Web Services, Avenue Guard binds the health-check port before Discord login starts. That keeps Render from killing the deploy while the bot is waiting out a temporary Discord login rate limit.
+On Render Web Services, Avenue Guard binds the health-check port before Discord login starts. That keeps Render from killing the deploy while the bot is waiting out a temporary Discord login rate limit. Open the Render service URL, or `/status`, to see whether the bot is still attempting Discord login, waiting on a rate limit, or fully online.
 
 3. Start Avenue Guard:
 

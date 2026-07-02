@@ -9,7 +9,7 @@ import discord
 
 from utils.config import Config
 from utils.db import Database
-from utils.keepalive import start_keepalive, start_keepalive_thread
+from utils.keepalive import set_keepalive_status, start_keepalive, start_keepalive_thread
 from utils.errors import setup_global_error_handlers, log_error
 from utils.views import (
     TrackingDeclineConfirmView,
@@ -172,6 +172,7 @@ def create_bot() -> discord.Bot:
         try:
             await bot.db.connect()
         except Exception as e:
+            set_keepalive_status("startup_error", f"Database setup failed: {type(e).__name__}")
             await log_error(bot, f"Database setup failed on startup: {repr(e)}")
             await bot.close()
             return
@@ -187,6 +188,7 @@ def create_bot() -> discord.Bot:
                 except Exception as e:
                     message = f"Bot is not in allowed guild_id={allowed}, or cannot fetch it: {type(e).__name__}: {e}. Shutting down."
                     startup_log(message)
+                    set_keepalive_status("startup_error", "Allowed guild check failed")
                     await log_error(bot, message)
                     await bot.close()
                     return
@@ -220,6 +222,7 @@ def create_bot() -> discord.Bot:
         # Register persistent views (for interactions to survive restarts)
         await bot.register_persistent_views()
 
+        set_keepalive_status("online", f"Logged in as {bot.user}")
         startup_log(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
     async def register_persistent_views():
@@ -250,23 +253,35 @@ def create_bot() -> discord.Bot:
     return bot
 
 def run_bot_with_startup_backoff(token: str) -> None:
+    set_keepalive_status("starting", "Starting health server")
     start_keepalive_thread()
     while True:
+        set_keepalive_status("discord_login", "Attempting Discord login")
         bot = create_bot()
         try:
             bot.run(token)
+            set_keepalive_status("stopped", "Discord client stopped")
             return
         except discord.LoginFailure:
+            set_keepalive_status("fatal_login_error", "Discord token login failed")
             startup_log("Discord login failed. Check DISCORD_TOKEN; this is not retryable.")
             raise
         except Exception as exc:
             if _is_discord_startup_rate_limit(exc):
                 seconds = _discord_login_retry_seconds()
+                next_retry_ts = int(time.time()) + seconds
+                set_keepalive_status(
+                    "waiting_rate_limit",
+                    "Discord/Cloudflare rate limited startup login",
+                    retry_after_seconds=seconds,
+                    next_retry_ts=next_retry_ts,
+                )
                 startup_log(
                     f"{_compact_startup_exception(exc)} Waiting {seconds} seconds before retrying so Render does not amplify the rate limit."
                 )
                 time.sleep(seconds)
                 continue
+            set_keepalive_status("crashed", f"{type(exc).__name__}: {exc}")
             startup_log(f"Bot crashed during run:\n{traceback.format_exc()}")
             raise
 
