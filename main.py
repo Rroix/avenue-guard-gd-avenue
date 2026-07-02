@@ -9,7 +9,7 @@ import discord
 
 from utils.config import Config
 from utils.db import Database
-from utils.keepalive import start_keepalive
+from utils.keepalive import start_keepalive, start_keepalive_thread
 from utils.errors import setup_global_error_handlers, log_error
 from utils.views import (
     TrackingDeclineConfirmView,
@@ -250,6 +250,7 @@ def create_bot() -> discord.Bot:
     return bot
 
 def run_bot_with_startup_backoff(token: str) -> None:
+    start_keepalive_thread()
     while True:
         bot = create_bot()
         try:
