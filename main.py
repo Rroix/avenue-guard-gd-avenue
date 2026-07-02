@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import time
 import traceback
 from pathlib import Path
 import discord
@@ -23,10 +25,43 @@ from utils.checks import ensure_allowed_guild_id
 DEFAULT_DB_PATH = "data/bot.db"
 TURSO_REPLICA_PATH = "data/turso-replica.db"
 RENDER_DISK_DB_PATH = "/var/data/avenue-guard/bot.db"
+DEFAULT_DISCORD_LOGIN_RETRY_SECONDS = 15 * 60
 
 
 def startup_log(message: str) -> None:
     print(f"[Avenue Guard startup] {message}", flush=True)
+
+
+def _discord_login_retry_seconds() -> int:
+    raw = os.getenv("DISCORD_LOGIN_RETRY_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_DISCORD_LOGIN_RETRY_SECONDS
+    try:
+        return max(60, int(raw))
+    except Exception:
+        return DEFAULT_DISCORD_LOGIN_RETRY_SECONDS
+
+
+def _compact_startup_exception(exc: Exception) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    lower = text.casefold()
+    if "<html" in lower or "cloudflare" in lower or "error 1015" in lower:
+        ray_match = re.search(r"Cloudflare Ray ID:\s*<[^>]+>\s*([^<\s]+)", text, flags=re.I)
+        if ray_match is None:
+            ray_match = re.search(r"ray id[:\s]+([A-Za-z0-9_-]+)", text, flags=re.I)
+        ray = f" Cloudflare Ray ID: {ray_match.group(1)}." if ray_match else ""
+        return f"{type(exc).__name__}: Discord/Cloudflare rate limited startup login; full HTML omitted.{ray}"
+    if len(text) > 2400:
+        return text[:2400] + "\n...truncated..."
+    return text
+
+
+def _is_discord_startup_rate_limit(exc: Exception) -> bool:
+    if not isinstance(exc, discord.HTTPException):
+        return False
+    text = str(exc).casefold()
+    status = int(getattr(exc, "status", 0) or 0)
+    return status == 429 or "error 1015" in text or "you are being rate limited" in text or "too many requests" in text
 
 
 def _database_path_usable(path: str) -> tuple[bool, str]:
@@ -214,14 +249,30 @@ def create_bot() -> discord.Bot:
     bot.loop.create_task(_load_cogs_logged())
     return bot
 
+def run_bot_with_startup_backoff(token: str) -> None:
+    while True:
+        bot = create_bot()
+        try:
+            bot.run(token)
+            return
+        except discord.LoginFailure:
+            startup_log("Discord login failed. Check DISCORD_TOKEN; this is not retryable.")
+            raise
+        except Exception as exc:
+            if _is_discord_startup_rate_limit(exc):
+                seconds = _discord_login_retry_seconds()
+                startup_log(
+                    f"{_compact_startup_exception(exc)} Waiting {seconds} seconds before retrying so Render does not amplify the rate limit."
+                )
+                time.sleep(seconds)
+                continue
+            startup_log(f"Bot crashed during run:\n{traceback.format_exc()}")
+            raise
+
+
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         startup_log("DISCORD_TOKEN environment variable is missing.")
         raise SystemExit("DISCORD_TOKEN environment variable is missing.")
-    bot = create_bot()
-    try:
-        bot.run(token)
-    except Exception:
-        startup_log(f"Bot crashed during run:\n{traceback.format_exc()}")
-        raise
+    run_bot_with_startup_backoff(token)

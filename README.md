@@ -297,6 +297,14 @@ pip install -r requirements.txt
 export DISCORD_TOKEN="your-token"
 ```
 
+Optional startup retry setting:
+
+```bash
+export DISCORD_LOGIN_RETRY_SECONDS="900"
+```
+
+This controls how long the bot waits before retrying when Discord/Cloudflare temporarily rate-limits startup login. The default is 15 minutes.
+
 3. Start Avenue Guard:
 
 ```bash
