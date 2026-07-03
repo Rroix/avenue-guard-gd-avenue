@@ -157,7 +157,7 @@ def create_bot() -> discord.Bot:
 
     setup_global_error_handlers(bot)
 
-    async def _load_cogs():
+    def _load_cogs():
         bot.load_extension("cogs.Mod")
         bot.load_extension("cogs.Tracking")
         bot.load_extension("cogs.Help")
@@ -237,19 +237,13 @@ def create_bot() -> discord.Bot:
 
     bot.register_persistent_views = register_persistent_views
 
-    async def _load_cogs_logged():
-        try:
-            await _load_cogs()
-        except Exception as e:
-            details = f"Cog load failed: {repr(e)}\n{traceback.format_exc()}"
-            startup_log(details)
-            try:
-                await log_error(bot, details)
-            except Exception:
-                pass
-            await bot.close()
+    try:
+        _load_cogs()
+    except Exception as e:
+        set_keepalive_status("startup_error", f"Cog load failed: {type(e).__name__}")
+        startup_log(f"Cog load failed: {repr(e)}\n{traceback.format_exc()}")
+        raise
 
-    bot.loop.create_task(_load_cogs_logged())
     return bot
 
 def run_bot_with_startup_backoff(token: str) -> None:
