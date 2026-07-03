@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import shutil
 import sqlite3
@@ -60,6 +62,45 @@ def _normalize_rows(cursor: Any, rows: Iterable[Any]) -> list[Any]:
     return [_normalize_row(cursor, row) for row in rows]
 
 
+def _jwt_payload(token: str) -> dict[str, Any]:
+    parts = str(token or "").strip().split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        raw = base64.urlsafe_b64decode((payload + padding).encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _token_scope_names(payload: dict[str, Any]) -> set[str]:
+    scopes = payload.get("scopes")
+    if isinstance(scopes, dict):
+        scopes = scopes.get("scopes")
+    if isinstance(scopes, str):
+        return {scopes}
+    if isinstance(scopes, list):
+        return {str(scope) for scope in scopes}
+    return set()
+
+
+def _looks_like_turso_platform_token(token: str) -> bool:
+    payload = _jwt_payload(token)
+    scopes = _token_scope_names(payload)
+    platform_scopes = {
+        "db:create",
+        "db:delete",
+        "db:configure",
+        "db:mint-token",
+        "group:configure",
+        "group:mint-token",
+    }
+    return bool(scopes & platform_scopes)
+
+
 class Database:
     """Small SQLite wrapper safe to use from an async bot.
 
@@ -82,6 +123,11 @@ class Database:
         if self.uses_remote:
             if libsql is None:
                 raise RuntimeError("TURSO_DATABASE_URL is configured, but the libsql Python package is not installed.")
+            if _looks_like_turso_platform_token(self.auth_token):
+                raise RuntimeError(
+                    "TURSO_AUTH_TOKEN looks like a Turso platform/API token, not a database auth token. "
+                    "Create a database token with `turso db tokens create <database-name>` and use that value instead."
+                )
             conn = libsql.connect(str(self.path), sync_url=self.remote_url, auth_token=self.auth_token)
         else:
             conn = sqlite3.connect(str(self.path), check_same_thread=False)

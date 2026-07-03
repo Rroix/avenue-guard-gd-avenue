@@ -226,7 +226,7 @@ Database storage lives under `database` in `config.json`.
 
 - `turso_url`: optional Turso/libSQL database URL. When this is set and `TURSO_AUTH_TOKEN` exists in the environment, the bot uses a local embedded replica synced to Turso.
 - `turso_replica_path`: optional local replica file used by Turso/libSQL. This can stay in `data/` because Turso is the durable source.
-- `TURSO_AUTH_TOKEN`: required environment variable for Turso/libSQL. Keep this secret in Render's environment settings, never in `config.json`.
+- `TURSO_AUTH_TOKEN`: required database auth token for Turso/libSQL. Generate it with `turso db tokens create <database-name>`; do not use a Turso platform/API token. Keep this secret in Render's environment settings, never in `config.json`.
 - `TURSO_DATABASE_URL`: optional environment variable that overrides `database.turso_url`.
 - `path`: optional local SQLite database path used when Turso is not configured. Leave blank to auto-detect `/var/data/avenue-guard/bot.db` when a Render Persistent Disk is mounted, then fall back to `data/bot.db` if it is not writable.
 - `AVENUE_GUARD_DB_PATH`: optional environment variable that overrides `database.path`.
