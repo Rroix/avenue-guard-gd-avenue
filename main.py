@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -9,7 +10,7 @@ import discord
 
 from utils.config import Config
 from utils.db import Database
-from utils.keepalive import set_keepalive_status, start_keepalive, start_keepalive_thread
+from utils.keepalive import get_keepalive_status, set_keepalive_status, start_keepalive, start_keepalive_thread
 from utils.errors import setup_global_error_handlers, log_error
 from utils.views import (
     TrackingDeclineConfirmView,
@@ -26,6 +27,7 @@ DEFAULT_DB_PATH = "data/bot.db"
 TURSO_REPLICA_PATH = "data/turso-replica.db"
 RENDER_DISK_DB_PATH = "/var/data/avenue-guard/bot.db"
 DEFAULT_DISCORD_LOGIN_RETRY_SECONDS = 15 * 60
+DEFAULT_STARTUP_ERROR_RETRY_SECONDS = 5 * 60
 
 
 def startup_log(message: str) -> None:
@@ -40,6 +42,25 @@ def _discord_login_retry_seconds() -> int:
         return max(60, int(raw))
     except Exception:
         return DEFAULT_DISCORD_LOGIN_RETRY_SECONDS
+
+
+def _startup_error_retry_seconds() -> int:
+    raw = os.getenv("STARTUP_ERROR_RETRY_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_STARTUP_ERROR_RETRY_SECONDS
+    try:
+        return max(60, int(raw))
+    except Exception:
+        return DEFAULT_STARTUP_ERROR_RETRY_SECONDS
+
+
+def _prepare_fresh_event_loop() -> None:
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed event loop")
+    except Exception:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def _compact_startup_exception(exc: Exception) -> str:
@@ -250,6 +271,7 @@ def run_bot_with_startup_backoff(token: str) -> None:
     set_keepalive_status("starting", "Starting health server")
     start_keepalive_thread()
     while True:
+        _prepare_fresh_event_loop()
         set_keepalive_status("discord_login", "Attempting Discord login")
         bot = create_bot()
         try:
@@ -275,6 +297,27 @@ def run_bot_with_startup_backoff(token: str) -> None:
                 )
                 time.sleep(seconds)
                 continue
+            if isinstance(exc, RuntimeError) and "event loop is closed" in str(exc).casefold():
+                set_keepalive_status("discord_login", "Resetting closed event loop before retry")
+                startup_log("Discord client left a closed event loop after a failed startup; resetting loop and retrying.")
+                time.sleep(2)
+                continue
+            if isinstance(exc, RuntimeError) and "session is closed" in str(exc).casefold():
+                status = get_keepalive_status()
+                if str(status.get("state")) == "startup_error":
+                    seconds = _startup_error_retry_seconds()
+                    next_retry_ts = int(time.time()) + seconds
+                    set_keepalive_status(
+                        "startup_error",
+                        str(status.get("detail") or "Startup failed before Discord became ready"),
+                        retry_after_seconds=seconds,
+                        next_retry_ts=next_retry_ts,
+                    )
+                    startup_log(
+                        f"Discord session closed because startup failed: {status.get('detail')}. Waiting {seconds} seconds before retrying."
+                    )
+                    time.sleep(seconds)
+                    continue
             set_keepalive_status("crashed", f"{type(exc).__name__}: {exc}")
             startup_log(f"Bot crashed during run:\n{traceback.format_exc()}")
             raise
