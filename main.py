@@ -55,12 +55,7 @@ def _startup_error_retry_seconds() -> int:
 
 
 def _prepare_fresh_event_loop() -> None:
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("closed event loop")
-    except Exception:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def _compact_startup_exception(exc: Exception) -> str:
@@ -83,6 +78,12 @@ def _is_discord_startup_rate_limit(exc: Exception) -> bool:
     text = str(exc).casefold()
     status = int(getattr(exc, "status", 0) or 0)
     return status == 429 or "error 1015" in text or "you are being rate limited" in text or "too many requests" in text
+
+
+def _run_preflight_database_check(bot: discord.Bot) -> None:
+    """Connect and migrate storage before Discord login advertises the bot online."""
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(bot.db.connect())
 
 
 def _database_path_usable(path: str) -> tuple[bool, str]:
@@ -274,6 +275,23 @@ def run_bot_with_startup_backoff(token: str) -> None:
         _prepare_fresh_event_loop()
         set_keepalive_status("discord_login", "Attempting Discord login")
         bot = create_bot()
+        try:
+            set_keepalive_status("database_check", "Checking database before Discord login")
+            _run_preflight_database_check(bot)
+        except Exception as exc:
+            seconds = _startup_error_retry_seconds()
+            next_retry_ts = int(time.time()) + seconds
+            detail = f"Database setup failed before Discord login: {type(exc).__name__}"
+            set_keepalive_status(
+                "startup_error",
+                detail,
+                retry_after_seconds=seconds,
+                next_retry_ts=next_retry_ts,
+            )
+            startup_log(f"{detail}: {repr(exc)}. Waiting {seconds} seconds before retrying.")
+            time.sleep(seconds)
+            continue
+        set_keepalive_status("discord_login", "Database ready; attempting Discord login")
         try:
             bot.run(token)
             set_keepalive_status("stopped", "Discord client stopped")
