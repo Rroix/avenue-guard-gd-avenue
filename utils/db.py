@@ -62,6 +62,10 @@ def _normalize_rows(cursor: Any, rows: Iterable[Any]) -> list[Any]:
     return [_normalize_row(cursor, row) for row in rows]
 
 
+def _fetchall(cursor: Any) -> list[Any]:
+    return list(cursor.fetchall())
+
+
 def _jwt_payload(token: str) -> dict[str, Any]:
     parts = str(token or "").strip().split(".")
     if len(parts) < 2:
@@ -670,7 +674,7 @@ class Database:
 
     def _ensure_column_sync(self, table: str, column: str, coltype: str) -> None:
         assert self._conn is not None
-        info = list(self._conn.execute(f"PRAGMA table_info({table})"))
+        info = _fetchall(self._conn.execute(f"PRAGMA table_info({table})"))
         cols = {_row_get(r, "name", index=1) for r in info}
         if column in cols:
             return
@@ -681,7 +685,7 @@ class Database:
 
     def _normalize_weekly_dm_log_sync(self) -> None:
         assert self._conn is not None
-        info = list(self._conn.execute("PRAGMA table_info(weekly_dm_log)"))
+        info = _fetchall(self._conn.execute("PRAGMA table_info(weekly_dm_log)"))
         cols = {_row_get(r, "name", index=1) for r in info}
         if "event" in cols and "action" not in cols:
             return
@@ -718,7 +722,7 @@ class Database:
         row = cur.fetchone()
         max_value = _row_get(row, "m", index=0)
         max_id = int(max_value) if max_value is not None else 0
-        for gid_row in self._conn.execute("SELECT DISTINCT guild_id FROM tickets"):
+        for gid_row in _fetchall(self._conn.execute("SELECT DISTINCT guild_id FROM tickets")):
             gid = int(_row_get(gid_row, "guild_id", index=0, default=0) or 0)
             cur2 = self._conn.execute("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (gid,))
             if cur2.fetchone() is None:
@@ -1113,7 +1117,7 @@ class Database:
                 max_value = _row_get(row, "m", index=0)
                 max_id = int(max_value) if max_value is not None else 0
                 # if sequence row missing, create it
-                for gid_row in self._conn.execute("SELECT DISTINCT guild_id FROM tickets"):
+                for gid_row in _fetchall(self._conn.execute("SELECT DISTINCT guild_id FROM tickets")):
                     gid = int(_row_get(gid_row, "guild_id", index=0, default=0) or 0)
                     cur2 = self._conn.execute("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (gid,))
                     if cur2.fetchone() is None:
@@ -1132,7 +1136,7 @@ class Database:
 
             def _run():
                 assert self._conn is not None
-                info = list(self._conn.execute("PRAGMA table_info(weekly_dm_log)"))
+                info = _fetchall(self._conn.execute("PRAGMA table_info(weekly_dm_log)"))
                 cols = {_row_get(r, "name", index=1) for r in info}
                 if "event" in cols and "action" not in cols:
                     return
@@ -1174,7 +1178,7 @@ class Database:
 
             def _run():
                 assert self._conn is not None
-                info = list(self._conn.execute(f"PRAGMA table_info({table})"))
+                info = _fetchall(self._conn.execute(f"PRAGMA table_info({table})"))
                 cols = {_row_get(r, "name", index=1) for r in info}
                 if column in cols:
                     return
