@@ -48,7 +48,7 @@ def get_keepalive_status() -> dict:
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
+    def _health_response(self) -> tuple[bytes, str]:
         status = get_keepalive_status()
         if self.path.rstrip("/") in {"/status", "/health"}:
             body = json.dumps(status, separators=(",", ":")).encode("utf-8")
@@ -60,10 +60,23 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 f"detail={status.get('detail', '')}\n"
             ).encode("utf-8")
             content_type = "text/plain; charset=utf-8"
+        return body, content_type
+
+    def _send_health_headers(self, body: bytes, content_type: str) -> None:
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
+
+    def do_GET(self) -> None:
+        body, content_type = self._health_response()
+        self._send_health_headers(body, content_type)
         self.wfile.write(body)
+
+    def do_HEAD(self) -> None:
+        body, content_type = self._health_response()
+        self._send_health_headers(body, content_type)
 
     def log_message(self, format: str, *args) -> None:
         return
@@ -92,7 +105,10 @@ async def _handle(request: web.Request) -> web.Response:
     status = get_keepalive_status()
     if request.path.rstrip("/") in {"/status", "/health"}:
         return web.json_response(status)
-    return web.Response(text=f"OK\nstate={status.get('state', 'unknown')}\ndetail={status.get('detail', '')}\n")
+    return web.Response(
+        text=f"OK\nstate={status.get('state', 'unknown')}\ndetail={status.get('detail', '')}\n",
+        headers={"Cache-Control": "no-store"},
+    )
 
 async def start_keepalive() -> None:
     if _thread_started:
@@ -101,7 +117,9 @@ async def start_keepalive() -> None:
         start_keepalive_thread()
         return
     app = web.Application()
-    app.router.add_get("/", _handle)
+    app.router.add_route("*", "/", _handle)
+    app.router.add_route("*", "/health", _handle)
+    app.router.add_route("*", "/status", _handle)
     runner = web.AppRunner(app)
     await runner.setup()
 
