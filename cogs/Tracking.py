@@ -878,7 +878,7 @@ class TrackingCog(commands.Cog):
 
         try:
             user = await self.bot.fetch_user(user_id)
-            await user.send("Thanks! Your request has been recorded.")
+            await user.send(f"Thanks! Your request has been recorded: {msg.jump_url}")
         except Exception:
             pass
 

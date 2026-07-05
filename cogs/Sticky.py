@@ -162,6 +162,10 @@ class StickyCog(commands.Cog):
         except asyncio.CancelledError:
             return
 
+        text = str(entry.get("message", "") or "")
+        if not text:
+            return
+
         # delete previous sticky
         db = self.bot.db
         row = await db.fetchone(
@@ -173,12 +177,26 @@ class StickyCog(commands.Cog):
             try:
                 msg = await channel.fetch_message(last_id)
                 await msg.delete()
-            except Exception:
-                pass
+            except Exception as e:
+                await log_error(self.bot, f"Sticky cleanup could not delete saved sticky message_id={last_id} channel_id={channel.id}: {repr(e)}")
 
-        text = str(entry.get("message", "") or "")
-        if not text:
-            return
+        # Recovery cleanup for deployments whose database state was reset or migrated.
+        # Only deletes exact matching bot-authored sticky copies.
+        try:
+            me_id = int(getattr(self.bot.user, "id", 0) or 0)
+            async for old in channel.history(limit=50):
+                if old.id == last_id:
+                    continue
+                if me_id and getattr(old.author, "id", 0) != me_id:
+                    continue
+                if (old.content or "") != text:
+                    continue
+                try:
+                    await old.delete()
+                except Exception as e:
+                    await log_error(self.bot, f"Sticky cleanup could not delete duplicate sticky message_id={old.id} channel_id={channel.id}: {repr(e)}")
+        except Exception as e:
+            await log_error(self.bot, f"Sticky cleanup history scan failed for channel_id={channel.id}: {repr(e)}")
 
         try:
             sent = await channel.send(text, allowed_mentions=no_mentions())
@@ -187,8 +205,8 @@ class StickyCog(commands.Cog):
                 "ON CONFLICT(guild_id, channel_id) DO UPDATE SET last_sticky_message_id=excluded.last_sticky_message_id",
                 (guild.id, channel.id, sent.id),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(self.bot, f"Sticky send/state update failed for channel_id={channel.id}: {repr(e)}")
 
     # ---------------------------
     # Forum first-message feature

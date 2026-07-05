@@ -58,12 +58,12 @@ def _normalize_row(cursor: Any, row: Any) -> Any:
     return row
 
 
-def _normalize_rows(cursor: Any, rows: Iterable[Any]) -> list[Any]:
-    return [_normalize_row(cursor, row) for row in rows]
+def _normalize_rows(cursor: Any, rows: Iterable[Any] | None) -> list[Any]:
+    return [_normalize_row(cursor, row) for row in (rows or [])]
 
 
 def _fetchall(cursor: Any) -> list[Any]:
-    return list(cursor.fetchall())
+    return list(cursor.fetchall() or [])
 
 
 def _jwt_payload(token: str) -> dict[str, Any]:
