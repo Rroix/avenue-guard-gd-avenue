@@ -31,7 +31,8 @@
     "_comment_gambling": "Role granted by rare gambling wins.",
     "gambling_reward_role_id": "1455041373337288846",
     "_comment_rps": "Role awarded when a user wins 5 rock-paper-scissors games in a row.",
-    "rps_streak_role_id": "1455041515398369375"
+    "rps_streak_role_id": "1455041515398369375",
+    "review_access_role_id": "1524279436327784558"
   },
   "permissions": {
     "_comment": "Permission policy toggles.",
@@ -40,6 +41,7 @@
   "channels": {
     "_comment_core": "Core channels used by features.",
     "autodelete_channel_id": "820590823573815326",
+    "review_access_channel_id": "1524293581991444510",
     "weekly_request_channel_ID": "1120741230570127371",
     "dm_fail_log_channel_id": "1445502925081284729",
     "global_error_log_channel_id": "1455041991531430136",
@@ -281,7 +283,7 @@
     "messages": {
       "closed": "Requests are closed :/",
       "no_requirements": "You don't meet the requirements, please read the requesting rules",
-      "first_time_prompt": "It seems like it is your first time requesting a level, **bad things will happen if you do not read the following carefully**.\n- If the level utilizes an external song, there must be a fitting in-game replacement and you must say it on your request.\n- Requesting any level that breaks Geometry Dash's upload guidelines such as controversial or nsfw levels will lead to request restriction or ban depending on the rule broken.\n- Submit levels that you think deserve a rate. Don't send previews or layouts (also short length levels no allowed)\n- Don't force us to revise, review or send to mods your level.\n- Don't get mad if your level hasn't been sent.\n- Send the level only 1 time.\n- Don't promote your level on any other channel or send it to private messages.\nIf you plan on breaking any of these rules, please press I Will. If you plan on following and not breaking our rules, please press I Won't.",
+      "first_time_prompt": "Before requesting, confirm that you have read the request rules and will follow them. Rule-breaking requests may lead to request restrictions.",
       "success": "Your request has been submitted!",
       "edit_success": "Your request has been updated!",
       "edit_window_expired": "Your request can no longer be edited.",

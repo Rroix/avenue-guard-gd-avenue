@@ -629,6 +629,9 @@ class TrackingCog(commands.Cog):
         excluded_channels = set(self._cfg_int_list("channels", "excluded_tracking_channel_ids")) | set(
             self._cfg_int_list("channels", "bot_commands_channel_ids")
         )
+        review_access_channel_id = self._cfg_int("channels", "review_access_channel_id", 0)
+        if review_access_channel_id:
+            excluded_channels.add(review_access_channel_id)
         if message.channel.id in excluded_channels:
             return
 

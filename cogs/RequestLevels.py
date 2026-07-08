@@ -162,21 +162,13 @@ class FirstRequestChoiceView(discord.ui.View):
         self.user_id = user_id
 
         will = discord.ui.Button(label="I will", style=discord.ButtonStyle.secondary)
-        wont = discord.ui.Button(label="I won't", style=discord.ButtonStyle.secondary)
         will.callback = self._will
-        wont.callback = self._wont
         self.add_item(will)
-        self.add_item(wont)
 
     async def _will(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("This prompt is not for you.", ephemeral=True)
-        await self.cog.handle_first_choice(interaction, will_request_again=True)
-
-    async def _wont(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("This prompt is not for you.", ephemeral=True)
-        await self.cog.handle_first_choice(interaction, will_request_again=False)
+        await self.cog.handle_first_choice(interaction)
 
 
 class OtherReasonView(discord.ui.View):
@@ -2133,31 +2125,19 @@ class RequestLevelsCog(commands.Cog):
         initial = self._request_initial_values(request_row)
         await ctx.send_modal(LevelRequestModal(self, ctx.user.id, edit=True, initial=initial))
 
-    async def handle_first_choice(self, interaction: discord.Interaction, will_request_again: bool):
+    async def handle_first_choice(self, interaction: discord.Interaction):
         if interaction.guild is None:
             return await interaction.response.send_message("Wrong server.", ephemeral=True)
         member = await self._resolve_member(interaction.guild, interaction.user)
         if member is None:
             return await interaction.response.send_message("Member not found.", ephemeral=True)
 
-        if will_request_again:
-            role_id = self._cfg_int("request_banned_role_id")
-            role = interaction.guild.get_role(role_id) if role_id else None
-            if role is None:
-                return await interaction.response.send_message(self._message("not_configured", "The request system is not fully configured yet."), ephemeral=True)
-            try:
-                if role not in member.roles:
-                    await member.add_roles(role, reason="Level request first-time choice")
-            except Exception:
-                return await interaction.response.send_message("I couldn't give you the configured role.", ephemeral=True)
-            return await interaction.response.send_message("Done.", ephemeral=True)
-
         role_id = self._cfg_int("has_requested_role_id")
         role = interaction.guild.get_role(role_id) if role_id else None
         if role is not None:
             try:
                 if role not in member.roles:
-                    await member.add_roles(role, reason="Level request started")
+                    await member.add_roles(role, reason="Level request rules acknowledged")
             except Exception:
                 return await interaction.response.send_message("I couldn't give you the configured role.", ephemeral=True)
 

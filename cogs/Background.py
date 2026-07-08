@@ -190,7 +190,11 @@ class BackgroundCog(commands.Cog):
     # --------------------
     def _excluded_channels(self) -> set[int]:
         ids = self.bot.config.get_int_list("background", "exclude_channel_ids")
-        return set(ids)
+        excluded = set(ids)
+        review_access_channel_id = self.bot.config.get_int("channels", "review_access_channel_id")
+        if review_access_channel_id:
+            excluded.add(review_access_channel_id)
+        return excluded
 
     def _status_rotation_enabled(self) -> bool:
         return bool(self.bot.config.get("background", "status_rotation", "enabled", default=False))

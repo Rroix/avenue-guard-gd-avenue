@@ -18,6 +18,9 @@ class ModCog(commands.Cog):
         if message.guild is None or not ensure_allowed_guild_id(message.guild, allowed_guild_id):
             return
 
+        if await self._handle_review_access_message(message):
+            return
+
         target_channel_id = cfg.get_int("channels", "autodelete_channel_id")
         if not target_channel_id:
             return
@@ -48,6 +51,42 @@ class ModCog(commands.Cog):
                 await member.add_roles(role, reason="Autodeletion restriction")
         except Exception:
             pass
+
+    async def _handle_review_access_message(self, message: discord.Message) -> bool:
+        cfg = self.bot.config
+        channel_id = cfg.get_int("channels", "review_access_channel_id")
+        if not channel_id or message.channel.id != channel_id:
+            return False
+
+        member = message.guild.get_member(message.author.id) if message.guild else None
+        if member is None:
+            return True
+
+        whitelist_roles = set(cfg.get_int_list("roles", "whitelisted_deletion_ID_roles"))
+        whitelist_roles.update(cfg.get_int_list("roles", "admin_owner_role_ids"))
+        mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID")
+        if mod_role_id:
+            whitelist_roles.add(mod_role_id)
+        if member.guild_permissions.administrator or member_has_any_role(member, list(whitelist_roles)):
+            return True
+
+        expected = "I agree to get review access"
+        content = str(message.content or "").strip()
+        if expected.casefold() not in content.casefold():
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return True
+
+        role_id = cfg.get_int("roles", "review_access_role_id")
+        role = message.guild.get_role(role_id) if role_id else None
+        if role is not None and role not in member.roles:
+            try:
+                await member.add_roles(role, reason="Review access agreement")
+            except Exception:
+                pass
+        return True
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):

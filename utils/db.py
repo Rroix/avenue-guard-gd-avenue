@@ -105,6 +105,21 @@ def _looks_like_turso_platform_token(token: str) -> bool:
     return bool(scopes & platform_scopes)
 
 
+def _is_recoverable_remote_error(exc: Exception) -> bool:
+    text = repr(exc).casefold()
+    markers = (
+        "connection has reached an invalid state",
+        "started with txn",
+        "stream error",
+        "s3 error",
+        "internalservererror",
+        "sqlite_unknown",
+        "failed to list objects in s3 storage",
+        "hrana",
+    )
+    return any(marker in text for marker in markers)
+
+
 class Database:
     """Small SQLite wrapper safe to use from an async bot.
 
@@ -122,6 +137,21 @@ class Database:
         self._lock = asyncio.Lock()
         self._conn: Optional[Any] = None
         self._ready = False
+
+    def _close_connection_sync(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        self._conn = None
+        self._ready = False
+
+    def _reopen_connection_sync(self) -> None:
+        self._close_connection_sync()
+        self._conn = self._open_connection_sync()
+        self._ready = True
 
     def _open_connection_sync(self) -> Any:
         if self.uses_remote:
@@ -151,6 +181,53 @@ class Database:
         if callable(sync):
             sync()
 
+    def _sync_remote_with_retry_sync(self) -> None:
+        if not self.uses_remote:
+            return
+
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                self._sync_remote_sync()
+                return
+            except Exception as exc:
+                last_error = exc
+                if not _is_recoverable_remote_error(exc) or attempt >= 2:
+                    raise
+                time.sleep(0.25 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
+
+    def _commit_and_sync_sync(self) -> None:
+        assert self._conn is not None
+        self._conn.commit()
+        self._sync_remote_with_retry_sync()
+
+    async def _run_locked_with_retry(self, operation, *, retry_operation: bool = True) -> Any:
+        await self.connect()
+        attempts = 3 if self.uses_remote and retry_operation else 1
+        last_error: Optional[Exception] = None
+
+        for attempt in range(attempts):
+            async with self._lock:
+                assert self._conn is not None
+
+                try:
+                    return await asyncio.to_thread(operation)
+                except Exception as exc:
+                    last_error = exc
+                    should_recover = self.uses_remote and _is_recoverable_remote_error(exc)
+                    if should_recover:
+                        await asyncio.to_thread(self._reopen_connection_sync)
+                    if not should_recover or attempt >= attempts - 1:
+                        raise
+
+            await asyncio.sleep(0.35 * (attempt + 1))
+
+        if last_error is not None:
+            raise last_error
+        return None
+
     async def connect(self) -> None:
         async with self._lock:
             if self._conn is not None and self._ready:
@@ -162,7 +239,7 @@ class Database:
 
                 assert self._conn is not None
                 self._migrate_sync()
-                self._sync_remote_sync()
+                self._sync_remote_with_retry_sync()
 
             await asyncio.to_thread(_connect_and_migrate)
             self._ready = True
@@ -172,13 +249,7 @@ class Database:
             if self._conn is None:
                 return
 
-            def _close():
-                assert self._conn is not None
-                self._conn.close()
-
-            await asyncio.to_thread(_close)
-            self._conn = None
-            self._ready = False
+            await asyncio.to_thread(self._close_connection_sync)
 
     async def backup_to(self, target_path: str | Path) -> int:
         await self.connect()
@@ -190,7 +261,7 @@ class Database:
             def _backup() -> int:
                 assert self._conn is not None
                 if self.uses_remote:
-                    self._sync_remote_sync()
+                    self._sync_remote_with_retry_sync()
                     if not self.path.exists():
                         raise RuntimeError("The local Turso replica file does not exist yet, so no backup file can be created.")
                     shutil.copy2(self.path, target)
@@ -669,8 +740,7 @@ class Database:
         self._ensure_column_sync("level_request_scheduled_openings", "open_message", "TEXT")
         self._normalize_weekly_dm_log_sync()
         self._init_ticket_sequences_sync()
-        self._conn.commit()
-        self._sync_remote_sync()
+        self._commit_and_sync_sync()
 
     def _ensure_column_sync(self, table: str, column: str, coltype: str) -> None:
         assert self._conn is not None
@@ -1125,8 +1195,7 @@ class Database:
                             "INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)",
                             (gid, max_id + 1 if max_id > 0 else 1)
                         )
-                self._conn.commit()
-                self._sync_remote_sync()
+                self._commit_and_sync_sync()
 
             await asyncio.to_thread(_init_seq)
 
@@ -1166,8 +1235,7 @@ class Database:
                 )
                 self._conn.execute("DROP TABLE weekly_dm_log")
                 self._conn.execute("ALTER TABLE weekly_dm_log_new RENAME TO weekly_dm_log")
-                self._conn.commit()
-                self._sync_remote_sync()
+                self._commit_and_sync_sync()
 
             await asyncio.to_thread(_run)
 
@@ -1184,8 +1252,7 @@ class Database:
                     return
                 try:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-                    self._conn.commit()
-                    self._sync_remote_sync()
+                    self._commit_and_sync_sync()
                 except Exception:
                     # ignore if cannot alter
                     pass
@@ -1193,75 +1260,52 @@ class Database:
             await asyncio.to_thread(_run)
 
     async def next_ticket_id(self, guild_id: int) -> int:
-        await self.connect()
-        async with self._lock:
+        def _run():
             assert self._conn is not None
-
-            def _run():
-                assert self._conn is not None
-                cur = self._conn.execute("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (guild_id,))
-                row = cur.fetchone()
-                if row is None:
-                    next_id = 1
-                    self._conn.execute("INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)", (guild_id, 2))
-                    self._conn.commit()
-                    self._sync_remote_sync()
-                    return next_id
-                next_id = int(_row_get(row, "next_ticket_id", index=0, default=1) or 1)
-                self._conn.execute("UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?", (next_id + 1, guild_id))
-                self._conn.commit()
-                self._sync_remote_sync()
+            cur = self._conn.execute("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (guild_id,))
+            row = cur.fetchone()
+            if row is None:
+                next_id = 1
+                self._conn.execute("INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)", (guild_id, 2))
+                self._commit_and_sync_sync()
                 return next_id
+            next_id = int(_row_get(row, "next_ticket_id", index=0, default=1) or 1)
+            self._conn.execute("UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?", (next_id + 1, guild_id))
+            self._commit_and_sync_sync()
+            return next_id
 
-            return await asyncio.to_thread(_run)
+        return await self._run_locked_with_retry(_run, retry_operation=False)
 
     async def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
-        await self.connect()
-        async with self._lock:
+        def _run():
             assert self._conn is not None
+            self._conn.execute(sql, params)
+            self._commit_and_sync_sync()
 
-            def _run():
-                assert self._conn is not None
-                self._conn.execute(sql, params)
-                self._conn.commit()
-                self._sync_remote_sync()
-
-            await asyncio.to_thread(_run)
+        await self._run_locked_with_retry(_run, retry_operation=False)
 
     async def executemany(self, sql: str, seq: Iterable[Sequence[Any]]) -> None:
-        await self.connect()
         items = list(seq)
-        async with self._lock:
+
+        def _run():
             assert self._conn is not None
+            self._conn.executemany(sql, items)
+            self._commit_and_sync_sync()
 
-            def _run():
-                assert self._conn is not None
-                self._conn.executemany(sql, items)
-                self._conn.commit()
-                self._sync_remote_sync()
-
-            await asyncio.to_thread(_run)
+        await self._run_locked_with_retry(_run, retry_operation=False)
 
     async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[Any]:
-        await self.connect()
-        async with self._lock:
+        def _run():
             assert self._conn is not None
+            cur = self._conn.execute(sql, params)
+            return _normalize_row(cur, cur.fetchone())
 
-            def _run():
-                assert self._conn is not None
-                cur = self._conn.execute(sql, params)
-                return _normalize_row(cur, cur.fetchone())
-
-            return await asyncio.to_thread(_run)
+        return await self._run_locked_with_retry(_run)
 
     async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[Any]:
-        await self.connect()
-        async with self._lock:
+        def _run():
             assert self._conn is not None
+            cur = self._conn.execute(sql, params)
+            return _normalize_rows(cur, cur.fetchall())
 
-            def _run():
-                assert self._conn is not None
-                cur = self._conn.execute(sql, params)
-                return _normalize_rows(cur, cur.fetchall())
-
-            return await asyncio.to_thread(_run)
+        return await self._run_locked_with_retry(_run)

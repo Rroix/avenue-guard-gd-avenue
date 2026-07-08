@@ -2388,6 +2388,7 @@ class CommandsCog(commands.Cog):
         cfg = self.bot.config
         for key in (
             "autodelete_channel_id",
+            "review_access_channel_id",
             "weekly_request_channel_ID",
             "dm_fail_log_channel_id",
             "global_error_log_channel_id",
@@ -2417,12 +2418,14 @@ class CommandsCog(commands.Cog):
         else:
             issues.append(f"database.path: {storage_note}")
 
-        for key in ("MOD_ROLE_ID", "restriction_role_ID", "gambling_reward_role_id", "rps_streak_role_id"):
+        for key in ("MOD_ROLE_ID", "restriction_role_ID", "gambling_reward_role_id", "rps_streak_role_id", "review_access_role_id"):
             check_role(f"roles.{key}", cfg.get_int("roles", key))
         for idx, role_id in enumerate(cfg.get_int_list("roles", "admin_owner_role_ids"), start=1):
             check_role(f"roles.admin_owner_role_ids[{idx}]", role_id)
         for idx, role_id in enumerate(cfg.get_int_list("roles", "excluded_tracking_role_id"), start=1):
             check_role(f"roles.excluded_tracking_role_id[{idx}]", role_id)
+        for idx, role_id in enumerate(cfg.get_int_list("roles", "whitelisted_deletion_ID_roles"), start=1):
+            check_role(f"roles.whitelisted_deletion_ID_roles[{idx}]", role_id)
         for key in ("has_requested_role_id", "request_banned_role_id"):
             check_role(f"level_requests.{key}", cfg.get_int("level_requests", key))
         for idx, role_id in enumerate(cfg.get_int_list("level_requests", "required_role_ids"), start=1):

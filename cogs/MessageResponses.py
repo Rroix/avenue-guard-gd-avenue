@@ -98,6 +98,10 @@ class MessageResponsesCog(commands.Cog):
         if not ensure_allowed_guild_id(message.guild, allowed_guild_id):
             return
 
+        review_access_channel_id = cfg.get_int("channels", "review_access_channel_id")
+        if review_access_channel_id and message.channel.id == review_access_channel_id:
+            return
+
         if not self._rules:
             return
 

@@ -130,6 +130,9 @@ class StickyCog(commands.Cog):
         allowed_guild_id = cfg.get_int("guild", "allowed_guild_id")
         if not ensure_allowed_guild_id(message.guild, allowed_guild_id):
             return
+        review_access_channel_id = cfg.get_int("channels", "review_access_channel_id")
+        if review_access_channel_id and message.channel.id == review_access_channel_id:
+            return
 
         # Forum-first-message fallback:
         # Normal path (on_thread_create) should run first. This fallback:
@@ -177,6 +180,8 @@ class StickyCog(commands.Cog):
             try:
                 msg = await channel.fetch_message(last_id)
                 await msg.delete()
+            except discord.NotFound:
+                pass
             except Exception as e:
                 await log_error(self.bot, f"Sticky cleanup could not delete saved sticky message_id={last_id} channel_id={channel.id}: {repr(e)}")
 
@@ -193,6 +198,8 @@ class StickyCog(commands.Cog):
                     continue
                 try:
                     await old.delete()
+                except discord.NotFound:
+                    pass
                 except Exception as e:
                     await log_error(self.bot, f"Sticky cleanup could not delete duplicate sticky message_id={old.id} channel_id={channel.id}: {repr(e)}")
         except Exception as e:

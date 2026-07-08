@@ -11,6 +11,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Auto-deletes messages and reactions in the configured creator-points proof channel.
 - Applies a restriction role to users who post/react where they should not.
 - Allows configured whitelist roles to bypass that restriction flow.
+- Grants review access when a user posts a message containing the configured agreement phrase in the review-access channel and deletes non-matching messages there.
 - Sends configurable DMs when users gain watched roles.
 
 ### Weekly Activity Requests
@@ -57,7 +58,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Shows request age with Discord relative timestamps.
 - Resets per-user and per-level duplicate tracking when a new wave starts.
 - Checks configurable required roles before showing the request form.
-- Supports the first-request `I will` / `I won't` choice flow with configurable roles.
+- Supports a first-request rules acknowledgement button that grants the configured clearance role and skips the prompt in future waves.
 - Sends staff review embeds to `level_requests.level_requested`.
 - Configured reviewer roles, admins, and owners can choose `Send`, `Reject`, or `Other`.
 - Staff can filter pending live-wave and weekly requests with `/requests pending`.
@@ -216,7 +217,7 @@ Use `off`, `disable`, `none`, or `clear` as the word to disable enforcement for 
 
 ## Configuration Files
 
-- `config.json` controls guild IDs, roles, channels, live request waves, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, server icon rotation, persistent database storage, automatic database backups, background summaries, and impact report exports.
+- `config.json` controls guild IDs, roles, channels, live request waves, review-access agreement gating, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, server icon rotation, persistent database storage, automatic database backups, background summaries, and impact report exports.
 - `responses.json` controls automatic message responses.
 - The configured SQLite path stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, help submissions, tickets, cooldowns, transcript pointers, reminders, daily stats, impact snapshots, and database backup records.
 
@@ -264,8 +265,8 @@ Set these before opening requests:
 - `sent_channel`: where accepted/sent result embeds go.
 - `rejected_channel`: where rejected and `Other` result embeds go.
 - `required_role_ids`: roles allowed to request. Empty means everyone can request unless banned.
-- `has_requested_role_id`: role used for users who already passed the first-request prompt.
-- `request_banned_role_id`: role assigned by the `I will` choice and blocked from requesting.
+- `has_requested_role_id`: clearance role used for users who already acknowledged the first-request rules prompt.
+- `request_banned_role_id`: role blocked from requesting.
 - `reviewer_role_ids`: roles allowed to use request review controls and reviewer filters.
 - `request_post_close_edit_minutes`: how long users may keep editing pending requests after the wave closes.
 - `open_announcement`: controls the message sent when waves open. Blank `message` uses the default `<@&role>, requests have been opened for {condition_text}`.
