@@ -5,6 +5,36 @@ from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, member_has_any_role
 
+
+def _review_access_text(value: str) -> str:
+    cleaned = " ".join(str(value or "").casefold().strip().split())
+    return cleaned.rstrip(".,!?")
+
+
+def _within_one_edit(actual: str, expected: str) -> bool:
+    if actual == expected:
+        return True
+    if abs(len(actual) - len(expected)) > 1:
+        return False
+
+    if len(actual) == len(expected):
+        differences = sum(1 for a, b in zip(actual, expected) if a != b)
+        return differences <= 1
+
+    shorter, longer = (actual, expected) if len(actual) < len(expected) else (expected, actual)
+    i = j = edits = 0
+    while i < len(shorter) and j < len(longer):
+        if shorter[i] == longer[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        j += 1
+    return True
+
+
 class ModCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
@@ -70,9 +100,16 @@ class ModCog(commands.Cog):
         if member.guild_permissions.administrator or member_has_any_role(member, list(whitelist_roles)):
             return True
 
-        expected = "I agree to get review access"
+        expected = str(
+            cfg.get(
+                "review_access",
+                "agreement_phrase",
+                default="I have read and understood the review access conditions",
+            )
+            or "I have read and understood the review access conditions"
+        )
         content = str(message.content or "").strip()
-        if expected.casefold() not in content.casefold():
+        if not _within_one_edit(_review_access_text(content), _review_access_text(expected)):
             try:
                 await message.delete()
             except Exception:

@@ -201,7 +201,15 @@ class Database:
     def _commit_and_sync_sync(self) -> None:
         assert self._conn is not None
         self._conn.commit()
-        self._sync_remote_with_retry_sync()
+        try:
+            self._sync_remote_with_retry_sync()
+        except Exception as exc:
+            # The local commit already succeeded. For embedded Turso/libSQL,
+            # a temporary remote sync failure should not make callers re-run a
+            # non-idempotent write such as an activity increment.
+            if self.uses_remote and _is_recoverable_remote_error(exc):
+                return
+            raise
 
     async def _run_locked_with_retry(self, operation, *, retry_operation: bool = True) -> Any:
         await self.connect()
@@ -630,6 +638,14 @@ class Database:
                 day_key TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 created_ts INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, day_key)
+            );""",
+            """CREATE TABLE IF NOT EXISTS daily_summary_reports(
+                guild_id INTEGER NOT NULL,
+                day_key TEXT NOT NULL,
+                channel_id INTEGER,
+                message_id INTEGER,
+                sent_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, day_key)
             );""",
             """CREATE TABLE IF NOT EXISTS impact_snapshots(
@@ -1066,6 +1082,14 @@ class Database:
                 day_key TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 created_ts INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, day_key)
+            );""",
+            """CREATE TABLE IF NOT EXISTS daily_summary_reports(
+                guild_id INTEGER NOT NULL,
+                day_key TEXT NOT NULL,
+                channel_id INTEGER,
+                message_id INTEGER,
+                sent_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, day_key)
             );""",
             """CREATE TABLE IF NOT EXISTS impact_snapshots(

@@ -2749,10 +2749,11 @@ class CommandsCog(commands.Cog):
         top = []
         for uid, cnt in raw:
             member = await self._resolve_member(ctx.guild, uid)
-            if member is None or member.bot:
-                continue
-            if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
-                continue
+            if member is not None:
+                if member.bot:
+                    continue
+                if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
+                    continue
             top.append((uid, cnt))
             if len(top) >= 20:
                 break

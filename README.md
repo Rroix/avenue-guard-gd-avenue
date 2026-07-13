@@ -11,7 +11,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Auto-deletes messages and reactions in the configured creator-points proof channel.
 - Applies a restriction role to users who post/react where they should not.
 - Allows configured whitelist roles to bypass that restriction flow.
-- Grants review access when a user posts a message containing the configured agreement phrase in the review-access channel and deletes non-matching messages there.
+- Grants review access when a user posts the configured agreement phrase in the review-access channel, with case-insensitive matching and one-character typo tolerance.
 - Sends configurable DMs when users gain watched roles.
 
 ### Weekly Activity Requests

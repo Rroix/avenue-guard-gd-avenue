@@ -151,6 +151,12 @@ class BackgroundCog(commands.Cog):
         except Exception:
             pass
 
+        if self._daily_summary_enabled() and guild is not None:
+            try:
+                await self._send_daily_summary_for_day(guild, _day_key(now_madrid() - timedelta(days=1)))
+            except Exception as e:
+                await log_error(self.bot, f"Daily summary catch-up failed: {repr(e)}")
+
     def on_config_reload(self) -> None:
         # Restart daily loop if time changed
         try:
@@ -463,6 +469,19 @@ class BackgroundCog(commands.Cog):
 
     def _daily_reset_after_report(self) -> bool:
         return bool(self.bot.config.get("background", "daily_summary", "reset_after_report", default=True))
+
+    async def _daily_summary_already_sent(self, guild_id: int, day_key: str) -> bool:
+        row = await self.bot.db.fetchone(
+            "SELECT 1 FROM daily_summary_reports WHERE guild_id=? AND day_key=?",
+            (guild_id, day_key),
+        )
+        return row is not None
+
+    async def _record_daily_summary_sent(self, guild_id: int, day_key: str, channel_id: int, message_id: int) -> None:
+        await self.bot.db.execute(
+            "INSERT OR REPLACE INTO daily_summary_reports(guild_id,day_key,channel_id,message_id,sent_ts) VALUES(?,?,?,?,?)",
+            (guild_id, day_key, channel_id, message_id, int(time.time())),
+        )
 
     def _voice_sessions_from_guild(self, guild: discord.Guild, now_ts: int) -> Dict[int, int]:
         sessions: Dict[int, int] = {}
@@ -953,16 +972,12 @@ class BackgroundCog(commands.Cog):
             return discord.Color.green()
         return discord.Color.blurple()
 
-    @tasks.loop(time=dtime(hour=0, minute=0, tzinfo=TZ))
-    async def daily_report(self):
-        allowed = self.bot.config.get_int("guild", "allowed_guild_id")
-        guild = self.bot.get_guild(allowed) if allowed else None
-        if guild is None:
-            return
-
+    async def _send_daily_summary_for_day(self, guild: discord.Guild, report_day: Optional[str] = None) -> bool:
         today = _day_key()
-        yesterday = _day_key(now_madrid() - timedelta(days=1))
-        report_day = self._current_day if self._current_day != today else yesterday
+        report_day = report_day or (self._current_day if self._current_day != today else _day_key(now_madrid() - timedelta(days=1)))
+        if await self._daily_summary_already_sent(guild.id, report_day):
+            return False
+
         snapshot = self.stats if report_day == self._current_day else None
         if snapshot is None:
             snapshot = await self._load_daily_stats(guild.id, report_day)
@@ -1081,21 +1096,35 @@ class BackgroundCog(commands.Cog):
         channel = guild.get_channel(ch_id) if ch_id else None
         if isinstance(channel, discord.TextChannel):
             try:
-                await channel.send(embed=embed)
-            except Exception:
-                pass
+                sent = await channel.send(embed=embed)
+                await self._record_daily_summary_sent(guild.id, day_key, channel.id, sent.id)
+            except Exception as e:
+                await log_error(self.bot, f"Daily summary send failed for {day_key}: {repr(e)}")
+                return False
+        else:
+            await log_error(self.bot, f"Daily summary channel is missing or invalid: channel_id={ch_id}")
+            return False
 
         # persist
         try:
             await self._persist_daily_stats(guild.id, day_key, snapshot)
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(self.bot, f"Daily summary stats persist failed for {day_key}: {repr(e)}")
 
         if self._daily_reset_after_report() and self._current_day == day_key:
             self._current_day = today
             self.stats = DailyStats()
             reset_ts = report_boundary_ts if day_key != today else int(time.time())
             self.voice_sessions = self._voice_sessions_from_guild(guild, reset_ts)
+        return True
+
+    @tasks.loop(time=dtime(hour=0, minute=0, tzinfo=TZ))
+    async def daily_report(self):
+        allowed = self.bot.config.get_int("guild", "allowed_guild_id")
+        guild = self.bot.get_guild(allowed) if allowed else None
+        if guild is None:
+            return
+        await self._send_daily_summary_for_day(guild)
 
     @daily_report.before_loop
     async def _before_daily(self):

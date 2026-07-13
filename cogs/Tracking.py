@@ -357,6 +357,7 @@ class TrackingCog(commands.Cog):
         self._weekly_task = asyncio.create_task(self._weekly_loop())
         self._timeout_task = asyncio.create_task(self._timeout_loop())
         self._activity_flush_task = asyncio.create_task(self._activity_flush_loop())
+        asyncio.create_task(self._send_missing_weekly_recap_once())
 
     def on_config_reload(self) -> None:
         # no cached config in this cog
@@ -685,26 +686,31 @@ class TrackingCog(commands.Cog):
         if not counts and not last_seen:
             return
 
-        try:
-            if counts:
+        if counts:
+            try:
                 await self.bot.db.executemany(
                     "INSERT INTO activity_counts(guild_id,user_id,week_start,count) VALUES(?,?,?,?) "
                     "ON CONFLICT(guild_id,user_id,week_start) DO UPDATE SET count=count+excluded.count",
                     [(guild_id, user_id, week_start, amount) for (guild_id, user_id, week_start), amount in counts.items()],
                 )
-            if last_seen:
+            except Exception as e:
+                async with self._activity_lock:
+                    for key, amount in counts.items():
+                        self._pending_activity_counts[key] = self._pending_activity_counts.get(key, 0) + amount
+                await self._log_background_error("activity_flush_counts", f"Activity count flush failed: {repr(e)}")
+
+        if last_seen:
+            try:
                 await self.bot.db.executemany(
                     "INSERT INTO activity_last_counted(guild_id,user_id,last_counted_ts) VALUES(?,?,?) "
                     "ON CONFLICT(guild_id,user_id) DO UPDATE SET last_counted_ts=excluded.last_counted_ts",
                     [(guild_id, user_id, ts) for (guild_id, user_id), ts in last_seen.items()],
                 )
-        except Exception as e:
-            async with self._activity_lock:
-                for key, amount in counts.items():
-                    self._pending_activity_counts[key] = self._pending_activity_counts.get(key, 0) + amount
-                for key, ts in last_seen.items():
-                    self._pending_last_counted[key] = max(self._pending_last_counted.get(key, 0), ts)
-            await self._log_background_error("activity_flush_db", f"Activity flush failed: {repr(e)}")
+            except Exception as e:
+                async with self._activity_lock:
+                    for key, ts in last_seen.items():
+                        self._pending_last_counted[key] = max(self._pending_last_counted.get(key, 0), ts)
+                await self._log_background_error("activity_flush_last_seen", f"Activity cooldown flush failed: {repr(e)}")
 
     # ----------------------------
     # Weekly DM workflow in DMs
@@ -1173,6 +1179,45 @@ class TrackingCog(commands.Cog):
         except Exception as e:
             await log_error(self.bot, f"Weekly recap send failed for {week_start_iso}: {repr(e)}")
 
+    async def _ranked_rows_for_week(self, guild: discord.Guild, week_start_iso: str, limit: Optional[int] = None) -> list:
+        excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
+        sql = "SELECT user_id, count FROM activity_counts WHERE guild_id=? AND week_start=? ORDER BY count DESC"
+        params: tuple = (guild.id, week_start_iso)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (guild.id, week_start_iso, int(limit))
+        rows = await self.bot.db.fetchall(sql, params)
+        ranked_rows = []
+        for row in rows:
+            uid = int(row["user_id"])
+            member = await self._resolve_member(guild, uid)
+            if member is not None:
+                if member.bot:
+                    continue
+                if excluded_role_ids and any(role.id in excluded_role_ids for role in member.roles):
+                    continue
+            ranked_rows.append(row)
+        return ranked_rows
+
+    async def _send_missing_weekly_recap_once(self) -> None:
+        await self.bot.wait_until_ready()
+        allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
+        guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
+        if guild is None:
+            return
+        prev_week_start = week_start_sunday(week_start_sunday(now_madrid()) - timedelta(seconds=1)).isoformat()
+        try:
+            existing = await self.bot.db.fetchone(
+                "SELECT 1 FROM weekly_recaps WHERE guild_id=? AND week_start=?",
+                (guild.id, prev_week_start),
+            )
+            if existing:
+                return
+            rows = await self._ranked_rows_for_week(guild, prev_week_start)
+            await self._send_weekly_recap(guild, prev_week_start, rows)
+        except Exception as e:
+            await self._log_background_error("weekly_recap_catchup", f"Weekly recap catch-up failed: {repr(e)}")
+
     # ----------------------------
     # Weekly job execution
     # ----------------------------
@@ -1187,25 +1232,13 @@ class TrackingCog(commands.Cog):
         winners_to_dm = self._cfg_int("tracking", "winners_to_dm", 1)
         timeout_h = self._cfg_int("tracking", "dm_timeout_hours", 48)
 
-        excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_start", f"top_limit={top_limit} winners_to_dm={winners_to_dm} timeout_h={timeout_h}")
 
-        rows = await self.bot.db.fetchall(
-            "SELECT user_id, count FROM activity_counts WHERE guild_id=? AND week_start=? ORDER BY count DESC LIMIT ?",
-            (guild.id, week_start_iso, top_limit),
-        )
-
         ranked: List[int] = []
-        ranked_rows = []
-        for r in rows:
+        ranked_rows = await self._ranked_rows_for_week(guild, week_start_iso, top_limit)
+        for r in ranked_rows:
             uid = int(r["user_id"])
-            member = await self._resolve_member(guild, uid)
-            if member is None or member.bot:
-                continue
-            if excluded_role_ids and any(role.id in excluded_role_ids for role in member.roles):
-                continue
             ranked.append(uid)
-            ranked_rows.append(r)
 
         try:
             await self._update_weekly_streaks(guild, week_start_iso, ranked)
@@ -1482,10 +1515,11 @@ class TrackingCog(commands.Cog):
         for r in rows:
             uid = int(r["user_id"])
             m = await self._resolve_member(guild, uid)
-            if m is None or m.bot:
-                continue
-            if excluded_role_ids and any(role.id in excluded_role_ids for role in m.roles):
-                continue
+            if m is not None:
+                if m.bot:
+                    continue
+                if excluded_role_ids and any(role.id in excluded_role_ids for role in m.roles):
+                    continue
             eligible_total += 1
             if uid == user_id:
                 rank = eligible_total

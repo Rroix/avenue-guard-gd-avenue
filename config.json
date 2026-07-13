@@ -38,6 +38,10 @@
     "_comment": "Permission policy toggles.",
     "manage_guild_counts_as_mod": true
   },
+  "review_access": {
+    "_comment": "Users must send this phrase in channels.review_access_channel_id to receive roles.review_access_role_id. Matching is case-insensitive and allows one character of variation after cleanup.",
+    "agreement_phrase": "I have read and understood the review access conditions"
+  },
   "channels": {
     "_comment_core": "Core channels used by features.",
     "autodelete_channel_id": "820590823573815326",
@@ -188,6 +192,16 @@
           "color": "#BCC0C0"
         }
        }
+      },
+      {
+      "forum_channel_id": "1524280544580603914",
+      "templates": {
+        "default": {
+          "title": "Make sure your review passes our quality check!",
+          "description": "Your post must follow our server rules. For your review to be accepted, you should read over [how to use this channel](https://discord.com/channels/717003826288394271/1524285817860915382)",
+          "color": "#83D040"
+        }
+       }
       }
     ]
   },
@@ -198,7 +212,9 @@
     { "role_id": "1448668022070968441", "message": "Hi {user}, you have been marked as {role}, please select 'Contact staff' after DMing me on my selection menu to verify you are not a bot."},
     {"role_id": "1481774599820673154", "message" : "Hi {user}, you have received {role}, this will restrict your access to our server feedback. If you think this was a mistake or would like to appeal, please DM me and select 'Appeal punishment' on my menu selection."},
     {"role_id": "1463987510236545127", "message" : "Hi {user}, you have received {role}, this will restrict your access to our level requests. If you think this was a mistake or would like to appeal, please DM me and select 'Appeal punishment' on my menu selection or fill out this [form](https://forms.gle/o6YSEfRQt4HW9ozGA)."},
-    {"role_id": "1436721868244779089", "message" : "Hi {user}, you have received {role}, this will restrict your access to our Creator Points role proof channel. If you think this was a mistake or would like to appeal, please DM me and select 'Appeal punishment' on my menu selection."}
+    {"role_id": "1436721868244779089", "message" : "Hi {user}, you have received {role}, this will restrict your access to our Creator Points role proof channel. If you think this was a mistake or would like to appeal, please DM me and select 'Appeal punishment' on my menu selection."},
+    {"role_id": "1526093750651195553", "message" : "Hi {user}, you have received {role}, this will restrict your access to our server applications. If you think this was a mistake or would like to appeal, please DM me and select 'Appeal punishment' on my menu selection."},
+    {"role_id": "1524279436327784558", "message" : "Hi {user}, you now have access to reviews!"}
   ]
 },
   "fun": {
@@ -471,7 +487,7 @@
     },
     "server_icon_rotation": {
       "_comment": "Rotates the server icon from configured image URLs. mode is disabled, linear, or random.",
-      "mode": "linear",
+      "mode": "disabled",
       "interval_seconds": 300,
       "current_index": -1,
       "current_url": "",

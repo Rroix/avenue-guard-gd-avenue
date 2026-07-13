@@ -12,7 +12,7 @@ GD Avenue is a Geometry Dash Discord community, and even if it doesn't seem like
 
 This bot isn't really a moderation tool. It is closer to a community operations assistant specific to our community. It connects several systems together: request management, activity tracking, support tickets, private help menus, forum reminders, moderation checks, analytics, backups, and small interactive features that make the server feel more alive... AND FUN.
 
-The most important goal I had in mind is consistency. If a workflow starts, Avenue Guard remembers it, logs it, and keeps it recoverable. A level request should not disappear because the bot we depended on went offline (it can still happen, but at least it is 100% on us and not on another person). And you know, a server this big benefits from some QOL improvements like ticket transcripts, staff appeal reviews, weekly rewards... in a highly customizable way.  The bot is built around that kind of practical reliability.
+The most important goal I had in mind is consistency. If a workflow starts, Avenue Guard remembers it, logs it, and keeps it recoverable. A level request should not disappear because the bot we depended on went offline (it can still happen, but at least it is 100% on us and not on another person). And you know, a server this big benefits from some QOL improvements like ticket transcripts, staff appeal reviews, weekly rewards... in a highly customizable way. The bot is built around that kind of practical reliability.
 
 ## Level Requests
 
@@ -66,18 +66,22 @@ Behind the scenes, Avenue Guard has several tools for keeping itself healthy. It
 
 This is important because our bot depends on many moving parts like channels, roles, permissions, messages, buttons, background tasks, and persistent data. If any of those drift, we can at least know what is missing and how to fix it.
 
-The bot stores important workflow state persistently. In production it can use Turso/libSQL, which gives the bot SQLite-compatible remote storage while still keeping local development simple. That storage includes request waves, ticket data, transcripts, weekly tracking, help submissions, request reviews, validation cache, backups, restore history, and impact snapshots. So basically, the bot should not forget the important parts of the server's operations.
+The bot stores important workflow state persistently. In production, Avenue Guard uses **Turso/libSQL** as its durable database layer. Turso is SQLite-compatible, which means the bot can keep the simplicity of SQLite while syncing important state to remote storage instead of relying on a host's temporary filesystem. This matters a lot on platforms where clearing cache or restarting a service could otherwise wipe local files.
+
+The implementation uses a local embedded replica for fast reads and writes, then syncs that replica with the Turso database. In practice, this lets the bot behave like a normal SQLite bot during development while still having production-grade persistence for real server workflows. The database wrapper also includes startup checks, token validation, retry handling for temporary Turso/libSQL sync errors, and safer fallback behavior if a configured storage path is not writable.
+
+That persistent storage includes request waves, ticket data, transcripts, weekly tracking, help submissions, request reviews, validation cache, backups, restore history, and impact snapshots. So basically, the bot should not forget the important parts of the server's operations.
 
 Some of the reliability methods behind Avenue Guard include:
 
-1. **Persistent storage for long workflows**: request waves, tickets, weekly rewards, scheduled openings, reviews, transcripts, backups, and impact snapshots are stored in SQLite-compatible storage so they can survive restarts.
+1. **Turso/libSQL persistent storage for long workflows**: request waves, tickets, weekly rewards, scheduled openings, reviews, transcripts, backups, and impact snapshots are stored in SQLite-compatible remote storage so they can survive restarts and host cache clears.
 2. **Atomic counters and protected state updates**: ticket numbers, request counts, duplicate checks, and review transitions are handled carefully so two users or two reviewers cannot accidentally claim the same state at the same time.
 3. **Persistent Discord components**: buttons and menus are registered again after restarts, so old request buttons, review buttons, ticket controls, and help-menu controls can still route to the correct workflow.
 4. **Pre-action validation**: the bot checks roles, channels, permissions, level IDs, URLs, request state, and duplicate submissions before allowing important actions to continue.
 5. **External validation with caching and fallbacks**: Geometry Dash level checks use external sources, cached results, cooldowns, and provider backoff so one failing service does not break the whole request system.
 6. **Recovery and repair commands**: staff can refresh request buttons, rebuild summaries, relock reviewed requests, check storage, run diagnostics, create backups, and restore local uploaded database copies when running on local SQLite.
 7. **Audit trails and logs**: request edits, reviewed levels, weekly reward events, ticket transcripts, forum deletions, admin actions, backups, restores, and impact reports all leave records.
-8. **Safe backup flow**: the bot can create zipped database backups, validate local uploaded database copies when appropriate, migrate restored data, and log the recovery.
+8. **Safe backup flow**: the bot can create zipped database backups, validate local uploaded database copies when appropriate, migrate restored data, and log the recovery. Turso remains the main production source of truth, while backups act as an extra safety layer.
 9. **Rate limits and cooldowns**: activity tracking, help flows, validation checks, fun commands, and auto-responses use limits to reduce spam and accidental overload.
 10. **Config checks and permission diagnostics**: the bot can scan for missing roles, missing channels, bad template variables, broken permissions, and unhealthy background tasks before they become bigger problems.
 
