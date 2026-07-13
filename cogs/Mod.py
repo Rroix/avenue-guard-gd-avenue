@@ -137,6 +137,14 @@ class ModCog(commands.Cog):
                 )
                 return True
             await self._send_role_dm(member, role, source="review_access")
+        try:
+            await message.delete()
+        except Exception as e:
+            await log_error(
+                self.bot,
+                f"Review access accepted message delete failed in channel_id={message.channel.id} "
+                f"message_id={message.id} user_id={message.author.id}: {repr(e)}",
+            )
         return True
 
     def _dm_templates_for_role(self, role_id: int) -> list[str]:
