@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import time
+
 import discord
 from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, member_has_any_role
+from utils.errors import log_error
 
 
 def _review_access_text(value: str) -> str:
     cleaned = " ".join(str(value or "").casefold().strip().split())
-    return cleaned.rstrip(".,!?")
+    if cleaned.endswith((".", ",", "!", "?")):
+        cleaned = cleaned[:-1].rstrip()
+    return cleaned
 
 
 def _within_one_edit(actual: str, expected: str) -> bool:
@@ -38,6 +43,7 @@ def _within_one_edit(actual: str, expected: str) -> bool:
 class ModCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
+        self._recent_role_dms: dict[tuple[int, int], float] = {}
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -92,11 +98,7 @@ class ModCog(commands.Cog):
         if member is None:
             return True
 
-        whitelist_roles = set(cfg.get_int_list("roles", "whitelisted_deletion_ID_roles"))
-        whitelist_roles.update(cfg.get_int_list("roles", "admin_owner_role_ids"))
-        mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID")
-        if mod_role_id:
-            whitelist_roles.add(mod_role_id)
+        whitelist_roles = set(cfg.get_int_list("roles", "admin_owner_role_ids"))
         if member.guild_permissions.administrator or member_has_any_role(member, list(whitelist_roles)):
             return True
 
@@ -112,18 +114,77 @@ class ModCog(commands.Cog):
         if not _within_one_edit(_review_access_text(content), _review_access_text(expected)):
             try:
                 await message.delete()
-            except Exception:
-                pass
+            except Exception as e:
+                await log_error(
+                    self.bot,
+                    f"Review access message delete failed in channel_id={message.channel.id} "
+                    f"message_id={message.id} user_id={message.author.id}: {repr(e)}",
+                )
             return True
 
         role_id = cfg.get_int("roles", "review_access_role_id")
         role = message.guild.get_role(role_id) if role_id else None
+        if role is None:
+            await log_error(self.bot, f"Review access role is missing or invalid: role_id={role_id}")
+            return True
         if role is not None and role not in member.roles:
             try:
                 await member.add_roles(role, reason="Review access agreement")
-            except Exception:
-                pass
+            except Exception as e:
+                await log_error(
+                    self.bot,
+                    f"Review access role grant failed for user_id={member.id} role_id={role.id}: {repr(e)}",
+                )
+                return True
+            await self._send_role_dm(member, role, source="review_access")
         return True
+
+    def _dm_templates_for_role(self, role_id: int) -> list[str]:
+        cfg = self.bot.config
+        templates: list[str] = []
+        entries = cfg.get("autoDM", "entries", default=None)
+        if isinstance(entries, list):
+            for ent in entries:
+                if not isinstance(ent, dict):
+                    continue
+                try:
+                    entry_role_id = int(ent.get("role_id"))
+                except Exception:
+                    continue
+                if entry_role_id != int(role_id):
+                    continue
+                msg = str(ent.get("message", "") or "").strip()
+                if msg:
+                    templates.append(msg)
+
+        legacy_role_id = cfg.get_int("roles", "autoDM_watched_role_id")
+        if legacy_role_id and int(legacy_role_id) == int(role_id):
+            legacy_msg = cfg.get_str("autoDM", "message", default="")
+            if legacy_msg:
+                templates.append(legacy_msg)
+        return templates
+
+    async def _send_role_dm(self, member: discord.Member, role: discord.Role, *, source: str) -> None:
+        now = time.monotonic()
+        key = (member.id, role.id)
+        if now - self._recent_role_dms.get(key, 0) < 30:
+            return
+        for msg_template in self._dm_templates_for_role(role.id):
+            txt = (
+                str(msg_template)
+                .replace("{user}", member.mention)
+                .replace("{role}", role.name)
+                .replace("{guild}", member.guild.name)
+            )
+            try:
+                await member.send(txt)
+                self._recent_role_dms[key] = now
+            except Exception as e:
+                await log_error(
+                    self.bot,
+                    f"Role DM failed for source={source} user_id={member.id} role_id={role.id}: {repr(e)}",
+                )
+            return
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
@@ -208,16 +269,18 @@ class ModCog(commands.Cog):
         for role_id, msg_template in rules:
             if role_id in after_ids and role_id not in before_ids:
                 role = after.guild.get_role(role_id)
-                txt = (
-                    str(msg_template)
-                    .replace("{user}", after.mention)
-                    .replace("{role}", role.name if role else str(role_id))
-                    .replace("{guild}", after.guild.name)
-                )
-                try:
-                    await after.send(txt)
-                except Exception:
-                    pass
+                if role is not None:
+                    await self._send_role_dm(after, role, source="member_update")
+                elif msg_template:
+                    try:
+                        await after.send(
+                            str(msg_template)
+                            .replace("{user}", after.mention)
+                            .replace("{role}", str(role_id))
+                            .replace("{guild}", after.guild.name)
+                        )
+                    except Exception as e:
+                        await log_error(self.bot, f"Role DM failed for missing role_id={role_id} user_id={after.id}: {repr(e)}")
 
 def setup(bot: discord.Bot):
     bot.add_cog(ModCog(bot))
