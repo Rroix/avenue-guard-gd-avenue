@@ -255,11 +255,11 @@
 4. Press the button as a user without required roles.
    - Expected: ephemeral no-requirements message.
 5. Press the button as an eligible user without `has_requested_role_id`.
-   - Expected: ephemeral first-time prompt with `I will` and `I won't`.
+   - Expected: concise ephemeral rules acknowledgement with one grey `I will` button.
 6. Press `I will`.
-   - Expected: user receives `request_banned_role_id`; future button presses are blocked by requirements.
-7. Remove the banned role, press again, then press `I won't`.
    - Expected: user receives `has_requested_role_id` and the request modal opens.
+7. Press the request button in a later wave.
+   - Expected: the acknowledgement is skipped and the request modal opens directly.
 8. Submit a valid modal.
    - Expected: staff embed appears in `level_requested`; user sees success; `/requests-are` count increases by 1.
    - Expected: staff embed shows how long ago it was submitted.
@@ -415,7 +415,7 @@
 8. Run `/requests pending scope:all status:pending`.
    - Expected: pending live request reviews and weekly request reviews are listed separately with jump links when message IDs are available.
 9. Run `/requests repair` as an admin.
-   - Expected: recovery embed reports the request button refresh, wave summary refresh, recreated/refreshed pending messages, stale validations refreshed, and reviewed messages relocked.
+   - Expected: recovery embed reports the request button refresh, wave summary refresh, recreated/refreshed pending messages, stale validations refreshed, and both live and weekly reviewed messages relocked.
 10. Send several normal chat messages.
    - Expected: tracking still counts activity, but writes are flushed according to `tracking.activity_flush_seconds`.
 11. Run `/restart` after sending a counted message.

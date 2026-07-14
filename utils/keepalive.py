@@ -91,10 +91,12 @@ def start_keepalive_thread() -> None:
     port = int(os.getenv("PORT", "8080"))
 
     def _run() -> None:
+        global _thread_started
         try:
-            server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+            server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)  # nosec B104
             server.serve_forever()
         except OSError as e:
+            _thread_started = False
             print(f"[Avenue Guard startup] Keepalive port {port} could not start: {type(e).__name__}: {e}", flush=True)
 
     thread = threading.Thread(target=_run, name="avenue-guard-keepalive", daemon=True)
@@ -124,5 +126,5 @@ async def start_keepalive() -> None:
     await runner.setup()
 
     port = int(os.getenv("PORT", "8080"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", port)  # nosec B104
     await site.start()

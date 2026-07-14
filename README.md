@@ -229,6 +229,8 @@ Database storage lives under `database` in `config.json`.
 - `turso_replica_path`: optional local replica file used by Turso/libSQL. This can stay in `data/` because Turso is the durable source.
 - `TURSO_AUTH_TOKEN`: required database auth token for Turso/libSQL. Generate it with `turso db tokens create <database-name>`; do not use a Turso platform/API token. Keep this secret in Render's environment settings, never in `config.json`.
 - `TURSO_DATABASE_URL`: optional environment variable that overrides `database.turso_url`.
+- `require_remote_when_configured`: prevents a missing Turso token or unwritable replica from silently moving production onto disposable local storage.
+- `ALLOW_LOCAL_DATABASE_FALLBACK`: explicit development-only override for the protection above.
 - `path`: optional local SQLite database path used when Turso is not configured. Leave blank to auto-detect `/var/data/avenue-guard/bot.db` when a Render Persistent Disk is mounted, then fall back to `data/bot.db` if it is not writable.
 - `AVENUE_GUARD_DB_PATH`: optional environment variable that overrides `database.path`.
 - `backups.enabled`: enables scheduled zipped SQLite backups.
@@ -298,6 +300,12 @@ pip install -r requirements.txt
 export DISCORD_TOKEN="your-token"
 ```
 
+Because this repository has a Turso URL configured, production refuses to silently fall back to disposable storage when `TURSO_AUTH_TOKEN` is missing. For intentional local-only development, opt in explicitly:
+
+```bash
+export ALLOW_LOCAL_DATABASE_FALLBACK="1"
+```
+
 Optional startup retry setting:
 
 ```bash
@@ -338,4 +346,13 @@ For free Render deployments, use Turso/libSQL by setting `database.turso_url` or
 
 ## Local Testing
 
-Use `TEST_CHECKLIST.md` for the full server-side test flow. It covers startup, moderation, live request waves, tracking, help sessions, ticket closure, transcript requests, sticky messages, forum reminders, required-word deletion, and fun commands.
+Install the development tools and run the automated audit suite:
+
+```bash
+pip install -r requirements-dev.txt
+./scripts/quality_check.sh
+```
+
+The suite checks migrations from an empty database, transaction rollback, concurrent ticket IDs, backup integrity, GD validation, request schedules and edit windows, cold-cache tracking ranks, runtime configuration persistence, URL and regex safety, daily-summary durability, lint, dependency vulnerabilities, and common security mistakes.
+
+Use `TEST_CHECKLIST.md` for the full Discord-side test flow. It covers startup, moderation, live request waves, tracking, help sessions, ticket closure, transcript requests, sticky messages, forum reminders, required-word deletion, and fun commands.

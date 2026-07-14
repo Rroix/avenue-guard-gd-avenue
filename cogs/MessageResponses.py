@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import discord
 from discord.ext import commands
@@ -11,6 +11,7 @@ from discord.ext import commands
 from utils.checks import ensure_allowed_guild_id, basic_color
 from utils.errors import log_error
 from utils.mentions import no_mentions
+
 
 class MessageResponsesCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
@@ -53,7 +54,7 @@ class MessageResponsesCog(commands.Cog):
             return 1600
 
     async def _log_rule_error(self, key: str, message: str) -> None:
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_rule_error_log.get(key, 0.0) < 300:
             return
         self._last_rule_error_log[key] = now
@@ -71,8 +72,14 @@ class MessageResponsesCog(commands.Cog):
                 embed_text = rule.get("Embed_text", {})
                 if not isinstance(embed_text, dict):
                     issues.append(f"Rule #{idx}: Embed_text must be an object")
+                elif not str(embed_text.get("title", "") or "").strip() and not str(
+                    embed_text.get("description", "") or ""
+                ).strip():
+                    issues.append(f"Rule #{idx}: Embed enabled but title and description are empty")
             if bool(rule.get("Message", False)) and not str(rule.get("Message_text", "") or "").strip():
                 issues.append(f"Rule #{idx}: Message enabled but Message_text is empty")
+            if not bool(rule.get("Embed", False)) and not bool(rule.get("Message", False)):
+                issues.append(f"Rule #{idx}: neither Embed nor Message output is enabled")
             channels = rule.get("Channels", [])
             if channels and not isinstance(channels, list):
                 issues.append(f"Rule #{idx}: Channels must be a list")
@@ -80,8 +87,14 @@ class MessageResponsesCog(commands.Cog):
 
     def _cooldown_ok(self, user_id: int) -> bool:
         cfg = self.bot.config
-        cd = int(cfg.get("responses", "cooldown_seconds", default=15) or 15)
-        now = time.time()
+        try:
+            cd = max(0, min(3600, int(cfg.get("responses", "cooldown_seconds", default=15) or 15)))
+        except (TypeError, ValueError):
+            cd = 15
+        now = time.monotonic()
+        if len(self._cooldown) > 5000:
+            cutoff = now - max(cd, 60) * 2
+            self._cooldown = {uid: seen for uid, seen in self._cooldown.items() if seen >= cutoff}
         last = self._cooldown.get(user_id, 0.0)
         if now - last < cd:
             return False
@@ -107,6 +120,7 @@ class MessageResponsesCog(commands.Cog):
 
         content = (message.content or "").strip()
         lowered = content.casefold()
+        first_match_only = bool(cfg.get("responses", "first_match_only", default=True))
 
         for rule in self._rules:
             try:
@@ -139,32 +153,43 @@ class MessageResponsesCog(commands.Cog):
                 respond = bool(rule.get("Respond", False))
                 use_embed = bool(rule.get("Embed", False))
                 use_msg = bool(rule.get("Message", False))
-
-                if (use_embed or use_msg) and not self._cooldown_ok(message.author.id):
-                    return
+                sent_response = False
 
                 if use_embed:
                     et = rule.get("Embed_text", {}) or {}
-                    title = str(et.get("title", "") or "")
-                    desc = str(et.get("description", "") or "")
+                    title = str(et.get("title", "") or "")[:256]
+                    desc = str(et.get("description", "") or "")[:4096]
+                    if not title and not desc:
+                        await self._log_rule_error(trigger[:80], f"Message response rule {trigger!r} has an empty embed")
+                        continue
+                    if not self._cooldown_ok(message.author.id):
+                        return
                     color = basic_color(str(et.get("color", "") or ""))
                     embed = discord.Embed(title=title or None, description=desc or None, color=color)
                     if respond:
                         await message.reply(embed=embed, mention_author=False, allowed_mentions=no_mentions())
                     else:
                         await message.channel.send(embed=embed, allowed_mentions=no_mentions())
+                    sent_response = True
                 elif use_msg:
                     text = str(rule.get("Message_text", "") or "")[: self._max_response_chars()]
+                    if not text:
+                        await self._log_rule_error(trigger[:80], f"Message response rule {trigger!r} has empty text")
+                        continue
+                    if not self._cooldown_ok(message.author.id):
+                        return
                     if respond:
                         await message.reply(text, mention_author=False, allowed_mentions=no_mentions())
                     else:
                         await message.channel.send(text, allowed_mentions=no_mentions())
+                    sent_response = True
 
-                # first match only
-                break
+                if sent_response and first_match_only:
+                    break
             except Exception as e:
                 await self._log_rule_error(str(rule.get("Content", ""))[:80], f"Message response rule failed: {repr(e)}")
                 continue
+
 
 def setup(bot: discord.Bot):
     bot.add_cog(MessageResponsesCog(bot))

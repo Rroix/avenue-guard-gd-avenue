@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import hashlib
+import ipaddress
+import json
 import random
+import socket
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time as dtime
 from typing import Dict, Optional, List, Tuple
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import discord
@@ -14,12 +18,15 @@ from discord.ext import commands, tasks
 
 from utils.checks import ensure_allowed_guild_id
 from utils.errors import log_error
+from utils.mentions import no_mentions
 from utils.server_icons import (
     ensure_server_icon_config,
+    is_valid_icon_url,
     normalize_server_icon_mode,
     parse_server_icon_index,
     server_icon_url_warning,
 )
+from utils.runtime_config import persist_server_icon_config
 from utils.timeutils import TZ, now_madrid, week_start_sunday
 
 def _day_key(dt: Optional[datetime] = None) -> str:
@@ -84,6 +91,7 @@ class DailyStats:
     commands: int = 0
     command_errors: int = 0
     commands_by_name: Dict[str, int] = field(default_factory=dict)
+    commands_by_user: Dict[int, int] = field(default_factory=dict)
 
     by_channel: Dict[int, int] = field(default_factory=dict)
     by_user: Dict[int, int] = field(default_factory=dict)
@@ -99,25 +107,50 @@ class BackgroundCog(commands.Cog):
         self._status_index = -1  # start at -1 so first rotation shows the first status
         self._last_status_swap = 0.0
         self._last_db_backup_ts = 0
+        self._completed_day_stats: Dict[str, DailyStats] = {}
+        self._persist_tasks: set[asyncio.Task] = set()
+        self._server_icon_lock = asyncio.Lock()
+
+    def cog_unload(self) -> None:
+        for loop in (
+            self.daily_report,
+            self.rotate_status,
+            self.rotate_server_icon,
+            self.update_snapshot,
+            self.database_backup,
+        ):
+            try:
+                if loop.is_running():
+                    loop.cancel()
+            except Exception:
+                pass
+        try:
+            task = asyncio.create_task(self._persist_current_day())
+            self._track_background_persist(task)
+        except Exception:
+            pass
 
     async def start_background(self):
-        if self._started:
-            return
-        self._started = True
-
         try:
             await self.bot.db.connect()
         except Exception as e:
             await log_error(self.bot, f"Background DB setup failed: {repr(e)}")
 
-        # Initialize voice sessions from current state (best-effort)
+        first_start = not self._started
+        self._started = True
+
+        # Initialize persisted state once. Loop startup still proceeds if this
+        # read fails so a transient Turso outage cannot disable all summaries.
         cfg = self.bot.config
         allowed = cfg.get_int("guild", "allowed_guild_id")
         guild = self.bot.get_guild(allowed) if allowed else None
-        if guild:
-            saved = await self._load_daily_stats(guild.id, self._current_day)
-            if saved is not None:
-                self.stats = saved
+        if guild and first_start:
+            try:
+                saved = await self._load_daily_stats(guild.id, self._current_day)
+                if saved is not None:
+                    self.stats = saved
+            except Exception as e:
+                await log_error(self.bot, f"Daily stats startup restore failed: {repr(e)}")
             now_ts = int(time.time())
             self.voice_sessions = self._voice_sessions_from_guild(guild, now_ts)
 
@@ -129,27 +162,28 @@ class BackgroundCog(commands.Cog):
             try:
                 if not self.rotate_status.is_running():
                     self.rotate_status.start()
-            except Exception:
-                pass
+            except Exception as e:
+                await log_error(self.bot, f"Status rotation startup failed: {repr(e)}")
 
         if self._server_icon_rotation_enabled():
             try:
                 if not self.rotate_server_icon.is_running():
                     self.rotate_server_icon.start()
-            except Exception:
-                pass
+            except Exception as e:
+                await log_error(self.bot, f"Server icon rotation startup failed: {repr(e)}")
 
         try:
             if not self.update_snapshot.is_running():
                 self.update_snapshot.start()
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(self.bot, f"Daily snapshot startup failed: {repr(e)}")
 
-        try:
-            if not self.database_backup.is_running():
-                self.database_backup.start()
-        except Exception:
-            pass
+        if self._database_backup_enabled():
+            try:
+                if not self.database_backup.is_running():
+                    self.database_backup.start()
+            except Exception as e:
+                await log_error(self.bot, f"Database backup startup failed: {repr(e)}")
 
         if self._daily_summary_enabled() and guild is not None:
             try:
@@ -158,38 +192,50 @@ class BackgroundCog(commands.Cog):
                 await log_error(self.bot, f"Daily summary catch-up failed: {repr(e)}")
 
     def on_config_reload(self) -> None:
-        # Restart daily loop if time changed
         try:
-            if self.daily_report.is_running():
+            if self._daily_summary_enabled():
+                if self._started:
+                    self._start_daily_report_loop()
+            elif self.daily_report.is_running():
                 self.daily_report.cancel()
-        except Exception:
-            pass
-        if self._started and self._daily_summary_enabled():
-            self._start_daily_report_loop()
+        except Exception as e:
+            try:
+                asyncio.create_task(log_error(self.bot, f"Daily summary config reload failed: {repr(e)}"))
+            except Exception:
+                pass
         try:
             if self._status_rotation_enabled():
                 if not self.rotate_status.is_running():
                     self.rotate_status.start()
             elif self.rotate_status.is_running():
                 self.rotate_status.cancel()
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                asyncio.create_task(log_error(self.bot, f"Status rotation config reload failed: {repr(e)}"))
+            except Exception:
+                pass
         try:
             if self._server_icon_rotation_enabled():
                 if not self.rotate_server_icon.is_running():
                     self.rotate_server_icon.start()
             elif self.rotate_server_icon.is_running():
                 self.rotate_server_icon.cancel()
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                asyncio.create_task(log_error(self.bot, f"Server icon config reload failed: {repr(e)}"))
+            except Exception:
+                pass
         try:
             if self._database_backup_enabled():
                 if not self.database_backup.is_running():
                     self.database_backup.start()
             elif self.database_backup.is_running():
                 self.database_backup.cancel()
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                asyncio.create_task(log_error(self.bot, f"Database backup config reload failed: {repr(e)}"))
+            except Exception:
+                pass
 
     # --------------------
     # Config helpers
@@ -278,6 +324,33 @@ class BackgroundCog(commands.Cog):
             return True
         return False
 
+    async def _assert_public_server_icon_url(self, url: str) -> None:
+        if not is_valid_icon_url(url):
+            raise RuntimeError("image URL is invalid or points to a private address")
+        parsed = urlparse(url)
+        hostname = str(parsed.hostname or "").rstrip(".")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            literal = ipaddress.ip_address(hostname)
+            addresses = {literal}
+        except ValueError:
+            try:
+                records = await asyncio.get_running_loop().getaddrinfo(
+                    hostname,
+                    port,
+                    type=socket.SOCK_STREAM,
+                )
+            except OSError as e:
+                raise RuntimeError(f"image host could not be resolved: {e}") from e
+            addresses = set()
+            for record in records:
+                try:
+                    addresses.add(ipaddress.ip_address(record[4][0]))
+                except (ValueError, IndexError):
+                    continue
+        if not addresses or any(not address.is_global for address in addresses):
+            raise RuntimeError("image URL resolves to a private or reserved address")
+
     async def _download_server_icon(self, url: str) -> bytes:
         warning = server_icon_url_warning(url)
         if warning:
@@ -286,18 +359,33 @@ class BackgroundCog(commands.Cog):
         max_bytes = 8 * 1024 * 1024
         headers = {"User-Agent": "AvenueGuard/1.0"}
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status >= 400:
-                    raise RuntimeError(f"image URL returned HTTP {resp.status}")
-                content_type = str(resp.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().casefold()
-                if content_type and not (content_type.startswith("image/") or content_type == "application/octet-stream"):
-                    raise RuntimeError(f"image URL returned `{content_type}` instead of an image")
-                data = await resp.content.read(max_bytes + 1)
+            current_url = url
+            for _redirect_count in range(4):
+                await self._assert_public_server_icon_url(current_url)
+                async with session.get(current_url, headers=headers, allow_redirects=False) as resp:
+                    if 300 <= resp.status < 400 and resp.headers.get("Location"):
+                        current_url = urljoin(current_url, str(resp.headers["Location"]))
+                        continue
+                    if resp.status >= 400:
+                        raise RuntimeError(f"image URL returned HTTP {resp.status}")
+                    content_type = str(resp.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().casefold()
+                    if content_type and not (content_type.startswith("image/") or content_type == "application/octet-stream"):
+                        raise RuntimeError(f"image URL returned `{content_type}` instead of an image")
+                    try:
+                        content_length = int(resp.headers.get("Content-Length", 0) or 0)
+                    except (TypeError, ValueError):
+                        content_length = 0
+                    if content_length > max_bytes:
+                        raise RuntimeError("image is larger than 8 MB")
+                    data = await resp.content.read(max_bytes + 1)
+                    break
+            else:
+                raise RuntimeError("image URL redirected too many times")
         if not data:
             raise RuntimeError("image URL returned an empty file")
         if len(data) > max_bytes:
             raise RuntimeError("image is larger than 8 MB")
-        sample = data[:4096].casefold()
+        sample = data[:4096].lower()
         if b"<html" in sample or b"cloudflare" in sample:
             raise RuntimeError("image URL returned an HTML/Cloudflare page instead of an image")
         if not self._looks_like_server_icon_image(data):
@@ -323,15 +411,38 @@ class BackgroundCog(commands.Cog):
                 return idx
         return -1
 
-    def _remember_server_icon_error(self, cfg: dict, message: str) -> None:
+    async def _persist_server_icon_state(self, cfg: dict) -> None:
+        await persist_server_icon_config(self.bot, cfg)
+        try:
+            self.bot.config.save()
+        except Exception as e:
+            await log_error(self.bot, f"Server icon state persisted remotely but local config save failed: {repr(e)}")
+
+    async def _remember_server_icon_error(self, cfg: dict, message: str) -> None:
         cfg["last_error"] = str(message or "")[:500]
         cfg["last_error_ts"] = int(time.time())
         try:
-            self.bot.config.save()
-        except Exception:
-            pass
+            await self._persist_server_icon_state(cfg)
+        except Exception as e:
+            await log_error(self.bot, f"Server icon error state could not be persisted: {repr(e)}")
 
     async def rotate_server_icon_once(
+        self,
+        guild: discord.Guild,
+        *,
+        force: bool = False,
+        actor_id: int = 0,
+        target_index: int = -1,
+    ) -> tuple[bool, str]:
+        async with self._server_icon_lock:
+            return await self._rotate_server_icon_once_locked(
+                guild,
+                force=force,
+                actor_id=actor_id,
+                target_index=target_index,
+            )
+
+    async def _rotate_server_icon_once_locked(
         self,
         guild: discord.Guild,
         *,
@@ -385,7 +496,7 @@ class BackgroundCog(commands.Cog):
 
         if changed_index < 0:
             detail = "; ".join(failures[:3]) or "all configured images failed"
-            self._remember_server_icon_error(cfg, detail)
+            await self._remember_server_icon_error(cfg, detail)
             return False, f"I couldn't change the server icon. {detail}"
 
         now_ts = int(time.time())
@@ -395,9 +506,9 @@ class BackgroundCog(commands.Cog):
         cfg["last_error"] = ""
         cfg["last_error_ts"] = 0
         try:
-            self.bot.config.save()
+            await self._persist_server_icon_state(cfg)
         except Exception as e:
-            await log_error(self.bot, f"Server icon rotation changed icon but failed to save config: {repr(e)}")
+            await log_error(self.bot, f"Server icon rotation changed icon but failed to persist state: {repr(e)}")
             return True, f"Changed the server icon to image #{changed_index + 1}, but couldn't save the new index."
 
         return True, f"Changed the server icon to image #{changed_index + 1}."
@@ -442,8 +553,8 @@ class BackgroundCog(commands.Cog):
                 (guild.id,)
             )
             open_tickets = int(row3["c"]) if row3 else 0
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(self.bot, f"Status rotation data lookup failed: {repr(e)}")
 
         mapping = _SafeDict({
             "members": str(members),
@@ -514,6 +625,7 @@ class BackgroundCog(commands.Cog):
             "by_channel": snapshot.by_channel,
             "by_user": snapshot.by_user,
             "commands_by_name": snapshot.commands_by_name,
+            "commands_by_user": snapshot.commands_by_user,
         }
 
     def _stats_from_payload(self, payload: dict) -> DailyStats:
@@ -530,6 +642,7 @@ class BackgroundCog(commands.Cog):
         snapshot.by_channel = {int(k): int(v) for k, v in (payload.get("by_channel") or {}).items()}
         snapshot.by_user = {int(k): int(v) for k, v in (payload.get("by_user") or {}).items()}
         snapshot.commands_by_name = {str(k): int(v) for k, v in (payload.get("commands_by_name") or {}).items()}
+        snapshot.commands_by_user = {int(k): int(v) for k, v in (payload.get("commands_by_user") or {}).items()}
         return snapshot
 
     async def _load_daily_stats(self, guild_id: int, day_key: str) -> Optional[DailyStats]:
@@ -578,7 +691,10 @@ class BackgroundCog(commands.Cog):
                 continue
 
     def _track_background_persist(self, task: asyncio.Task) -> None:
+        self._persist_tasks.add(task)
+
         def _done(done: asyncio.Task):
+            self._persist_tasks.discard(done)
             try:
                 exc = done.exception()
             except asyncio.CancelledError:
@@ -599,6 +715,9 @@ class BackgroundCog(commands.Cog):
             allowed = self.bot.config.get_int("guild", "allowed_guild_id")
             old_day = self._current_day
             old_stats = self.stats
+            self._completed_day_stats[old_day] = old_stats
+            for stale_day in sorted(self._completed_day_stats)[:-7]:
+                self._completed_day_stats.pop(stale_day, None)
             boundary_ts = self._rollover_boundary_ts(old_day)
             if allowed:
                 self._add_voice_until(old_stats, boundary_ts)
@@ -747,8 +866,8 @@ class BackgroundCog(commands.Cog):
         try:
             in_voice = sum(1 for m in member.guild.members if (not m.bot) and m.voice and m.voice.channel)
             snapshot.peak_voice_users = max(snapshot.peak_voice_users, in_voice)
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(self.bot, f"Voice snapshot update failed: {repr(e)}")
 
     @commands.Cog.listener()
     async def on_application_command_completion(self, ctx: discord.ApplicationContext):
@@ -762,6 +881,9 @@ class BackgroundCog(commands.Cog):
         snapshot.commands += 1
         name = getattr(ctx.command, "qualified_name", None) or getattr(ctx.command, "name", "unknown")
         snapshot.commands_by_name[str(name)] = snapshot.commands_by_name.get(str(name), 0) + 1
+        user_id = int(getattr(getattr(ctx, "user", None), "id", 0) or 0)
+        if user_id:
+            snapshot.commands_by_user[user_id] = snapshot.commands_by_user.get(user_id, 0) + 1
 
     @commands.Cog.listener()
     async def on_application_command_error(self, ctx: discord.ApplicationContext, error: Exception):
@@ -772,7 +894,13 @@ class BackgroundCog(commands.Cog):
             return
         self._rollover_if_needed(ctx.guild)
         snapshot = self.stats
+        snapshot.commands += 1
         snapshot.command_errors += 1
+        name = getattr(ctx.command, "qualified_name", None) or getattr(ctx.command, "name", "unknown")
+        snapshot.commands_by_name[str(name)] = snapshot.commands_by_name.get(str(name), 0) + 1
+        user_id = int(getattr(getattr(ctx, "user", None), "id", 0) or 0)
+        if user_id:
+            snapshot.commands_by_user[user_id] = snapshot.commands_by_user.get(user_id, 0) + 1
 
     # --------------------
     # Tasks
@@ -788,12 +916,15 @@ class BackgroundCog(commands.Cog):
         try:
             online = sum(1 for m in guild.members if (not m.bot) and m.status != discord.Status.offline)
             snapshot.peak_online_members = max(snapshot.peak_online_members, online)
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(self.bot, f"Presence snapshot update failed: {repr(e)}")
         try:
-            await self._persist_daily_stats(guild.id, self._current_day, snapshot)
-        except Exception:
-            pass
+            await self._persist_current_day()
+        except Exception as e:
+            await self._log_snapshot_failure(e)
+
+    async def _log_snapshot_failure(self, error: Exception) -> None:
+        await log_error(self.bot, f"Daily snapshot persist failed: {repr(error)}")
 
     @update_snapshot.before_loop
     async def _before_snapshot(self):
@@ -821,8 +952,8 @@ class BackgroundCog(commands.Cog):
             )
             if row and row["backup_ts"] is not None:
                 self._last_db_backup_ts = max(self._last_db_backup_ts, int(row["backup_ts"]))
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(self.bot, f"Database backup schedule lookup failed: {repr(e)}")
 
         if self._last_db_backup_ts and now_ts - self._last_db_backup_ts < interval:
             return
@@ -880,8 +1011,8 @@ class BackgroundCog(commands.Cog):
 
         try:
             await self.bot.change_presence(activity=discord.Activity(type=atype, name=txt))
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(self.bot, f"Status rotation update failed: {repr(e)}")
 
     @rotate_status.before_loop
     async def _before_rotate(self):
@@ -978,7 +1109,7 @@ class BackgroundCog(commands.Cog):
         if await self._daily_summary_already_sent(guild.id, report_day):
             return False
 
-        snapshot = self.stats if report_day == self._current_day else None
+        snapshot = self.stats if report_day == self._current_day else self._completed_day_stats.get(report_day)
         if snapshot is None:
             snapshot = await self._load_daily_stats(guild.id, report_day)
         if snapshot is None:
@@ -996,14 +1127,31 @@ class BackgroundCog(commands.Cog):
         voice_minutes = int(snapshot.voice_minutes)
         report_boundary_ts = self._rollover_boundary_ts(day_key)
         if day_key == self._current_day:
-            now_ts = report_boundary_ts if day_key != today else int(time.time())
-            for joined_ts in self.voice_sessions.values():
-                try:
-                    minutes = int((now_ts - int(joined_ts)) // 60)
-                    if minutes > 0:
-                        voice_minutes += minutes
-                except Exception:
-                    continue
+            if day_key != today:
+                # Close active sessions at the exact day boundary before the
+                # old snapshot is persisted. Previously this time appeared in
+                # the embed but disappeared from historical/impact data.
+                self._add_voice_until(snapshot, report_boundary_ts)
+                self.voice_sessions = self._voice_sessions_from_guild(guild, report_boundary_ts)
+                voice_minutes = int(snapshot.voice_minutes)
+            else:
+                now_ts = int(time.time())
+                for joined_ts in self.voice_sessions.values():
+                    try:
+                        minutes = int((now_ts - int(joined_ts)) // 60)
+                        if minutes > 0:
+                            voice_minutes += minutes
+                    except Exception:
+                        continue
+
+        # Persist the exact snapshot before sending. If Discord accepts the
+        # summary and the process exits immediately afterwards, impact history
+        # must already contain the day that was announced.
+        try:
+            await self._persist_daily_stats(guild.id, day_key, snapshot)
+        except Exception as e:
+            await log_error(self.bot, f"Daily summary stats persist failed for {day_key}: {repr(e)}")
+            return False
 
         active_channels = len(snapshot.by_channel)
         active_members = len(snapshot.by_user)
@@ -1094,22 +1242,29 @@ class BackgroundCog(commands.Cog):
 
         ch_id = self._daily_summary_channel_id()
         channel = guild.get_channel(ch_id) if ch_id else None
-        if isinstance(channel, discord.TextChannel):
+        if channel is None and ch_id:
             try:
-                sent = await channel.send(embed=embed)
+                channel = await guild.fetch_channel(ch_id)
+            except Exception:
+                channel = None
+        if isinstance(channel, discord.TextChannel):
+            sent = None
+            try:
+                sent = await channel.send(embed=embed, allowed_mentions=no_mentions())
                 await self._record_daily_summary_sent(guild.id, day_key, channel.id, sent.id)
             except Exception as e:
+                if sent is not None:
+                    try:
+                        await sent.delete()
+                    except Exception:
+                        pass
                 await log_error(self.bot, f"Daily summary send failed for {day_key}: {repr(e)}")
                 return False
         else:
             await log_error(self.bot, f"Daily summary channel is missing or invalid: channel_id={ch_id}")
             return False
 
-        # persist
-        try:
-            await self._persist_daily_stats(guild.id, day_key, snapshot)
-        except Exception as e:
-            await log_error(self.bot, f"Daily summary stats persist failed for {day_key}: {repr(e)}")
+        self._completed_day_stats.pop(day_key, None)
 
         if self._daily_reset_after_report() and self._current_day == day_key:
             self._current_day = today
@@ -1120,11 +1275,17 @@ class BackgroundCog(commands.Cog):
 
     @tasks.loop(time=dtime(hour=0, minute=0, tzinfo=TZ))
     async def daily_report(self):
-        allowed = self.bot.config.get_int("guild", "allowed_guild_id")
-        guild = self.bot.get_guild(allowed) if allowed else None
-        if guild is None:
-            return
-        await self._send_daily_summary_for_day(guild)
+        try:
+            allowed = self.bot.config.get_int("guild", "allowed_guild_id")
+            guild = self.bot.get_guild(allowed) if allowed else None
+            if guild is None:
+                return
+            await self._send_daily_summary_for_day(guild)
+        except Exception as e:
+            # discord.ext.tasks stops a loop when its body raises. Containing
+            # transient Discord/Turso failures here keeps tomorrow's report
+            # scheduled even when today's attempt cannot complete.
+            await log_error(self.bot, f"Daily report attempt failed: {repr(e)}")
 
     @daily_report.before_loop
     async def _before_daily(self):

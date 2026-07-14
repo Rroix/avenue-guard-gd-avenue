@@ -116,6 +116,12 @@ def _is_recoverable_remote_error(exc: Exception) -> bool:
         "sqlite_unknown",
         "failed to list objects in s3 storage",
         "hrana",
+        "status=500",
+        "http 500",
+        "temporarily unavailable",
+        "service unavailable",
+        "connection reset",
+        "timed out",
     )
     return any(marker in text for marker in markers)
 
@@ -137,6 +143,10 @@ class Database:
         self._lock = asyncio.Lock()
         self._conn: Optional[Any] = None
         self._ready = False
+        self._remote_dirty = False
+        self._remote_sync_retry_after = 0.0
+        self._last_remote_sync_error = ""
+        self._last_remote_sync_error_ts = 0
 
     def _close_connection_sync(self) -> None:
         if self._conn is None:
@@ -171,6 +181,11 @@ class Database:
             conn.execute("PRAGMA foreign_keys=ON;")
         except Exception:
             pass
+        for pragma in ("PRAGMA busy_timeout=5000;", "PRAGMA synchronous=NORMAL;"):
+            try:
+                conn.execute(pragma)
+            except Exception:
+                pass
         conn.commit()
         return conn
 
@@ -198,18 +213,48 @@ class Database:
         if last_error is not None:
             raise last_error
 
+    def _try_pending_remote_sync_sync(self) -> None:
+        """Retry a previously deferred remote sync without blocking every query."""
+        if not self.uses_remote or not self._remote_dirty:
+            return
+        if time.monotonic() < self._remote_sync_retry_after:
+            return
+        try:
+            self._sync_remote_with_retry_sync()
+        except Exception as exc:
+            self._last_remote_sync_error = f"{type(exc).__name__}: {exc}"[:1000]
+            self._last_remote_sync_error_ts = int(time.time())
+            retry_delay = 5.0 if _is_recoverable_remote_error(exc) else 60.0
+            self._remote_sync_retry_after = time.monotonic() + retry_delay
+            return
+        self._remote_dirty = False
+        self._remote_sync_retry_after = 0.0
+        self._last_remote_sync_error = ""
+        self._last_remote_sync_error_ts = 0
+
     def _commit_and_sync_sync(self) -> None:
         assert self._conn is not None
         self._conn.commit()
         try:
             self._sync_remote_with_retry_sync()
         except Exception as exc:
-            # The local commit already succeeded. For embedded Turso/libSQL,
-            # a temporary remote sync failure should not make callers re-run a
-            # non-idempotent write such as an activity increment.
-            if self.uses_remote and _is_recoverable_remote_error(exc):
+            # The local commit already succeeded. A replication failure must
+            # not make callers re-run a non-idempotent write such as an
+            # activity increment. Initial connection still performs a strict
+            # sync, so invalid credentials prevent startup rather than silently
+            # running as local-only storage.
+            if self.uses_remote:
+                self._remote_dirty = True
+                self._last_remote_sync_error = f"{type(exc).__name__}: {exc}"[:1000]
+                self._last_remote_sync_error_ts = int(time.time())
+                retry_delay = 5.0 if _is_recoverable_remote_error(exc) else 60.0
+                self._remote_sync_retry_after = time.monotonic() + retry_delay
                 return
             raise
+        self._remote_dirty = False
+        self._remote_sync_retry_after = 0.0
+        self._last_remote_sync_error = ""
+        self._last_remote_sync_error_ts = 0
 
     async def _run_locked_with_retry(self, operation, *, retry_operation: bool = True) -> Any:
         await self.connect()
@@ -221,6 +266,7 @@ class Database:
                 assert self._conn is not None
 
                 try:
+                    await asyncio.to_thread(self._try_pending_remote_sync_sync)
                     return await asyncio.to_thread(operation)
                 except Exception as exc:
                     last_error = exc
@@ -268,15 +314,35 @@ class Database:
 
             def _backup() -> int:
                 assert self._conn is not None
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
                 if self.uses_remote:
-                    self._sync_remote_with_retry_sync()
+                    # A backup of the transactionally consistent local replica
+                    # is still valuable during a temporary Turso outage. Try
+                    # replication first, but do not make remote availability a
+                    # prerequisite for producing a recovery file.
+                    self._remote_dirty = True
+                    self._try_pending_remote_sync_sync()
                     if not self.path.exists():
                         raise RuntimeError("The local Turso replica file does not exist yet, so no backup file can be created.")
-                    shutil.copy2(self.path, target)
-                    return int(target.stat().st_size)
-                self._conn.execute("PRAGMA wal_checkpoint(FULL);")
-                with sqlite3.connect(str(target)) as dest:
-                    self._conn.backup(dest)
+                    # The embedded replica can have live WAL state. SQLite's
+                    # backup API produces a transactionally consistent file;
+                    # copying only the main file can omit committed pages.
+                    source_uri = f"file:{self.path}?mode=ro"
+                    with sqlite3.connect(source_uri, uri=True) as source, sqlite3.connect(str(target)) as dest:
+                        source.backup(dest)
+                else:
+                    self._conn.execute("PRAGMA wal_checkpoint(FULL);")
+                    with sqlite3.connect(str(target)) as dest:
+                        self._conn.backup(dest)
+
+                with sqlite3.connect(f"file:{target}?mode=ro", uri=True) as check:
+                    row = check.execute("PRAGMA integrity_check;").fetchone()
+                    result = str(row[0] if row else "")
+                    if result.casefold() != "ok":
+                        raise sqlite3.DatabaseError(f"backup integrity_check returned {result!r}")
                 return int(target.stat().st_size)
 
             return await asyncio.to_thread(_backup)
@@ -404,6 +470,7 @@ class Database:
                 user_id INTEGER NOT NULL,
                 stage TEXT NOT NULL,
                 expires_ts INTEGER NOT NULL,
+                decline_prompt_message_id INTEGER,
                 active INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (guild_id, week_start, user_id)
             );""",
@@ -473,6 +540,7 @@ class Database:
                 review_text TEXT,
                 reviewed_by INTEGER,
                 reviewed_ts INTEGER,
+                edit_deadline_ts INTEGER,
                 created_ts INTEGER NOT NULL,
                 data_json TEXT NOT NULL DEFAULT '{}'
             );""",
@@ -490,6 +558,8 @@ class Database:
                 satisfaction_comment TEXT,
                 satisfaction_user_id INTEGER,
                 satisfaction_ts INTEGER,
+                satisfaction_message_id INTEGER,
+                closing_prompt_message_id INTEGER,
                 opening_message_id INTEGER
             );""",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_ticket_id
@@ -680,6 +750,11 @@ class Database:
                 known_tables_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (guild_id, restore_ts)
             );""",
+            """CREATE TABLE IF NOT EXISTS runtime_settings(
+                setting_key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_ts INTEGER NOT NULL
+            );""",
             """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
                 ON activity_counts(guild_id, week_start, count DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry
@@ -717,7 +792,13 @@ class Database:
             """CREATE INDEX IF NOT EXISTS idx_database_restore_log_guild
                 ON database_restore_log(guild_id, restore_ts DESC);""",
         ]
-        for stmt in stmts:
+        index_stmts = [
+            stmt
+            for stmt in stmts
+            if stmt.lstrip().upper().startswith(("CREATE INDEX", "CREATE UNIQUE INDEX"))
+        ]
+        table_stmts = [stmt for stmt in stmts if stmt not in index_stmts]
+        for stmt in table_stmts:
             self._conn.execute(stmt)
 
         self._ensure_column_sync("tickets", "ticket_id", "INTEGER")
@@ -727,7 +808,10 @@ class Database:
         self._ensure_column_sync("tickets", "satisfaction_comment", "TEXT")
         self._ensure_column_sync("tickets", "satisfaction_user_id", "INTEGER")
         self._ensure_column_sync("tickets", "satisfaction_ts", "INTEGER")
+        self._ensure_column_sync("tickets", "satisfaction_message_id", "INTEGER")
+        self._ensure_column_sync("tickets", "closing_prompt_message_id", "INTEGER")
         self._ensure_column_sync("tickets", "opening_message_id", "INTEGER")
+        self._ensure_column_sync("weekly_sessions", "decline_prompt_message_id", "INTEGER")
         self._ensure_column_sync("transcript_requests", "ticket_id", "INTEGER")
         self._ensure_column_sync("level_request_state", "request_channel_id", "INTEGER")
         self._ensure_column_sync("level_request_state", "request_message_id", "INTEGER")
@@ -737,6 +821,7 @@ class Database:
         self._ensure_column_sync("level_request_submissions", "review_text", "TEXT")
         self._ensure_column_sync("level_request_submissions", "reviewed_by", "INTEGER")
         self._ensure_column_sync("level_request_submissions", "reviewed_ts", "INTEGER")
+        self._ensure_column_sync("level_request_submissions", "edit_deadline_ts", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "channel_id", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "rank", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "result", "TEXT")
@@ -756,6 +841,8 @@ class Database:
         self._ensure_column_sync("level_request_scheduled_openings", "open_message", "TEXT")
         self._normalize_weekly_dm_log_sync()
         self._init_ticket_sequences_sync()
+        for stmt in index_stmts:
+            self._conn.execute(stmt)
         self._commit_and_sync_sync()
 
     def _ensure_column_sync(self, table: str, column: str, coltype: str) -> None:
@@ -764,10 +851,7 @@ class Database:
         cols = {_row_get(r, "name", index=1) for r in info}
         if column in cols:
             return
-        try:
-            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-        except Exception:
-            pass
+        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
     def _normalize_weekly_dm_log_sync(self) -> None:
         assert self._conn is not None
@@ -795,8 +879,9 @@ class Database:
                 ts INTEGER NOT NULL
             );"""
         )
+        # event_expr is chosen solely from the fixed migration expressions above.
         self._conn.execute(
-            "INSERT INTO weekly_dm_log_new(guild_id, week_start, user_id, event, detail, ts) "
+            "INSERT INTO weekly_dm_log_new(guild_id, week_start, user_id, event, detail, ts) "  # nosec
             f"SELECT guild_id, week_start, user_id, {event_expr}, COALESCE(detail, ''), ts FROM weekly_dm_log"
         )
         self._conn.execute("DROP TABLE weekly_dm_log")
@@ -804,484 +889,28 @@ class Database:
 
     def _init_ticket_sequences_sync(self) -> None:
         assert self._conn is not None
-        cur = self._conn.execute("SELECT MAX(ticket_id) AS m FROM tickets")
-        row = cur.fetchone()
-        max_value = _row_get(row, "m", index=0)
-        max_id = int(max_value) if max_value is not None else 0
         for gid_row in _fetchall(self._conn.execute("SELECT DISTINCT guild_id FROM tickets")):
             gid = int(_row_get(gid_row, "guild_id", index=0, default=0) or 0)
+            max_row = self._conn.execute(
+                "SELECT MAX(ticket_id) AS m FROM tickets WHERE guild_id=?",
+                (gid,),
+            ).fetchone()
+            max_value = _row_get(max_row, "m", index=0)
+            max_id = int(max_value) if max_value is not None else 0
             cur2 = self._conn.execute("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (gid,))
-            if cur2.fetchone() is None:
+            sequence_row = cur2.fetchone()
+            if sequence_row is None:
                 self._conn.execute(
                     "INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)",
                     (gid, max_id + 1 if max_id > 0 else 1),
                 )
-
-    async def _migrate(self) -> None:
-        # Create base tables first
-        stmts = [
-            """CREATE TABLE IF NOT EXISTS activity_counts(
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                week_start TEXT NOT NULL,
-                count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (guild_id, user_id, week_start)
-            );""",
-            """CREATE TABLE IF NOT EXISTS activity_last_counted(
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                last_counted_ts INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, user_id)
-            );""",
-            """CREATE TABLE IF NOT EXISTS weekly_claims(
-                guild_id INTEGER NOT NULL,
-                week_start TEXT NOT NULL,
-                user_id INTEGER NOT NULL,
-                rank INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                contacted_ts INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, week_start, user_id)
-            );""",
-            """CREATE TABLE IF NOT EXISTS weekly_sessions(
-                guild_id INTEGER NOT NULL,
-                week_start TEXT NOT NULL,
-                user_id INTEGER NOT NULL,
-                stage TEXT NOT NULL,
-                expires_ts INTEGER NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY (guild_id, week_start, user_id)
-            );""",
-            """CREATE TABLE IF NOT EXISTS weekly_dm_log(
-    guild_id INTEGER NOT NULL,
-    week_start TEXT NOT NULL,
-    user_id INTEGER NOT NULL,
-    event TEXT NOT NULL,
-    detail TEXT NOT NULL,
-    ts INTEGER NOT NULL
-);""",
-"""CREATE TABLE IF NOT EXISTS weekly_reminders(
-    guild_id INTEGER NOT NULL,
-    week_start TEXT NOT NULL,
-    user_id INTEGER NOT NULL,
-    reminded_ts INTEGER NOT NULL,
-    PRIMARY KEY (guild_id, week_start, user_id)
-);""",
-"""CREATE TABLE IF NOT EXISTS weekly_runs(
-    guild_id INTEGER NOT NULL,
-    week_start TEXT NOT NULL,
-    ran_ts INTEGER NOT NULL,
-    PRIMARY KEY (guild_id, week_start)
-);""",
-"""CREATE TABLE IF NOT EXISTS weekly_reward_disabled(
-    guild_id INTEGER NOT NULL,
-    week_start TEXT NOT NULL,
-    disabled_ts INTEGER NOT NULL,
-    disabled_by INTEGER NOT NULL,
-    PRIMARY KEY (guild_id, week_start)
-);""",
-"""CREATE TABLE IF NOT EXISTS weekly_streaks(
-    guild_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    streak INTEGER NOT NULL DEFAULT 0,
-    best_streak INTEGER NOT NULL DEFAULT 0,
-    last_week_start TEXT,
-    updated_ts INTEGER NOT NULL,
-    PRIMARY KEY (guild_id, user_id)
-);""",
-"""CREATE TABLE IF NOT EXISTS weekly_recaps(
-    guild_id INTEGER NOT NULL,
-    week_start TEXT NOT NULL,
-    message_id INTEGER,
-    channel_id INTEGER,
-    created_ts INTEGER NOT NULL,
-    PRIMARY KEY (guild_id, week_start)
-);""",
-"""CREATE TABLE IF NOT EXISTS anti_farm_events(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    channel_id INTEGER,
-    reason TEXT NOT NULL,
-    sample TEXT NOT NULL DEFAULT '',
-    ts INTEGER NOT NULL
-);""",
-"""CREATE TABLE IF NOT EXISTS weekly_request_reviews(
-    guild_id INTEGER NOT NULL,
-    request_message_id INTEGER PRIMARY KEY,
-    channel_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    week_start TEXT NOT NULL,
-    rank INTEGER,
-    status TEXT NOT NULL DEFAULT 'pending',
-    result TEXT,
-    review_text TEXT,
-    reviewed_by INTEGER,
-    reviewed_ts INTEGER,
-    created_ts INTEGER NOT NULL,
-    data_json TEXT NOT NULL DEFAULT '{}'
-);""",
-"""CREATE TABLE IF NOT EXISTS tickets(
-                guild_id INTEGER NOT NULL,
-                channel_id INTEGER PRIMARY KEY,
-                creator_id INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL,
-                last_user_activity_ts INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                ticket_id INTEGER,
-                status_tag TEXT NOT NULL DEFAULT 'waiting_staff',
-                closed_ts INTEGER,
-                satisfaction_score INTEGER,
-                satisfaction_comment TEXT,
-                satisfaction_user_id INTEGER,
-                satisfaction_ts INTEGER,
-                opening_message_id INTEGER
-            );""",
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_ticket_id
-                ON tickets(guild_id, ticket_id) WHERE ticket_id IS NOT NULL;""",
-            """CREATE TABLE IF NOT EXISTS ticket_sequences(
-                guild_id INTEGER PRIMARY KEY,
-                next_ticket_id INTEGER NOT NULL
-            );""",
-            """CREATE TABLE IF NOT EXISTS ticket_transcripts(
-                guild_id INTEGER NOT NULL,
-                ticket_id INTEGER NOT NULL,
-                log_channel_id INTEGER NOT NULL,
-                log_message_id INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, ticket_id)
-            );""",
-            """CREATE TABLE IF NOT EXISTS ticket_cooldowns(
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                last_created_ts INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, user_id)
-            );""",
-            """CREATE TABLE IF NOT EXISTS sticky_state(
-                guild_id INTEGER NOT NULL,
-                channel_id INTEGER NOT NULL,
-                last_sticky_message_id INTEGER,
-                PRIMARY KEY (guild_id, channel_id)
-            );""",
-            """CREATE TABLE IF NOT EXISTS help_sessions(
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                stage TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                data_json TEXT NOT NULL DEFAULT '{}',
-                PRIMARY KEY (guild_id, user_id)
-            );""",
-            """CREATE TABLE IF NOT EXISTS help_cooldowns(
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                action TEXT NOT NULL,
-                last_used_ts INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, user_id, action)
-            );""",
-            """CREATE TABLE IF NOT EXISTS help_submissions(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                user_id INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_ts INTEGER NOT NULL,
-                updated_ts INTEGER NOT NULL,
-                log_channel_id INTEGER,
-                log_message_id INTEGER,
-                data_json TEXT NOT NULL DEFAULT '{}',
-                response_text TEXT,
-                responded_by INTEGER,
-                responded_ts INTEGER
-            );""",
-            """CREATE TABLE IF NOT EXISTS transcript_requests(
-                guild_id INTEGER NOT NULL,
-                request_message_id INTEGER PRIMARY KEY,
-                ticket_channel_id INTEGER NOT NULL,
-                requester_id INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                ticket_id INTEGER
-            );""",
-            """CREATE TABLE IF NOT EXISTS rps_streaks(
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                streak INTEGER NOT NULL,
-                updated_ts INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, user_id)
-            );""",
-            """CREATE TABLE IF NOT EXISTS level_request_state(
-                guild_id INTEGER PRIMARY KEY,
-                state TEXT NOT NULL DEFAULT 'closed',
-                wave_id INTEGER NOT NULL DEFAULT 0,
-                request_limit INTEGER,
-                close_ts INTEGER,
-                submitted_count INTEGER NOT NULL DEFAULT 0,
-                opened_ts INTEGER,
-                closed_ts INTEGER,
-                request_channel_id INTEGER,
-                request_message_id INTEGER,
-                request_type TEXT
-            );""",
-            """CREATE TABLE IF NOT EXISTS level_request_submissions(
-                guild_id INTEGER NOT NULL,
-                wave_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                level_id TEXT NOT NULL,
-                request_message_id INTEGER UNIQUE,
-                status TEXT NOT NULL,
-                result TEXT,
-                review_text TEXT,
-                reviewed_by INTEGER,
-                reviewed_ts INTEGER,
-                created_ts INTEGER NOT NULL,
-                data_json TEXT NOT NULL DEFAULT '{}',
-                PRIMARY KEY (guild_id, wave_id, user_id),
-                UNIQUE (guild_id, wave_id, level_id)
-            );""",
-            """CREATE TABLE IF NOT EXISTS level_request_wave_summaries(
-                guild_id INTEGER NOT NULL,
-                wave_id INTEGER NOT NULL,
-                channel_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL,
-                updated_ts INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, wave_id)
-            );""",
-            """CREATE TABLE IF NOT EXISTS level_request_scheduled_openings(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                request_limit INTEGER,
-                close_minutes INTEGER,
-                open_ts INTEGER NOT NULL,
-                request_type TEXT,
-                open_message TEXT,
-                created_by INTEGER NOT NULL,
-                created_ts INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                opened_wave_id INTEGER
-            );""",
-            """CREATE TABLE IF NOT EXISTS level_request_edit_audit(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                wave_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                request_message_id INTEGER,
-                old_level_id TEXT,
-                new_level_id TEXT,
-                old_data_json TEXT NOT NULL DEFAULT '{}',
-                new_data_json TEXT NOT NULL DEFAULT '{}',
-                edited_ts INTEGER NOT NULL
-            );""",
-            """CREATE TABLE IF NOT EXISTS gd_level_validation_cache(
-                level_id TEXT PRIMARY KEY,
-                checked_ts INTEGER NOT NULL,
-                expires_ts INTEGER NOT NULL,
-                data_json TEXT NOT NULL DEFAULT '{}'
-            );""",
-            """CREATE TABLE IF NOT EXISTS daily_stats(
-                guild_id INTEGER NOT NULL,
-                day_key TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, day_key)
-            );""",
-            """CREATE TABLE IF NOT EXISTS daily_summary_reports(
-                guild_id INTEGER NOT NULL,
-                day_key TEXT NOT NULL,
-                channel_id INTEGER,
-                message_id INTEGER,
-                sent_ts INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, day_key)
-            );""",
-            """CREATE TABLE IF NOT EXISTS impact_snapshots(
-                guild_id INTEGER NOT NULL,
-                snapshot_ts INTEGER NOT NULL,
-                report_channel_id INTEGER,
-                report_message_id INTEGER,
-                payload_json TEXT NOT NULL,
-                PRIMARY KEY (guild_id, snapshot_ts)
-            );""",
-            """CREATE TABLE IF NOT EXISTS database_backups(
-                guild_id INTEGER NOT NULL,
-                backup_ts INTEGER NOT NULL,
-                channel_id INTEGER,
-                message_id INTEGER,
-                size_bytes INTEGER NOT NULL DEFAULT 0,
-                reason TEXT NOT NULL DEFAULT '',
-                requested_by INTEGER,
-                filename TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (guild_id, backup_ts)
-            );""",
-            """CREATE TABLE IF NOT EXISTS database_restore_log(
-                guild_id INTEGER NOT NULL,
-                restore_ts INTEGER NOT NULL,
-                uploaded_by INTEGER NOT NULL,
-                source_filename TEXT NOT NULL DEFAULT '',
-                size_bytes INTEGER NOT NULL DEFAULT 0,
-                pre_restore_backup_channel_id INTEGER,
-                pre_restore_backup_message_id INTEGER,
-                pre_restore_backup_filename TEXT NOT NULL DEFAULT '',
-                tables_count INTEGER NOT NULL DEFAULT 0,
-                known_tables_json TEXT NOT NULL DEFAULT '[]',
-                PRIMARY KEY (guild_id, restore_ts)
-            );""",
-            """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
-                ON activity_counts(guild_id, week_start, count DESC);""",
-            """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry
-                ON weekly_sessions(guild_id, active, expires_ts);""",
-            """CREATE INDEX IF NOT EXISTS idx_weekly_claims_status
-                ON weekly_claims(guild_id, week_start, status);""",
-            """CREATE INDEX IF NOT EXISTS idx_tickets_status_activity
-                ON tickets(guild_id, status, last_user_activity_ts);""",
-            """CREATE INDEX IF NOT EXISTS idx_level_request_submissions_status
-                ON level_request_submissions(guild_id, status, wave_id);""",
-            """CREATE INDEX IF NOT EXISTS idx_level_request_scheduled_openings_pending
-                ON level_request_scheduled_openings(guild_id, status, open_ts);""",
-            """CREATE INDEX IF NOT EXISTS idx_level_request_edit_audit_lookup
-                ON level_request_edit_audit(guild_id, wave_id, user_id, edited_ts DESC);""",
-            """CREATE INDEX IF NOT EXISTS idx_level_request_edit_audit_message
-                ON level_request_edit_audit(guild_id, request_message_id);""",
-            """CREATE INDEX IF NOT EXISTS idx_gd_level_validation_cache_expiry
-                ON gd_level_validation_cache(expires_ts);""",
-            """CREATE INDEX IF NOT EXISTS idx_weekly_request_reviews_status
-                ON weekly_request_reviews(guild_id, status, week_start);""",
-            """CREATE INDEX IF NOT EXISTS idx_weekly_streaks
-                ON weekly_streaks(guild_id, streak DESC, best_streak DESC);""",
-            """CREATE INDEX IF NOT EXISTS idx_anti_farm_events_lookup
-                ON anti_farm_events(guild_id, user_id, ts DESC);""",
-            """CREATE INDEX IF NOT EXISTS idx_transcript_requests_ticket_status
-                ON transcript_requests(guild_id, ticket_id, status);""",
-            """CREATE INDEX IF NOT EXISTS idx_help_submissions_user_status
-                ON help_submissions(guild_id, user_id, status, created_ts DESC);""",
-            """CREATE INDEX IF NOT EXISTS idx_help_submissions_log_message
-                ON help_submissions(guild_id, log_channel_id, log_message_id);""",
-            """CREATE INDEX IF NOT EXISTS idx_impact_snapshots_guild
-                ON impact_snapshots(guild_id, snapshot_ts DESC);""",
-            """CREATE INDEX IF NOT EXISTS idx_database_backups_guild
-                ON database_backups(guild_id, backup_ts DESC);""",
-            """CREATE INDEX IF NOT EXISTS idx_database_restore_log_guild
-                ON database_restore_log(guild_id, restore_ts DESC);""",
-        ]
-        for s in stmts:
-            await self.execute(s)
-
-        # Ensure columns exist on older DBs
-        await self._ensure_column("tickets", "ticket_id", "INTEGER")
-        await self._ensure_column("tickets", "status_tag", "TEXT NOT NULL DEFAULT 'waiting_staff'")
-        await self._ensure_column("tickets", "closed_ts", "INTEGER")
-        await self._ensure_column("tickets", "satisfaction_score", "INTEGER")
-        await self._ensure_column("tickets", "satisfaction_comment", "TEXT")
-        await self._ensure_column("tickets", "satisfaction_user_id", "INTEGER")
-        await self._ensure_column("tickets", "satisfaction_ts", "INTEGER")
-        await self._ensure_column("tickets", "opening_message_id", "INTEGER")
-        await self._ensure_column("transcript_requests", "ticket_id", "INTEGER")
-        await self._ensure_column("level_request_state", "request_channel_id", "INTEGER")
-        await self._ensure_column("level_request_state", "request_message_id", "INTEGER")
-        await self._ensure_column("level_request_state", "request_type", "TEXT")
-        await self._ensure_column("level_request_submissions", "request_message_id", "INTEGER")
-        await self._ensure_column("level_request_submissions", "result", "TEXT")
-        await self._ensure_column("level_request_submissions", "review_text", "TEXT")
-        await self._ensure_column("level_request_submissions", "reviewed_by", "INTEGER")
-        await self._ensure_column("level_request_submissions", "reviewed_ts", "INTEGER")
-        await self._ensure_column("weekly_request_reviews", "channel_id", "INTEGER")
-        await self._ensure_column("weekly_request_reviews", "rank", "INTEGER")
-        await self._ensure_column("weekly_request_reviews", "result", "TEXT")
-        await self._ensure_column("weekly_request_reviews", "review_text", "TEXT")
-        await self._ensure_column("weekly_request_reviews", "reviewed_by", "INTEGER")
-        await self._ensure_column("weekly_request_reviews", "reviewed_ts", "INTEGER")
-        await self._ensure_column("weekly_request_reviews", "data_json", "TEXT NOT NULL DEFAULT '{}'")
-        await self._ensure_column("help_submissions", "response_text", "TEXT")
-        await self._ensure_column("help_submissions", "responded_by", "INTEGER")
-        await self._ensure_column("help_submissions", "responded_ts", "INTEGER")
-        await self._ensure_column("level_request_wave_summaries", "channel_id", "INTEGER")
-        await self._ensure_column("level_request_wave_summaries", "message_id", "INTEGER")
-        await self._ensure_column("level_request_wave_summaries", "created_ts", "INTEGER")
-        await self._ensure_column("level_request_wave_summaries", "updated_ts", "INTEGER")
-        await self._ensure_column("level_request_scheduled_openings", "opened_wave_id", "INTEGER")
-        await self._ensure_column("level_request_scheduled_openings", "request_type", "TEXT")
-        await self._ensure_column("level_request_scheduled_openings", "open_message", "TEXT")
-        await self._normalize_weekly_dm_log()
-
-        # Ensure sequence exists (set next_ticket_id based on max ticket_id)
-        async with self._lock:
-            assert self._conn is not None
-
-            def _init_seq():
-                cur = self._conn.execute("SELECT MAX(ticket_id) AS m FROM tickets")
-                row = cur.fetchone()
-                max_value = _row_get(row, "m", index=0)
-                max_id = int(max_value) if max_value is not None else 0
-                # if sequence row missing, create it
-                for gid_row in _fetchall(self._conn.execute("SELECT DISTINCT guild_id FROM tickets")):
-                    gid = int(_row_get(gid_row, "guild_id", index=0, default=0) or 0)
-                    cur2 = self._conn.execute("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (gid,))
-                    if cur2.fetchone() is None:
-                        self._conn.execute(
-                            "INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)",
-                            (gid, max_id + 1 if max_id > 0 else 1)
-                        )
-                self._commit_and_sync_sync()
-
-            await asyncio.to_thread(_init_seq)
-
-    async def _normalize_weekly_dm_log(self) -> None:
-        async with self._lock:
-            assert self._conn is not None
-
-            def _run():
-                assert self._conn is not None
-                info = _fetchall(self._conn.execute("PRAGMA table_info(weekly_dm_log)"))
-                cols = {_row_get(r, "name", index=1) for r in info}
-                if "event" in cols and "action" not in cols:
-                    return
-
-                event_expr = "''"
-                if "event" in cols and "action" in cols:
-                    event_expr = "COALESCE(event, action, '')"
-                elif "event" in cols:
-                    event_expr = "COALESCE(event, '')"
-                elif "action" in cols:
-                    event_expr = "COALESCE(action, '')"
-
-                self._conn.execute("DROP TABLE IF EXISTS weekly_dm_log_new")
-                self._conn.execute(
-                    """CREATE TABLE weekly_dm_log_new(
-                        guild_id INTEGER NOT NULL,
-                        week_start TEXT NOT NULL,
-                        user_id INTEGER NOT NULL,
-                        event TEXT NOT NULL,
-                        detail TEXT NOT NULL,
-                        ts INTEGER NOT NULL
-                    );"""
-                )
-                self._conn.execute(
-                    "INSERT INTO weekly_dm_log_new(guild_id, week_start, user_id, event, detail, ts) "
-                    f"SELECT guild_id, week_start, user_id, {event_expr}, COALESCE(detail, ''), ts FROM weekly_dm_log"
-                )
-                self._conn.execute("DROP TABLE weekly_dm_log")
-                self._conn.execute("ALTER TABLE weekly_dm_log_new RENAME TO weekly_dm_log")
-                self._commit_and_sync_sync()
-
-            await asyncio.to_thread(_run)
-
-    async def _ensure_column(self, table: str, column: str, coltype: str) -> None:
-        await self.connect()
-        async with self._lock:
-            assert self._conn is not None
-
-            def _run():
-                assert self._conn is not None
-                info = _fetchall(self._conn.execute(f"PRAGMA table_info({table})"))
-                cols = {_row_get(r, "name", index=1) for r in info}
-                if column in cols:
-                    return
-                try:
-                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-                    self._commit_and_sync_sync()
-                except Exception:
-                    # ignore if cannot alter
-                    pass
-
-            await asyncio.to_thread(_run)
+            else:
+                current_next = int(_row_get(sequence_row, "next_ticket_id", index=0, default=1) or 1)
+                if current_next <= max_id:
+                    self._conn.execute(
+                        "UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?",
+                        (max_id + 1, gid),
+                    )
 
     async def next_ticket_id(self, guild_id: int) -> int:
         def _run():
@@ -1307,6 +936,83 @@ class Database:
             self._commit_and_sync_sync()
 
         await self._run_locked_with_retry(_run, retry_operation=False)
+
+    async def execute_insert(self, sql: str, params: Sequence[Any] = ()) -> int:
+        """Execute one INSERT and return its generated integer row ID."""
+
+        def _run() -> int:
+            assert self._conn is not None
+            cursor = self._conn.execute(sql, params)
+            row_id = getattr(cursor, "lastrowid", None)
+            if row_id is None:
+                row = self._conn.execute("SELECT last_insert_rowid()").fetchone()
+                row_id = _row_get(row, "last_insert_rowid()", index=0, default=0)
+            self._commit_and_sync_sync()
+            return int(row_id or 0)
+
+        return await self._run_locked_with_retry(_run, retry_operation=False)
+
+    async def execute_transaction(
+        self,
+        statements: Iterable[tuple[str, Sequence[Any]]],
+        *,
+        retry_safe: bool = False,
+    ) -> None:
+        """Commit several statements atomically on the local/remote replica."""
+        items = [(sql, tuple(params)) for sql, params in statements]
+        if not items:
+            return
+
+        def _run() -> None:
+            assert self._conn is not None
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                for sql, params in items:
+                    self._conn.execute(sql, params)
+                self._commit_and_sync_sync()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+        await self._run_locked_with_retry(_run, retry_operation=retry_safe)
+
+    async def set_runtime_setting(self, key: str, value: Any) -> None:
+        payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+        await self.execute(
+            "INSERT INTO runtime_settings(setting_key,value_json,updated_ts) VALUES(?,?,?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json, updated_ts=excluded.updated_ts",
+            (str(key), payload, int(time.time())),
+        )
+
+    async def get_runtime_setting(self, key: str, default: Any = None) -> Any:
+        row = await self.fetchone(
+            "SELECT value_json FROM runtime_settings WHERE setting_key=?",
+            (str(key),),
+        )
+        if not row:
+            return default
+        try:
+            return json.loads(str(row["value_json"] or "null"))
+        except Exception:
+            return default
+
+    async def sync_remote(self) -> bool:
+        """Force any pending embedded-replica changes toward the remote primary."""
+        if not self.uses_remote:
+            return True
+
+        def _run() -> bool:
+            self._sync_remote_with_retry_sync()
+            self._remote_dirty = False
+            self._remote_sync_retry_after = 0.0
+            self._last_remote_sync_error = ""
+            self._last_remote_sync_error_ts = 0
+            return True
+
+        return bool(await self._run_locked_with_retry(_run))
 
     async def executemany(self, sql: str, seq: Iterable[Sequence[Any]]) -> None:
         items = list(seq)

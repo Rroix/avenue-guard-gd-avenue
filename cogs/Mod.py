@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 import discord
@@ -7,13 +8,11 @@ from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, member_has_any_role
 from utils.errors import log_error
+from utils.mentions import no_mentions
 
 
 def _review_access_text(value: str) -> str:
-    cleaned = " ".join(str(value or "").casefold().strip().split())
-    if cleaned.endswith((".", ",", "!", "?")):
-        cleaned = cleaned[:-1].rstrip()
-    return cleaned
+    return " ".join(str(value or "").casefold().strip().split())
 
 
 def _within_one_edit(actual: str, expected: str) -> bool:
@@ -23,7 +22,7 @@ def _within_one_edit(actual: str, expected: str) -> bool:
         return False
 
     if len(actual) == len(expected):
-        differences = sum(1 for a, b in zip(actual, expected) if a != b)
+        differences = sum(1 for a, b in zip(actual, expected, strict=True) if a != b)
         return differences <= 1
 
     shorter, longer = (actual, expected) if len(actual) < len(expected) else (expected, actual)
@@ -44,6 +43,7 @@ class ModCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
         self._recent_role_dms: dict[tuple[int, int], float] = {}
+        self._role_dm_lock = asyncio.Lock()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -78,15 +78,22 @@ class ModCog(commands.Cog):
         # delete the message and apply restriction role
         try:
             await message.delete()
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(
+                self.bot,
+                f"Autodelete message removal failed channel_id={message.channel.id} "
+                f"message_id={message.id} user_id={message.author.id}: {repr(e)}",
+            )
 
         try:
             role = message.guild.get_role(restriction_role_id)
             if role and role not in member.roles:
                 await member.add_roles(role, reason="Autodeletion restriction")
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(
+                self.bot,
+                f"Autodelete restriction grant failed user_id={member.id} role_id={restriction_role_id}: {repr(e)}",
+            )
 
     async def _handle_review_access_message(self, message: discord.Message) -> bool:
         cfg = self.bot.config
@@ -126,6 +133,17 @@ class ModCog(commands.Cog):
         role = message.guild.get_role(role_id) if role_id else None
         if role is None:
             await log_error(self.bot, f"Review access role is missing or invalid: role_id={role_id}")
+            try:
+                await member.send(
+                    "I couldn't grant review access because the role is unavailable. Please contact staff.",
+                    allowed_mentions=no_mentions(),
+                )
+            except Exception:
+                pass
+            try:
+                await message.delete()
+            except Exception:
+                pass
             return True
         if role is not None and role not in member.roles:
             try:
@@ -173,10 +191,21 @@ class ModCog(commands.Cog):
         return templates
 
     async def _send_role_dm(self, member: discord.Member, role: discord.Role, *, source: str) -> None:
+        async with self._role_dm_lock:
+            await self._send_role_dm_locked(member, role, source=source)
+
+    async def _send_role_dm_locked(self, member: discord.Member, role: discord.Role, *, source: str) -> None:
         now = time.monotonic()
         key = (member.id, role.id)
         if now - self._recent_role_dms.get(key, 0) < 30:
             return
+        if len(self._recent_role_dms) > 5000:
+            cutoff = now - 300
+            self._recent_role_dms = {
+                cached_key: seen
+                for cached_key, seen in self._recent_role_dms.items()
+                if seen >= cutoff
+            }
         for msg_template in self._dm_templates_for_role(role.id):
             txt = (
                 str(msg_template)
@@ -185,7 +214,7 @@ class ModCog(commands.Cog):
                 .replace("{guild}", member.guild.name)
             )
             try:
-                await member.send(txt)
+                await member.send(txt[:2000], allowed_mentions=no_mentions())
                 self._recent_role_dms[key] = now
             except Exception as e:
                 await log_error(
@@ -231,22 +260,31 @@ class ModCog(commands.Cog):
             if isinstance(channel, discord.TextChannel):
                 msg = await channel.fetch_message(payload.message_id)
                 await msg.remove_reaction(payload.emoji, member)
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(
+                self.bot,
+                f"Autodelete reaction removal failed channel_id={payload.channel_id} "
+                f"message_id={payload.message_id} user_id={member.id}: {repr(e)}",
+            )
 
         try:
             role = guild.get_role(restriction_role_id)
             if role and role not in member.roles:
                 await member.add_roles(role, reason="Autodeletion reaction restriction")
-        except Exception:
-            pass
+        except Exception as e:
+            await log_error(
+                self.bot,
+                f"Reaction restriction grant failed user_id={member.id} role_id={restriction_role_id}: {repr(e)}",
+            )
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         cfg = self.bot.config
         allowed_guild_id = cfg.get_int("guild", "allowed_guild_id")
         if after.guild.id != allowed_guild_id:
-            return        # DM-on-role supports one legacy role or multiple entries.
+            return
+
+        # DM-on-role supports one legacy role or multiple entries.
         rules = []
         entries = cfg.get("autoDM", "entries", default=None)
         if isinstance(entries, list):
@@ -285,7 +323,8 @@ class ModCog(commands.Cog):
                             str(msg_template)
                             .replace("{user}", after.mention)
                             .replace("{role}", str(role_id))
-                            .replace("{guild}", after.guild.name)
+                            .replace("{guild}", after.guild.name)[:2000],
+                            allowed_mentions=no_mentions(),
                         )
                     except Exception as e:
                         await log_error(self.bot, f"Role DM failed for missing role_id={role_id} user_id={after.id}: {repr(e)}")

@@ -16,18 +16,21 @@ from utils.views import (
     TrackingDeclineConfirmView,
     TicketClosePromptView,
     HelpMenuView,
-    HelpModConfirmView,
     TranscriptRequestView,
     LevelRequestButtonView,
     LevelRequestReviewView,
 )
-from utils.checks import ensure_allowed_guild_id
+from utils.runtime_config import load_runtime_config_overrides
 
 DEFAULT_DB_PATH = "data/bot.db"
 TURSO_REPLICA_PATH = "data/turso-replica.db"
 RENDER_DISK_DB_PATH = "/var/data/avenue-guard/bot.db"
 DEFAULT_DISCORD_LOGIN_RETRY_SECONDS = 15 * 60
 DEFAULT_STARTUP_ERROR_RETRY_SECONDS = 5 * 60
+
+
+class PersistenceConfigurationError(RuntimeError):
+    """Raised when a configured durable database would silently degrade."""
 
 
 def startup_log(message: str) -> None:
@@ -86,6 +89,47 @@ def _run_preflight_database_check(bot: discord.Bot) -> None:
     loop.run_until_complete(bot.db.connect())
 
 
+async def _close_runtime_storage(bot: discord.Bot) -> None:
+    """Best-effort flush on Discord's event loop before it is torn down."""
+    tracking = bot.get_cog("TrackingCog")
+    flush_activity = getattr(tracking, "flush_activity_counts", None)
+    if callable(flush_activity):
+        try:
+            await flush_activity()
+        except Exception as e:
+            startup_log(f"Activity flush during shutdown failed: {type(e).__name__}: {e}")
+
+    background = bot.get_cog("BackgroundCog")
+    persist_daily = getattr(background, "_persist_current_day", None)
+    if callable(persist_daily):
+        try:
+            await persist_daily()
+        except Exception as e:
+            startup_log(f"Daily stats flush during shutdown failed: {type(e).__name__}: {e}")
+
+    try:
+        await bot.db.sync_remote()
+    except Exception as e:
+        startup_log(f"Final database sync failed: {type(e).__name__}: {e}")
+    finally:
+        await bot.db.close()
+
+
+def _install_storage_close_hook(bot: discord.Bot) -> None:
+    original_close = bot.close
+    bot._runtime_storage_closed = False
+
+    async def close_with_storage_flush() -> None:
+        try:
+            if not bot._runtime_storage_closed:
+                bot._runtime_storage_closed = True
+                await _close_runtime_storage(bot)
+        finally:
+            await original_close()
+
+    bot.close = close_with_storage_flush
+
+
 def _database_path_usable(path: str) -> tuple[bool, str]:
     try:
         candidate = Path(path)
@@ -103,6 +147,13 @@ def _database_path_usable(path: str) -> tuple[bool, str]:
 
 def resolve_db_path(config: Config) -> tuple[str, str, str, str, str]:
     warnings: list[str] = []
+    require_remote = bool(config.get("database", "require_remote_when_configured", default=True))
+    allow_local_fallback = os.getenv("ALLOW_LOCAL_DATABASE_FALLBACK", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     turso_url = (
         os.getenv("TURSO_DATABASE_URL", "")
         or os.getenv("LIBSQL_URL", "")
@@ -119,11 +170,21 @@ def resolve_db_path(config: Config) -> tuple[str, str, str, str, str]:
             ok, error = _database_path_usable(replica_path)
             if ok:
                 return replica_path, "Turso/libSQL embedded replica", "", turso_url, turso_token
-            warnings.append(
-                f"Turso replica path is not writable: {replica_path} ({error}); falling back to local SQLite"
-            )
+            message = f"Turso replica path is not writable: {replica_path} ({error})"
+            if require_remote and not allow_local_fallback:
+                raise PersistenceConfigurationError(
+                    f"{message}. Refusing to start on disposable local storage. Fix TURSO_REPLICA_PATH or set "
+                    "ALLOW_LOCAL_DATABASE_FALLBACK=1 for intentional local development."
+                )
+            warnings.append(f"{message}; falling back to local SQLite")
         else:
-            warnings.append("A Turso/libSQL database URL is set but TURSO_AUTH_TOKEN is missing; falling back to local SQLite")
+            message = "A Turso/libSQL database URL is set but TURSO_AUTH_TOKEN is missing"
+            if require_remote and not allow_local_fallback:
+                raise PersistenceConfigurationError(
+                    f"{message}. Refusing to start on disposable local storage. Add the database token or set "
+                    "ALLOW_LOCAL_DATABASE_FALLBACK=1 for intentional local development."
+                )
+            warnings.append(f"{message}; falling back to local SQLite")
 
     env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
     candidates: list[tuple[str, str, bool]] = []
@@ -176,6 +237,7 @@ def create_bot() -> discord.Bot:
     bot.db_path, bot.db_path_source, bot.db_path_warning, bot.db_remote_url, bot.db_remote_token = resolve_db_path(bot.config)
     startup_log(f"Using database path: {bot.db_path} ({bot.db_path_source})")
     bot.db = Database(bot.db_path, remote_url=bot.db_remote_url, auth_token=bot.db_remote_token)
+    _install_storage_close_hook(bot)
 
     setup_global_error_handlers(bot)
 
@@ -198,6 +260,15 @@ def create_bot() -> discord.Bot:
             await log_error(bot, f"Database setup failed on startup: {repr(e)}")
             await bot.close()
             return
+
+        try:
+            await load_runtime_config_overrides(bot)
+            for cog in bot.cogs.values():
+                reload_hook = getattr(cog, "on_config_reload", None)
+                if callable(reload_hook):
+                    reload_hook()
+        except Exception as e:
+            await log_error(bot, f"Runtime config override load failed: {repr(e)}")
 
         # Ensure only in allowed guild
         allowed = bot.config.get_int("guild", "allowed_guild_id")
@@ -225,34 +296,28 @@ def create_bot() -> discord.Bot:
             pass
 
         # Start background tasks in cogs
-        tracking = bot.get_cog("TrackingCog")
-        if tracking:
-            await tracking.start_background()
-
-        helpcog = bot.get_cog("HelpCog")
-        if helpcog:
-            await helpcog.start_background()
-
-        requestcog = bot.get_cog("RequestLevelsCog")
-        if requestcog:
-            await requestcog.start_background()
-        
-        bgcog = bot.get_cog("BackgroundCog")
-        if bgcog:
-            await bgcog.start_background()
+        for cog_name in ("TrackingCog", "HelpCog", "RequestLevelsCog", "BackgroundCog"):
+            cog = bot.get_cog(cog_name)
+            start = getattr(cog, "start_background", None)
+            if not callable(start):
+                continue
+            try:
+                await start()
+            except Exception as e:
+                await log_error(bot, f"{cog_name} background startup failed: {repr(e)}")
 
         # Register persistent views (for interactions to survive restarts)
-        await bot.register_persistent_views()
+        if not getattr(bot, "_persistent_views_registered", False):
+            await bot.register_persistent_views()
+            bot._persistent_views_registered = True
 
         set_keepalive_status("online", f"Logged in as {bot.user}")
         startup_log(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
     async def register_persistent_views():
-        # It's okay to add multiple times; discord.py ignores duplicates by custom_id mapping.
         bot.add_view(TrackingDeclineConfirmView())
         bot.add_view(TicketClosePromptView())
         bot.add_view(HelpMenuView())
-        bot.add_view(HelpModConfirmView())
         bot.add_view(TranscriptRequestView())
         bot.add_view(LevelRequestButtonView())
         bot.add_view(LevelRequestReviewView())
@@ -274,11 +339,28 @@ def run_bot_with_startup_backoff(token: str) -> None:
     while True:
         _prepare_fresh_event_loop()
         set_keepalive_status("discord_login", "Attempting Discord login")
-        bot = create_bot()
+        try:
+            bot = create_bot()
+        except PersistenceConfigurationError as exc:
+            seconds = _startup_error_retry_seconds()
+            next_retry_ts = int(time.time()) + seconds
+            set_keepalive_status(
+                "startup_error",
+                "Persistent database configuration is incomplete",
+                retry_after_seconds=seconds,
+                next_retry_ts=next_retry_ts,
+            )
+            startup_log(f"{exc} Waiting {seconds} seconds before retrying.")
+            time.sleep(seconds)
+            continue
         try:
             set_keepalive_status("database_check", "Checking database before Discord login")
             _run_preflight_database_check(bot)
         except Exception as exc:
+            try:
+                asyncio.get_event_loop().run_until_complete(bot.db.close())
+            except Exception:
+                pass
             seconds = _startup_error_retry_seconds()
             next_retry_ts = int(time.time()) + seconds
             detail = f"Database setup failed before Discord login: {type(exc).__name__}"

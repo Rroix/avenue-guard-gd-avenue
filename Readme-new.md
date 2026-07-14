@@ -70,6 +70,8 @@ The bot stores important workflow state persistently. In production, Avenue Guar
 
 The implementation uses a local embedded replica for fast reads and writes, then syncs that replica with the Turso database. In practice, this lets the bot behave like a normal SQLite bot during development while still having production-grade persistence for real server workflows. The database wrapper also includes startup checks, token validation, retry handling for temporary Turso/libSQL sync errors, and safer fallback behavior if a configured storage path is not writable.
 
+Production also refuses to silently switch to disposable local storage when Turso is configured but its token or replica path is unavailable. The health endpoint reports the startup problem until storage is repaired, while local development can explicitly opt into a temporary fallback.
+
 That persistent storage includes request waves, ticket data, transcripts, weekly tracking, help submissions, request reviews, validation cache, backups, restore history, and impact snapshots. So basically, the bot should not forget the important parts of the server's operations.
 
 Some of the reliability methods behind Avenue Guard include:
@@ -120,6 +122,7 @@ Real server architecture:
 | `docs/` | Private manuals and generated documentation | Used for understanding and maintaining the bot privately |
 | `scripts/` | Documentation and maintenance scripts | Helps generate internal documentation and supporting files |
 | `requirements.txt` | Runtime dependencies | Defines the packages needed to run the bot |
+| `requirements-dev.txt` and `tests/` | Automated quality and regression checks | Verifies database, request, tracking, validation, persistence, and safety behavior before deployment |
 | `TEST_CHECKLIST.md` | Manual testing checklist | Helps verify important Discord workflows after changes |
 
 In a simplified scheme, the flow looks like this:

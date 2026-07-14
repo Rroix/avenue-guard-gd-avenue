@@ -6,8 +6,30 @@ import time
 import traceback
 import discord
 
+from utils.mentions import no_mentions
+
 _ERROR_DEDUPE_SECONDS = 300
 _recent_error_logs: dict[str, float] = {}
+
+
+def _redact_secrets(message: str) -> str:
+    text = str(message or "")
+    text = re.sub(
+        r"(?i)\b(DISCORD_TOKEN|TURSO_AUTH_TOKEN|LIBSQL_AUTH_TOKEN|DATABASE_URL)\s*[:=]\s*([^\s,;]+)",
+        lambda match: f"{match.group(1)}=[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+        "[REDACTED JWT]",
+        text,
+    )
+    text = re.sub(
+        r"\b(?:mfa\.[A-Za-z0-9_-]{20,}|[MN][A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{20,})\b",
+        "[REDACTED DISCORD TOKEN]",
+        text,
+    )
+    return text
 
 
 def _compact_error_message(message: str, limit: int = 3600) -> str:
@@ -47,7 +69,7 @@ def _dedupe_key(message: str) -> str:
 
 
 async def log_error(bot: discord.Client, message: str) -> None:
-    message = _compact_error_message(message)
+    message = _compact_error_message(_redact_secrets(message))
     try:
         print(f"[Avenue Guard error] {message}", flush=True)
     except Exception:
@@ -61,7 +83,10 @@ async def log_error(bot: discord.Client, message: str) -> None:
             return
         channel = bot.get_channel(ch_id)
         if channel is None:
-            return
+            try:
+                channel = await bot.fetch_channel(ch_id)
+            except Exception:
+                return
         message = _compact_error_message(message, limit=3800)
         now = time.monotonic()
         stale_keys = [old_key for old_key, old_ts in _recent_error_logs.items() if now - old_ts >= _ERROR_DEDUPE_SECONDS]
@@ -72,26 +97,48 @@ async def log_error(bot: discord.Client, message: str) -> None:
         if now - last_sent < _ERROR_DEDUPE_SECONDS:
             return
         _recent_error_logs[key] = now
+        safe_message = message.replace("```", "` ` `")
         embed = discord.Embed(
             title="Bot Error",
-            description=f"```py\n{message}\n```",
+            description=f"```py\n{safe_message}\n```",
             color=discord.Color.red(),
             timestamp=datetime.now(timezone.utc),
         )
         embed.set_footer(text="Avenue Guard error log")
         try:
-            await channel.send(embed=embed)
-        except Exception:
+            await channel.send(embed=embed, allowed_mentions=no_mentions())
+        except Exception as send_error:
             if len(message) > 1800:
                 message = message[:1800] + "\n...truncated..."
-            await channel.send(f"```py\n{message}\n```")
-    except Exception:
-        pass
+            try:
+                await channel.send(
+                    f"```py\n{message.replace('```', '` ` `')}\n```",
+                    allowed_mentions=no_mentions(),
+                )
+            except Exception:
+                try:
+                    print(
+                        f"[Avenue Guard error] Discord error-log delivery failed: "
+                        f"{type(send_error).__name__}: {send_error}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+    except Exception as logging_error:
+        try:
+            print(
+                f"[Avenue Guard error] Error logger failed: "
+                f"{type(logging_error).__name__}: {logging_error}",
+                flush=True,
+            )
+        except Exception:
+            pass
 
 def setup_global_error_handlers(bot: discord.Client) -> None:
     @bot.event
     async def on_application_command_error(ctx: discord.ApplicationContext, error: Exception):
-        await log_error(bot, f"Command error: {repr(error)}\n{traceback.format_exc()}")
+        error_trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        await log_error(bot, f"Command error: {repr(error)}\n{error_trace}")
         try:
             await ctx.respond("Something went wrong while running that command.", ephemeral=True)
         except Exception:

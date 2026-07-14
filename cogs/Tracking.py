@@ -12,6 +12,7 @@ from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, basic_color
 from utils.errors import log_error
+from utils.mentions import no_mentions
 from utils.timeutils import now_madrid, week_start_sunday, TZ
 from utils.views import LevelRequestReviewView, TrackingDeclineConfirmView
 
@@ -47,7 +48,10 @@ class TrackingCog(commands.Cog):
         self._weekly_task: Optional[asyncio.Task] = None
         self._timeout_task: Optional[asyncio.Task] = None
         self._activity_flush_task: Optional[asyncio.Task] = None
+        self._recap_task: Optional[asyncio.Task] = None
         self._activity_lock = asyncio.Lock()
+        self._weekly_offer_lock = asyncio.Lock()
+        self._weekly_submit_lock = asyncio.Lock()
         self._pending_activity_counts: dict[tuple[int, int, str], int] = {}
         self._pending_last_counted: dict[tuple[int, int], int] = {}
         self._last_counted_cache: dict[tuple[int, int], int] = {}
@@ -112,21 +116,34 @@ class TrackingCog(commands.Cog):
         if not isinstance(template, dict):
             template = {}
 
+        title = self._format_template(template.get("title", default_title), variables)
+        description = self._format_template(template.get("description", ""), variables)
         embed = discord.Embed(
-            title=self._format_template(template.get("title", default_title), variables) or None,
-            description=self._format_template(template.get("description", ""), variables) or None,
+            title=title[:256] or None,
+            description=description[:4096] or None,
             color=basic_color(self._format_template(template.get("color", default_color), variables) or default_color),
         )
-        for field in template.get("fields", []) or []:
+        fields = template.get("fields", []) or []
+        if not isinstance(fields, list):
+            fields = []
+        total_chars = len(str(embed.title or "")) + len(str(embed.description or ""))
+        for field in fields[:25]:
             if not isinstance(field, dict):
                 continue
             name = self._format_template(field.get("name", ""), variables)
             value = self._format_template(field.get("value", ""), variables)
             if name and value:
-                embed.add_field(name=name[:256], value=value[:1024], inline=bool(field.get("inline", False)))
+                name = name[:256]
+                value = value[:1024]
+                if total_chars + len(name) + len(value) > 5800:
+                    break
+                embed.add_field(name=name, value=value, inline=bool(field.get("inline", False)))
+                total_chars += len(name) + len(value)
         footer = self._format_template(template.get("footer", ""), variables)
         if footer:
-            embed.set_footer(text=footer[:2048])
+            footer = footer[: min(2048, max(0, 5900 - total_chars))]
+            if footer:
+                embed.set_footer(text=footer)
         thumbnail_url = self._format_template(template.get("thumbnail_url", ""), variables)
         if thumbnail_url:
             embed.set_thumbnail(url=thumbnail_url)
@@ -175,7 +192,7 @@ class TrackingCog(commands.Cog):
                 data[current_key] = f"{previous}\n{line}".strip() if previous else line
 
         if not data.get("level_id"):
-            match = re.search(r"\b(?:level\s*)?id\s*[:#-]?\s*([0-9]{3,})\b", str(content or ""), flags=re.I)
+            match = re.search(r"\b(?:level\s*)?id\s*[:#-]?\s*([0-9]{7,9})\b", str(content or ""), flags=re.I)
             if match:
                 data["level_id"] = match.group(1)
         if not data.get("level_name"):
@@ -250,9 +267,12 @@ class TrackingCog(commands.Cog):
     async def _dm_user(self, user_id: int, message: str) -> None:
         try:
             user = await self.bot.fetch_user(int(user_id))
-            await user.send(str(message)[:2000])
-        except Exception:
-            pass
+            await user.send(str(message)[:2000], allowed_mentions=no_mentions())
+        except Exception as e:
+            await self._log_background_error(
+                "tracking_user_dm",
+                f"Tracking workflow DM failed for user_id={user_id}: {repr(e)}",
+            )
 
     async def _validate_weekly_request_for_review(
         self,
@@ -308,56 +328,100 @@ class TrackingCog(commands.Cog):
     # Startup / schema
     # ----------------------------
     async def start_background(self):
-        if self._started:
+        weekly_running = self._weekly_task is not None and not self._weekly_task.done()
+        timeout_running = self._timeout_task is not None and not self._timeout_task.done()
+        flush_running = self._activity_flush_task is not None and not self._activity_flush_task.done()
+        if self._started and weekly_running and timeout_running and flush_running:
             return
         self._started = True
 
-        # Ensure DB is ready and schema exists (best-effort; db.py migrations may already do this)
+        # Database.connect owns all schema migrations. Re-running CREATE TABLE
+        # statements here caused unnecessary Turso commits on every restart.
         try:
             await self.bot.db.connect()
-            await self.bot.db.execute(
-                """CREATE TABLE IF NOT EXISTS weekly_runs(
-                    guild_id INTEGER NOT NULL,
-                    week_start TEXT NOT NULL,
-                    ran_ts INTEGER NOT NULL,
-                    PRIMARY KEY (guild_id, week_start)
-                );"""
-            )
-            await self.bot.db.execute(
-                """CREATE TABLE IF NOT EXISTS weekly_reward_disabled(
-                    guild_id INTEGER NOT NULL,
-                    week_start TEXT NOT NULL,
-                    disabled_ts INTEGER NOT NULL,
-                    disabled_by INTEGER NOT NULL,
-                    PRIMARY KEY (guild_id, week_start)
-                );"""
-            )
-            await self.bot.db.execute(
-                """CREATE TABLE IF NOT EXISTS weekly_dm_log(
-                    guild_id INTEGER NOT NULL,
-                    week_start TEXT NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    event TEXT NOT NULL,
-                    detail TEXT NOT NULL,
-                    ts INTEGER NOT NULL
-                );"""
-            )
-            await self.bot.db.execute(
-                """CREATE TABLE IF NOT EXISTS weekly_reminders(
-                    guild_id INTEGER NOT NULL,
-                    week_start TEXT NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    reminded_ts INTEGER NOT NULL,
-                    PRIMARY KEY (guild_id, week_start, user_id)
-                );"""
-            )
+            await self._recover_contacting_claims()
         except Exception as e:
             await self._log_background_error("tracking_schema", f"Tracking schema setup failed: {repr(e)}")
 
-        self._weekly_task = asyncio.create_task(self._weekly_loop())
-        self._timeout_task = asyncio.create_task(self._timeout_loop())
-        self._activity_flush_task = asyncio.create_task(self._activity_flush_loop())
-        asyncio.create_task(self._send_missing_weekly_recap_once())
+        if not weekly_running:
+            self._weekly_task = asyncio.create_task(self._weekly_loop())
+        if not timeout_running:
+            self._timeout_task = asyncio.create_task(self._timeout_loop())
+        if not flush_running:
+            self._activity_flush_task = asyncio.create_task(self._activity_flush_loop())
+        if self._recap_task is None or self._recap_task.done():
+            self._recap_task = asyncio.create_task(self._weekly_recap_loop())
+
+    def cog_unload(self) -> None:
+        for task in (self._weekly_task, self._timeout_task, self._activity_flush_task, self._recap_task):
+            if task and not task.done():
+                task.cancel()
+        try:
+            asyncio.create_task(self.flush_activity_counts())
+        except Exception:
+            pass
+
+    async def _recover_contacting_claims(self) -> None:
+        """Finish weekly offers interrupted between reservation and DM setup."""
+        allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
+        guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
+        if guild is None:
+            return
+        rows = await self.bot.db.fetchall(
+            "SELECT week_start,user_id,rank,contacted_ts FROM weekly_claims "
+            "WHERE guild_id=? AND status='contacting' ORDER BY contacted_ts ASC LIMIT 50",
+            (guild.id,),
+        )
+        timeout_h = max(1, self._cfg_int("tracking", "dm_timeout_hours", 48))
+        for row in rows:
+            user_id = int(row["user_id"])
+            week_start_iso = str(row["week_start"])
+            member = await self._resolve_member(guild, user_id)
+            if member is None or member.bot:
+                await self.bot.db.execute(
+                    "UPDATE weekly_claims SET status='dm_closed' WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
+                    (guild.id, week_start_iso, user_id),
+                )
+                continue
+            now_ts = int(time.time())
+            expires = now_ts + timeout_h * 3600
+            try:
+                user = await self.bot.fetch_user(user_id)
+                content, embed = self._build_request_dm_message(timeout_h, expires)
+                await user.send(content=content or None, embed=embed, allowed_mentions=no_mentions())
+            except Exception as e:
+                await self.bot.db.execute(
+                    "UPDATE weekly_claims SET status='dm_closed' WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
+                    (guild.id, week_start_iso, user_id),
+                )
+                await self._log_weekly(guild, week_start_iso, user_id, "dm_failed", f"recovery_error={type(e).__name__}")
+                continue
+
+            try:
+                await self.bot.db.execute_transaction(
+                    (
+                        (
+                            "UPDATE weekly_claims SET status='pending', contacted_ts=? "
+                            "WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
+                            (now_ts, guild.id, week_start_iso, user_id),
+                        ),
+                        (
+                            "INSERT INTO weekly_sessions(guild_id,week_start,user_id,stage,expires_ts,active) VALUES(?,?,?,?,?,1) "
+                            "ON CONFLICT(guild_id,week_start,user_id) DO UPDATE SET "
+                            "stage='awaiting_request', expires_ts=excluded.expires_ts, active=1, decline_prompt_message_id=NULL",
+                            (guild.id, week_start_iso, user_id, "awaiting_request", expires),
+                        ),
+                    ),
+                    retry_safe=True,
+                )
+                await self._log_weekly(guild, week_start_iso, user_id, "dm_sent", "recovered_interrupted_offer=true")
+            except Exception as e:
+                # The DM was delivered. Keep the reservation so another member
+                # is not offered the same reward while storage recovers.
+                await self._log_background_error(
+                    "weekly_recovery_finalize",
+                    f"Recovered weekly DM sent but state finalize failed for user_id={user_id}: {repr(e)}",
+                )
 
     def on_config_reload(self) -> None:
         # no cached config in this cog
@@ -385,17 +449,22 @@ class TrackingCog(commands.Cog):
 
     async def disable_weekly_reward_for_current_week(self, guild: discord.Guild, disabled_by: int) -> str:
         week_start_iso = week_start_sunday(now_madrid()).isoformat()
-        await self.bot.db.execute(
-            "INSERT OR REPLACE INTO weekly_reward_disabled(guild_id, week_start, disabled_ts, disabled_by) VALUES(?,?,?,?)",
-            (guild.id, week_start_iso, int(time.time()), int(disabled_by)),
-        )
-        await self.bot.db.execute(
-            "UPDATE weekly_claims SET status='disabled' WHERE guild_id=? AND week_start=? AND status='pending'",
-            (guild.id, week_start_iso),
-        )
-        await self.bot.db.execute(
-            "UPDATE weekly_sessions SET active=0 WHERE guild_id=? AND week_start=?",
-            (guild.id, week_start_iso),
+        await self.bot.db.execute_transaction(
+            (
+                (
+                    "INSERT OR REPLACE INTO weekly_reward_disabled(guild_id, week_start, disabled_ts, disabled_by) VALUES(?,?,?,?)",
+                    (guild.id, week_start_iso, int(time.time()), int(disabled_by)),
+                ),
+                (
+                    "UPDATE weekly_claims SET status='disabled' WHERE guild_id=? AND week_start=? AND status IN ('pending','contacting')",
+                    (guild.id, week_start_iso),
+                ),
+                (
+                    "UPDATE weekly_sessions SET active=0, decline_prompt_message_id=NULL WHERE guild_id=? AND week_start=?",
+                    (guild.id, week_start_iso),
+                ),
+            ),
+            retry_safe=True,
         )
         await self._log_weekly(guild, week_start_iso, disabled_by, "weekly_reward_disabled", "Reward disabled for this tracking week")
         return week_start_iso
@@ -404,24 +473,29 @@ class TrackingCog(commands.Cog):
         week_start_iso = week_start_sunday(now_madrid()).isoformat()
         was_disabled = await self.weekly_reward_disabled(guild.id, week_start_iso)
 
-        await self.bot.db.execute(
-            "DELETE FROM weekly_reward_disabled WHERE guild_id=? AND week_start=?",
-            (guild.id, week_start_iso),
-        )
-        await self.bot.db.execute(
-            "UPDATE weekly_sessions SET active=1, stage='awaiting_request' "
-            "WHERE guild_id=? AND week_start=? AND EXISTS ("
-            "SELECT 1 FROM weekly_claims c "
-            "WHERE c.guild_id=weekly_sessions.guild_id "
-            "AND c.week_start=weekly_sessions.week_start "
-            "AND c.user_id=weekly_sessions.user_id "
-            "AND c.status='disabled'"
-            ")",
-            (guild.id, week_start_iso),
-        )
-        await self.bot.db.execute(
-            "UPDATE weekly_claims SET status='pending' WHERE guild_id=? AND week_start=? AND status='disabled'",
-            (guild.id, week_start_iso),
+        await self.bot.db.execute_transaction(
+            (
+                (
+                    "DELETE FROM weekly_reward_disabled WHERE guild_id=? AND week_start=?",
+                    (guild.id, week_start_iso),
+                ),
+                (
+                    "UPDATE weekly_sessions SET active=1, stage='awaiting_request' "
+                    "WHERE guild_id=? AND week_start=? AND EXISTS ("
+                    "SELECT 1 FROM weekly_claims c "
+                    "WHERE c.guild_id=weekly_sessions.guild_id "
+                    "AND c.week_start=weekly_sessions.week_start "
+                    "AND c.user_id=weekly_sessions.user_id "
+                    "AND c.status='disabled'"
+                    ")",
+                    (guild.id, week_start_iso),
+                ),
+                (
+                    "UPDATE weekly_claims SET status='pending' WHERE guild_id=? AND week_start=? AND status='disabled'",
+                    (guild.id, week_start_iso),
+                ),
+            ),
+            retry_safe=True,
         )
 
         await self._log_weekly(guild, week_start_iso, enabled_by, "weekly_reward_enabled", "Reward enabled for this tracking week")
@@ -481,8 +555,8 @@ class TrackingCog(commands.Cog):
                 "INSERT INTO weekly_dm_log(guild_id, week_start, user_id, event, detail, ts) VALUES(?,?,?,?,?,?)",
                 (guild.id, week_start, int(user_id), str(event), str(detail)[:500], int(time.time())),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            await self._log_background_error("weekly_db_log", f"Weekly workflow database log failed: {repr(e)}")
 
         # Optional channel log
         log_channel_id = self._cfg_int("tracking", "log_channel_id", 0)
@@ -490,6 +564,11 @@ class TrackingCog(commands.Cog):
             log_channel_id = self._cfg_int("channels", "general_logging_channel_id", 0)
 
         ch = guild.get_channel(log_channel_id) if log_channel_id else None
+        if ch is None and log_channel_id:
+            try:
+                ch = await guild.fetch_channel(log_channel_id)
+            except Exception:
+                ch = None
         if isinstance(ch, discord.TextChannel):
             try:
                 label, color = self._weekly_log_meta(event)
@@ -507,9 +586,9 @@ class TrackingCog(commands.Cog):
                     emb.add_field(name="Member", value="Server-wide", inline=True)
                 emb.add_field(name="Details", value=self._weekly_detail_lines(detail), inline=False)
                 emb.set_footer(text="Weekly request workflow")
-                await ch.send(embed=emb)
-            except Exception:
-                pass
+                await ch.send(embed=emb, allowed_mentions=no_mentions())
+            except Exception as e:
+                await self._log_background_error("weekly_channel_log", f"Weekly workflow channel log failed: {repr(e)}")
 
     def _anti_farm_cfg(self) -> dict:
         cfg = self.bot.config.get("tracking", "anti_farm", default={}) or {}
@@ -552,6 +631,14 @@ class TrackingCog(commands.Cog):
         low_effort = len(set(compact)) < min_unique or len(words) < min_words
 
         key = (message.guild.id, message.author.id)
+        if len(self._anti_farm_cache) > 5000:
+            stale_keys = [
+                cache_key
+                for cache_key, entries in self._anti_farm_cache.items()
+                if not entries or now - int(entries[-1][0]) > window
+            ]
+            for cache_key in stale_keys[:1000]:
+                self._anti_farm_cache.pop(cache_key, None)
         history = [(ts, sig) for ts, sig in self._anti_farm_cache.get(key, []) if now - int(ts) <= window]
         repeat_count = 1 + sum(1 for _ts, sig in history if sig == signature)
         history.append((now, signature))
@@ -564,6 +651,10 @@ class TrackingCog(commands.Cog):
     async def _record_anti_farm_event(self, message: discord.Message, reason: str, now: int) -> None:
         sample = str(message.content or "").strip().replace("\n", " ")[:180]
         log_key = (message.guild.id, message.author.id, reason)
+        if len(self._anti_farm_last_log) > 5000:
+            for stale_key, stale_ts in list(self._anti_farm_last_log.items())[:1000]:
+                if now - int(stale_ts) >= 300:
+                    self._anti_farm_last_log.pop(stale_key, None)
         last_log = self._anti_farm_last_log.get(log_key, 0)
         if last_log and now - last_log < 300:
             return
@@ -573,8 +664,8 @@ class TrackingCog(commands.Cog):
                 "INSERT INTO anti_farm_events(guild_id,user_id,channel_id,reason,sample,ts) VALUES(?,?,?,?,?,?)",
                 (message.guild.id, message.author.id, message.channel.id, reason, sample, now),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            await self._log_background_error("anti_farm_db", f"Anti-farm event persistence failed: {repr(e)}")
 
         cfg = self._anti_farm_cfg()
         try:
@@ -584,6 +675,11 @@ class TrackingCog(commands.Cog):
         if not channel_id:
             channel_id = self._cfg_int("channels", "general_logging_channel_id", 0)
         channel = message.guild.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await message.guild.fetch_channel(channel_id)
+            except Exception:
+                channel = None
         if not isinstance(channel, discord.TextChannel):
             return
         embed = discord.Embed(
@@ -598,9 +694,9 @@ class TrackingCog(commands.Cog):
         if sample:
             embed.add_field(name="Sample", value=sample[:1024], inline=False)
         try:
-            await channel.send(embed=embed)
-        except Exception:
-            pass
+            await channel.send(embed=embed, allowed_mentions=no_mentions())
+        except Exception as e:
+            await self._log_background_error("anti_farm_log", f"Anti-farm channel log failed: {repr(e)}")
 
     # ----------------------------
     # Activity counting
@@ -637,12 +733,16 @@ class TrackingCog(commands.Cog):
             return
 
         now = int(time.time())
+        if len(self._last_counted_cache) > 20000:
+            oldest = sorted(self._last_counted_cache.items(), key=lambda item: item[1])[:5000]
+            for old_key, _ in oldest:
+                self._last_counted_cache.pop(old_key, None)
         anti_farm_reason = await self._anti_farm_reason(message, now)
         if anti_farm_reason:
             await self._record_anti_farm_event(message, anti_farm_reason, now)
             return
 
-        cd = self._cfg_int("tracking", "count_cooldown_seconds", 10)
+        cd = max(0, min(3600, self._cfg_int("tracking", "count_cooldown_seconds", 10)))
         cache_key = (message.guild.id, message.author.id)
 
         last_counted = self._last_counted_cache.get(cache_key)
@@ -697,7 +797,13 @@ class TrackingCog(commands.Cog):
                 async with self._activity_lock:
                     for key, amount in counts.items():
                         self._pending_activity_counts[key] = self._pending_activity_counts.get(key, 0) + amount
+                    for key, ts in last_seen.items():
+                        self._pending_last_counted[key] = max(self._pending_last_counted.get(key, 0), ts)
                 await self._log_background_error("activity_flush_counts", f"Activity count flush failed: {repr(e)}")
+                # Do not persist a cooldown timestamp for a message whose
+                # count did not persist. Otherwise a restart can lose the
+                # message permanently while still suppressing the next one.
+                return
 
         if last_seen:
             try:
@@ -735,6 +841,10 @@ class TrackingCog(commands.Cog):
         sess = rows[0]
         expires_ts = int(sess["expires_ts"])
         if int(time.time()) > expires_ts:
+            try:
+                await message.channel.send("That weekly request offer has expired.", allowed_mentions=no_mentions())
+            except Exception:
+                pass
             return
 
         content = (message.content or "").strip()
@@ -752,14 +862,28 @@ class TrackingCog(commands.Cog):
                 title="Are you sure?",
                 description="If you confirm, the request will be offered to the next eligible member.",
             )
+            prompt = None
             try:
-                await message.channel.send(embed=embed, view=TrackingDeclineConfirmView())
-                await self.bot.db.execute(
-                    "UPDATE weekly_sessions SET stage='confirm_decline' WHERE guild_id=? AND user_id=? AND week_start=?",
-                    (allowed_guild_id, message.author.id, sess["week_start"]),
+                prompt = await message.channel.send(
+                    embed=embed,
+                    view=TrackingDeclineConfirmView(),
+                    allowed_mentions=no_mentions(),
                 )
-            except Exception:
-                pass
+                await self.bot.db.execute(
+                    "UPDATE weekly_sessions SET stage='confirm_decline', decline_prompt_message_id=? "
+                    "WHERE guild_id=? AND user_id=? AND week_start=? AND active=1",
+                    (prompt.id, allowed_guild_id, message.author.id, sess["week_start"]),
+                )
+            except Exception as e:
+                if prompt is not None:
+                    try:
+                        await prompt.delete()
+                    except Exception:
+                        pass
+                await self._log_background_error(
+                    "weekly_decline_prompt",
+                    f"Weekly decline confirmation setup failed for user_id={message.author.id}: {repr(e)}",
+                )
             return
 
         if sess["stage"] == "confirm_decline":
@@ -767,7 +891,8 @@ class TrackingCog(commands.Cog):
 
         missing = self._weekly_request_missing_fields(content)
         if not missing:
-            await self._record_request(guild, message.author.id, sess["week_start"], content)
+            async with self._weekly_submit_lock:
+                await self._record_request(guild, message.author.id, sess["week_start"], content)
             return
 
         try:
@@ -779,6 +904,15 @@ class TrackingCog(commands.Cog):
             pass
 
     async def _record_request(self, guild: discord.Guild, user_id: int, week_start_iso: str, content: str):
+        active = await self.bot.db.fetchone(
+            "SELECT c.rank AS rank FROM weekly_claims c "
+            "JOIN weekly_sessions s ON s.guild_id=c.guild_id AND s.week_start=c.week_start AND s.user_id=c.user_id "
+            "WHERE c.guild_id=? AND c.week_start=? AND c.user_id=? AND c.status='pending' AND s.active=1",
+            (guild.id, week_start_iso, user_id),
+        )
+        if not active:
+            return
+
         weekly_channel_id = self._cfg_int("channels", "weekly_request_channel_ID", 0)
         channel = await self._configured_channel(guild, weekly_channel_id)
         if channel is None:
@@ -791,11 +925,7 @@ class TrackingCog(commands.Cog):
                 pass
             return
 
-        row = await self.bot.db.fetchone(
-            "SELECT rank FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
-            (guild.id, week_start_iso, user_id),
-        )
-        rank = int(row["rank"]) if row else None
+        rank = int(active["rank"]) if active["rank"] is not None else None
 
         review_data = self._weekly_request_review_data(content)
         ok, review_data = await self._validate_weekly_request_for_review(guild, user_id, week_start_iso, review_data)
@@ -829,7 +959,11 @@ class TrackingCog(commands.Cog):
 
         msg = None
         try:
-            msg = await channel.send(embed=embed, view=LevelRequestReviewView())
+            msg = await channel.send(
+                embed=embed,
+                view=LevelRequestReviewView(),
+                allowed_mentions=no_mentions(),
+            )
         except Exception as e:
             await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=weekly_request_send_failed error={type(e).__name__}")
             await log_error(self.bot, f"Weekly request from user_id={user_id} could not be sent to staff channel {channel.id}: {repr(e)}")
@@ -841,21 +975,36 @@ class TrackingCog(commands.Cog):
             return
 
         try:
-            await self.bot.db.execute(
-                "INSERT OR REPLACE INTO weekly_request_reviews("
-                "guild_id,request_message_id,channel_id,user_id,week_start,rank,status,created_ts,data_json"
-                ") VALUES(?,?,?,?,?,?,?,?,?)",
+            await self.bot.db.execute_transaction(
                 (
-                    guild.id,
-                    msg.id,
-                    channel.id,
-                    user_id,
-                    week_start_iso,
-                    rank,
-                    "pending",
-                    created_ts,
-                    json.dumps(review_data, separators=(",", ":")),
+                    (
+                        "INSERT INTO weekly_request_reviews("
+                        "guild_id,request_message_id,channel_id,user_id,week_start,rank,status,created_ts,data_json"
+                        ") VALUES(?,?,?,?,?,?,?,?,?)",
+                        (
+                            guild.id,
+                            msg.id,
+                            channel.id,
+                            user_id,
+                            week_start_iso,
+                            rank,
+                            "pending",
+                            created_ts,
+                            json.dumps(review_data, separators=(",", ":")),
+                        ),
+                    ),
+                    (
+                        "UPDATE weekly_claims SET status='claimed' "
+                        "WHERE guild_id=? AND week_start=? AND user_id=? AND status='pending'",
+                        (guild.id, week_start_iso, user_id),
+                    ),
+                    (
+                        "UPDATE weekly_sessions SET active=0, decline_prompt_message_id=NULL "
+                        "WHERE guild_id=? AND week_start=? AND user_id=?",
+                        (guild.id, week_start_iso, user_id),
+                    ),
                 ),
+                retry_safe=True,
             )
         except Exception as e:
             try:
@@ -874,22 +1023,19 @@ class TrackingCog(commands.Cog):
                 pass
             return
 
-        # Mark claimed & close session
-        await self.bot.db.execute(
-            "UPDATE weekly_claims SET status='claimed' WHERE guild_id=? AND week_start=? AND user_id=?",
-            (guild.id, week_start_iso, user_id),
-        )
-        await self.bot.db.execute(
-            "UPDATE weekly_sessions SET active=0 WHERE guild_id=? AND week_start=? AND user_id=?",
-            (guild.id, week_start_iso, user_id),
-        )
         await self._log_weekly(guild, week_start_iso, user_id, "request_recorded", f"rank={rank if rank is not None else 'unknown'}")
 
         try:
             user = await self.bot.fetch_user(user_id)
-            await user.send(f"Thanks! Your request has been recorded: {msg.jump_url}")
-        except Exception:
-            pass
+            await user.send(
+                f"Thanks! Your request has been recorded: {msg.jump_url}",
+                allowed_mentions=no_mentions(),
+            )
+        except Exception as e:
+            await self._log_background_error(
+                "weekly_request_confirmation_dm",
+                f"Weekly request confirmation DM failed for user_id={user_id}: {repr(e)}",
+            )
 
     # Button callback entrypoint (view calls this)
     async def handle_decline_confirm(self, interaction: discord.Interaction, confirmed: bool):
@@ -902,41 +1048,58 @@ class TrackingCog(commands.Cog):
                 pass
             return
 
-        row = await self.bot.db.fetchone(
-            "SELECT week_start FROM weekly_sessions "
-            "WHERE guild_id=? AND user_id=? AND active=1 AND stage='confirm_decline' "
-            "ORDER BY week_start DESC LIMIT 1",
-            (guild.id, interaction.user.id),
-        )
-        if not row:
-            try:
-                await interaction.response.send_message("No pending confirmation found.", ephemeral=True)
-            except Exception:
-                pass
-            return
-
-        week_start_iso = row["week_start"]
-
-        if not confirmed:
-            try:
-                await interaction.response.send_message("Request resumed, please send your request with the format!", ephemeral=True)
-            except Exception:
-                pass
-            await self.bot.db.execute(
-                "UPDATE weekly_sessions SET stage='awaiting_request' WHERE guild_id=? AND user_id=? AND week_start=?",
-                (guild.id, interaction.user.id, week_start_iso),
+        async with self._weekly_submit_lock:
+            row = await self.bot.db.fetchone(
+                "SELECT week_start FROM weekly_sessions "
+                "WHERE guild_id=? AND user_id=? AND active=1 AND stage='confirm_decline' "
+                "AND decline_prompt_message_id=? "
+                "ORDER BY week_start DESC LIMIT 1",
+                (guild.id, interaction.user.id, int(getattr(interaction.message, "id", 0) or 0)),
             )
-            return
+            if not row:
+                try:
+                    await interaction.response.send_message("No pending confirmation found.", ephemeral=True)
+                except Exception:
+                    pass
+                return
 
-        await self.bot.db.execute(
-            "UPDATE weekly_claims SET status='declined' WHERE guild_id=? AND week_start=? AND user_id=?",
-            (guild.id, week_start_iso, interaction.user.id),
-        )
+            week_start_iso = row["week_start"]
+
+            if not confirmed:
+                await self.bot.db.execute(
+                    "UPDATE weekly_sessions SET stage='awaiting_request', decline_prompt_message_id=NULL "
+                    "WHERE guild_id=? AND user_id=? AND week_start=?",
+                    (guild.id, interaction.user.id, week_start_iso),
+                )
+                try:
+                    await interaction.message.edit(content="Weekly request resumed.", view=None)
+                except Exception:
+                    pass
+                try:
+                    await interaction.response.send_message("Request resumed, please send your request with the format!", ephemeral=True)
+                except Exception:
+                    pass
+                return
+
+            await self.bot.db.execute_transaction(
+                (
+                    (
+                        "UPDATE weekly_claims SET status='declined' WHERE guild_id=? AND week_start=? AND user_id=? AND status='pending'",
+                        (guild.id, week_start_iso, interaction.user.id),
+                    ),
+                    (
+                        "UPDATE weekly_sessions SET active=0, decline_prompt_message_id=NULL "
+                        "WHERE guild_id=? AND week_start=? AND user_id=? AND active=1",
+                        (guild.id, week_start_iso, interaction.user.id),
+                    ),
+                ),
+                retry_safe=True,
+            )
+        try:
+            await interaction.message.edit(content="Weekly request declined.", view=None)
+        except Exception:
+            pass
         await self._log_weekly(guild, week_start_iso, interaction.user.id, "declined", "User confirmed decline")
-        await self.bot.db.execute(
-            "UPDATE weekly_sessions SET active=0 WHERE guild_id=? AND week_start=? AND user_id=?",
-            (guild.id, week_start_iso, interaction.user.id),
-        )
         try:
             await interaction.response.send_message("Confirmed. Offering the request to the next eligible member.", ephemeral=True)
         except Exception:
@@ -990,11 +1153,37 @@ class TrackingCog(commands.Cog):
             except Exception as e:
                 await self._log_background_error("weekly_loop", f"Weekly loop error: {repr(e)}")
 
+    def _weekly_recap_due(self, current: datetime) -> bool:
+        recap_cfg = self.bot.config.get("background", "weekly_recap", default={}) or {}
+        configured = recap_cfg.get("time", "00:10") if isinstance(recap_cfg, dict) else "00:10"
+        match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", str(configured or ""))
+        if not match:
+            hour, minute = 0, 10
+        else:
+            hour, minute = int(match.group(1)), int(match.group(2))
+            if hour > 23 or minute > 59:
+                hour, minute = 0, 10
+        target = week_start_sunday(current).replace(hour=hour, minute=minute)
+        return current >= target
+
+    async def _weekly_recap_loop(self):
+        await self.bot.wait_until_ready()
+        while True:
+            try:
+                await self._send_missing_weekly_recap_once()
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                await self._log_background_error("weekly_recap_loop", f"Weekly recap loop error: {repr(e)}")
+                await asyncio.sleep(60)
+
     async def _timeout_loop(self):
         await self.bot.wait_until_ready()
         while True:
             try:
                 await asyncio.sleep(600)  # every 10 minutes
+                await self._recover_contacting_claims()
                 await self._process_timeouts()
                 await self._process_reminders()
             except asyncio.CancelledError:
@@ -1017,22 +1206,38 @@ class TrackingCog(commands.Cog):
             week_start_iso = r["week_start"]
             user_id = int(r["user_id"])
 
+            async with self._weekly_submit_lock:
+                current = await self.bot.db.fetchone(
+                    "SELECT 1 FROM weekly_sessions s JOIN weekly_claims c "
+                    "ON c.guild_id=s.guild_id AND c.week_start=s.week_start AND c.user_id=s.user_id "
+                    "WHERE s.guild_id=? AND s.week_start=? AND s.user_id=? AND s.active=1 "
+                    "AND s.expires_ts<=? AND c.status='pending'",
+                    (guild.id, week_start_iso, user_id, now_ts),
+                )
+                if not current:
+                    continue
+                await self.bot.db.execute_transaction(
+                    (
+                        (
+                            "UPDATE weekly_claims SET status='timed_out' WHERE guild_id=? AND week_start=? AND user_id=? AND status='pending'",
+                            (guild.id, week_start_iso, user_id),
+                        ),
+                        (
+                            "UPDATE weekly_sessions SET active=0, decline_prompt_message_id=NULL "
+                            "WHERE guild_id=? AND week_start=? AND user_id=? AND active=1",
+                            (guild.id, week_start_iso, user_id),
+                        ),
+                    ),
+                    retry_safe=True,
+                )
+
             try:
                 user = await self.bot.fetch_user(user_id)
-                await user.send("Request timed out")
+                await user.send("Request timed out", allowed_mentions=no_mentions())
                 await self._log_weekly(guild, week_start_iso, user_id, "timeout_dm_sent", "")
-            except Exception:
-                pass
-
-            await self.bot.db.execute(
-                "UPDATE weekly_claims SET status='timed_out' WHERE guild_id=? AND week_start=? AND user_id=?",
-                (guild.id, week_start_iso, user_id),
-            )
+            except Exception as e:
+                await self._log_weekly(guild, week_start_iso, user_id, "timeout_dm_failed", type(e).__name__)
             await self._log_weekly(guild, week_start_iso, user_id, "timed_out", "No reply before deadline")
-            await self.bot.db.execute(
-                "UPDATE weekly_sessions SET active=0 WHERE guild_id=? AND week_start=? AND user_id=?",
-                (guild.id, week_start_iso, user_id),
-            )
 
             await self._contact_next_eligible(guild, week_start_iso)
 
@@ -1045,7 +1250,7 @@ class TrackingCog(commands.Cog):
         now_ts = int(time.time())
         try:
             week_dt = datetime.fromisoformat(week_start_iso)
-            prev_week = (week_dt - timedelta(days=7)).date().isoformat()
+            prev_week = (week_dt - timedelta(days=7)).isoformat()
         except Exception:
             prev_week = ""
 
@@ -1072,7 +1277,8 @@ class TrackingCog(commands.Cog):
         if top_users:
             placeholders = ",".join("?" for _ in top_users)
             await self.bot.db.execute(
-                f"UPDATE weekly_streaks SET streak=0, last_week_start=?, updated_ts=? WHERE guild_id=? AND user_id NOT IN ({placeholders}) AND streak>0",
+                # The generated fragment contains only one bound placeholder per integer user ID.
+                f"UPDATE weekly_streaks SET streak=0, last_week_start=?, updated_ts=? WHERE guild_id=? AND user_id NOT IN ({placeholders}) AND streak>0",  # nosec
                 (week_start_iso, now_ts, guild.id, *top_users),
             )
         else:
@@ -1106,7 +1312,16 @@ class TrackingCog(commands.Cog):
         if not channel_id:
             channel_id = self._cfg_int("channels", "general_logging_channel_id", 0)
         channel = guild.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await guild.fetch_channel(channel_id)
+            except Exception:
+                channel = None
         if not isinstance(channel, discord.TextChannel):
+            await self._log_background_error(
+                "weekly_recap_channel",
+                f"Weekly recap channel is missing or invalid: channel_id={channel_id}",
+            )
             return
 
         try:
@@ -1131,8 +1346,8 @@ class TrackingCog(commands.Cog):
         reviewed = sum(int(row["c"]) for row in review_rows if str(row["status"]) == "reviewed")
         pending_reviews = sum(int(row["c"]) for row in review_rows if str(row["status"]) == "pending")
         farm_row = await self.bot.db.fetchone(
-            "SELECT COUNT(*) AS c FROM anti_farm_events WHERE guild_id=? AND ts>=?",
-            (guild.id, week_start_ts),
+            "SELECT COUNT(*) AS c FROM anti_farm_events WHERE guild_id=? AND ts>=? AND ts<?",
+            (guild.id, week_start_ts, week_start_ts + 7 * 24 * 3600),
         )
         farm_count = int(farm_row["c"] or 0) if farm_row else 0
 
@@ -1170,16 +1385,29 @@ class TrackingCog(commands.Cog):
         embed.add_field(name="Top Members", value="\n".join(top_lines)[:1024] or "No eligible activity.", inline=False)
         embed.add_field(name="Signals", value=f"Anti-farm skips logged: **{farm_count}**", inline=True)
         embed.set_footer(text="Private weekly recap")
+        msg = None
         try:
-            msg = await channel.send(embed=embed)
+            msg = await channel.send(embed=embed, allowed_mentions=no_mentions())
             await self.bot.db.execute(
                 "INSERT OR REPLACE INTO weekly_recaps(guild_id,week_start,message_id,channel_id,created_ts) VALUES(?,?,?,?,?)",
                 (guild.id, week_start_iso, msg.id, channel.id, int(time.time())),
             )
         except Exception as e:
+            if msg is not None:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
             await log_error(self.bot, f"Weekly recap send failed for {week_start_iso}: {repr(e)}")
 
-    async def _ranked_rows_for_week(self, guild: discord.Guild, week_start_iso: str, limit: Optional[int] = None) -> list:
+    async def _ranked_rows_for_week(
+        self,
+        guild: discord.Guild,
+        week_start_iso: str,
+        limit: Optional[int] = None,
+        *,
+        include_unresolved: bool = True,
+    ) -> list:
         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
         sql = "SELECT user_id, count FROM activity_counts WHERE guild_id=? AND week_start=? ORDER BY count DESC"
         params: tuple = (guild.id, week_start_iso)
@@ -1190,12 +1418,31 @@ class TrackingCog(commands.Cog):
         ranked_rows = []
         for row in rows:
             uid = int(row["user_id"])
-            member = await self._resolve_member(guild, uid)
+            # Member intent keeps the guild cache populated. Ranking from that
+            # cache avoids one REST request per tracked user and prevents a
+            # large leaderboard from exhausting Discord's rate limit.
+            member = guild.get_member(uid)
+            if member is None and not include_unresolved:
+                # The weekly reward run happens once per week, so resolving
+                # its bounded candidate set is worth the REST calls. A cold
+                # member cache must never turn a valid top member into an
+                # empty reward list after a restart.
+                try:
+                    member = await guild.fetch_member(uid)
+                except discord.NotFound:
+                    continue
+                except Exception:
+                    # Let the weekly scheduler retry before writing its run
+                    # marker instead of permanently completing with an empty
+                    # ranking during a transient Discord API failure.
+                    raise
             if member is not None:
                 if member.bot:
                     continue
                 if excluded_role_ids and any(role.id in excluded_role_ids for role in member.roles):
                     continue
+            elif not include_unresolved:
+                continue
             ranked_rows.append(row)
         return ranked_rows
 
@@ -1205,8 +1452,18 @@ class TrackingCog(commands.Cog):
         guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
         if guild is None:
             return
-        prev_week_start = week_start_sunday(week_start_sunday(now_madrid()) - timedelta(seconds=1)).isoformat()
+        current = now_madrid()
+        if not self._weekly_recap_due(current):
+            return
+        this_week_start = week_start_sunday(current)
+        prev_week_start = week_start_sunday(this_week_start - timedelta(seconds=1)).isoformat()
         try:
+            completed = await self.bot.db.fetchone(
+                "SELECT 1 FROM weekly_runs WHERE guild_id=? AND week_start=?",
+                (guild.id, this_week_start.isoformat()),
+            )
+            if not completed:
+                return
             existing = await self.bot.db.fetchone(
                 "SELECT 1 FROM weekly_recaps WHERE guild_id=? AND week_start=?",
                 (guild.id, prev_week_start),
@@ -1228,14 +1485,19 @@ class TrackingCog(commands.Cog):
             return
         await self.flush_activity_counts()
 
-        top_limit = self._cfg_int("tracking", "top_limit", 20)
-        winners_to_dm = self._cfg_int("tracking", "winners_to_dm", 1)
-        timeout_h = self._cfg_int("tracking", "dm_timeout_hours", 48)
+        top_limit = max(1, min(500, self._cfg_int("tracking", "top_limit", 20)))
+        winners_to_dm = max(0, min(top_limit, self._cfg_int("tracking", "winners_to_dm", 1)))
+        timeout_h = max(1, min(24 * 30, self._cfg_int("tracking", "dm_timeout_hours", 48)))
 
         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_start", f"top_limit={top_limit} winners_to_dm={winners_to_dm} timeout_h={timeout_h}")
 
         ranked: List[int] = []
-        ranked_rows = await self._ranked_rows_for_week(guild, week_start_iso, top_limit)
+        ranked_rows = await self._ranked_rows_for_week(
+            guild,
+            week_start_iso,
+            top_limit,
+            include_unresolved=False,
+        )
         for r in ranked_rows:
             uid = int(r["user_id"])
             ranked.append(uid)
@@ -1247,10 +1509,6 @@ class TrackingCog(commands.Cog):
 
         if await self.weekly_reward_disabled(guild.id, week_start_iso):
             await self._log_weekly(guild, week_start_iso, 0, "weekly_reward_skipped", "Reward disabled for this tracking week")
-            try:
-                await self._send_weekly_recap(guild, week_start_iso, ranked_rows)
-            except Exception as e:
-                await self._log_background_error("weekly_recap", f"Weekly recap failed: {repr(e)}")
             await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted=0 eligible_ranked={len(ranked)}")
             return
 
@@ -1263,68 +1521,110 @@ class TrackingCog(commands.Cog):
                 contacted += 1
 
         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted={contacted} eligible_ranked={len(ranked)}")
-        try:
-            await self._send_weekly_recap(guild, week_start_iso, ranked_rows)
-        except Exception as e:
-            await self._log_background_error("weekly_recap", f"Weekly recap failed: {repr(e)}")
 
     async def _contact_user_for_week(self, guild: discord.Guild, week_start_iso: str, user_id: int, rank: int, timeout_hours: int, force: bool = False) -> bool:
         if not force and await self.weekly_reward_disabled(guild.id, week_start_iso):
             await self._log_weekly(guild, week_start_iso, user_id, "skipped_reward_disabled", "")
             return False
 
-        # don't contact if already contacted this week
-        row = await self.bot.db.fetchone(
-            "SELECT status FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
-            (guild.id, week_start_iso, user_id),
-        )
-        if row is not None:
-            await self._log_weekly(guild, week_start_iso, user_id, "skipped_already_contacted", f"status={row['status']}")
+        member = await self._resolve_member(guild, user_id)
+        if member is None or member.bot:
+            await self._log_weekly(guild, week_start_iso, user_id, "no_eligible_member", "reason=member_missing_or_bot")
             return False
+        if not force:
+            excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
+            if excluded_role_ids and any(role.id in excluded_role_ids for role in member.roles):
+                await self._log_weekly(guild, week_start_iso, user_id, "no_eligible_member", "reason=excluded_role")
+                return False
 
         now_ts = int(time.time())
-        expires = now_ts + int(timeout_hours) * 3600
+        timeout_hours = max(1, int(timeout_hours))
+        expires = now_ts + timeout_hours * 3600
+
+        # Reserve the offer before sending the DM. Concurrent scheduler/force
+        # runs now see `contacting` and cannot send the same offer twice.
+        async with self._weekly_offer_lock:
+            row = await self.bot.db.fetchone(
+                "SELECT status FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
+                (guild.id, week_start_iso, user_id),
+            )
+            if row is not None:
+                await self._log_weekly(
+                    guild,
+                    week_start_iso,
+                    user_id,
+                    "skipped_already_contacted",
+                    f"status={row['status']}",
+                )
+                return False
+            await self.bot.db.execute(
+                "INSERT INTO weekly_claims(guild_id,week_start,user_id,rank,status,contacted_ts) VALUES(?,?,?,?,?,?)",
+                (guild.id, week_start_iso, user_id, rank, "contacting", now_ts),
+            )
 
         try:
             user = await self.bot.fetch_user(user_id)
-            content, embed = self._build_request_dm_message(int(timeout_hours), expires)
-            await user.send(content=content or None, embed=embed)
-            await self._log_weekly(guild, week_start_iso, user_id, "dm_sent", f"rank={rank} timeout_hours={timeout_hours}")
+            content, embed = self._build_request_dm_message(timeout_hours, expires)
+            await user.send(content=content or None, embed=embed, allowed_mentions=no_mentions())
         except Exception as e:
             await self.bot.db.execute(
-                "INSERT INTO weekly_claims(guild_id,week_start,user_id,rank,status,contacted_ts) VALUES(?,?,?,?,?,?)",
-                (guild.id, week_start_iso, user_id, rank, "dm_closed", now_ts),
+                "UPDATE weekly_claims SET status='dm_closed' "
+                "WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
+                (guild.id, week_start_iso, user_id),
             )
             await self._log_weekly(guild, week_start_iso, user_id, "dm_failed", type(e).__name__)
 
             log_ch_id = self._cfg_int("channels", "dm_fail_log_channel_id", 0)
             log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
+            if log_ch is None and log_ch_id:
+                try:
+                    log_ch = await guild.fetch_channel(log_ch_id)
+                except Exception:
+                    log_ch = None
             if isinstance(log_ch, discord.TextChannel):
-                embed = discord.Embed(
+                failure_embed = discord.Embed(
                     title="Weekly Request DM Failed",
                     description=f"A weekly request DM could not be delivered to <@{user_id}>",
                     color=discord.Color.red(),
                     timestamp=now_madrid(),
                 )
-                embed.add_field(name="Member", value=f"<@{user_id}>\n`{user_id}`", inline=True)
-                embed.add_field(name="Week", value=week_start_iso, inline=True)
-                embed.add_field(name="Reason", value=type(e).__name__, inline=True)
-                embed.set_footer(text="Weekly request workflow")
+                failure_embed.add_field(name="Member", value=f"<@{user_id}>\n`{user_id}`", inline=True)
+                failure_embed.add_field(name="Week", value=week_start_iso, inline=True)
+                failure_embed.add_field(name="Reason", value=type(e).__name__, inline=True)
+                failure_embed.set_footer(text="Weekly request workflow")
                 try:
-                    await log_ch.send(embed=embed)
-                except Exception:
-                    pass
+                    await log_ch.send(embed=failure_embed, allowed_mentions=no_mentions())
+                except Exception as log_error_exc:
+                    await self._log_background_error("weekly_dm_fail_channel", f"Weekly DM failure log send failed: {repr(log_error_exc)}")
             return False
 
-        await self.bot.db.execute(
-            "INSERT INTO weekly_claims(guild_id,week_start,user_id,rank,status,contacted_ts) VALUES(?,?,?,?,?,?)",
-            (guild.id, week_start_iso, user_id, rank, "pending", now_ts),
-        )
-        await self.bot.db.execute(
-            "INSERT INTO weekly_sessions(guild_id,week_start,user_id,stage,expires_ts,active) VALUES(?,?,?,?,?,1) "
-            "ON CONFLICT(guild_id,week_start,user_id) DO UPDATE SET stage='awaiting_request', expires_ts=excluded.expires_ts, active=1",
-            (guild.id, week_start_iso, user_id, "awaiting_request", expires),
-        )
+        try:
+            await self.bot.db.execute_transaction(
+                (
+                    (
+                        "UPDATE weekly_claims SET status='pending' "
+                        "WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
+                        (guild.id, week_start_iso, user_id),
+                    ),
+                    (
+                        "INSERT INTO weekly_sessions(guild_id,week_start,user_id,stage,expires_ts,active) VALUES(?,?,?,?,?,1) "
+                        "ON CONFLICT(guild_id,week_start,user_id) DO UPDATE SET "
+                        "stage='awaiting_request', expires_ts=excluded.expires_ts, active=1, decline_prompt_message_id=NULL",
+                        (guild.id, week_start_iso, user_id, "awaiting_request", expires),
+                    ),
+                ),
+                retry_safe=True,
+            )
+        except Exception as e:
+            # Keep the `contacting` reservation. Startup recovery can safely
+            # finish it without awarding an additional member in the meantime.
+            await self._log_background_error(
+                "weekly_offer_finalize",
+                f"Weekly DM sent but offer state could not be finalized for user_id={user_id}: {repr(e)}",
+            )
+            return True
+
+        await self._log_weekly(guild, week_start_iso, user_id, "dm_sent", f"rank={rank} timeout_hours={timeout_hours}")
         return True
 
     async def _contact_next_eligible(self, guild: discord.Guild, week_start_iso: str):
@@ -1332,8 +1632,8 @@ class TrackingCog(commands.Cog):
             await self._log_weekly(guild, week_start_iso, 0, "next_offer_skipped_reward_disabled", "")
             return
 
-        cfg_top_limit = self._cfg_int("tracking", "top_limit", 20)
-        timeout_h = self._cfg_int("tracking", "dm_timeout_hours", 48)
+        cfg_top_limit = max(1, min(500, self._cfg_int("tracking", "top_limit", 20)))
+        timeout_h = max(1, min(24 * 30, self._cfg_int("tracking", "dm_timeout_hours", 48)))
         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
 
         rows = await self.bot.db.fetchall(
@@ -1370,8 +1670,16 @@ class TrackingCog(commands.Cog):
                 "offered_next",
                 f"rank={idx} skipped_missing={skipped_missing} skipped_excluded={skipped_excluded} skipped_existing={skipped_existing}",
             )
-            await self._contact_user_for_week(guild, week_start_iso, uid, rank=idx, timeout_hours=timeout_h)
-            return
+            contacted = await self._contact_user_for_week(
+                guild,
+                week_start_iso,
+                uid,
+                rank=idx,
+                timeout_hours=timeout_h,
+            )
+            if contacted:
+                return
+            skipped_existing += 1
 
         await self._log_weekly(
             guild,
@@ -1468,7 +1776,7 @@ class TrackingCog(commands.Cog):
             try:
                 user = await self.bot.fetch_user(user_id)
                 content, embed = self._build_reminder_message(expires_ts)
-                await user.send(content=content or None, embed=embed)
+                await user.send(content=content or None, embed=embed, allowed_mentions=no_mentions())
                 await self.bot.db.execute(
                     "INSERT OR REPLACE INTO weekly_reminders(guild_id,week_start,user_id,reminded_ts) VALUES(?,?,?,?)",
                     (guild.id, week_start_iso, user_id, now_ts),
@@ -1482,6 +1790,7 @@ class TrackingCog(commands.Cog):
     # ----------------------------
     async def get_top(self, guild_id: int, week_start_iso: str, limit: int = 20) -> List[Tuple[int, int]]:
         await self.flush_activity_counts()
+        limit = max(1, min(500, int(limit)))
         rows = await self.bot.db.fetchall(
             "SELECT user_id, count FROM activity_counts WHERE guild_id=? AND week_start=? ORDER BY count DESC LIMIT ?",
             (guild_id, week_start_iso, limit),
@@ -1514,22 +1823,23 @@ class TrackingCog(commands.Cog):
         eligible_total = 0
         for r in rows:
             uid = int(r["user_id"])
-            m = await self._resolve_member(guild, uid)
-            if m is not None:
-                if m.bot:
-                    continue
-                if excluded_role_ids and any(role.id in excluded_role_ids for role in m.roles):
-                    continue
+            m = member if uid == user_id else guild.get_member(uid)
+            # Activity rows are only created by on_message after bot and role
+            # eligibility checks. Keep uncached rows in the ranking; known
+            # members are re-checked so current exclusions still apply.
+            if m is not None and m.bot:
+                continue
+            if m is not None and excluded_role_ids and any(role.id in excluded_role_ids for role in m.roles):
+                continue
             eligible_total += 1
-            if uid == user_id:
+            if uid == user_id and rank is None:
                 rank = eligible_total
-                break
 
         return count, rank, eligible_total
 
     async def force_dm_for_user(self, guild: discord.Guild, week_start_iso: str, user_id: int, timeout_hours: Optional[int] = None) -> tuple[bool, str]:
         await self.flush_activity_counts()
-        timeout_h = int(timeout_hours or self._cfg_int("tracking", "dm_timeout_hours", 48) or 48)
+        timeout_h = max(1, min(24 * 30, int(timeout_hours or self._cfg_int("tracking", "dm_timeout_hours", 48) or 48)))
 
         if await self.weekly_reward_disabled(guild.id, week_start_iso):
             await self._log_weekly(guild, week_start_iso, user_id, "force_dm_override", "reason=weekly_reward_disabled")
@@ -1551,13 +1861,18 @@ class TrackingCog(commands.Cog):
             if status not in {"dm_closed", "disabled"}:
                 await self._log_weekly(guild, week_start_iso, user_id, "force_dm_blocked", f"reason=existing_status status={status}")
                 return False, f"Cannot force DM: user already has status '{status}' for this week."
-            await self.bot.db.execute(
-                "DELETE FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
-                (guild.id, week_start_iso, user_id),
-            )
-            await self.bot.db.execute(
-                "DELETE FROM weekly_sessions WHERE guild_id=? AND week_start=? AND user_id=?",
-                (guild.id, week_start_iso, user_id),
+            await self.bot.db.execute_transaction(
+                (
+                    (
+                        "DELETE FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
+                        (guild.id, week_start_iso, user_id),
+                    ),
+                    (
+                        "DELETE FROM weekly_sessions WHERE guild_id=? AND week_start=? AND user_id=?",
+                        (guild.id, week_start_iso, user_id),
+                    ),
+                ),
+                retry_safe=True,
             )
 
         # Estimate rank among eligible (best-effort)
@@ -1588,8 +1903,13 @@ class TrackingCog(commands.Cog):
     async def reset_current_week(self, guild_id: int) -> None:
         await self.flush_activity_counts()
         ws = week_start_sunday(now_madrid()).isoformat()
-        await self.bot.db.execute("DELETE FROM activity_counts WHERE guild_id=? AND week_start=?", (guild_id, ws))
-        await self.bot.db.execute("DELETE FROM activity_last_counted WHERE guild_id=?", (guild_id,))
+        await self.bot.db.execute_transaction(
+            (
+                ("DELETE FROM activity_counts WHERE guild_id=? AND week_start=?", (guild_id, ws)),
+                ("DELETE FROM activity_last_counted WHERE guild_id=?", (guild_id,)),
+            ),
+            retry_safe=True,
+        )
         async with self._activity_lock:
             self._pending_activity_counts = {
                 key: value for key, value in self._pending_activity_counts.items()

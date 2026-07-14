@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import io
-from datetime import datetime
-from typing import Optional
+
 import discord
 
 async def build_text_transcript(channel: discord.TextChannel, limit: int = 2000) -> io.BytesIO:

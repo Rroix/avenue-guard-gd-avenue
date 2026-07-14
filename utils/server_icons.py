@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -16,7 +17,18 @@ def is_valid_icon_url(value: Any) -> bool:
     if not url or len(url) > 2000:
         return False
     parsed = urlparse(url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    hostname = parsed.hostname.casefold().rstrip(".")
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return False
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return True
+    return address.is_global
 
 
 def is_expiring_discord_attachment_url(value: Any) -> bool:

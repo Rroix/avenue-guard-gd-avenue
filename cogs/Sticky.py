@@ -16,15 +16,14 @@ class StickyCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
         self._debounce_tasks: Dict[int, asyncio.Task] = {}
+        self._sticky_channel_locks: Dict[int, asyncio.Lock] = {}
+        self._background_tasks: set[asyncio.Task] = set()
+        self._sticky_recovery_scanned: set[int] = set()
         self._sticky_entries: List[Dict[str, Any]] = []
 
         # forum_channel_id -> templates dict (keys: "default" and tag_id strings)
         self._forum_rules: Dict[int, Dict[str, Dict[str, Any]]] = {}
         self._forum_required_rules: Dict[int, Dict[str, Any]] = {}
-
-        # Intentionally used for tag lookup (you asked to keep this pattern).
-        # In multi-forum mode we set this per-thread before selecting templates.
-        self._forum_templates: Dict[str, Dict[str, Any]] = {}
 
         # Thread IDs we've already handled this runtime
         self._forum_sent_threads: set[int] = set()
@@ -34,6 +33,33 @@ class StickyCog(commands.Cog):
         self._forum_thread_locks: Dict[int, asyncio.Lock] = {}
 
         self.reload_from_config()
+
+    def cog_unload(self) -> None:
+        for task in (*self._debounce_tasks.values(), *self._background_tasks):
+            if not task.done():
+                task.cancel()
+        self._debounce_tasks.clear()
+        self._background_tasks.clear()
+
+    def _start_background_task(self, coroutine, *, label: str) -> asyncio.Task:
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+
+        def _done(completed: asyncio.Task) -> None:
+            self._background_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except Exception:
+                return
+            if error is not None:
+                log_task = asyncio.create_task(log_error(self.bot, f"{label} failed: {repr(error)}"))
+                self._background_tasks.add(log_task)
+                log_task.add_done_callback(self._background_tasks.discard)
+
+        task.add_done_callback(_done)
+        return task
 
     def reload_from_config(self) -> None:
         cfg = self.bot.config
@@ -68,18 +94,12 @@ class StickyCog(commands.Cog):
                 if required_rule:
                     self._forum_required_rules[int(ch_id)] = required_rule
 
-        # If legacy single-forum config is used, keep _forum_templates pointing there.
-        if len(self._forum_rules) == 1:
-            self._forum_templates = next(iter(self._forum_rules.values()))
-        else:
-            self._forum_templates = {}
-
     def on_config_reload(self) -> None:
         self.reload_from_config()
 
     def _required_rule_from_config(self, source: Dict[str, Any], fallback: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         fallback = fallback or {}
-        word = str(source.get("required_word", fallback.get("word", "")) or "").strip()
+        word = str(source.get("required_word", fallback.get("word", "")) or "").strip()[:256]
         if not word:
             return None
 
@@ -105,7 +125,7 @@ class StickyCog(commands.Cog):
         return {
             "word": word,
             "dm_message": dm_message,
-            "delete_delay_seconds": max(0.0, delay),
+            "delete_delay_seconds": max(0.0, min(delay, 3600.0)),
             "match_mode": match_mode,
         }
 
@@ -141,9 +161,12 @@ class StickyCog(commands.Cog):
         # - if no, sends
         try:
             if isinstance(message.channel, discord.Thread) and message.channel.parent_id in self._forum_rules:
-                asyncio.create_task(self._forum_first_message_flow(message.channel, prefer_normal=False))
-        except Exception:
-            pass
+                self._start_background_task(
+                    self._forum_first_message_flow(message.channel, prefer_normal=False),
+                    label=f"Forum fallback for thread {message.channel.id}",
+                )
+        except Exception as e:
+            await log_error(self.bot, f"Could not schedule forum fallback for channel_id={message.channel.id}: {repr(e)}")
 
         entry = self._get_sticky_for_channel(message.channel.id)
         if not entry:
@@ -154,10 +177,20 @@ class StickyCog(commands.Cog):
         if task and not task.done():
             task.cancel()
 
-        delay = float(entry.get("delay_seconds", 5) or 5)
-        self._debounce_tasks[message.channel.id] = asyncio.create_task(
+        try:
+            delay = max(0.0, min(300.0, float(entry.get("delay_seconds", 5) or 5)))
+        except (TypeError, ValueError):
+            delay = 5.0
+        sticky_task = asyncio.create_task(
             self._do_sticky(message.channel, message.guild, entry, delay)
         )
+        self._debounce_tasks[message.channel.id] = sticky_task
+
+        def _remove(completed: asyncio.Task) -> None:
+            if self._debounce_tasks.get(message.channel.id) is completed:
+                self._debounce_tasks.pop(message.channel.id, None)
+
+        sticky_task.add_done_callback(_remove)
 
     async def _do_sticky(self, channel: discord.TextChannel, guild: discord.Guild, entry: Dict[str, Any], delay: float):
         try:
@@ -169,42 +202,70 @@ class StickyCog(commands.Cog):
         if not text:
             return
 
+        # Once replacement begins, let it finish even if another message
+        # resets the debounce timer. Cancelling between send and DB save would
+        # leave an untracked sticky that the next refresh could duplicate.
+        critical = self._start_background_task(
+            self._replace_sticky(channel, guild, text),
+            label=f"Sticky replacement for channel {channel.id}",
+        )
+        try:
+            await asyncio.shield(critical)
+        except asyncio.CancelledError:
+            return
+
+    async def _replace_sticky(self, channel: discord.TextChannel, guild: discord.Guild, text: str) -> None:
+        lock = self._sticky_channel_locks.setdefault(channel.id, asyncio.Lock())
+        async with lock:
+            await self._replace_sticky_locked(channel, guild, text)
+
+    async def _replace_sticky_locked(self, channel: discord.TextChannel, guild: discord.Guild, text: str) -> None:
+
         # delete previous sticky
         db = self.bot.db
-        row = await db.fetchone(
-            "SELECT last_sticky_message_id FROM sticky_state WHERE guild_id=? AND channel_id=?",
-            (guild.id, channel.id),
-        )
+        try:
+            row = await db.fetchone(
+                "SELECT last_sticky_message_id FROM sticky_state WHERE guild_id=? AND channel_id=?",
+                (guild.id, channel.id),
+            )
+        except Exception as e:
+            await log_error(self.bot, f"Sticky state lookup failed for channel_id={channel.id}: {repr(e)}")
+            return
         last_id = int(row["last_sticky_message_id"]) if row and row["last_sticky_message_id"] else None
+        previous_missing = last_id is None
         if last_id:
             try:
                 msg = await channel.fetch_message(last_id)
                 await msg.delete()
             except discord.NotFound:
-                pass
+                previous_missing = True
             except Exception as e:
                 await log_error(self.bot, f"Sticky cleanup could not delete saved sticky message_id={last_id} channel_id={channel.id}: {repr(e)}")
+                return
 
         # Recovery cleanup for deployments whose database state was reset or migrated.
         # Only deletes exact matching bot-authored sticky copies.
-        try:
-            me_id = int(getattr(self.bot.user, "id", 0) or 0)
-            async for old in channel.history(limit=50):
-                if old.id == last_id:
-                    continue
-                if me_id and getattr(old.author, "id", 0) != me_id:
-                    continue
-                if (old.content or "") != text:
-                    continue
-                try:
-                    await old.delete()
-                except discord.NotFound:
-                    pass
-                except Exception as e:
-                    await log_error(self.bot, f"Sticky cleanup could not delete duplicate sticky message_id={old.id} channel_id={channel.id}: {repr(e)}")
-        except Exception as e:
-            await log_error(self.bot, f"Sticky cleanup history scan failed for channel_id={channel.id}: {repr(e)}")
+        if previous_missing or channel.id not in self._sticky_recovery_scanned:
+            self._sticky_recovery_scanned.add(channel.id)
+            try:
+                me_id = int(getattr(self.bot.user, "id", 0) or 0)
+                async for old in channel.history(limit=50):
+                    if old.id == last_id:
+                        continue
+                    if me_id and getattr(old.author, "id", 0) != me_id:
+                        continue
+                    if (old.content or "") != text:
+                        continue
+                    try:
+                        await old.delete()
+                    except discord.NotFound:
+                        pass
+                    except Exception as e:
+                        await log_error(self.bot, f"Sticky cleanup could not delete duplicate sticky message_id={old.id} channel_id={channel.id}: {repr(e)}")
+            except Exception as e:
+                await log_error(self.bot, f"Sticky cleanup history scan failed for channel_id={channel.id}: {repr(e)}")
 
+        sent = None
         try:
             sent = await channel.send(text, allowed_mentions=no_mentions())
             await db.execute(
@@ -213,6 +274,16 @@ class StickyCog(commands.Cog):
                 (guild.id, channel.id, sent.id),
             )
         except Exception as e:
+            if sent is not None:
+                try:
+                    await sent.delete()
+                except discord.NotFound:
+                    pass
+                except Exception as cleanup_error:
+                    await log_error(
+                        self.bot,
+                        f"Untracked sticky cleanup failed message_id={sent.id} channel_id={channel.id}: {repr(cleanup_error)}",
+                    )
             await log_error(self.bot, f"Sticky send/state update failed for channel_id={channel.id}: {repr(e)}")
 
     # ---------------------------
@@ -236,15 +307,33 @@ class StickyCog(commands.Cog):
             for thread_id in removable[: len(self._forum_thread_locks) - max_items]:
                 self._forum_thread_locks.pop(thread_id, None)
 
+    def _forum_template_for_thread(self, thread: discord.Thread) -> Dict[str, Any]:
+        templates = self._forum_rules.get(thread.parent_id, {})
+        template = templates.get("default", {}) if isinstance(templates, dict) else {}
+        try:
+            for tag in getattr(thread, "applied_tags", []) or []:
+                candidate = templates.get(str(tag.id))
+                if isinstance(candidate, dict):
+                    return candidate
+        except Exception:
+            pass
+        return template if isinstance(template, dict) else {}
+
     async def _thread_has_bot_message(self, thread: discord.Thread, limit: int = 25) -> bool:
-        """Manual check: if the bot has already posted in this thread, we shouldn't send again."""
+        """Return whether this thread already contains its configured reminder."""
         me = self.bot.user
         if me is None:
             return False
+        template = self._forum_template_for_thread(thread)
+        expected_title = str(template.get("title", "") or "")[:256]
+        expected_description = str(template.get("description", "") or "")[:4096]
         try:
             async for msg in thread.history(limit=limit, oldest_first=True):
-                if msg.author and msg.author.id == me.id:
-                    return True
+                if not msg.author or msg.author.id != me.id:
+                    continue
+                for embed in msg.embeds:
+                    if (embed.title or "") == expected_title and (embed.description or "") == expected_description:
+                        return True
         except Exception:
             # If we can't read history, play safe and avoid double posting.
             return True
@@ -255,31 +344,16 @@ class StickyCog(commands.Cog):
         if thread.guild is None:
             return False
 
-        templates = self._forum_rules.get(thread.parent_id)
-        if not templates:
+        if thread.parent_id not in self._forum_rules:
             return False
+        template = self._forum_template_for_thread(thread)
 
-        # Keep your intentional mapping: assign per-forum templates here
-        self._forum_templates = templates
-
-        # choose template by first matching applied tag, else default
-        template = templates.get("default", {}) or {}
-        try:
-            applied = getattr(thread, "applied_tags", []) or []
-            for tag in applied:
-                t = self._forum_templates.get(str(tag.id))
-                if isinstance(t, dict):
-                    template = t
-                    break
-        except Exception:
-            pass
-
-        title = str(template.get("title", "") or "")
-        desc = str(template.get("description", "") or "")
+        title = str(template.get("title", "") or "")[:256]
+        desc = str(template.get("description", "") or "")[:4096]
         color = basic_color(str(template.get("color", "") or "blurple"))
         embed = discord.Embed(title=title or None, description=desc or None, color=color)
 
-        await thread.send(embed=embed)
+        await thread.send(embed=embed, allowed_mentions=no_mentions())
         return True
 
     def _schedule_required_word_check(self, thread: discord.Thread) -> None:
@@ -288,15 +362,34 @@ class StickyCog(commands.Cog):
         if thread.id in self._forum_required_checked_threads:
             return
         self._forum_required_checked_threads.add(thread.id)
-        try:
-            asyncio.create_task(self._enforce_required_word(thread))
-        except Exception:
-            pass
+        self._start_background_task(
+            self._enforce_required_word(thread),
+            label=f"Required-word check for thread {thread.id}",
+        )
 
     def _normalize_required_word_text(self, value: Any) -> str:
         text = str(value or "")
         text = re.sub(r"[\u200b-\u200f\ufeff]", "", text)
         return text.casefold()
+
+    def _required_regex_is_safe(self, pattern: str) -> bool:
+        """Allow useful search regexes while rejecting high-risk constructs."""
+        if not pattern or len(pattern) > 128:
+            return False
+        # Group nesting, lookarounds, backreferences, and repeated wildcard
+        # quantifiers are unnecessary for this feature and are common sources
+        # of catastrophic backtracking in Python's standard regex engine.
+        if any(token in pattern for token in ("(", ")", "(?", "\\1", "\\2", "\\3")):
+            return False
+        if re.search(r"(?:\.\*|\.\+).*(?:\.\*|\.\+)", pattern):
+            return False
+        if re.search(r"(?:[*+?]|\{\d+(?:,\d*)?\})\s*(?:[*+?]|\{)", pattern):
+            return False
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            return False
+        return True
 
     async def _thread_contains_required_word(self, thread: discord.Thread, required_word: str, match_mode: str = "contains") -> bool:
         needle = self._normalize_required_word_text(required_word).strip()
@@ -316,17 +409,16 @@ class StickyCog(commands.Cog):
             # If history cannot be read, avoid deleting a valid thread by mistake.
             return True
 
-        haystack = self._normalize_required_word_text("\n".join(text_parts))
+        haystack = self._normalize_required_word_text("\n".join(text_parts))[:20000]
         if not needle:
             return True
         if match_mode == "whole_word":
             pattern = rf"(?<![0-9A-Za-z_]){re.escape(needle)}(?![0-9A-Za-z_])"
             return re.search(pattern, haystack) is not None
         if match_mode == "regex":
-            try:
-                return re.search(required_word, haystack, re.IGNORECASE) is not None
-            except re.error:
+            if not self._required_regex_is_safe(required_word):
                 return needle in haystack
+            return re.search(required_word, haystack[:4000], re.IGNORECASE) is not None
         return needle in haystack
 
     async def _find_thread_owner(self, thread: discord.Thread) -> Optional[discord.abc.User]:
@@ -354,6 +446,11 @@ class StickyCog(commands.Cog):
             return
         channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
         channel = guild.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await guild.fetch_channel(channel_id)
+            except Exception:
+                channel = None
         if not isinstance(channel, discord.TextChannel):
             return
 
@@ -397,6 +494,17 @@ class StickyCog(commands.Cog):
             return
 
         owner = await self._find_thread_owner(thread)
+        try:
+            try:
+                if getattr(thread, "archived", False) or getattr(thread, "locked", False):
+                    await thread.edit(archived=False, locked=False)
+            except Exception:
+                pass
+            await thread.delete()
+        except Exception as e:
+            await log_error(self.bot, f"Could not delete thread {thread.id} missing required word {required_word!r}: {repr(e)}")
+            return
+
         dm_template = str(rule.get("dm_message", "") or "")
         if owner and dm_template:
             try:
@@ -408,21 +516,15 @@ class StickyCog(commands.Cog):
             except Exception:
                 dm_text = dm_template
             try:
-                await owner.send(dm_text)
-            except Exception:
-                pass
+                await owner.send(dm_text, allowed_mentions=no_mentions())
+            except Exception as e:
+                await log_error(
+                    self.bot,
+                    f"Required-word infraction DM failed thread_id={thread.id} "
+                    f"owner_id={getattr(owner, 'id', 0)}: {repr(e)}",
+                )
 
         await self._log_required_word_deletion(thread, owner, required_word, match_mode)
-
-        try:
-            try:
-                if getattr(thread, "archived", False) or getattr(thread, "locked", False):
-                    await thread.edit(archived=False, locked=False)
-            except Exception:
-                pass
-            await thread.delete()
-        except Exception as e:
-            await log_error(self.bot, f"Could not delete thread {thread.id} missing required word {required_word!r}: {repr(e)}")
 
     async def _forum_first_message_flow(self, thread: discord.Thread, prefer_normal: bool) -> None:
         """One task at a time per thread.
@@ -462,6 +564,7 @@ class StickyCog(commands.Cog):
                     return
 
                 # Try to send with retries (attachment posts can race thread readiness)
+                last_error: Optional[Exception] = None
                 for attempt in range(6):
                     try:
                         if attempt == 0:
@@ -471,11 +574,17 @@ class StickyCog(commands.Cog):
                             self._forum_sent_threads.add(thread.id)
                             self._schedule_required_word_check(thread)
                         return
-                    except Exception:
+                    except Exception as e:
+                        last_error = e
                         try:
                             await asyncio.sleep(1.0 + attempt * 0.5)
                         except Exception:
                             return
+                if last_error is not None:
+                    await log_error(
+                        self.bot,
+                        f"Forum first message exhausted retries thread_id={thread.id}: {repr(last_error)}",
+                    )
         finally:
             waiters = getattr(lock, "_waiters", None)
             has_waiters = bool(waiters)
@@ -493,10 +602,10 @@ class StickyCog(commands.Cog):
             return
 
         # Normal path: prefer_normal=True so it doesn't delay.
-        try:
-            asyncio.create_task(self._forum_first_message_flow(thread, prefer_normal=True))
-        except Exception:
-            pass
+        self._start_background_task(
+            self._forum_first_message_flow(thread, prefer_normal=True),
+            label=f"Forum first message for thread {thread.id}",
+        )
 
 
 def setup(bot: discord.Bot):

@@ -11,6 +11,7 @@ import time
 import re
 import string
 import zipfile
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -27,6 +28,11 @@ from utils.server_icons import (
     parse_server_icon_index,
     server_icon_url_warning,
     VALID_SERVER_ICON_MODES,
+)
+from utils.runtime_config import (
+    load_runtime_config_overrides,
+    persist_forum_required_rules,
+    persist_server_icon_config,
 )
 from utils.timeutils import now_madrid, week_start_sunday
 from utils.errors import log_error
@@ -143,6 +149,8 @@ class CommandsCog(commands.Cog):
         # Hardcoded anti-spam cooldowns
         self._gamble_last_ts: dict[int, float] = {}  # user_id -> last /gambling time
         self._rps_last_ts: dict[int, float] = {}  # user_id -> last /rock-paper-scissors time
+        self._server_icon_config_lock = asyncio.Lock()
+        self._forum_config_lock = asyncio.Lock()
 
         # Command groups (guild-scoped for fast sync)
         self.bot_group = discord.SlashCommandGroup("bot", "Bot diagnostics", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
@@ -274,6 +282,28 @@ class CommandsCog(commands.Cog):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def _backup_retention_count(self) -> int:
+        try:
+            value = int(self.bot.config.get("database", "backups", "local_retention_count", default=10) or 10)
+        except Exception:
+            value = 10
+        return max(1, min(100, value))
+
+    def _prune_local_backups(self) -> None:
+        backup_dir = self._backup_local_dir()
+        if not backup_dir.exists():
+            return
+        files = sorted(
+            backup_dir.glob("avenue-guard-db-*.sqlite3.zip"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for old_path in files[self._backup_retention_count():]:
+            try:
+                old_path.unlink()
+            except FileNotFoundError:
+                pass
+
     def _database_path(self) -> Path:
         return Path(str(getattr(self.bot, "db_path", getattr(self.bot.db, "path", "data/bot.db"))))
 
@@ -301,7 +331,8 @@ class CommandsCog(commands.Cog):
         likely_ephemeral = (
             lowered.startswith("data/")
             or "/data/" in lowered and "var/data" not in lowered
-            or lowered.startswith("/tmp")
+            # This classifies a configured path; it does not create a temp file.
+            or lowered.startswith("/tmp")  # nosec B108
             or lowered.startswith("/private/tmp")
             or "/opt/render/project/src" in lowered
         )
@@ -327,10 +358,23 @@ class CommandsCog(commands.Cog):
         ts = int(time.time())
         slug = now_madrid().strftime("%Y%m%d-%H%M%S")
         raw_path = backup_dir / f"avenue-guard-db-{slug}.sqlite3"
-        size_bytes = await self.bot.db.backup_to(raw_path)
-        zip_path = self._zip_backup_file(raw_path, slug)
+        try:
+            size_bytes = await self.bot.db.backup_to(raw_path)
+            await self._validate_restore_database(raw_path)
+            zip_path = self._zip_backup_file(raw_path, slug)
+        finally:
+            try:
+                raw_path.unlink()
+            except FileNotFoundError:
+                pass
+        self._prune_local_backups()
         channel_id = self._backup_channel_id()
         channel = guild.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await guild.fetch_channel(channel_id)
+            except Exception:
+                channel = None
         if not isinstance(channel, discord.TextChannel):
             await log_error(self.bot, f"Database backup created locally but backup channel is missing: {zip_path}")
             return None
@@ -364,19 +408,24 @@ class CommandsCog(commands.Cog):
             file=discord.File(str(zip_path), filename=zip_path.name),
             allowed_mentions=no_mentions(),
         )
-        await self.bot.db.execute(
-            "INSERT OR REPLACE INTO database_backups(guild_id,backup_ts,channel_id,message_id,size_bytes,reason,requested_by,filename) VALUES(?,?,?,?,?,?,?,?)",
-            (
-                int(guild.id),
-                ts,
-                int(channel.id),
-                int(sent.id),
-                int(zipped_size),
-                str(reason),
-                int(requested_by or 0),
-                str(zip_path.name),
-            ),
-        )
+        try:
+            await self.bot.db.execute(
+                "INSERT OR REPLACE INTO database_backups(guild_id,backup_ts,channel_id,message_id,size_bytes,reason,requested_by,filename) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    int(guild.id),
+                    ts,
+                    int(channel.id),
+                    int(sent.id),
+                    int(zipped_size),
+                    str(reason),
+                    int(requested_by or 0),
+                    str(zip_path.name),
+                ),
+            )
+        except Exception as e:
+            # The durable Discord copy already exists. Do not make the
+            # scheduler post a duplicate merely because its audit row failed.
+            await log_error(self.bot, f"Database backup posted but audit row failed: {repr(e)}")
         return sent
 
     def _restore_safe_filename(self, filename: str) -> str:
@@ -476,11 +525,42 @@ class CommandsCog(commands.Cog):
                 return 0.0
 
     async def _impact_group_counts(self, table: str, column: str, guild_id: int, extra_where: str = "") -> dict[str, int]:
-        sql = (
-            f"SELECT COALESCE({column}, 'unknown') AS key, COUNT(*) AS value "
-            f"FROM {table} WHERE guild_id=? {extra_where} "
-            f"GROUP BY COALESCE({column}, 'unknown') ORDER BY value DESC"
-        )
+        # Map semantic keys to complete statements. Identifiers cannot be SQL
+        # parameters, so accepting arbitrary table/column strings here would
+        # make a harmless internal helper too easy to misuse later.
+        queries = {
+            ("level_request_submissions", "result", "AND status='reviewed'"): (
+                "SELECT COALESCE(result, 'unknown') AS key, COUNT(*) AS value FROM level_request_submissions "
+                "WHERE guild_id=? AND status='reviewed' GROUP BY COALESCE(result, 'unknown') ORDER BY value DESC"
+            ),
+            ("weekly_request_reviews", "result", "AND status='reviewed'"): (
+                "SELECT COALESCE(result, 'unknown') AS key, COUNT(*) AS value FROM weekly_request_reviews "
+                "WHERE guild_id=? AND status='reviewed' GROUP BY COALESCE(result, 'unknown') ORDER BY value DESC"
+            ),
+            ("weekly_claims", "status", ""): (
+                "SELECT COALESCE(status, 'unknown') AS key, COUNT(*) AS value FROM weekly_claims "
+                "WHERE guild_id=? GROUP BY COALESCE(status, 'unknown') ORDER BY value DESC"
+            ),
+            ("tickets", "status_tag", ""): (
+                "SELECT COALESCE(status_tag, 'unknown') AS key, COUNT(*) AS value FROM tickets "
+                "WHERE guild_id=? GROUP BY COALESCE(status_tag, 'unknown') ORDER BY value DESC"
+            ),
+            ("help_submissions", "kind", ""): (
+                "SELECT COALESCE(kind, 'unknown') AS key, COUNT(*) AS value FROM help_submissions "
+                "WHERE guild_id=? GROUP BY COALESCE(kind, 'unknown') ORDER BY value DESC"
+            ),
+            ("help_submissions", "status", ""): (
+                "SELECT COALESCE(status, 'unknown') AS key, COUNT(*) AS value FROM help_submissions "
+                "WHERE guild_id=? GROUP BY COALESCE(status, 'unknown') ORDER BY value DESC"
+            ),
+            ("transcript_requests", "status", ""): (
+                "SELECT COALESCE(status, 'unknown') AS key, COUNT(*) AS value FROM transcript_requests "
+                "WHERE guild_id=? GROUP BY COALESCE(status, 'unknown') ORDER BY value DESC"
+            ),
+        }
+        sql = queries.get((str(table), str(column), str(extra_where)))
+        if sql is None:
+            raise ValueError("Unsupported impact grouping")
         rows = await self.bot.db.fetchall(sql, (guild_id,))
         return {str(row["key"] or "unknown"): int(row["value"] or 0) for row in rows}
 
@@ -509,8 +589,11 @@ class CommandsCog(commands.Cog):
             "top_command_count": 0,
             "series": [],
             "command_totals": {},
+            "unique_user_ids": [],
+            "calendar_days": 0,
         }
         command_totals: dict[str, int] = {}
+        unique_user_ids: set[int] = set()
         for row in rows:
             day_key = str(row["day_key"] or totals["latest_day"])
             totals["latest_day"] = day_key
@@ -540,6 +623,16 @@ class CommandsCog(commands.Cog):
                 "top_command": "",
                 "top_command_count": 0,
             }
+            for source in (payload.get("by_user") or {}, payload.get("commands_by_user") or {}):
+                if not isinstance(source, dict):
+                    continue
+                for raw_user_id in source:
+                    try:
+                        user_id = int(raw_user_id)
+                    except Exception:
+                        continue
+                    if user_id > 0:
+                        unique_user_ids.add(user_id)
             for key in (
                 "messages",
                 "edits",
@@ -574,6 +667,15 @@ class CommandsCog(commands.Cog):
                 day_record["top_command"] = name
                 day_record["top_command_count"] = int(count or 0)
             totals["series"].append(day_record)
+        totals["unique_user_ids"] = sorted(unique_user_ids)
+        valid_days: list[date] = []
+        for row in totals["series"]:
+            try:
+                valid_days.append(date.fromisoformat(str(row.get("day") or "")))
+            except Exception:
+                continue
+        if valid_days:
+            totals["calendar_days"] = (max(valid_days) - min(valid_days)).days + 1
         if command_totals:
             name, count = max(command_totals.items(), key=lambda item: item[1])
             totals["top_command"] = name
@@ -581,21 +683,27 @@ class CommandsCog(commands.Cog):
             totals["command_totals"] = dict(sorted(command_totals.items(), key=lambda item: item[1], reverse=True))
         return totals
 
-    def _impact_window_sum(self, series: list[dict], key: str, days: int, offset_days: int = 0) -> int:
+    def _impact_window_rows(self, series: list[dict], days: int, offset_days: int = 0) -> list[dict]:
         if not series or days <= 0:
-            return 0
-        end = len(series) - max(0, offset_days)
-        start = max(0, end - days)
-        if end <= 0 or start >= end:
-            return 0
-        return int(sum(int(row.get(key, 0) or 0) for row in series[start:end]))
+            return []
+        end_day = now_madrid().date() - timedelta(days=max(0, offset_days))
+        start_day = end_day - timedelta(days=days - 1)
+        rows: list[dict] = []
+        for row in series:
+            try:
+                row_day = date.fromisoformat(str(row.get("day") or ""))
+            except Exception:
+                continue
+            if start_day <= row_day <= end_day:
+                rows.append(row)
+        return rows
+
+    def _impact_window_sum(self, series: list[dict], key: str, days: int, offset_days: int = 0) -> int:
+        rows = self._impact_window_rows(series, days, offset_days)
+        return int(sum(int(row.get(key, 0) or 0) for row in rows))
 
     def _impact_window_average(self, series: list[dict], key: str, days: int, offset_days: int = 0) -> float:
-        if not series or days <= 0:
-            return 0.0
-        end = len(series) - max(0, offset_days)
-        start = max(0, end - days)
-        window = series[start:end] if end > start else []
+        window = self._impact_window_rows(series, days, offset_days)
         if not window:
             return 0.0
         return round(sum(float(row.get(key, 0) or 0) for row in window) / len(window), 2)
@@ -612,6 +720,8 @@ class CommandsCog(commands.Cog):
 
     def _impact_forecast(self, series: list[dict], review_backlog: int) -> dict:
         days_recorded = len(series or [])
+        coverage_7 = len(self._impact_window_rows(series, 7))
+        coverage_14 = len(self._impact_window_rows(series, 14))
         last_7_messages = self._impact_window_sum(series, "messages", 7)
         previous_7_messages = self._impact_window_sum(series, "messages", 7, 7)
         last_7_commands = self._impact_window_sum(series, "commands", 7)
@@ -622,13 +732,13 @@ class CommandsCog(commands.Cog):
         command_change = self._impact_percent_change(last_7_commands, previous_7_commands)
 
         projected_messages = int(max(0, round(last_7_messages + ((last_7_messages - previous_7_messages) * 0.5))))
-        if days_recorded < 7:
+        if coverage_7 < 5:
             projected_messages = int(round(self._impact_window_average(series, "messages", 7) * 7))
         projected_commands = int(max(0, round(last_7_commands + ((last_7_commands - previous_7_commands) * 0.5))))
-        if days_recorded < 7:
+        if coverage_7 < 5:
             projected_commands = int(round(self._impact_window_average(series, "commands", 7) * 7))
 
-        if days_recorded < 7:
+        if days_recorded < 7 or coverage_7 < 5 or coverage_14 < 10:
             signal = "Limited data"
         elif message_change >= 15 or command_change >= 15:
             signal = "Growing"
@@ -645,11 +755,15 @@ class CommandsCog(commands.Cog):
             recommendations.append("Command error rate is elevated; check recent error logs.")
         if signal == "Declining":
             recommendations.append("Recent activity is down; compare daily summaries with recent events or request openings.")
+        if coverage_7 < 5:
+            recommendations.append("Recent data coverage is incomplete; keep the bot online before relying on the forecast.")
         if not recommendations:
             recommendations.append("No urgent trend warning from the tracked data.")
 
         return {
             "days_recorded": days_recorded,
+            "data_coverage_7d": _fmt_percent(coverage_7, 7),
+            "data_coverage_14d": _fmt_percent(coverage_14, 14),
             "last_7_messages": int(last_7_messages),
             "previous_7_messages": int(previous_7_messages),
             "message_growth_percent": message_change,
@@ -671,9 +785,9 @@ class CommandsCog(commands.Cog):
         snapshot_ts = int(time.time())
         daily = await self._impact_daily_totals(guild_id)
 
-        unique_touched = await self._impact_scalar(
+        unique_rows = await self.bot.db.fetchall(
             """
-            SELECT COUNT(DISTINCT user_id) AS value FROM (
+            SELECT DISTINCT user_id FROM (
                 SELECT user_id FROM activity_counts WHERE guild_id=?
                 UNION SELECT user_id FROM weekly_claims WHERE guild_id=?
                 UNION SELECT user_id FROM weekly_sessions WHERE guild_id=?
@@ -688,6 +802,13 @@ class CommandsCog(commands.Cog):
             """,
             (guild_id,) * 10,
         )
+        unique_user_ids = {
+            int(row["user_id"])
+            for row in unique_rows
+            if row["user_id"] is not None and int(row["user_id"]) > 0
+        }
+        unique_user_ids.update(int(user_id) for user_id in daily.get("unique_user_ids", []) if int(user_id) > 0)
+        unique_touched = len(unique_user_ids)
         activity_messages = await self._impact_scalar(
             "SELECT COALESCE(SUM(count), 0) AS value FROM activity_counts WHERE guild_id=?",
             (guild_id,),
@@ -821,6 +942,10 @@ class CommandsCog(commands.Cog):
             "SELECT COUNT(*) AS value FROM daily_stats WHERE guild_id=?",
             (guild_id,),
         )
+        daily_summaries_sent = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM daily_summary_reports WHERE guild_id=?",
+            (guild_id,),
+        )
         weekly_recaps = await self._impact_scalar(
             "SELECT COUNT(*) AS value FROM weekly_recaps WHERE guild_id=?",
             (guild_id,),
@@ -950,6 +1075,8 @@ class CommandsCog(commands.Cog):
                 "transcript_request_statuses": await self._impact_group_counts("transcript_requests", "status", guild_id),
             },
             "operations": {
+                "daily_stat_days": int(daily_recaps),
+                "daily_summaries_sent": int(daily_summaries_sent),
                 "daily_summary_snapshots": int(daily_recaps),
                 "weekly_recap_snapshots": int(weekly_recaps),
                 "database_backups": int(database_backups),
@@ -1076,7 +1203,7 @@ class CommandsCog(commands.Cog):
 
         return "\n".join(
             [
-                f"# Avenue Guard Impact Report",
+                "# Avenue Guard Impact Report",
                 "",
                 f"Generated for **{metrics['report']['guild_name']}** on **{metrics['report']['snapshot_label']}**.",
                 "",
@@ -1245,6 +1372,18 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
         await self._defer(ctx, ephemeral=True)
+        tracking = self.bot.get_cog("TrackingCog")
+        if tracking is not None:
+            try:
+                await tracking.flush_activity_counts()
+            except Exception as e:
+                await log_error(self.bot, f"Impact report activity flush failed: {repr(e)}")
+        background = self.bot.get_cog("BackgroundCog")
+        if background is not None:
+            try:
+                await background._persist_current_day()
+            except Exception as e:
+                await log_error(self.bot, f"Impact report daily snapshot flush failed: {repr(e)}")
         metrics = await self._collect_impact_metrics(ctx.guild, ctx.user.id)
         embed = self._impact_report_embed(metrics)
         channel_id = self.bot.config.get_int("impact", "report_channel_id", default=0)
@@ -1569,13 +1708,25 @@ class CommandsCog(commands.Cog):
             except Exception:
                 pass
 
+    def _server_icon_operation_lock(self) -> asyncio.Lock:
+        background = self.bot.get_cog("BackgroundCog")
+        lock = getattr(background, "_server_icon_lock", None)
+        return lock if isinstance(lock, asyncio.Lock) else self._server_icon_config_lock
+
     async def _save_server_icon_config(self, ctx: discord.ApplicationContext, action: str, detail: str) -> bool:
         try:
+            cfg = ensure_server_icon_config(self.bot.config)
             if str(action or "").startswith("server_icon_"):
-                cfg = ensure_server_icon_config(self.bot.config)
                 cfg["last_error"] = ""
                 cfg["last_error_ts"] = 0
-            self.bot.config.save()
+            await persist_server_icon_config(self.bot, cfg)
+            try:
+                self.bot.config.save()
+            except Exception as local_error:
+                await log_error(
+                    self.bot,
+                    f"Server icon config persisted remotely but local config save failed: {repr(local_error)}",
+                )
             self._notify_background_config_reload()
         except Exception as e:
             await log_error(self.bot, f"Failed to save server icon config: {repr(e)}")
@@ -1604,10 +1755,11 @@ class CommandsCog(commands.Cog):
         raw_mode = str(mode or "").strip().casefold()
         if raw_mode not in VALID_SERVER_ICON_MODES:
             return await ctx.respond("Mode must be `random`, `linear`, or `disabled`.", ephemeral=True)
-        cfg = ensure_server_icon_config(self.bot.config)
-        cfg["mode"] = raw_mode
-        if not await self._save_server_icon_config(ctx, "server_icon_mode_updated", f"mode={raw_mode}"):
-            return
+        async with self._server_icon_operation_lock():
+            cfg = ensure_server_icon_config(self.bot.config)
+            cfg["mode"] = raw_mode
+            if not await self._save_server_icon_config(ctx, "server_icon_mode_updated", f"mode={raw_mode}"):
+                return
         await ctx.respond(f"Server icon rotation mode is now `{raw_mode}`.", ephemeral=True)
 
     async def server_icon_add(
@@ -1625,17 +1777,18 @@ class CommandsCog(commands.Cog):
         if warning:
             return await ctx.respond(f"I can't use that URL for rotation: {warning}", ephemeral=True)
 
-        cfg = ensure_server_icon_config(self.bot.config)
-        urls = list(cfg.get("urls", []) or [])
-        cleaned = str(url).strip()
-        if cleaned in urls:
-            return await ctx.respond("That icon URL is already in the list.", ephemeral=True)
-        if len(urls) >= 25:
-            return await ctx.respond("The icon list is full. Remove one before adding another.", ephemeral=True)
-        urls.append(cleaned)
-        cfg["urls"] = urls
-        if not await self._save_server_icon_config(ctx, "server_icon_url_added", f"count={len(urls)}"):
-            return
+        async with self._server_icon_operation_lock():
+            cfg = ensure_server_icon_config(self.bot.config)
+            urls = list(cfg.get("urls", []) or [])
+            cleaned = str(url).strip()
+            if cleaned in urls:
+                return await ctx.respond("That icon URL is already in the list.", ephemeral=True)
+            if len(urls) >= 25:
+                return await ctx.respond("The icon list is full. Remove one before adding another.", ephemeral=True)
+            urls.append(cleaned)
+            cfg["urls"] = urls
+            if not await self._save_server_icon_config(ctx, "server_icon_url_added", f"count={len(urls)}"):
+                return
         await ctx.respond(f"Added server icon URL as image #{len(urls)}.", ephemeral=True)
 
     async def server_icon_replace(
@@ -1654,19 +1807,20 @@ class CommandsCog(commands.Cog):
         if warning:
             return await ctx.respond(f"I can't use that URL for rotation: {warning}", ephemeral=True)
 
-        cfg = ensure_server_icon_config(self.bot.config)
-        urls = list(cfg.get("urls", []) or [])
-        idx = int(number) - 1
-        if idx < 0 or idx >= len(urls):
-            return await ctx.respond("That icon number does not exist.", ephemeral=True)
-        old_url = urls[idx]
-        urls[idx] = str(url).strip()
-        cfg["urls"] = urls
-        if parse_server_icon_index(cfg.get("current_index", -1), len(urls)) == idx or str(cfg.get("current_url", "") or "") == old_url:
-            cfg["current_index"] = -1
-            cfg["current_url"] = ""
-        if not await self._save_server_icon_config(ctx, "server_icon_url_replaced", f"number={number}"):
-            return
+        async with self._server_icon_operation_lock():
+            cfg = ensure_server_icon_config(self.bot.config)
+            urls = list(cfg.get("urls", []) or [])
+            idx = int(number) - 1
+            if idx < 0 or idx >= len(urls):
+                return await ctx.respond("That icon number does not exist.", ephemeral=True)
+            old_url = urls[idx]
+            urls[idx] = str(url).strip()
+            cfg["urls"] = urls
+            if parse_server_icon_index(cfg.get("current_index", -1), len(urls)) == idx or str(cfg.get("current_url", "") or "") == old_url:
+                cfg["current_index"] = -1
+                cfg["current_url"] = ""
+            if not await self._save_server_icon_config(ctx, "server_icon_url_replaced", f"number={number}"):
+                return
         await ctx.respond(f"Replaced server icon image #{number}.", ephemeral=True)
 
     async def server_icon_remove(
@@ -1679,23 +1833,24 @@ class CommandsCog(commands.Cog):
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
-        cfg = ensure_server_icon_config(self.bot.config)
-        urls = list(cfg.get("urls", []) or [])
-        idx = int(number) - 1
-        if idx < 0 or idx >= len(urls):
-            return await ctx.respond("That icon number does not exist.", ephemeral=True)
-        removed = urls.pop(idx)
-        current_index = parse_server_icon_index(cfg.get("current_index", -1), len(urls) + 1)
-        if current_index == idx:
-            cfg["current_index"] = -1
-            cfg["current_url"] = ""
-        elif current_index > idx:
-            cfg["current_index"] = current_index - 1
-        if str(cfg.get("current_url", "") or "") == removed:
-            cfg["current_url"] = ""
-        cfg["urls"] = urls
-        if not await self._save_server_icon_config(ctx, "server_icon_url_removed", f"number={number} url={removed[:120]}"):
-            return
+        async with self._server_icon_operation_lock():
+            cfg = ensure_server_icon_config(self.bot.config)
+            urls = list(cfg.get("urls", []) or [])
+            idx = int(number) - 1
+            if idx < 0 or idx >= len(urls):
+                return await ctx.respond("That icon number does not exist.", ephemeral=True)
+            removed = urls.pop(idx)
+            current_index = parse_server_icon_index(cfg.get("current_index", -1), len(urls) + 1)
+            if current_index == idx:
+                cfg["current_index"] = -1
+                cfg["current_url"] = ""
+            elif current_index > idx:
+                cfg["current_index"] = current_index - 1
+            if str(cfg.get("current_url", "") or "") == removed:
+                cfg["current_url"] = ""
+            cfg["urls"] = urls
+            if not await self._save_server_icon_config(ctx, "server_icon_url_removed", f"number={number} url={removed[:120]}"):
+                return
         await ctx.respond(f"Removed server icon image #{number}.", ephemeral=True)
 
     async def server_icon_set(
@@ -1809,6 +1964,9 @@ class CommandsCog(commands.Cog):
         if not storage_ok:
             issues.append("database storage: path may not be persistent")
             repairs.append("Configure Turso/libSQL with `TURSO_AUTH_TOKEN`, or set `AVENUE_GUARD_DB_PATH`/`database.path` to durable storage")
+        if bool(getattr(self.bot.db, "uses_remote", False)) and bool(getattr(self.bot.db, "_remote_dirty", False)):
+            issues.append("database replication: local commits are waiting to sync to Turso")
+            repairs.append("Check Turso status and credentials, then run `/resync`")
 
         category_id = cfg.get_int("tickets", "ticket_category_id")
         category = guild.get_channel(category_id) if category_id else None
@@ -1851,9 +2009,20 @@ class CommandsCog(commands.Cog):
         except Exception as e:
             db_ok = False
             db_note = type(e).__name__
+        if db_ok and bool(getattr(self.bot.db, "uses_remote", False)):
+            db_note = "Connected to Turso"
+            if bool(getattr(self.bot.db, "_remote_dirty", False)):
+                db_note = "Connected; replication pending"
         storage_note, storage_ok = self._database_storage_note()
 
-        request_row = await self.bot.db.fetchone("SELECT state, wave_id, submitted_count, request_limit, close_ts, request_type FROM level_request_state WHERE guild_id=?", (guild.id,))
+        try:
+            request_row = await self.bot.db.fetchone(
+                "SELECT state, wave_id, submitted_count, request_limit, close_ts, request_type "
+                "FROM level_request_state WHERE guild_id=?",
+                (guild.id,),
+            )
+        except Exception:
+            request_row = None
         request_state = "Not initialized"
         if request_row:
             limit = "none" if request_row["request_limit"] is None else str(int(request_row["request_limit"]))
@@ -1972,7 +2141,12 @@ class CommandsCog(commands.Cog):
         except Exception as e:
             db_ok = False
             db_note = type(e).__name__
+        if db_ok and bool(getattr(self.bot.db, "uses_remote", False)):
+            db_note = "Connected to Turso"
+            if bool(getattr(self.bot.db, "_remote_dirty", False)):
+                db_note = "Connected; replication pending"
 
+        storage_note, storage_ok = self._database_storage_note()
         open_tickets = await _count("SELECT COUNT(*) AS c FROM tickets WHERE guild_id=? AND status IN ('open','closing_prompted')", (guild.id,))
         active_weekly = await _count("SELECT COUNT(*) AS c FROM weekly_sessions WHERE guild_id=? AND active=1", (guild.id,))
         pending_live = await _count("SELECT COUNT(*) AS c FROM level_request_submissions WHERE guild_id=? AND status='pending'", (guild.id,))
@@ -2089,6 +2263,9 @@ class CommandsCog(commands.Cog):
             ok.append("database storage: persistent-looking")
         else:
             issues.append(f"database storage: {storage_note}")
+        if bool(getattr(self.bot.db, "uses_remote", False)) and bool(getattr(self.bot.db, "_remote_dirty", False)):
+            last_sync_error = str(getattr(self.bot.db, "_last_remote_sync_error", "") or "")
+            issues.append(f"Turso replication pending: {last_sync_error[:180] or 'sync retry queued'}")
 
         category_id = cfg.get_int("tickets", "ticket_category_id")
         category = guild.get_channel(category_id) if category_id else None
@@ -2131,7 +2308,8 @@ class CommandsCog(commands.Cog):
             else:
                 ok.append("ticket staff ping role: OK")
 
-        if me is not None:
+        icon_cfg = ensure_server_icon_config(cfg)
+        if me is not None and normalize_server_icon_mode(icon_cfg.get("mode")) != "disabled":
             guild_perms = getattr(me, "guild_permissions", None)
             if guild_perms is not None and bool(getattr(guild_perms, "manage_guild", False)):
                 ok.append("server icon rotation permission: OK")
@@ -2159,7 +2337,7 @@ class CommandsCog(commands.Cog):
         embed.add_field(name="Issues", value="\n".join(f"- {item}" for item in issues[:12])[:1024] or "No issues found.", inline=False)
         embed.add_field(name="Healthy Checks", value="\n".join(f"- {item}" for item in ok[:12])[:1024] or "No healthy checks recorded.", inline=False)
         if len(issues) > 12 or len(ok) > 12:
-            embed.set_footer(text=f"Showing first 12 issues and first 12 healthy checks.")
+            embed.set_footer(text="Showing first 12 issues and first 12 healthy checks.")
         await self._send(ctx, embed=embed, ephemeral=True)
 
     def _template_variables(self, text: str) -> tuple[set[str], Optional[str]]:
@@ -2434,6 +2612,71 @@ class CommandsCog(commands.Cog):
             check_role(f"level_requests.reviewer_role_ids[{idx}]", role_id)
         ok_count += self._validate_request_templates(issues)
 
+        def check_hhmm(label: str, value: object) -> None:
+            nonlocal ok_count
+            match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(value or "").strip())
+            if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+                issues.append(f"{label}: use a 24-hour HH:MM value")
+            else:
+                ok_count += 1
+
+        check_hhmm("background.daily_summary.time", cfg.get("background", "daily_summary", "time", default=""))
+        check_hhmm("background.weekly_recap.time", cfg.get("background", "weekly_recap", "time", default=""))
+
+        try:
+            session_timeout = int(cfg.get("help", "session_timeout_seconds", default=3600) or 3600)
+            if not 60 <= session_timeout <= 86400:
+                raise ValueError
+            ok_count += 1
+        except (TypeError, ValueError):
+            issues.append("help.session_timeout_seconds: must be between 60 and 86400")
+
+        validation_cfg = cfg.get("level_requests", "level_validation", default={}) or {}
+        if not isinstance(validation_cfg, dict):
+            issues.append("level_requests.level_validation: must be an object")
+        else:
+            providers = validation_cfg.get("providers", {}) or {}
+            enabled_providers = (
+                [name for name in ("gdbrowser", "boomlings") if bool(providers.get(name))]
+                if isinstance(providers, dict)
+                else []
+            )
+            if bool(validation_cfg.get("enabled", True)) and not enabled_providers:
+                issues.append("level_requests.level_validation.providers: enable gdbrowser, boomlings, or both")
+            else:
+                ok_count += len(enabled_providers)
+            numeric_limits = {
+                "cache_seconds": (60, 86400),
+                "request_timeout_seconds": (2, 20),
+                "per_user_cooldown_seconds": (0, 3600),
+                "per_user_window_seconds": (10, 86400),
+                "per_user_max_checks": (1, 100),
+                "provider_failure_threshold": (1, 100),
+                "provider_circuit_breaker_seconds": (30, 86400),
+            }
+            for key, (minimum, maximum) in numeric_limits.items():
+                try:
+                    value = int(validation_cfg.get(key))
+                    if not minimum <= value <= maximum:
+                        raise ValueError
+                    ok_count += 1
+                except (TypeError, ValueError):
+                    issues.append(f"level_requests.level_validation.{key}: must be {minimum}-{maximum}")
+            intervals = validation_cfg.get("provider_min_interval_seconds", {}) or {}
+            if not isinstance(intervals, dict):
+                issues.append("level_requests.level_validation.provider_min_interval_seconds: must be an object")
+            else:
+                for provider in ("gdbrowser", "boomlings"):
+                    try:
+                        interval = float(intervals.get(provider))
+                        if not 0 <= interval <= 10:
+                            raise ValueError
+                        ok_count += 1
+                    except (TypeError, ValueError):
+                        issues.append(
+                            f"level_requests.level_validation.provider_min_interval_seconds.{provider}: must be 0-10"
+                        )
+
         raw_server_icon_cfg = cfg.get("background", "server_icon_rotation", default={}) or {}
         raw_server_icon_mode = str(raw_server_icon_cfg.get("mode", "disabled") if isinstance(raw_server_icon_cfg, dict) else "disabled").strip().casefold()
         server_icon_cfg = ensure_server_icon_config(cfg)
@@ -2491,6 +2734,34 @@ class CommandsCog(commands.Cog):
                     except Exception:
                         forum_id = 0
                     check_channel(f"forum_first_message.entries[{idx}].forum_channel_id", forum_id, discord.ForumChannel)
+                    mode = str(entry.get("required_word_match_mode") or "contains").strip().casefold()
+                    if mode not in {"contains", "whole_word", "regex"}:
+                        issues.append(
+                            f"forum_first_message.entries[{idx}].required_word_match_mode: use contains, whole_word, or regex"
+                        )
+                    else:
+                        ok_count += 1
+                    required_word = str(entry.get("required_word") or "").strip()
+                    if mode == "regex" and required_word:
+                        sticky = self.bot.get_cog("StickyCog")
+                        safe_check = getattr(sticky, "_required_regex_is_safe", None)
+                        if not callable(safe_check) or not safe_check(required_word):
+                            issues.append(f"forum_first_message.entries[{idx}].required_word: unsafe regex")
+                        else:
+                            ok_count += 1
+                    try:
+                        delay = float(entry.get("required_word_delete_delay_seconds", 10))
+                        if not 0 <= delay <= 86400:
+                            raise ValueError
+                        ok_count += 1
+                    except (TypeError, ValueError):
+                        issues.append(
+                            f"forum_first_message.entries[{idx}].required_word_delete_delay_seconds: must be 0-86400"
+                        )
+                else:
+                    issues.append(f"forum_first_message.entries[{idx}]: must be an object")
+        else:
+            issues.append("forum_first_message.entries: must be a list")
 
         description = f"Checked **{ok_count + len(issues)}** configured references. **{ok_count}** OK, **{len(issues)}** issues."
         embed = discord.Embed(
@@ -2619,7 +2890,14 @@ class CommandsCog(commands.Cog):
         embed.add_field(name="Recreated pending", value=str(result.get("pending_messages_recreated", 0)), inline=True)
         embed.add_field(name="Refreshed pending", value=str(result.get("pending_messages_refreshed", 0)), inline=True)
         embed.add_field(name="Locked reviewed", value=str(result.get("reviewed_messages_locked", 0)), inline=True)
+        embed.add_field(name="Weekly recreated", value=str(result.get("weekly_pending_messages_recreated", 0)), inline=True)
+        embed.add_field(name="Weekly locked", value=str(result.get("weekly_reviewed_messages_locked", 0)), inline=True)
         embed.add_field(name="Validation refreshed", value=str(result.get("stale_validations_refreshed", 0)), inline=True)
+        embed.add_field(
+            name="Wave count",
+            value="reconciled" if result.get("state_count_reconciled") else "already correct",
+            inline=True,
+        )
         embed.add_field(name="Cache cleanup", value="done" if result.get("validation_cache_pruned") else "skipped", inline=True)
         if result.get("errors"):
             embed.add_field(name="Notes", value="\n".join(f"- {item}" for item in result["errors"][:8])[:1024], inline=False)
@@ -2663,7 +2941,8 @@ class CommandsCog(commands.Cog):
         live_rows = []
         if scope_key not in {"weekly", "weekly_only"}:
             live_rows = await self.bot.db.fetchall(
-                "SELECT wave_id, user_id, request_message_id, data_json, status, created_ts FROM level_request_submissions "
+                # Every clause is selected from the fixed list above; values remain bound parameters.
+                "SELECT wave_id, user_id, request_message_id, data_json, status, created_ts FROM level_request_submissions "  # nosec
                 f"WHERE {' AND '.join(live_where)} ORDER BY created_ts DESC LIMIT 15",
                 tuple(live_params),
             )
@@ -2676,7 +2955,8 @@ class CommandsCog(commands.Cog):
                 weekly_where.append("status=?")
                 weekly_params.append(status_key)
             weekly_rows = await self.bot.db.fetchall(
-                "SELECT week_start, user_id, request_message_id, channel_id, data_json, status, created_ts FROM weekly_request_reviews "
+                # Every clause is selected from the fixed list above; values remain bound parameters.
+                "SELECT week_start, user_id, request_message_id, channel_id, data_json, status, created_ts FROM weekly_request_reviews "  # nosec
                 f"WHERE {' AND '.join(weekly_where)} ORDER BY created_ts DESC LIMIT 15",
                 tuple(weekly_params),
             )
@@ -2739,7 +3019,7 @@ class CommandsCog(commands.Cog):
 
         await self._defer(ctx, ephemeral=False)
         ws = week_start_sunday(now_madrid()).isoformat()
-        raw = await tracking.get_top(ctx.guild.id, ws, limit=50)  # pull more then filter
+        raw = await tracking.get_top(ctx.guild.id, ws, limit=500)
 
         if not raw:
             return await self._send(ctx, "No activity tracked yet this week.")
@@ -2748,12 +3028,11 @@ class CommandsCog(commands.Cog):
 
         top = []
         for uid, cnt in raw:
-            member = await self._resolve_member(ctx.guild, uid)
-            if member is not None:
-                if member.bot:
-                    continue
-                if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
-                    continue
+            member = ctx.guild.get_member(uid)
+            if member is not None and member.bot:
+                continue
+            if member is not None and excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
+                continue
             top.append((uid, cnt))
             if len(top) >= 20:
                 break
@@ -3026,7 +3305,8 @@ class CommandsCog(commands.Cog):
             params.append(int(user.id))
 
         rows = await self.bot.db.fetchall(
-            "SELECT t.ticket_id, t.channel_id, t.creator_id, t.created_ts, t.closed_ts, t.status, t.status_tag, "
+            # Optional clauses are fixed locally; user values remain bound parameters.
+            "SELECT t.ticket_id, t.channel_id, t.creator_id, t.created_ts, t.closed_ts, t.status, t.status_tag, "  # nosec
             "tt.log_channel_id, tt.log_message_id, tt.created_ts AS transcript_ts "
             "FROM tickets t "
             "LEFT JOIN ticket_transcripts tt ON tt.guild_id=t.guild_id AND tt.ticket_id=t.ticket_id "
@@ -3081,7 +3361,13 @@ class CommandsCog(commands.Cog):
                 "forum_channel_id": forum_id,
                 "templates": templates,
             }
-            for key in ("required_word", "missing_required_word_dm", "required_word_dm_message", "required_word_delete_delay_seconds"):
+            for key in (
+                "required_word",
+                "missing_required_word_dm",
+                "required_word_dm_message",
+                "required_word_delete_delay_seconds",
+                "required_word_match_mode",
+            ):
                 if key in root:
                     entry[key] = root[key]
             root["entries"] = [entry]
@@ -3163,17 +3449,48 @@ class CommandsCog(commands.Cog):
         if new_word.casefold() in {"off", "disable", "disabled", "none", "clear"}:
             new_word = ""
 
-        entry["required_word"] = new_word
         mode = str(match_mode or "").strip().casefold()
         if mode:
             if mode not in {"contains", "whole_word", "regex"}:
                 return await ctx.respond("Match mode must be `contains`, `whole_word`, or `regex`.", ephemeral=True)
-            entry["required_word_match_mode"] = mode
-        try:
-            self.bot.config.save()
-        except Exception as e:
-            await log_error(self.bot, f"Failed to save forum required word: {repr(e)}")
-            return await ctx.respond("I couldn't save the new required word...", ephemeral=True)
+        effective_mode = mode or str(entry.get("required_word_match_mode") or "contains")
+        if effective_mode == "regex":
+            sticky = self.bot.get_cog("StickyCog")
+            safe_check = getattr(sticky, "_required_regex_is_safe", None)
+            if not callable(safe_check) or not safe_check(new_word):
+                return await ctx.respond(
+                    "That regex is too complex for safe forum matching. Use literals, character classes, anchors, or a simpler pattern.",
+                    ephemeral=True,
+                )
+
+        async with self._forum_config_lock:
+            had_word = "required_word" in entry
+            old_word = entry.get("required_word")
+            had_mode = "required_word_match_mode" in entry
+            old_mode = entry.get("required_word_match_mode")
+            entry["required_word"] = new_word
+            if mode:
+                entry["required_word_match_mode"] = mode
+            try:
+                await persist_forum_required_rules(self.bot)
+                try:
+                    self.bot.config.save()
+                except Exception as local_error:
+                    await log_error(
+                        self.bot,
+                        f"Forum required word persisted remotely but local config save failed: {repr(local_error)}",
+                    )
+            except Exception as e:
+                if had_word:
+                    entry["required_word"] = old_word
+                else:
+                    entry.pop("required_word", None)
+                if had_mode:
+                    entry["required_word_match_mode"] = old_mode
+                else:
+                    entry.pop("required_word_match_mode", None)
+                await log_error(self.bot, f"Failed to save forum required word: {repr(e)}")
+                return await ctx.respond("I couldn't save the new required word...", ephemeral=True)
 
         sticky = self.bot.get_cog("StickyCog")
         if sticky:
@@ -3207,6 +3524,10 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
         self.bot.config.reload()
+        try:
+            await load_runtime_config_overrides(self.bot)
+        except Exception as e:
+            await log_error(self.bot, f"Runtime config override reload failed: {repr(e)}")
 
         # notify cogs
         for cog in self.bot.cogs.values():

@@ -1,3 +1,4 @@
-py-cord>=2.4.1
-aiohttp>=3.8
-libsql>=0.1.0
+pip>=26.1.2
+py-cord>=2.8,<3
+aiohttp>=3.8,<4
+libsql>=0.1.0,<1

@@ -259,6 +259,7 @@
     "duplicate_window_hours": 24,
     "flow_start_window_seconds": 60,
     "max_flow_starts_per_window": 6,
+    "session_timeout_seconds": 3600,
     "_comment_cooldowns": "Help action cooldowns are enforced in code: appeal=48h, report_user=24h, bot_issue=6h, transcript=8h."
   },
   "level_requests": {
@@ -285,6 +286,10 @@
       "per_user_max_checks": 6,
       "provider_failure_threshold": 5,
       "provider_circuit_breaker_seconds": 300,
+      "provider_min_interval_seconds": {
+        "gdbrowser": 0.1,
+        "boomlings": 0.55
+      },
       "auto_reject_missing": true,
       "providers": {
         "gdbrowser": true,
@@ -502,6 +507,7 @@
   },
   "database": {
     "_comment": "Persistent storage. Turso/libSQL is preferred when turso_url plus TURSO_AUTH_TOKEN are configured. Otherwise leave path blank to auto-detect /var/data/avenue-guard/bot.db when a Render Persistent Disk is mounted, or set AVENUE_GUARD_DB_PATH.",
+    "require_remote_when_configured": true,
     "turso_url": "libsql://avenue-guard-johnreree.aws-us-east-2.turso.io",
     "turso_replica_path": "data/turso-replica.db",
     "path": "",
@@ -510,7 +516,8 @@
       "enabled": true,
       "channel_id": "1445502925081284729",
       "interval_hours": 12,
-      "local_dir": "backups"
+      "local_dir": "backups",
+      "local_retention_count": 10
     }
   },
   "impact": {

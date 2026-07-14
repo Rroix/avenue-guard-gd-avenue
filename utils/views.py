@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import discord
 
+from utils.mentions import no_mentions
+
 # Persistent custom_ids (stable across restarts)
 CID_TRACK_DECLINE_YES = "tracking_decline_yes"
 CID_TRACK_DECLINE_NO = "tracking_decline_no"
@@ -10,9 +12,6 @@ CID_TICKET_CLOSE_YES = "ticket_close_yes"
 CID_TICKET_CLOSE_NO = "ticket_close_no"
 
 CID_HELP_MENU = "help_menu_select"
-CID_HELP_MODCONF_YES = "help_modconfirm_yes"
-CID_HELP_MODCONF_NO = "help_modconfirm_no"
-
 CID_TRANSCRIPT_APPROVE = "transcript_approve"
 CID_TRANSCRIPT_DENY = "transcript_deny"
 
@@ -54,23 +53,6 @@ class TicketClosePromptView(discord.ui.View):
         cog = interaction.client.get_cog("HelpCog")
         if cog:
             await cog.handle_ticket_close_prompt(interaction, confirmed=False)
-
-
-class HelpModConfirmView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success, custom_id=CID_HELP_MODCONF_YES)
-    async def yes(self, button: discord.ui.Button, interaction: discord.Interaction):
-        cog = interaction.client.get_cog("HelpCog")
-        if cog:
-            await cog.handle_mod_confirm(interaction, confirmed=True)
-
-    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary, custom_id=CID_HELP_MODCONF_NO)
-    async def no(self, button: discord.ui.Button, interaction: discord.Interaction):
-        cog = interaction.client.get_cog("HelpCog")
-        if cog:
-            await cog.handle_mod_confirm(interaction, confirmed=False)
 
 
 class _HelpMenuSelect(discord.ui.Select):
@@ -142,7 +124,11 @@ class _HelpMenuSelect(discord.ui.Select):
         if cog:
             await cog.handle_help_selection(interaction, self.values[0])
         else:
-            await interaction.response.send_message("Help system is unavailable... Please contact <@1102884420207255653>")
+            await interaction.response.send_message(
+                "Help system is unavailable right now. Please contact staff.",
+                ephemeral=True,
+                allowed_mentions=no_mentions(),
+            )
 
 
 class HelpMenuView(discord.ui.View):

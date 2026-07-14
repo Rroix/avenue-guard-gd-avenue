@@ -9,7 +9,8 @@ import aiohttp
 
 GDBROWSER_LEVEL_URL = "https://gdbrowser.com/api/level/{level_id}"
 BOOMLINGS_LEVEL_URL = "https://www.boomlings.com/database/getGJLevels21.php"
-COMMON_SECRET = "Wmfd2893gb7"
+# Public Geometry Dash protocol value, not an application credential.
+COMMON_SECRET = "Wmfd2893gb7"  # nosec B105
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -86,6 +87,10 @@ def parse_gdbrowser_level(payload: Any, level_id: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return _provider_error("gdbrowser", "Unexpected response")
 
+    returned_id = str(payload.get("id") or "").strip()
+    if returned_id and returned_id != str(level_id).strip():
+        return _provider_error("gdbrowser", "Response level ID did not match the requested ID")
+
     difficulty = str(payload.get("difficulty") or "")
     length = str(payload.get("length") or "")
     stars = _as_int(payload.get("stars"), 0)
@@ -99,7 +104,7 @@ def parse_gdbrowser_level(payload: Any, level_id: str) -> dict[str, Any]:
         "provider": "gdbrowser",
         "ok": True,
         "exists": True,
-        "level_id": str(payload.get("id") or level_id),
+        "level_id": returned_id or str(level_id),
         "name": str(payload.get("name") or ""),
         "creator": str(payload.get("author") or ""),
         "difficulty": difficulty or "Unknown",
@@ -132,7 +137,10 @@ def parse_boomlings_level(text: str, level_id: str) -> dict[str, Any]:
             selected = parsed
             break
     if selected is None:
-        selected = _kv_pairs(level_parts[0])
+        # Search endpoints can return related/popular levels even when the
+        # exact ID is absent. Treating the first result as the requested level
+        # can validate and display metadata for the wrong submission.
+        return {"provider": "boomlings", "ok": True, "exists": False}
 
     parsed_id = str(selected.get("1") or level_id)
     stars = _as_int(selected.get("18"), 0)
