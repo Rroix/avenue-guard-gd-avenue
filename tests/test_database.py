@@ -87,3 +87,22 @@ async def test_backup_is_transactionally_valid_and_contains_latest_write(tmp_pat
         ).fetchone()[0]
     assert payload == '{"ok":true}'
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_local_interaction_read_skips_pending_remote_sync(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    await db.connect()
+    await db.set_runtime_setting("modal.test", {"ready": True})
+
+    def remote_sync_must_not_run():
+        raise AssertionError("modal-critical local reads must not wait on remote sync")
+
+    db._try_pending_remote_sync_sync = remote_sync_must_not_run
+    row = await db.fetchone_local(
+        "SELECT value_json FROM runtime_settings WHERE setting_key=?",
+        ("modal.test",),
+    )
+
+    assert row["value_json"] == '{"ready":true}'
+    await db.close()

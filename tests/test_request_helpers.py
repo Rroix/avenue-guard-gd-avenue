@@ -5,6 +5,7 @@ import pytest
 
 import cogs.RequestLevels as request_module
 from cogs.RequestLevels import RequestLevelsCog
+from utils.db import Database
 from utils.timeutils import TZ
 
 
@@ -99,3 +100,37 @@ def test_scheduled_opening_parses_local_time_and_future_month(monkeypatch):
 
     assert cog._parse_scheduled_open_ts("25:00")[0] is None
     assert cog._parse_scheduled_open_ts("18:99")[0] is None
+
+
+@pytest.mark.asyncio
+async def test_modal_edit_lookup_uses_open_wave_or_persisted_grace_deadline(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "requests.db"))
+    await db.connect()
+    now_ts = 2_000
+    monkeypatch.setattr(request_module.time_module, "time", lambda: now_ts)
+    await db.execute(
+        "INSERT INTO level_request_state(guild_id,state,wave_id,close_ts) VALUES(?,?,?,?)",
+        (717, "open", 4, now_ts + 60),
+    )
+    await db.execute(
+        "INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,status,created_ts,data_json) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (717, 4, 42, "111111111", "pending", now_ts, '{"level_name":"Test"}'),
+    )
+
+    cog = make_cog()
+    cog.bot.db = db
+    assert await cog._editable_user_submission_for_modal(717, 42) is not None
+
+    await db.execute(
+        "UPDATE level_request_state SET state='closed', close_ts=?, closed_ts=? WHERE guild_id=?",
+        (now_ts - 1, now_ts - 1, 717),
+    )
+    assert await cog._editable_user_submission_for_modal(717, 42) is None
+
+    await db.execute(
+        "UPDATE level_request_submissions SET edit_deadline_ts=? WHERE guild_id=? AND wave_id=? AND user_id=?",
+        (now_ts + 300, 717, 4, 42),
+    )
+    assert await cog._editable_user_submission_for_modal(717, 42) is not None
+    await db.close()

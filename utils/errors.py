@@ -68,6 +68,35 @@ def _dedupe_key(message: str) -> str:
     return text[:600]
 
 
+def _unwrap_command_error(error: Exception) -> Exception:
+    current = error
+    seen: set[int] = set()
+    for _ in range(5):
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        original = getattr(current, "original", None)
+        if not isinstance(original, Exception):
+            break
+        current = original
+    return current
+
+
+def _command_error_record(ctx: discord.ApplicationContext, error: Exception) -> dict[str, object]:
+    root = _unwrap_command_error(error)
+    command = getattr(ctx, "command", None)
+    command_name = str(getattr(command, "qualified_name", None) or getattr(command, "name", "unknown"))
+    code = int(getattr(root, "code", 0) or 0)
+    category = "interaction_timeout" if code == 10062 else type(root).__name__
+    detail = _compact_error_message(_redact_secrets(str(root)), limit=300).replace("\n", " ")
+    return {
+        "ts": int(time.time()),
+        "command": command_name[:100],
+        "category": category[:100],
+        "detail": detail[:300],
+    }
+
+
 async def log_error(bot: discord.Client, message: str) -> None:
     message = _compact_error_message(_redact_secrets(message))
     try:
@@ -137,8 +166,15 @@ async def log_error(bot: discord.Client, message: str) -> None:
 def setup_global_error_handlers(bot: discord.Client) -> None:
     @bot.event
     async def on_application_command_error(ctx: discord.ApplicationContext, error: Exception):
+        record = _command_error_record(ctx, error)
+        bot._last_command_error = record
         error_trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-        await log_error(bot, f"Command error: {repr(error)}\n{error_trace}")
+        await log_error(
+            bot,
+            f"Command error in /{record['command']} [{record['category']}]: {repr(error)}\n{error_trace}",
+        )
+        if record["category"] == "interaction_timeout":
+            return
         try:
             await ctx.respond("Something went wrong while running that command.", ephemeral=True)
         except Exception:

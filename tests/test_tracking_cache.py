@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cogs.Tracking import TrackingCog
+from utils.db import Database
+from utils.timeutils import now_madrid, week_start_sunday
 
 
 class FakeConfig:
@@ -78,3 +80,60 @@ async def test_known_excluded_members_are_still_removed_from_rank():
     assert count == 10
     assert rank is None
     assert eligible_total == 0
+
+
+@pytest.mark.asyncio
+async def test_weekly_reward_disable_and_enable_persist_and_restore_workflow_state(tmp_path):
+    db = Database(str(tmp_path / "tracking.db"))
+    await db.connect()
+    cog = object.__new__(TrackingCog)
+    cog.bot = SimpleNamespace(db=db)
+    cog._log_weekly = AsyncMock()
+    guild = SimpleNamespace(id=717)
+
+    week_start = week_start_sunday(now_madrid()).isoformat()
+    await db.execute(
+        "INSERT INTO weekly_claims(guild_id,week_start,user_id,rank,status,contacted_ts) VALUES(?,?,?,?,?,?)",
+        (guild.id, week_start, 99, 1, "pending", 1),
+    )
+    await db.execute(
+        "INSERT INTO weekly_sessions(guild_id,week_start,user_id,stage,expires_ts,active) VALUES(?,?,?,?,?,?)",
+        (guild.id, week_start, 99, "awaiting_request", 9_999_999_999, 1),
+    )
+
+    disabled_week = await cog.disable_weekly_reward_for_current_week(guild, 42)
+    disabled = await db.fetchone(
+        "SELECT disabled_by FROM weekly_reward_disabled WHERE guild_id=? AND week_start=?",
+        (guild.id, week_start),
+    )
+    disabled_claim = await db.fetchone(
+        "SELECT status FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
+        (guild.id, week_start, 99),
+    )
+    disabled_session = await db.fetchone(
+        "SELECT active FROM weekly_sessions WHERE guild_id=? AND week_start=? AND user_id=?",
+        (guild.id, week_start, 99),
+    )
+    assert disabled_week == week_start
+    assert int(disabled["disabled_by"]) == 42
+    assert disabled_claim["status"] == "disabled"
+    assert int(disabled_session["active"]) == 0
+
+    enabled_week, was_disabled = await cog.enable_weekly_reward_for_current_week(guild, 42)
+    claim = await db.fetchone(
+        "SELECT status FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
+        (guild.id, week_start, 99),
+    )
+    session = await db.fetchone(
+        "SELECT active,stage FROM weekly_sessions WHERE guild_id=? AND week_start=? AND user_id=?",
+        (guild.id, week_start, 99),
+    )
+
+    assert enabled_week == week_start
+    assert was_disabled is True
+    assert await cog.weekly_reward_disabled(guild.id, week_start) is False
+    assert claim["status"] == "pending"
+    assert int(session["active"]) == 1
+    assert session["stage"] == "awaiting_request"
+    assert cog._log_weekly.await_count == 2
+    await db.close()

@@ -57,12 +57,14 @@
 1. Run `/tracking top`
    - Expected: shows top list with counts.
 2. Run `/tracking disable_reward` as an admin.
-   - Expected: bot confirms the current tracking week reward is disabled.
+   - Expected: Discord immediately shows that the bot is working, then confirms the current tracking week reward is disabled without "application did not respond".
+   - Expected: the weekly log records `weekly_reward_disabled`; pending claims become disabled and active weekly sessions stop.
 3. Run `/tracking force_dm` for the same week after disabling reward.
    - Expected: bot still sends the manual weekly request DM unless the user already has a claim status.
    - Expected: the weekly request log embed has a clear title, event field, week, member context, and readable details.
 4. Run `/tracking enable_reward` as an admin.
-   - Expected: bot confirms the current tracking week reward is enabled again.
+   - Expected: Discord immediately shows that the bot is working, then confirms the current tracking week reward is enabled again without "application did not respond".
+   - Expected: the disable marker is removed; claims disabled by the command return to pending and their request sessions become active.
 5. Run `/tracking force_dm` again for an eligible user.
    - Expected: bot allows the manual weekly request DM again unless the user already has a claim status.
 6. Run `/tracking force_dm` for a member with an excluded tracking role.

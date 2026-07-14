@@ -1,6 +1,6 @@
 # Avenue Guard Full Bot Health Audit
 
-**Audit date:** 2026-07-13  
+**Audit date:** 2026-07-13; slash-command follow-up 2026-07-14
 **Scope:** startup, storage, all cogs, all persistent workflows, configuration, external APIs, permissions, security, performance, recovery, tests, and operator documentation
 
 ## Executive Result
@@ -9,7 +9,7 @@ Avenue Guard's architecture is appropriate for its current single-server workloa
 
 This audit found and fixed failure modes concentrated around restarts, transient Turso errors, incomplete Discord member caches, and Discord/database actions that cannot be committed in one shared transaction. No known dependency vulnerabilities or high-severity static security findings remain in the audited dependency set.
 
-The bot now has an automated regression suite. It currently contains **35 passing tests** and a repeatable quality command at `scripts/quality_check.sh`.
+The bot now has an automated regression suite. It currently contains **44 passing tests** and a repeatable quality command at `scripts/quality_check.sh`.
 
 ## What Was Reviewed
 
@@ -92,6 +92,17 @@ The bot now has an automated regression suite. It currently contains **35 passin
 - Icon URLs reject credentials, localhost, and literal private IPs; downloads validate DNS, redirects, MIME type, and size.
 - Icon changes are serialized between automatic and slash-command actions, and expiring Discord attachment URLs produce a clear warning.
 
+### Slash Commands
+
+- All **39 registered slash commands** serialize successfully, with valid command and option descriptions.
+- Commands that can touch Discord, Turso, configuration persistence, or member fetching acknowledge the interaction before that work starts.
+- `/tracking disable_reward` and `/tracking enable_reward` now defer first, so their successful database/log work cannot be followed by Discord's `10062 Unknown interaction` failure.
+- The reward toggles are integration-tested against a real migrated SQLite database, including claim and session state transitions in both directions.
+- `/edit-request` remains a modal-first command and uses one local-replica query that deliberately skips pending network synchronization.
+- `/restart` now uses the single graceful shutdown hook instead of flushing and closing runtime storage twice.
+- Dashboard navigation, scheduled-opening controls, and RPS choices also acknowledge before their database work.
+- The admin dashboard surfaces the most recent command failure for one hour, including interaction-timeout classification, and displays the persisted weekly reward state.
+
 ## Security Review
 
 - Error logs redact Discord tokens, Turso tokens, database URLs with credentials, and JWT-shaped secrets.
@@ -112,7 +123,7 @@ The following checks pass:
 ```text
 Python compileall                          PASS
 Ruff correctness checks                   PASS
-Pytest                                    35 passed
+Pytest                                    44 passed
 Bandit medium/high security scan          PASS
 pip-audit production requirements         PASS
 config.json and responses.json parsing    PASS
@@ -132,6 +143,8 @@ Important regression tests include:
 - daily persistence before Discord delivery;
 - runtime config round-trip through the database;
 - graceful shutdown flushing each runtime data source exactly once;
+- registration and description validation for all 39 slash commands;
+- early acknowledgement and persisted state transitions for both weekly reward toggles;
 - review phrase matching, icon URL safety, regex safety, and secret redaction;
 - refusal to silently degrade configured Turso storage.
 

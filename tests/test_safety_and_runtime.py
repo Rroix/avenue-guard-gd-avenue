@@ -5,7 +5,7 @@ import pytest
 
 from cogs.Mod import _review_access_text, _within_one_edit
 from cogs.Sticky import StickyCog
-from utils.errors import _compact_error_message, _redact_secrets
+from utils.errors import _command_error_record, _compact_error_message, _redact_secrets
 from utils.runtime_config import (
     FORUM_RULES_SETTING,
     SERVER_ICON_SETTING,
@@ -115,3 +115,18 @@ def test_error_logging_redacts_tokens_and_compacts_remote_html():
     compact = _compact_error_message("<html>Cloudflare Ray ID: abc123</html>")
     assert "full HTML omitted" in compact
     assert "abc123" in compact
+
+
+def test_unknown_interaction_error_is_classified_for_dashboard_visibility():
+    class UnknownInteraction(Exception):
+        code = 10062
+
+    wrapped = RuntimeError("application command failed")
+    wrapped.original = UnknownInteraction("404 Unknown interaction")
+    ctx = SimpleNamespace(command=SimpleNamespace(qualified_name="tracking enable_reward"))
+
+    record = _command_error_record(ctx, wrapped)
+
+    assert record["command"] == "tracking enable_reward"
+    assert record["category"] == "interaction_timeout"
+    assert "Unknown interaction" in record["detail"]

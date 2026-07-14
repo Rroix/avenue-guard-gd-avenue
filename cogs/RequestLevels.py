@@ -301,7 +301,7 @@ class ScheduledOpeningsView(discord.ui.View):
         if interaction.guild is None:
             await interaction.response.send_message("Wrong server.", ephemeral=True)
             return False
-        member = await self.cog._resolve_member(interaction.guild, interaction.user)
+        member = self.cog._cached_interaction_member(interaction)
         if member is None or not self.cog._is_admin(member):
             await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
             return False
@@ -319,12 +319,13 @@ class ScheduledOpeningsView(discord.ui.View):
     async def _refresh(self, interaction: discord.Interaction):
         if not await self._allowed(interaction):
             return
+        await interaction.response.defer()
         await self.cog.refresh_pending_openings_panel(interaction, self.user_id)
 
     async def _edit(self, interaction: discord.Interaction):
         if not await self._allowed(interaction):
             return
-        row = await self.cog.get_scheduled_opening(interaction.guild.id, self.selected_id)
+        row = await self.cog.get_scheduled_opening(interaction.guild.id, self.selected_id, local_only=True)
         if not row:
             return await interaction.response.send_message("That opening is no longer pending.", ephemeral=True)
         dt = datetime.fromtimestamp(int(row["open_ts"]), TZ)
@@ -340,11 +341,13 @@ class ScheduledOpeningsView(discord.ui.View):
     async def _delete(self, interaction: discord.Interaction):
         if not await self._allowed(interaction):
             return
+        await interaction.response.defer()
         await self.cog.delete_scheduled_opening(interaction, self.selected_id)
 
     async def _open_now(self, interaction: discord.Interaction):
         if not await self._allowed(interaction):
             return
+        await interaction.response.defer()
         await self.cog.open_scheduled_opening_now(interaction, self.selected_id)
 
 
@@ -362,7 +365,7 @@ class ScheduledOpenNowConfirmView(discord.ui.View):
         if interaction.guild is None:
             await interaction.response.send_message("Wrong server.", ephemeral=True)
             return False
-        member = await self.cog._resolve_member(interaction.guild, interaction.user)
+        member = self.cog._cached_interaction_member(interaction)
         if member is None or not self.cog._is_admin(member):
             await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
             return False
@@ -372,6 +375,7 @@ class ScheduledOpenNowConfirmView(discord.ui.View):
     async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
         if not await self._allowed(interaction):
             return
+        await interaction.response.defer()
         await self.cog.open_scheduled_opening_now(interaction, self.opening_id, force=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -574,6 +578,20 @@ class RequestLevelsCog(commands.Cog):
             "SELECT * FROM level_request_submissions WHERE guild_id=? AND user_id=? AND status='pending' "
             "AND edit_deadline_ts IS NOT NULL AND edit_deadline_ts>=? ORDER BY wave_id DESC LIMIT 1",
             (guild_id, user_id, int(time_module.time())),
+        )
+
+    async def _editable_user_submission_for_modal(self, guild_id: int, user_id: int):
+        """Use one replica-only read so /edit-request can answer with a modal."""
+        now_ts = int(time_module.time())
+        return await self.bot.db.fetchone_local(
+            "SELECT s.* FROM level_request_submissions s "
+            "WHERE s.guild_id=? AND s.user_id=? AND s.status='pending' AND ("
+            "(s.edit_deadline_ts IS NOT NULL AND s.edit_deadline_ts>=?) OR EXISTS ("
+            "SELECT 1 FROM level_request_state st WHERE st.guild_id=s.guild_id "
+            "AND st.wave_id=s.wave_id AND st.state=? "
+            "AND (st.close_ts IS NULL OR st.close_ts>?))) "
+            "ORDER BY s.wave_id DESC LIMIT 1",
+            (guild_id, user_id, now_ts, STATE_OPEN, now_ts),
         )
 
     async def _state_after_timed_close_check(self, guild: discord.Guild, state_row):
@@ -1549,8 +1567,9 @@ class RequestLevelsCog(commands.Cog):
             (guild_id, limit),
         )
 
-    async def get_scheduled_opening(self, guild_id: int, opening_id: int):
-        return await self.bot.db.fetchone(
+    async def get_scheduled_opening(self, guild_id: int, opening_id: int, *, local_only: bool = False):
+        fetch = self.bot.db.fetchone_local if local_only else self.bot.db.fetchone
+        return await fetch(
             "SELECT * FROM level_request_scheduled_openings WHERE guild_id=? AND id=? AND status='pending'",
             (guild_id, opening_id),
         )
@@ -1597,20 +1616,20 @@ class RequestLevelsCog(commands.Cog):
         rows = await self._scheduled_opening_rows(interaction.guild.id)
         embed = self._scheduled_openings_embed(rows)
         view = ScheduledOpeningsView(self, user_id, rows)
-        await interaction.response.edit_message(content=content or None, embed=embed, view=view)
+        await interaction.message.edit(content=content or None, embed=embed, view=view)
 
     async def delete_scheduled_opening(self, interaction: discord.Interaction, opening_id: int):
         async with self._scheduled_lock:
             row = await self.get_scheduled_opening(interaction.guild.id, opening_id)
             if row is None:
-                return await interaction.response.send_message("That opening is no longer pending.", ephemeral=True)
+                return await interaction.followup.send("That opening is no longer pending.", ephemeral=True)
             await self.bot.db.execute(
                 "UPDATE level_request_scheduled_openings SET status='deleted' WHERE guild_id=? AND id=? AND status='pending'",
                 (interaction.guild.id, opening_id),
             )
         await self._log_request_admin_action(interaction.guild, interaction.user.id, "scheduled_opening_deleted", f"opening_id={opening_id}")
         rows = await self._scheduled_opening_rows(interaction.guild.id)
-        await interaction.response.edit_message(
+        await interaction.message.edit(
             content=f"Deleted scheduled opening **#{opening_id}** if it was still pending.",
             embed=self._scheduled_openings_embed(rows),
             view=ScheduledOpeningsView(self, interaction.user.id, rows),
@@ -1623,10 +1642,10 @@ class RequestLevelsCog(commands.Cog):
     async def _open_scheduled_opening_now_locked(self, interaction: discord.Interaction, opening_id: int, force: bool = False):
         row = await self.get_scheduled_opening(interaction.guild.id, opening_id)
         if not row:
-            return await interaction.response.send_message("That opening is no longer pending.", ephemeral=True)
+            return await interaction.followup.send("That opening is no longer pending.", ephemeral=True)
         state_row = await self._get_state(interaction.guild.id)
         if not force and state_row and str(state_row["state"]) == STATE_OPEN:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "Requests are already open. Opening this now will start a new wave and replace the active opening. Confirm?",
                 view=ScheduledOpenNowConfirmView(self, interaction.user.id, opening_id),
                 ephemeral=True,
@@ -1645,7 +1664,7 @@ class RequestLevelsCog(commands.Cog):
                 scheduled_opening_id=opening_id,
             )
         except RuntimeError as e:
-            return await interaction.response.send_message(str(e), ephemeral=True)
+            return await interaction.followup.send(str(e), ephemeral=True)
         rows = await self._scheduled_opening_rows(interaction.guild.id)
         note = f"Opened scheduled opening **#{opening_id}** as wave **{wave_id}**."
         if request_type:
@@ -1653,7 +1672,7 @@ class RequestLevelsCog(commands.Cog):
         note += " Announcement sent."
         if close_ts:
             note += f" Closes <t:{close_ts}:R> unless the limit is reached first."
-        await interaction.response.edit_message(
+        await interaction.message.edit(
             content=note,
             embed=self._scheduled_openings_embed(rows),
             view=ScheduledOpeningsView(self, interaction.user.id, rows),
@@ -1677,7 +1696,7 @@ class RequestLevelsCog(commands.Cog):
     ):
         if interaction.guild is None:
             return await interaction.response.send_message("Wrong server.", ephemeral=True)
-        member = await self._resolve_member(interaction.guild, interaction.user)
+        member = self._cached_interaction_member(interaction)
         if member is None or not self._is_admin(member):
             return await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
 
@@ -1714,10 +1733,11 @@ class RequestLevelsCog(commands.Cog):
                 ephemeral=True,
             )
 
+        await interaction.response.defer(ephemeral=True)
         async with self._scheduled_lock:
             existing = await self.get_scheduled_opening(interaction.guild.id, opening_id)
             if existing is None:
-                return await interaction.response.send_message("That opening is no longer pending.", ephemeral=True)
+                return await interaction.followup.send("That opening is no longer pending.", ephemeral=True)
             await self.bot.db.execute(
                 "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=?, request_type=? WHERE guild_id=? AND id=? AND status='pending'",
                 (request_limit, close_value, open_ts, normalized_type or None, interaction.guild.id, opening_id),
@@ -1728,7 +1748,7 @@ class RequestLevelsCog(commands.Cog):
             "scheduled_opening_edited",
             f"opening_id={opening_id} open_ts={open_ts} limit={request_limit} close_minutes={close_value} request_type={normalized_type or 'any'}",
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Updated scheduled opening **#{opening_id}** for <t:{open_ts}:F> (<t:{open_ts}:R>).",
             ephemeral=True,
         )
@@ -2038,6 +2058,19 @@ class RequestLevelsCog(commands.Cog):
     def _in_allowed_guild(self, ctx: discord.ApplicationContext) -> bool:
         return ctx.guild is not None and ctx.guild.id == self.allowed_guild_id
 
+    async def _defer_command(self, ctx: discord.ApplicationContext) -> None:
+        response = getattr(getattr(ctx, "interaction", None), "response", None)
+        if response is not None and response.is_done():
+            return
+        await ctx.defer(ephemeral=True)
+
+    def _cached_interaction_member(self, interaction: discord.Interaction) -> Optional[discord.Member]:
+        if isinstance(interaction.user, discord.Member):
+            return interaction.user
+        if interaction.guild is None:
+            return None
+        return interaction.guild.get_member(int(interaction.user.id))
+
     async def _resolve_member(self, guild: discord.Guild, user) -> Optional[discord.Member]:
         if isinstance(user, discord.Member):
             return user
@@ -2149,6 +2182,7 @@ class RequestLevelsCog(commands.Cog):
     async def refresh_request_button(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer_command(ctx)
         member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not self._is_mod(member):
             return await ctx.respond("Only mods can use this.", ephemeral=True)
@@ -2171,6 +2205,7 @@ class RequestLevelsCog(commands.Cog):
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer_command(ctx)
         member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not self._is_admin(member):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
@@ -2256,6 +2291,7 @@ class RequestLevelsCog(commands.Cog):
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer_command(ctx)
         member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not self._is_admin(member):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
@@ -2341,6 +2377,7 @@ class RequestLevelsCog(commands.Cog):
     async def close_requests(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer_command(ctx)
         member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not self._is_admin(member):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
@@ -2357,6 +2394,7 @@ class RequestLevelsCog(commands.Cog):
     async def requests_are(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer_command(ctx)
         row = await self._get_state(ctx.guild.id)
         state_label = self._state_label(str(row["state"]))
         parts = [f"Requests are **{state_label}**.", f"Wave: **{int(row['wave_id'])}**.", f"Submitted: **{int(row['submitted_count'])}**."]
@@ -2433,20 +2471,11 @@ class RequestLevelsCog(commands.Cog):
     async def edit_request(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
-        row = await self._get_state(ctx.guild.id)
-        try:
-            row = await self._state_after_timed_close_check(ctx.guild, row)
-        except Exception as e:
-            await log_error(self.bot, f"Could not close expired request wave before edit command: {repr(e)}")
-        request_row = await self._current_user_submission(ctx.guild.id, int(row["wave_id"]), ctx.user.id)
-        if not request_row or not self._can_edit_submission(row, request_row):
-            request_row = await self._latest_editable_user_submission(ctx.guild.id, ctx.user.id)
+        # A modal must be the initial interaction response, so this path cannot
+        # defer. Keep it to one local-replica query and do no Discord I/O first.
+        request_row = await self._editable_user_submission_for_modal(ctx.guild.id, ctx.user.id)
         if not request_row:
             return await ctx.respond("You do not have a request with an active edit window.", ephemeral=True)
-        if str(request_row["status"]) != "pending":
-            return await ctx.respond("That request has already been reviewed.", ephemeral=True)
-        if not self._can_edit_submission(row, request_row):
-            return await ctx.respond(self._message("edit_window_expired", "Your request can no longer be edited."), ephemeral=True)
         initial = self._request_initial_values(request_row)
         await ctx.send_modal(
             LevelRequestModal(

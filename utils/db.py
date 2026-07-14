@@ -256,7 +256,13 @@ class Database:
         self._last_remote_sync_error = ""
         self._last_remote_sync_error_ts = 0
 
-    async def _run_locked_with_retry(self, operation, *, retry_operation: bool = True) -> Any:
+    async def _run_locked_with_retry(
+        self,
+        operation,
+        *,
+        retry_operation: bool = True,
+        attempt_pending_sync: bool = True,
+    ) -> Any:
         await self.connect()
         attempts = 3 if self.uses_remote and retry_operation else 1
         last_error: Optional[Exception] = None
@@ -266,7 +272,8 @@ class Database:
                 assert self._conn is not None
 
                 try:
-                    await asyncio.to_thread(self._try_pending_remote_sync_sync)
+                    if attempt_pending_sync:
+                        await asyncio.to_thread(self._try_pending_remote_sync_sync)
                     return await asyncio.to_thread(operation)
                 except Exception as exc:
                     last_error = exc
@@ -1031,6 +1038,21 @@ class Database:
             return _normalize_row(cur, cur.fetchone())
 
         return await self._run_locked_with_retry(_run)
+
+    async def fetchone_local(self, sql: str, params: Sequence[Any] = ()) -> Optional[Any]:
+        """Read current replica state without waiting for a pending remote sync.
+
+        This is reserved for Discord interactions that must return a modal as
+        their initial response. The bot is the only writer, so its committed
+        local replica already contains the newest application state.
+        """
+
+        def _run():
+            assert self._conn is not None
+            cur = self._conn.execute(sql, params)
+            return _normalize_row(cur, cur.fetchone())
+
+        return await self._run_locked_with_retry(_run, attempt_pending_sync=False)
 
     async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[Any]:
         def _run():

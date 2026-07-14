@@ -103,26 +103,23 @@ class AdminDashboardView(discord.ui.View):
         self.user_id = int(user_id)
         self.page = page
 
-    async def _allowed(self, interaction: discord.Interaction) -> bool:
+    async def _show(self, interaction: discord.Interaction, page: str):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This dashboard belongs to another admin.", ephemeral=True)
-            return False
+            return
         if interaction.guild is None:
             await interaction.response.send_message("Wrong server.", ephemeral=True)
-            return False
+            return
+
+        await interaction.response.defer()
         member = await self.cog._resolve_member(interaction.guild, interaction.user)
         admin_roles = self.cog.bot.config.get_int_list("roles", "admin_owner_role_ids")
         if member is None or not is_admin_or_owner(member, admin_roles):
-            await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
-            return False
-        return True
-
-    async def _show(self, interaction: discord.Interaction, page: str):
-        if not await self._allowed(interaction):
+            await interaction.followup.send("You don't have permission to use this.", ephemeral=True)
             return
         self.page = page
         embed = await self.cog._admin_dashboard_embed(interaction.guild, page)
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.message.edit(embed=embed, view=self)
 
     @discord.ui.button(label="Overview", style=discord.ButtonStyle.primary)
     async def overview(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -223,16 +220,17 @@ class CommandsCog(commands.Cog):
         return ctx.guild is not None and ctx.guild.id == self.allowed_guild_id
 
     async def _defer(self, ctx: discord.ApplicationContext, ephemeral: bool = True) -> None:
-        try:
-            await ctx.defer(ephemeral=ephemeral)
-        except Exception:
-            pass
+        response = getattr(getattr(ctx, "interaction", None), "response", None)
+        if response is not None and response.is_done():
+            return
+        # Do not swallow an expired interaction here. Mutating commands must
+        # stop instead of completing an operation the user sees as failed.
+        await ctx.defer(ephemeral=ephemeral)
 
     async def _send(self, ctx: discord.ApplicationContext, *args, **kwargs):
-        try:
-            return await ctx.followup.send(*args, **kwargs)
-        except Exception:
-            return await ctx.respond(*args, **kwargs)
+        # Pycord routes Interaction.respond to the initial response or the
+        # follow-up webhook depending on whether the command was deferred.
+        return await ctx.respond(*args, **kwargs)
 
     async def _log_admin_action(self, guild: discord.Guild, user_id: int, action: str, detail: str = "") -> None:
         channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
@@ -1368,10 +1366,10 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
-        if not await self._is_impact_owner_ctx(ctx):
-            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
-
         await self._defer(ctx, ephemeral=True)
+        if not await self._is_impact_owner_ctx(ctx):
+            return await self._send(ctx, "You don't have permission to use this.", ephemeral=True)
+
         tracking = self.bot.get_cog("TrackingCog")
         if tracking is not None:
             try:
@@ -1440,10 +1438,10 @@ class CommandsCog(commands.Cog):
     async def bot_backup(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
-        if not await self._is_impact_owner_ctx(ctx):
-            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
-
         await self._defer(ctx, ephemeral=True)
+        if not await self._is_impact_owner_ctx(ctx):
+            return await self._send(ctx, "You don't have permission to use this.", ephemeral=True)
+
         try:
             sent = await self._post_database_backup(ctx.guild, reason="manual", requested_by=ctx.user.id)
         except Exception as e:
@@ -1464,18 +1462,19 @@ class CommandsCog(commands.Cog):
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_impact_owner_ctx(ctx):
-            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+            return await self._send(ctx, "You don't have permission to use this.", ephemeral=True)
         if str(confirm or "").strip() != "RESTORE":
-            return await ctx.respond("Type `RESTORE` in the confirm option to replace the live database.", ephemeral=True)
+            return await self._send(ctx, "Type `RESTORE` in the confirm option to replace the live database.", ephemeral=True)
         if bool(getattr(self.bot.db, "uses_remote", False)):
-            return await ctx.respond(
+            return await self._send(
+                ctx,
                 "Turso/libSQL remote storage is active, so uploaded SQLite restore is disabled to protect the remote primary. "
                 "Use Turso backup/import tools for a full remote restore.",
                 ephemeral=True,
             )
 
-        await self._defer(ctx, ephemeral=True)
         uploaded_path: Path | None = None
         restore_path: Path | None = None
         original_name = str(getattr(archive, "filename", "uploaded.sqlite3") or "uploaded.sqlite3")
@@ -1560,10 +1559,10 @@ class CommandsCog(commands.Cog):
     async def bot_storage(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
-        if not await self._is_impact_owner_ctx(ctx):
-            return await ctx.respond("You don't have permission to use this.", ephemeral=True)
-
         await self._defer(ctx, ephemeral=True)
+        if not await self._is_impact_owner_ctx(ctx):
+            return await self._send(ctx, "You don't have permission to use this.", ephemeral=True)
+
         storage_note, storage_ok = self._database_storage_note()
         channel_id = self._backup_channel_id()
         backup_row = await self.bot.db.fetchone(
@@ -1738,6 +1737,7 @@ class CommandsCog(commands.Cog):
     async def server_icon_status(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
         await ctx.respond(embed=self._server_icon_status_embed(), ephemeral=True, allowed_mentions=no_mentions())
@@ -1749,6 +1749,7 @@ class CommandsCog(commands.Cog):
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
@@ -1769,6 +1770,7 @@ class CommandsCog(commands.Cog):
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
         if not is_valid_icon_url(url):
@@ -1799,6 +1801,7 @@ class CommandsCog(commands.Cog):
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
         if not is_valid_icon_url(url):
@@ -1830,6 +1833,7 @@ class CommandsCog(commands.Cog):
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
@@ -1860,9 +1864,9 @@ class CommandsCog(commands.Cog):
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
-        await self._defer(ctx, ephemeral=True)
         cfg = ensure_server_icon_config(self.bot.config)
         urls = list(cfg.get("urls", []) or [])
         target_index = parse_server_icon_index(int(number) - 1, len(urls))
@@ -1880,9 +1884,9 @@ class CommandsCog(commands.Cog):
     async def server_icon_next(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
-        await self._defer(ctx, ephemeral=True)
         background = self.bot.get_cog("BackgroundCog")
         rotate = getattr(background, "rotate_server_icon_once", None)
         if not callable(rotate):
@@ -1967,6 +1971,18 @@ class CommandsCog(commands.Cog):
         if bool(getattr(self.bot.db, "uses_remote", False)) and bool(getattr(self.bot.db, "_remote_dirty", False)):
             issues.append("database replication: local commits are waiting to sync to Turso")
             repairs.append("Check Turso status and credentials, then run `/resync`")
+
+        command_error = getattr(self.bot, "_last_command_error", None)
+        if isinstance(command_error, dict):
+            error_ts = int(command_error.get("ts", 0) or 0)
+            if error_ts and int(time.time()) - error_ts <= 3600:
+                command_name = str(command_error.get("command") or "unknown")[:100]
+                category = str(command_error.get("category") or "error")[:100]
+                issues.append(f"recent command failure: `/{command_name}` ({category}) <t:{error_ts}:R>")
+                if category == "interaction_timeout":
+                    repairs.append("The command missed Discord's response window; verify the current deployment includes early command deferrals")
+                else:
+                    repairs.append("Check the global error log for the most recent command traceback")
 
         category_id = cfg.get_int("tickets", "ticket_category_id")
         category = guild.get_channel(category_id) if category_id else None
@@ -2079,6 +2095,13 @@ class CommandsCog(commands.Cog):
         pending_weekly = await self._count_db("SELECT COUNT(*) AS c FROM weekly_request_reviews WHERE guild_id=? AND status='pending'", (guild.id,))
         active_weekly = await self._count_db("SELECT COUNT(*) AS c FROM weekly_sessions WHERE guild_id=? AND active=1", (guild.id,))
         farm_events = await self._count_db("SELECT COUNT(*) AS c FROM anti_farm_events WHERE guild_id=? AND ts>=?", (guild.id, int(time.time()) - 7 * 86400))
+        current_week = week_start_sunday(now_madrid()).isoformat()
+        reward_disabled = bool(
+            await self._count_db(
+                "SELECT COUNT(*) AS c FROM weekly_reward_disabled WHERE guild_id=? AND week_start=?",
+                (guild.id, current_week),
+            )
+        )
 
         embed = discord.Embed(
             title="Avenue Guard Admin Dashboard",
@@ -2088,7 +2111,15 @@ class CommandsCog(commands.Cog):
         )
         embed.add_field(name="Core", value=f"Database: **{db_note}**\nLatency: **{round(self.bot.latency * 1000)} ms**\nLoaded cogs: **{len(self.bot.cogs)}**", inline=True)
         embed.add_field(name="Requests", value=f"{request_state}\nPending reviews: **{pending_live}** live / **{pending_weekly}** weekly", inline=True)
-        embed.add_field(name="Tracking", value=f"Active weekly sessions: **{active_weekly}**\nAnti-farm events, 7d: **{farm_events}**", inline=True)
+        embed.add_field(
+            name="Tracking",
+            value=(
+                f"Weekly reward: **{'Disabled' if reward_disabled else 'Enabled'}**\n"
+                f"Active weekly sessions: **{active_weekly}**\n"
+                f"Anti-farm events, 7d: **{farm_events}**"
+            ),
+            inline=True,
+        )
         embed.add_field(name="Tickets", value=f"Open tickets: **{open_tickets}**", inline=True)
         embed.add_field(name="Icon Rotation", value=icon_text, inline=True)
         embed.add_field(
@@ -2110,9 +2141,9 @@ class CommandsCog(commands.Cog):
     async def bot_dashboard(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
-        await self._defer(ctx, ephemeral=True)
         embed = await self._admin_dashboard_embed(ctx.guild, "overview")
         await self._send(ctx, embed=embed, view=AdminDashboardView(self, ctx.user.id), ephemeral=True)
 
@@ -2121,10 +2152,10 @@ class CommandsCog(commands.Cog):
     async def bot_health(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
-        await self._defer(ctx, ephemeral=True)
         guild = ctx.guild
 
         async def _count(sql: str, params: tuple) -> int:
@@ -2210,10 +2241,10 @@ class CommandsCog(commands.Cog):
     async def bot_doctor(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
-        await self._defer(ctx, ephemeral=True)
         guild = ctx.guild
         cfg = self.bot.config
         me = guild.me or guild.get_member(self.bot.user.id)
@@ -2531,10 +2562,10 @@ class CommandsCog(commands.Cog):
     async def bot_config_check(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
-        await self._defer(ctx, ephemeral=True)
         guild = ctx.guild
         issues: list[str] = []
         ok_count = 0
@@ -2818,12 +2849,12 @@ class CommandsCog(commands.Cog):
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_request_staff_ctx(ctx):
             return await ctx.respond("Only request reviewers can use this.", ephemeral=True)
 
         message_id_int = self._parse_snowflake_arg(message_id)
         user_id_int = self._parse_snowflake_arg(user_id)
-        await self._defer(ctx, ephemeral=True)
 
         if message_id_int:
             rows = await self.bot.db.fetchall(
@@ -2869,6 +2900,7 @@ class CommandsCog(commands.Cog):
     async def requests_repair(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
@@ -2876,7 +2908,6 @@ class CommandsCog(commands.Cog):
         if cog is None or not hasattr(cog, "repair_request_system"):
             return await ctx.respond("Request system cog not loaded.", ephemeral=True)
 
-        await self._defer(ctx, ephemeral=True)
         result = await cog.repair_request_system(ctx.guild)
         await self._log_admin_action(
             ctx.guild,
@@ -2912,10 +2943,10 @@ class CommandsCog(commands.Cog):
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
         if not await self._is_request_staff_ctx(ctx):
             return await ctx.respond("Only request reviewers can use this.", ephemeral=True)
 
-        await self._defer(ctx, ephemeral=True)
         scope_key = str(scope or "current_wave").strip().casefold().replace("-", "_")
         status_key = str(status or "pending").strip().casefold()
         if status_key in {"unreviewed", "open"}:
@@ -3124,6 +3155,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
+        await self._defer(ctx, ephemeral=True)
         admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
         invoker = await self._resolve_member(ctx.guild, ctx.user)
         if invoker is None or not is_admin_or_owner(invoker, admin_roles):
@@ -3133,7 +3165,6 @@ class CommandsCog(commands.Cog):
         if tracking is None:
             return await ctx.respond("Tracking cog not loaded.", ephemeral=True)
 
-        await self._defer(ctx, ephemeral=True)
         ws = week_start_sunday(now_madrid()).isoformat()
         ok, msg = await tracking.force_dm_for_user(ctx.guild, ws, member.id)
         await self._log_admin_action(ctx.guild, ctx.user.id, "tracking_force_dm", f"target_user={member.id} ok={ok}")
@@ -3143,6 +3174,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
+        await self._defer(ctx, ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
         admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
         if member is None or not is_admin_or_owner(member, admin_roles):
@@ -3152,7 +3184,6 @@ class CommandsCog(commands.Cog):
         if tracking is None:
             return await ctx.respond("Tracking cog not loaded.", ephemeral=True)
 
-        await self._defer(ctx, ephemeral=True)
         await tracking.reset_current_week(ctx.guild.id)
         await self._log_admin_action(ctx.guild, ctx.user.id, "tracking_reset", "current_week=true")
         await self._send(ctx, "Tracking stats for the current week have been reset.", ephemeral=True)
@@ -3161,6 +3192,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
+        await self._defer(ctx, ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
         admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
         if member is None or not is_admin_or_owner(member, admin_roles):
@@ -3172,7 +3204,8 @@ class CommandsCog(commands.Cog):
 
         week_start_iso = await tracking.disable_weekly_reward_for_current_week(ctx.guild, ctx.user.id)
         await self._log_admin_action(ctx.guild, ctx.user.id, "tracking_weekly_reward_disabled", f"week_start={week_start_iso}")
-        await ctx.respond(
+        await self._send(
+            ctx,
             f"Weekly request reward disabled for the current tracking week starting **{week_start_iso}**.",
             ephemeral=True,
         )
@@ -3181,6 +3214,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
+        await self._defer(ctx, ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
         admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
         if member is None or not is_admin_or_owner(member, admin_roles):
@@ -3201,13 +3235,14 @@ class CommandsCog(commands.Cog):
             msg = f"Weekly request reward re-enabled for the current tracking week starting **{week_start_iso}**."
         else:
             msg = f"Weekly request reward was already enabled for the current tracking week starting **{week_start_iso}**."
-        await ctx.respond(msg, ephemeral=True)
+        await self._send(ctx, msg, ephemeral=True)
 
     # --- /ticket close ---
     async def ticket_close(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
+        await self._defer(ctx, ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
         mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
         allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
@@ -3239,6 +3274,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
+        await self._defer(ctx, ephemeral=False)
         member = await self._resolve_member(ctx.guild, ctx.user)
         mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
         allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
@@ -3286,6 +3322,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
+        await self._defer(ctx, ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
         mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
         allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
@@ -3430,6 +3467,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
+        await self._defer(ctx, ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not member.guild_permissions.administrator:
             return await ctx.respond("Nah, you can't use this", ephemeral=True)
@@ -3518,6 +3556,7 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
+        await self._defer(ctx, ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
         admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
         if member is None or not is_admin_or_owner(member, admin_roles):
@@ -3552,36 +3591,16 @@ class CommandsCog(commands.Cog):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
+        await self._defer(ctx, ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
         admin_roles = self.bot.config.get_int_list("roles", "admin_owner_role_ids")
         if member is None or not is_admin_or_owner(member, admin_roles):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
-        await self._log_admin_action(ctx.guild, ctx.user.id, "bot_restart", "manual restart command")
         await ctx.respond("Restarting...", ephemeral=True)
-        tracking = self.bot.get_cog("TrackingCog")
-        if tracking is not None:
-            flush = getattr(tracking, "flush_activity_counts", None)
-            if callable(flush):
-                try:
-                    await flush()
-                except Exception as e:
-                    await log_error(self.bot, f"Restart activity flush failed: {repr(e)}")
-
-        background = self.bot.get_cog("BackgroundCog")
-        if background is not None:
-            persist = getattr(background, "_persist_current_day", None)
-            if callable(persist):
-                try:
-                    await persist()
-                except Exception as e:
-                    await log_error(self.bot, f"Restart daily summary flush failed: {repr(e)}")
-
-        try:
-            await self.bot.db.close()
-        except Exception as e:
-            await log_error(self.bot, f"Restart database close failed: {repr(e)}")
-
+        await self._log_admin_action(ctx.guild, ctx.user.id, "bot_restart", "manual restart command")
+        # bot.close is wrapped in main.py and flushes tracking, daily metrics,
+        # remote replication, and the database exactly once.
         await self.bot.close()
         os._exit(0)
 
@@ -3637,6 +3656,7 @@ class CommandsCog(commands.Cog):
                         if interaction.user.id != self.user_id:
                             return await interaction.response.send_message("This game isn't for you.", ephemeral=True)
 
+                        await interaction.response.defer()
                         bot_choice = random.choice(options)
                         o = outcome(choice, bot_choice)
 
@@ -3681,7 +3701,6 @@ class CommandsCog(commands.Cog):
                             f"{reward_text}"
                         )
 
-                        await interaction.response.defer()
                         await interaction.message.edit(content=content, view=None)
                     except Exception as e:
                         try:
