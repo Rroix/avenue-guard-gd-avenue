@@ -573,6 +573,12 @@ class RequestLevelsCog(commands.Cog):
             (guild_id, wave_id, user_id),
         )
 
+    async def _current_user_submission_local(self, guild_id: int, wave_id: int, user_id: int):
+        return await self.bot.db.fetchone_local(
+            "SELECT * FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+            (guild_id, wave_id, user_id),
+        )
+
     async def _latest_editable_user_submission(self, guild_id: int, user_id: int):
         return await self.bot.db.fetchone(
             "SELECT * FROM level_request_submissions WHERE guild_id=? AND user_id=? AND status='pending' "
@@ -1871,6 +1877,12 @@ class RequestLevelsCog(commands.Cog):
         )
         return await self.bot.db.fetchone("SELECT * FROM level_request_state WHERE guild_id=?", (guild_id,))
 
+    async def _get_state_local(self, guild_id: int):
+        return await self.bot.db.fetchone_local(
+            "SELECT * FROM level_request_state WHERE guild_id=?",
+            (guild_id,),
+        )
+
     async def _set_state_closed(self, guild: discord.Guild, reason: str = "manual") -> None:
         async with self._state_lock:
             async with self._submit_lock:
@@ -2420,13 +2432,29 @@ class RequestLevelsCog(commands.Cog):
         if interaction.guild is None:
             return await interaction.response.send_message("Wrong server.", ephemeral=True)
 
-        row = await self._get_state(interaction.guild.id)
-        try:
-            row = await self._state_after_timed_close_check(interaction.guild, row)
-        except Exception as e:
-            await log_error(self.bot, f"Could not refresh request button after timed close: {repr(e)}")
+        # A modal must be the initial response. Replica-only reads avoid waiting
+        # for Turso synchronization before Discord's response deadline.
+        row = await self._get_state_local(interaction.guild.id)
+        if row is None:
+            return await interaction.response.send_message(
+                "The request system is still initializing. Please try again in a moment.",
+                ephemeral=True,
+            )
 
-        request_row = await self._current_user_submission(interaction.guild.id, int(row["wave_id"]), interaction.user.id)
+        close_ts = self._row_value(row, "close_ts", None)
+        if str(row["state"]) == STATE_OPEN and close_ts is not None and int(close_ts) <= int(time_module.time()):
+            await interaction.response.send_message(self._message("closed", "Requests are closed :/"), ephemeral=True)
+            self._start_background_task(
+                self._set_state_closed(interaction.guild, reason="time limit"),
+                label=f"Timed request close guild_id={interaction.guild.id}",
+            )
+            return
+
+        request_row = await self._current_user_submission_local(
+            interaction.guild.id,
+            int(row["wave_id"]),
+            interaction.user.id,
+        )
         if request_row:
             if self._can_edit_submission(row, request_row):
                 return await interaction.response.send_modal(
@@ -2450,7 +2478,7 @@ class RequestLevelsCog(commands.Cog):
         if str(row["state"]) != STATE_OPEN:
             return await interaction.response.send_message(self._message("closed", "Requests are closed :/"), ephemeral=True)
 
-        member = await self._resolve_member(interaction.guild, interaction.user)
+        member = self._cached_interaction_member(interaction)
         if member is None or not await self._requirements_ok(member):
             return await interaction.response.send_message(
                 self._message("no_requirements", "You don't meet the requirements, please read the requesting rules"),
@@ -2490,20 +2518,23 @@ class RequestLevelsCog(commands.Cog):
     async def handle_first_choice(self, interaction: discord.Interaction):
         if interaction.guild is None:
             return await interaction.response.send_message("Wrong server.", ephemeral=True)
-        member = await self._resolve_member(interaction.guild, interaction.user)
+        member = self._cached_interaction_member(interaction)
         if member is None:
             return await interaction.response.send_message("Member not found.", ephemeral=True)
 
         role_id = self._cfg_int("has_requested_role_id")
         role = interaction.guild.get_role(role_id) if role_id else None
+        await interaction.response.send_modal(LevelRequestModal(self, interaction.user.id))
+
         if role is not None:
             try:
                 if role not in member.roles:
                     await member.add_roles(role, reason="Level request rules acknowledged")
-            except Exception:
-                return await interaction.response.send_message("I couldn't give you the configured role.", ephemeral=True)
-
-        await interaction.response.send_modal(LevelRequestModal(self, interaction.user.id))
+            except Exception as e:
+                await log_error(
+                    self.bot,
+                    f"Could not add first-request clearance role user_id={interaction.user.id} role_id={role_id}: {repr(e)}",
+                )
 
     async def handle_request_form(self, interaction: discord.Interaction, data: Dict[str, str]):
         if interaction.guild is None:
@@ -2929,6 +2960,31 @@ class RequestLevelsCog(commands.Cog):
             return "weekly", row
         return "", None
 
+    async def _review_target_by_message_local(self, guild_id: int, message_id: int):
+        row = await self.bot.db.fetchone_local(
+            "SELECT CASE "
+            "WHEN EXISTS(SELECT 1 FROM level_request_submissions WHERE guild_id=? AND request_message_id=?) THEN 'wave' "
+            "WHEN EXISTS(SELECT 1 FROM weekly_request_reviews WHERE guild_id=? AND request_message_id=?) THEN 'weekly' "
+            "ELSE '' END AS target_kind, "
+            "COALESCE("
+            "(SELECT status FROM level_request_submissions WHERE guild_id=? AND request_message_id=? LIMIT 1), "
+            "(SELECT status FROM weekly_request_reviews WHERE guild_id=? AND request_message_id=? LIMIT 1)"
+            ") AS status",
+            (
+                guild_id,
+                message_id,
+                guild_id,
+                message_id,
+                guild_id,
+                message_id,
+                guild_id,
+                message_id,
+            ),
+        )
+        if row is None or not str(row["target_kind"] or ""):
+            return "", None
+        return str(row["target_kind"]), row
+
     async def _channel_by_id(self, guild: discord.Guild, channel_id: int) -> Optional[discord.TextChannel]:
         channel = guild.get_channel(channel_id) if channel_id else None
         if channel is None and channel_id:
@@ -2946,9 +3002,10 @@ class RequestLevelsCog(commands.Cog):
     async def handle_review_button(self, interaction: discord.Interaction, action: str):
         if interaction.guild is None or interaction.message is None:
             return await interaction.response.send_message("Request not found.", ephemeral=True)
-        if not await self._is_reviewer_interaction(interaction):
+        member = self._cached_interaction_member(interaction)
+        if member is None or not self._has_reviewer_role(member):
             return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
-        _, row = await self._review_target_by_message(interaction.guild.id, interaction.message.id)
+        _, row = await self._review_target_by_message_local(interaction.guild.id, interaction.message.id)
         if not row:
             return await interaction.response.send_message("Request not found.", ephemeral=True)
         if str(row["status"]) != "pending":
@@ -2963,18 +3020,18 @@ class RequestLevelsCog(commands.Cog):
         await self._finalize_review(interaction, message_id, result_key, review)
 
     async def handle_other_reason(self, interaction: discord.Interaction, message_id: int, reason_key: str):
-        if not await self._is_reviewer_interaction(interaction):
-            return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
         await self._finalize_review(interaction, message_id, reason_key, "")
 
     async def _finalize_review(self, interaction: discord.Interaction, message_id: int, result_key: str, review: str):
         if interaction.guild is None:
             return await self._reply_ephemeral(interaction, "Wrong server.")
-        if not await self._is_reviewer_interaction(interaction):
-            return await self._reply_ephemeral(interaction, "Only reviewers can use these controls.")
 
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
+
+        member = self._cached_interaction_member(interaction)
+        if member is None or not self._has_reviewer_role(member):
+            return await self._reply_ephemeral(interaction, "Only reviewers can use these controls.")
 
         async with self._review_lock:
             target_kind, row = await self._review_target_by_message(interaction.guild.id, message_id)

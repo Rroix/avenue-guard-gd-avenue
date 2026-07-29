@@ -79,7 +79,8 @@
 ## 7) Help: DM menu gating
 1. DM the bot.
    - Expected: help dashboard embed + select menu.
-   - Expected: dashboard shows active ticket status, weekly activity, live request state, recent help submissions, and cooldowns.
+   - Expected: dashboard shows weekly activity, plus active tickets and recent support only when they exist.
+   - Expected: level request information appears only if you submitted in the current wave, with its result and review-message link.
    - Expected: the dashboard menu does not include a Dashboard option.
 2. If you are currently in weekly request DM flow (pending), DM the bot.
    - Expected: help menu should NOT interrupt.
@@ -92,12 +93,12 @@
 
 ## 8) Help: FAQ
 1. DM bot → select `FAQ`
-   - Expected: embed with FAQ entries.
-   - Expected: the previous dashboard message is deleted and the FAQ menu does not include FAQ.
-2. DM bot → select `Search FAQ`, then type `request`.
-   - Expected: matching FAQ entries appear with Back/Cancel/Start Over controls.
-3. DM bot outside a flow with `faq collab`.
-   - Expected: matching FAQ entries appear directly and the menu does not include Search FAQ.
+   - Expected: a clean FAQ page with up to four entries and Previous/Next/Back controls.
+   - Expected: the previous dashboard message is deleted.
+2. Press `Next`, then `Previous`.
+   - Expected: the old FAQ page is deleted and the requested page replaces it.
+3. Send a normal DM containing a word that appears in the FAQ.
+   - Expected: the dashboard appears; the bot does not interpret free text as an FAQ search.
 
 ---
 
@@ -106,14 +107,44 @@
 2. Reply with your punishment details.
    - Expected: the next appeal step appears with Back/Cancel/Start Over controls.
 3. Reply with why it should be lifted.
-   - Expected: preview embed appears with Submit/Edit/Cancel/Start Over buttons.
-4. Press Edit.
-   - Expected: bot lets you rewrite the appeal reason before staff sees it.
-5. Press Submit.
+   - Expected: the bot asks what will change in your behavior if the punishment is revoked.
+4. Reply with the expected behavior change.
+   - Expected: preview embed includes all three answers and Submit/Edit/Cancel/Start Over buttons.
+5. Press Edit.
+   - Expected: the appeal restarts from its first question so all three answers can be corrected.
+6. Press Submit.
    - Expected: confirmation DM includes a tracked ID like `A-12`.
    - Expected: structured staff-log embed posted to `channels.appeals_log_channel_id` with the same ID and attachment links if included.
-6. As staff, reply to the staff-log embed.
+7. As staff, reply to the staff-log embed.
    - Expected: bot DMs the response to the submitter and marks the log as responded.
+
+---
+
+## 9A) Help: Partnership
+1. DM bot → select `Wanna partner?`
+   - Expected: a concise requirements confirmation appears.
+2. Press `Not now`.
+   - Expected: the confirmation is deleted and the support dashboard returns.
+3. Open it again and press `Yes, contact the team`.
+   - Expected: a private partnership ticket is created.
+   - Expected: only `tickets.partnership_ping_role_id` is pinged; the normal ticket staff role is not pinged.
+   - Expected: both the mod role and partnership role can view the ticket.
+
+---
+
+## 9B) Help: Former-member ban support
+1. From an account that is not in GD Avenue, DM the bot.
+   - Expected: the join link and ban-help explanation appear with only `Appeal ban` and `I don't know why I was banned`.
+2. Complete `Appeal ban`.
+   - Expected: the same three-step appeal and staff preview work without guild membership.
+3. Select `I don't know why I was banned`.
+   - Expected: the user receives a patience message and staff receives a durable `BI-<id>` embed with known bot history.
+4. As staff, press `Give info`.
+   - Expected: a modal accepts optional Reason, Date, Evidence links, Notes, and up to three evidence files.
+5. Submit the modal, inspect the confirmation, then press `Yes, send it`.
+   - Expected: only populated fields are DMed to the user, attached evidence is included, and the staff button is disabled.
+6. Repeat with every modal field empty.
+   - Expected: the user receives the configured fallback explanation without empty field labels.
 
 ---
 
@@ -150,7 +181,7 @@
 ## 13) Tickets: Mod contact + cooldown
 **Setup:** ticket category + mod role + logging channel.
 1. DM bot → select `Contact staff`
-   - Expected: a compact FAQ suggestion embed appears with topic buttons for Moderation, Level requests, Server help, Other, and Cancel.
+   - Expected: a concise topic panel appears with Moderation, Level requests, Server help, Other, and navigation controls.
 2. Choose `Level requests`.
    - Expected: ticket channel created under category with the topic in the channel name/opening message.
    - Expected: the opening message shows `Status: Waiting for staff`.

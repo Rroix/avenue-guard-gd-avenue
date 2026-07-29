@@ -20,6 +20,7 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         "level_request_state",
         "level_request_submissions",
         "weekly_request_reviews",
+        "ban_info_requests",
         "daily_stats",
         "impact_snapshots",
         "runtime_settings",

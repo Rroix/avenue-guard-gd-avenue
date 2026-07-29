@@ -38,9 +38,9 @@ The weekly system also tracks streaks, so members who stay active across multipl
 
 ## Help, Reports, Appeals, And Tickets
 
-Avenue Guard includes an in DMs help system. Members can open a private help menu, search FAQ entries, check basic status information, submit appeals, report users, report bot issues, request transcripts, or create a private staff ticket.
+Avenue Guard includes an in-DMs help system. Members can browse a paginated FAQ, check concise personal status information, submit appeals, report users, report bot issues, request transcripts, contact the partnership team, or create a private staff ticket. A member who has submitted a level in the current request wave also sees its latest review status and a direct link to the staff review card.
 
-The help flow is designed to reduce confusion. Before opening a ticket, the bot can suggest relevant FAQ entries to avoid any unnecessary pings. If the member still needs help, the bot can create a private channel between the member and staff. Tickets have statuses such as waiting for user, waiting for staff, and resolved to help index and distribute for staff.
+The help flow is designed to reduce confusion. Each page keeps its choices short, old panels are removed as the user moves forward, and any appeal or report is previewed before it reaches staff. Former members are not locked out of support: they can appeal a ban or ask staff to retrieve the available reason, date, evidence, and notes through a dedicated private workflow. Partnership requests use their own confirmation and notify the partnership team instead of the normal ticket ping. Tickets have statuses such as waiting for user, waiting for staff, and resolved to help staff organize their queue.
 
 When a ticket closes, Avenue Guard saves a transcript before deleting the channel. It can also ask for satisfaction feedback, which helps measure whether support workflows are actually helping members. This makes tickets more accountable and easier to review later as well as any necessary proof of interactions.
 

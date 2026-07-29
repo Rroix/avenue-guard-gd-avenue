@@ -625,6 +625,25 @@ class Database:
                 responded_by INTEGER,
                 responded_ts INTEGER
             );""",
+            """CREATE TABLE IF NOT EXISTS ban_info_requests(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL,
+                log_channel_id INTEGER,
+                log_message_id INTEGER,
+                handled_by INTEGER,
+                reason TEXT,
+                ban_date TEXT,
+                evidence_text TEXT,
+                evidence_files_json TEXT NOT NULL DEFAULT '[]',
+                notes TEXT,
+                history_json TEXT NOT NULL DEFAULT '{}',
+                delivered_ts INTEGER,
+                error_text TEXT
+            );""",
             """CREATE TABLE IF NOT EXISTS transcript_requests(
                 guild_id INTEGER NOT NULL,
                 request_message_id INTEGER PRIMARY KEY,
@@ -792,6 +811,11 @@ class Database:
                 ON help_submissions(guild_id, user_id, status, created_ts DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_help_submissions_log_message
                 ON help_submissions(guild_id, log_channel_id, log_message_id);""",
+            """CREATE INDEX IF NOT EXISTS idx_ban_info_requests_user_status
+                ON ban_info_requests(guild_id, user_id, status, created_ts DESC);""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_ban_info_requests_log_message
+                ON ban_info_requests(guild_id, log_channel_id, log_message_id)
+                WHERE log_message_id IS NOT NULL;""",
             """CREATE INDEX IF NOT EXISTS idx_impact_snapshots_guild
                 ON impact_snapshots(guild_id, snapshot_ts DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_database_backups_guild

@@ -16,6 +16,8 @@ from utils.views import (
     TrackingDeclineConfirmView,
     TicketClosePromptView,
     HelpMenuView,
+    FormerMemberHelpView,
+    BanInfoGiveInfoView,
     TranscriptRequestView,
     LevelRequestButtonView,
     LevelRequestReviewView,
@@ -318,6 +320,8 @@ def create_bot() -> discord.Bot:
         bot.add_view(TrackingDeclineConfirmView())
         bot.add_view(TicketClosePromptView())
         bot.add_view(HelpMenuView())
+        bot.add_view(FormerMemberHelpView())
+        bot.add_view(BanInfoGiveInfoView())
         bot.add_view(TranscriptRequestView())
         bot.add_view(LevelRequestButtonView())
         bot.add_view(LevelRequestReviewView())

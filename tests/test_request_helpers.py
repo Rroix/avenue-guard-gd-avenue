@@ -134,3 +134,52 @@ async def test_modal_edit_lookup_uses_open_wave_or_persisted_grace_deadline(tmp_
     )
     assert await cog._editable_user_submission_for_modal(717, 42) is not None
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_review_modal_lookup_uses_one_valid_local_query(tmp_path):
+    db = Database(str(tmp_path / "review-target.db"))
+    await db.connect()
+    await db.execute(
+        "INSERT INTO level_request_submissions("
+        "guild_id,wave_id,user_id,level_id,status,created_ts,data_json,request_message_id"
+        ") VALUES(?,?,?,?,?,?,?,?)",
+        (717, 4, 42, "111111111", "pending", 2_000, "{}", 9_001),
+    )
+
+    cog = make_cog()
+    cog.bot.db = db
+    target_kind, row = await cog._review_target_by_message_local(717, 9_001)
+
+    assert target_kind == "wave"
+    assert row["status"] == "pending"
+    assert await cog._review_target_by_message_local(717, 9_002) == ("", None)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_first_request_choice_opens_modal_before_role_api_call():
+    events = []
+    role = SimpleNamespace(id=55)
+
+    async def add_roles(*args, **kwargs):
+        events.append("role")
+
+    async def send_modal(modal):
+        events.append("modal")
+
+    member = SimpleNamespace(id=42, roles=[], add_roles=add_roles)
+    guild = SimpleNamespace(get_role=lambda role_id: role if role_id == 55 else None)
+    interaction = SimpleNamespace(
+        guild=guild,
+        user=SimpleNamespace(id=42),
+        response=SimpleNamespace(send_modal=send_modal),
+    )
+    cog = make_cog()
+    cog._cached_interaction_member = lambda _: member
+    cog._cfg_int = lambda *args, **kwargs: 55
+    cog.bot = SimpleNamespace(config=FakeConfig())
+
+    await cog.handle_first_choice(interaction)
+
+    assert events == ["modal", "role"]

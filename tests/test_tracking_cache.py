@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import asyncio
 
 import pytest
 
@@ -137,3 +138,51 @@ async def test_weekly_reward_disable_and_enable_persist_and_restore_workflow_sta
     assert session["stage"] == "awaiting_request"
     assert cog._log_weekly.await_count == 2
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_decline_confirmation_defers_before_database_work():
+    events = []
+
+    class Response:
+        def __init__(self):
+            self.done = False
+
+        def is_done(self):
+            return self.done
+
+        async def defer(self, **kwargs):
+            events.append("defer")
+            self.done = True
+
+        async def send_message(self, *args, **kwargs):
+            events.append("initial_response")
+            self.done = True
+
+    class Followup:
+        async def send(self, *args, **kwargs):
+            events.append("followup")
+
+    class EmptyDatabase:
+        async def fetchone(self, *args, **kwargs):
+            events.append("database")
+            return None
+
+    guild = SimpleNamespace(id=717)
+    cog = object.__new__(TrackingCog)
+    cog.bot = SimpleNamespace(
+        db=EmptyDatabase(),
+        get_guild=lambda guild_id: guild if guild_id == 717 else None,
+    )
+    cog._weekly_submit_lock = asyncio.Lock()
+    cog._cfg_int = lambda *args, **kwargs: 717
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=42),
+        message=SimpleNamespace(id=9_001),
+        response=Response(),
+        followup=Followup(),
+    )
+
+    await cog.handle_decline_confirm(interaction, confirmed=False)
+
+    assert events == ["defer", "database", "followup"]

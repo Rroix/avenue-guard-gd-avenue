@@ -555,6 +555,10 @@ class CommandsCog(commands.Cog):
                 "SELECT COALESCE(status, 'unknown') AS key, COUNT(*) AS value FROM transcript_requests "
                 "WHERE guild_id=? GROUP BY COALESCE(status, 'unknown') ORDER BY value DESC"
             ),
+            ("ban_info_requests", "status", ""): (
+                "SELECT COALESCE(status, 'unknown') AS key, COUNT(*) AS value FROM ban_info_requests "
+                "WHERE guild_id=? GROUP BY COALESCE(status, 'unknown') ORDER BY value DESC"
+            ),
         }
         sql = queries.get((str(table), str(column), str(extra_where)))
         if sql is None:
@@ -793,12 +797,13 @@ class CommandsCog(commands.Cog):
                 UNION SELECT user_id FROM weekly_request_reviews WHERE guild_id=?
                 UNION SELECT creator_id AS user_id FROM tickets WHERE guild_id=?
                 UNION SELECT user_id FROM help_submissions WHERE guild_id=?
+                UNION SELECT user_id FROM ban_info_requests WHERE guild_id=?
                 UNION SELECT requester_id AS user_id FROM transcript_requests WHERE guild_id=?
                 UNION SELECT user_id FROM level_request_submissions WHERE guild_id=?
                 UNION SELECT user_id FROM anti_farm_events WHERE guild_id=?
             ) WHERE user_id IS NOT NULL AND user_id>0
             """,
-            (guild_id,) * 10,
+            (guild_id,) * 11,
         )
         unique_user_ids = {
             int(row["user_id"])
@@ -928,6 +933,14 @@ class CommandsCog(commands.Cog):
             "SELECT COUNT(*) AS value FROM help_submissions WHERE guild_id=?",
             (guild_id,),
         )
+        ban_info_requests = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM ban_info_requests WHERE guild_id=?",
+            (guild_id,),
+        )
+        ban_info_delivered = await self._impact_scalar(
+            "SELECT COUNT(*) AS value FROM ban_info_requests WHERE guild_id=? AND status='delivered'",
+            (guild_id,),
+        )
         transcript_requests = await self._impact_scalar(
             "SELECT COUNT(*) AS value FROM transcript_requests WHERE guild_id=?",
             (guild_id,),
@@ -982,6 +995,7 @@ class CommandsCog(commands.Cog):
             + int(weekly_dm_logs)
             + int(tickets)
             + int(help_submissions)
+            + int(ban_info_requests)
             + int(transcript_requests)
             + int(transcripts_saved)
             + int(request_edits)
@@ -991,7 +1005,7 @@ class CommandsCog(commands.Cog):
             + int(database_restores)
         )
 
-        support_items = int(tickets) + int(help_submissions) + int(transcript_requests)
+        support_items = int(tickets) + int(help_submissions) + int(ban_info_requests) + int(transcript_requests)
         level_requests_total = int(live_requests) + int(weekly_reviews)
         current_members = int(getattr(guild, "member_count", 0) or 0)
         cached_members = len(getattr(guild, "members", []) or [])
@@ -1069,6 +1083,9 @@ class CommandsCog(commands.Cog):
                 "help_submissions_total": int(help_submissions),
                 "help_kinds": await self._impact_group_counts("help_submissions", "kind", guild_id),
                 "help_statuses": await self._impact_group_counts("help_submissions", "status", guild_id),
+                "ban_info_requests_total": int(ban_info_requests),
+                "ban_info_delivered": int(ban_info_delivered),
+                "ban_info_statuses": await self._impact_group_counts("ban_info_requests", "status", guild_id),
                 "transcript_requests_total": int(transcript_requests),
                 "transcript_request_statuses": await self._impact_group_counts("transcript_requests", "status", guild_id),
             },
@@ -1266,6 +1283,7 @@ class CommandsCog(commands.Cog):
                 f"- Ticket transcripts saved: **{_fmt_num(support['ticket_transcripts_saved'])}**",
                 f"- Satisfaction responses: **{_fmt_num(support['satisfaction_responses'])}** with average **{support['satisfaction_average']}**",
                 f"- Help submissions: **{_fmt_num(support['help_submissions_total'])}**",
+                f"- Ban information requests: **{_fmt_num(support['ban_info_requests_total'])}** total, **{_fmt_num(support['ban_info_delivered'])}** delivered",
                 f"- Transcript requests: **{_fmt_num(support['transcript_requests_total'])}**",
                 "",
                 "## Weekly Rewards And Safety",
@@ -1323,6 +1341,7 @@ class CommandsCog(commands.Cog):
             value=(
                 f"Tickets: **{_fmt_num(support['tickets_total'])}**\n"
                 f"Help submissions: **{_fmt_num(support['help_submissions_total'])}**\n"
+                f"Ban info delivered: **{_fmt_num(support['ban_info_delivered'])}**\n"
                 f"Transcripts: **{_fmt_num(support['ticket_transcripts_saved'])}**"
             ),
             inline=True,
@@ -1993,6 +2012,11 @@ class CommandsCog(commands.Cog):
             issues.append("ticket category: bot cannot manage channels")
             repairs.append("Give the bot Manage Channels in the ticket category")
 
+        partnership_role_id = cfg.get_int("tickets", "partnership_ping_role_id", default=0)
+        if not partnership_role_id or guild.get_role(partnership_role_id) is None:
+            issues.append("partnership tickets: notification role is missing")
+            repairs.append("Set `tickets.partnership_ping_role_id` to the partnership team role")
+
         request_cog = self.bot.get_cog("RequestLevelsCog")
         if request_cog is None:
             issues.append("request system: cog not loaded")
@@ -2338,6 +2362,13 @@ class CommandsCog(commands.Cog):
                 issues.append(f"ticket staff ping role `{staff_ping_role_id}`: missing")
             else:
                 ok.append("ticket staff ping role: OK")
+        partnership_role_id = cfg.get_int("tickets", "partnership_ping_role_id", default=0)
+        if not partnership_role_id:
+            issues.append("partnership ticket role: not configured")
+        elif guild.get_role(partnership_role_id) is None:
+            issues.append(f"partnership ticket role `{partnership_role_id}`: missing")
+        else:
+            ok.append("partnership ticket role: OK")
 
         icon_cfg = ensure_server_icon_config(cfg)
         if me is not None and normalize_server_icon_mode(icon_cfg.get("mode")) != "disabled":
@@ -2613,6 +2644,10 @@ class CommandsCog(commands.Cog):
         staff_ping_role_id = cfg.get_int("tickets", "staff_ping_role_id", default=0)
         if staff_ping_role_id:
             check_role("tickets.staff_ping_role_id", staff_ping_role_id)
+        check_role(
+            "tickets.partnership_ping_role_id",
+            cfg.get_int("tickets", "partnership_ping_role_id", default=0),
+        )
         for key in ("request_channel", "level_requested", "sent_channel", "rejected_channel"):
             check_channel(f"level_requests.{key}", cfg.get_int("level_requests", key), discord.TextChannel)
         check_channel(

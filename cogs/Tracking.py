@@ -59,6 +59,11 @@ class TrackingCog(commands.Cog):
         self._anti_farm_cache: dict[tuple[int, int], list[tuple[int, str]]] = {}
         self._anti_farm_last_log: dict[tuple[int, int, str], int] = {}
 
+    async def _respond_interaction(self, interaction: discord.Interaction, content: str, **kwargs):
+        if interaction.response.is_done():
+            return await interaction.followup.send(content, **kwargs)
+        return await interaction.response.send_message(content, **kwargs)
+
     # ----------------------------
     # Config helpers (robust)
     # ----------------------------
@@ -1042,11 +1047,13 @@ class TrackingCog(commands.Cog):
         allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
         guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
         if guild is None:
-            try:
-                await interaction.response.send_message("Guild not found.", ephemeral=True)
-            except Exception:
-                pass
+            await self._respond_interaction(interaction, "Guild not found.", ephemeral=True)
             return
+
+        # Turso recovery can take longer than Discord's initial-response
+        # deadline. Reserve the interaction before taking locks or reading.
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
 
         async with self._weekly_submit_lock:
             row = await self.bot.db.fetchone(
@@ -1057,10 +1064,7 @@ class TrackingCog(commands.Cog):
                 (guild.id, interaction.user.id, int(getattr(interaction.message, "id", 0) or 0)),
             )
             if not row:
-                try:
-                    await interaction.response.send_message("No pending confirmation found.", ephemeral=True)
-                except Exception:
-                    pass
+                await self._respond_interaction(interaction, "No pending confirmation found.", ephemeral=True)
                 return
 
             week_start_iso = row["week_start"]
@@ -1075,10 +1079,11 @@ class TrackingCog(commands.Cog):
                     await interaction.message.edit(content="Weekly request resumed.", view=None)
                 except Exception:
                     pass
-                try:
-                    await interaction.response.send_message("Request resumed, please send your request with the format!", ephemeral=True)
-                except Exception:
-                    pass
+                await self._respond_interaction(
+                    interaction,
+                    "Request resumed, please send your request with the format!",
+                    ephemeral=True,
+                )
                 return
 
             await self.bot.db.execute_transaction(
@@ -1100,10 +1105,11 @@ class TrackingCog(commands.Cog):
         except Exception:
             pass
         await self._log_weekly(guild, week_start_iso, interaction.user.id, "declined", "User confirmed decline")
-        try:
-            await interaction.response.send_message("Confirmed. Offering the request to the next eligible member.", ephemeral=True)
-        except Exception:
-            pass
+        await self._respond_interaction(
+            interaction,
+            "Confirmed. Offering the request to the next eligible member.",
+            ephemeral=True,
+        )
         await self._contact_next_eligible(guild, week_start_iso)
 
     # ----------------------------

@@ -70,13 +70,16 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Stores request state, request button message ID, wave count, submitted users, and submitted level IDs in SQLite so restarts do not wipe the wave.
 
 ### Help Menu And Staff Tickets
-- DMs members a help dashboard with active tickets, weekly activity, live request state, recent help submissions, and cooldowns.
+- DMs members a compact help dashboard with active tickets, weekly activity, recent support, and their current-wave level request when one exists.
+- Shows the user's current level as pending, accepted, rejected, or rejected for a specific reason, with a direct link to the review message.
 - Supports Back, Cancel, and Start Over controls during active DM help flows.
 - Cleans up the previous DM help screen when members select a new option, press a flow button, cancel, or start over.
 - Hides the current help screen from the menu so members are not offered the same page they are already viewing.
-- Supports FAQ browsing and keyword search from the menu or by typing phrases like `faq request`.
-- Suggests relevant FAQ entries before opening a staff ticket.
-- Supports FAQ, punishment appeals, user reports, bot issue reports, weekly status checks, transcript requests, and staff contact tickets.
+- Presents the configured FAQ as short paginated pages without intercepting normal DM text as a search query.
+- Supports FAQ, three-step punishment appeals, user reports, bot issue reports, weekly status checks, transcript requests, partnership requests, and staff contact tickets.
+- Lets former members appeal a server ban or ask staff to retrieve their ban information without being in the guild.
+- Gives staff a persistent ban-information control with optional reason, date, evidence links, notes, and modal file uploads, followed by a delivery preview and DM.
+- Routes partnership tickets only to the configured partnership role while retaining normal moderator visibility.
 - Appeals, reports, and bot issue reports show a preview before submission, keep attachment links, receive tracked IDs, and can be checked later from My submissions.
 - Staff can reply to a tracked appeal/report/bug log embed to relay a response back to the submitter by DM.
 - Creates routed private ticket channels for the requester and staff, using the selected topic in the ticket name and opening message.
@@ -219,7 +222,7 @@ Use `off`, `disable`, `none`, or `clear` as the word to disable enforcement for 
 
 - `config.json` controls guild IDs, roles, channels, live request waves, review-access agreement gating, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, server icon rotation, persistent database storage, automatic database backups, background summaries, and impact report exports.
 - `responses.json` controls automatic message responses.
-- The configured SQLite path stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, help submissions, tickets, cooldowns, transcript pointers, reminders, daily stats, impact snapshots, and database backup records.
+- The configured database stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, help submissions, ban-information requests, tickets, cooldowns, transcript pointers, reminders, daily stats, impact snapshots, and database backup records.
 
 ### Database And Backup Config
 
@@ -256,6 +259,18 @@ Server icon rotation lives under `background.server_icon_rotation` in `config.js
 - `urls`: direct image URLs used for the server icon.
 - `current_index`, `current_url`, and `last_changed_ts`: saved state used by the rotation loop.
 - `last_error` and `last_error_ts`: the most recent rotation failure shown in `/server_icon status`.
+
+### Help And Ticket Config
+
+DM support and ticket routing use the `help` and `tickets` sections in `config.json`.
+
+- `help.faq.entries`: the paginated FAQ shown in DMs. Normal messages are not interpreted as searches.
+- `help.partnership.requirements_message`: the confirmation text shown before opening a partnership ticket.
+- `help.ban_info_max_evidence_mb`: the combined evidence-file memory limit while staff previews ban information.
+- `help.session_timeout_seconds`: how long an unfinished appeal, report, bug, or transcript flow remains active.
+- `tickets.partnership_ping_role_id`: the only role mentioned when a partnership ticket opens. The normal moderator role still receives channel access without being pinged.
+- `tickets.staff_ping_role_id`: the notification role used for ordinary staff tickets.
+- Ban-information requests and their delivery states are stored in `ban_info_requests`, so pending staff work survives restarts.
 
 ### Level Request Config
 
