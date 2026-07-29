@@ -104,18 +104,21 @@
 
 ## 9) Help: Appeal punishment
 1. DM bot → select `Appeal punishment`
-2. Reply with your punishment details.
+   - Expected: the opening panel has `Start` and `Cancel`; it does not show a disabled Back button.
+2. Press `Start`.
+   - Expected: the opening panel is deleted and the first question appears.
+3. Reply with your punishment details.
    - Expected: the next appeal step appears with Back/Cancel/Start Over controls.
-3. Reply with why it should be lifted.
+4. Reply with why it should be lifted.
    - Expected: the bot asks what will change in your behavior if the punishment is revoked.
-4. Reply with the expected behavior change.
+5. Reply with the expected behavior change.
    - Expected: preview embed includes all three answers and Submit/Edit/Cancel/Start Over buttons.
-5. Press Edit.
+6. Press Edit.
    - Expected: the appeal restarts from its first question so all three answers can be corrected.
-6. Press Submit.
+7. Press Submit.
    - Expected: confirmation DM includes a tracked ID like `A-12`.
    - Expected: structured staff-log embed posted to `channels.appeals_log_channel_id` with the same ID and attachment links if included.
-7. As staff, reply to the staff-log embed.
+8. As staff, reply to the staff-log embed.
    - Expected: bot DMs the response to the submitter and marks the log as responded.
 
 ---
@@ -150,7 +153,7 @@
 
 ## 10) Help: Report user/message
 1. DM bot → select `Report a user/message`
-2. Reply with message link or user ID + reason.
+2. Press `Start`, then reply with a message link or user ID + reason.
    - Expected: preview embed appears before staff sees it.
 3. Press Submit.
    - Expected: confirmation DM includes a tracked ID like `R-12`.
@@ -162,7 +165,7 @@
 
 ## 11) Help: Report bot issue
 1. DM bot → select `Report a bot issue`
-2. Reply with the issue details and attach a screenshot if useful.
+2. Press `Start`, then reply with the issue details and attach a screenshot if useful.
    - Expected: preview embed appears before staff sees it and includes attachment links.
 3. Press Submit.
    - Expected: confirmation DM includes a tracked ID like `B-12`.
@@ -215,7 +218,7 @@
 ## 15) Help: Transcript requests (staff approval)
 1. Create a ticket (so you have a ticket channel)
 2. DM bot → select `Request transcript`
-3. Reply with the ticket channel mention or ID.
+3. Press `Start`, then reply with the ticket channel mention, channel ID, or short Ticket ID such as `T3`.
    - Expected: structured transcript request embed posted in `channels.transcript_requests_channel_id` with Approve/Deny buttons.
 4. As a mod, press Approve
    - Expected: user receives transcript file in DM

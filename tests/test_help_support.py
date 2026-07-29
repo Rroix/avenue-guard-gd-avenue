@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cogs.Help import BanInfoModal, HelpCog
+from cogs.Help import BanInfoModal, HelpCog, HelpSessionControlView
 from utils.db import Database
 from utils.views import FormerMemberHelpView, HelpMenuView
 
@@ -44,6 +44,7 @@ class FakeConfig:
 def make_cog(db=None):
     cog = object.__new__(HelpCog)
     cog.bot = SimpleNamespace(config=FakeConfig(), db=db)
+    cog._last_error_log = {}
     return cog
 
 
@@ -72,6 +73,15 @@ async def test_ban_information_modal_serializes_file_upload():
     assert len(payload["components"]) == 5
     assert payload["components"][-1]["component"]["type"] == 19
     assert payload["components"][-1]["component"]["required"] is False
+
+
+@pytest.mark.asyncio
+async def test_initial_help_flow_has_start_and_no_dead_navigation_buttons():
+    initial = HelpSessionControlView(make_cog(), 42, 717, allow_back=False, show_start=True)
+    assert [item.label for item in initial.children] == ["Start", "Cancel"]
+
+    active = HelpSessionControlView(make_cog(), 42, 717, allow_back=False)
+    assert [item.label for item in active.children] == ["Cancel", "Start over"]
 
 
 @pytest.mark.asyncio
@@ -211,6 +221,104 @@ async def test_single_answer_support_flows_continue_to_preview(tmp_path, stage, 
     assert handled is True
     assert row["stage"] == f"preview_{kind}"
     assert channel.send.await_args.kwargs["embed"].title.startswith("Review ")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_live_session_cache_survives_stale_turso_read():
+    class StaleReplica:
+        execute = AsyncMock()
+        fetchone_local = AsyncMock(return_value=None)
+        fetchone = AsyncMock(return_value=None)
+
+    db = StaleReplica()
+    cog = make_cog(db)
+    guild = SimpleNamespace(id=717)
+    channel = SimpleNamespace(send=AsyncMock())
+    author = SimpleNamespace(id=42)
+
+    await cog._start_help_session(author.id, guild.id, "report_details", {})
+    handled = await cog._handle_help_session_message(
+        guild,
+        SimpleNamespace(
+            author=author,
+            content="User 123 repeatedly posted abusive messages",
+            attachments=[],
+            channel=channel,
+        ),
+    )
+
+    assert handled is True
+    assert db.fetchone_local.await_count == 0
+    assert cog._help_session_cache[(guild.id, author.id)]["stage"] == "preview_report"
+    assert channel.send.await_args.kwargs["embed"].title == "Review Report"
+
+
+@pytest.mark.asyncio
+async def test_live_session_continues_during_transient_storage_failure():
+    class FailingReplica:
+        execute = AsyncMock(side_effect=RuntimeError("temporary Turso outage"))
+        fetchone_local = AsyncMock(side_effect=RuntimeError("temporary Turso outage"))
+        fetchone = AsyncMock(side_effect=RuntimeError("temporary Turso outage"))
+
+    cog = make_cog(FailingReplica())
+    cog._log_background_error = AsyncMock()
+    guild = SimpleNamespace(id=717)
+    channel = SimpleNamespace(send=AsyncMock())
+    author = SimpleNamespace(id=42)
+
+    await cog._start_help_session(author.id, guild.id, "bot_issue_details", {})
+    handled = await cog._handle_help_session_message(
+        guild,
+        SimpleNamespace(
+            author=author,
+            content="The request button stopped responding",
+            attachments=[],
+            channel=channel,
+        ),
+    )
+
+    assert handled is True
+    assert cog._help_session_cache[(guild.id, author.id)]["stage"] == "preview_bot_issue"
+    assert channel.send.await_args.kwargs["embed"].title == "Review Bot issue"
+
+
+@pytest.mark.asyncio
+async def test_transcript_session_accepts_short_ticket_code(tmp_path):
+    db = Database(str(tmp_path / "transcript-flow.db"))
+    await db.connect()
+    await db.execute(
+        "INSERT INTO tickets(guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,ticket_id) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (717, 999, 42, 1, 1, "closed", 3),
+    )
+    cog = make_cog(db)
+    cog._create_transcript_request = AsyncMock(return_value=(True, ""))
+    cog._touch_help_cooldown = AsyncMock()
+    guild = SimpleNamespace(id=717)
+    channel = SimpleNamespace(send=AsyncMock())
+    author = SimpleNamespace(id=42)
+
+    await cog._start_help_session(author.id, guild.id, "transcript_ticket", {})
+    handled = await cog._handle_help_session_message(
+        guild,
+        SimpleNamespace(
+            author=author,
+            content="T3",
+            attachments=[],
+            channel=channel,
+        ),
+    )
+
+    assert handled is True
+    cog._create_transcript_request.assert_awaited_once_with(
+        guild,
+        requester_id=author.id,
+        ticket_channel_id=999,
+        ticket_id=3,
+    )
+    assert "sent to staff" in channel.send.await_args.args[0]
+    assert await cog._get_help_session(author.id, guild.id) is None
     await db.close()
 
 

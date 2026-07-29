@@ -62,20 +62,39 @@ def _ticket_status_label(value: Any) -> str:
 
 
 class HelpSessionControlView(discord.ui.View):
-    def __init__(self, cog, user_id: int, guild_id: int, allow_back: bool = True):
+    def __init__(
+        self,
+        cog,
+        user_id: int,
+        guild_id: int,
+        allow_back: bool = True,
+        show_start: bool = False,
+    ):
         super().__init__(timeout=900)
         self.cog = cog
         self.user_id = int(user_id)
         self.guild_id = int(guild_id)
-        for item in self.children:
-            if getattr(item, "label", "") == "Back":
-                item.disabled = not allow_back
+        for item in list(self.children):
+            label = getattr(item, "label", "")
+            should_remove = (
+                (label == "Start" and not show_start)
+                or (label == "Back" and not allow_back)
+                or (label == "Start over" and show_start)
+            )
+            if should_remove:
+                self.remove_item(item)
 
     async def _allowed(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This help flow is not for you.", ephemeral=True)
             return False
         return True
+
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.primary)
+    async def start(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if not await self._allowed(interaction):
+            return
+        await self.cog.handle_help_session_control(interaction, self.guild_id, "start")
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
     async def back(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -426,6 +445,9 @@ class HelpCog(commands.Cog):
         self._satisfaction_lock = asyncio.Lock()
         self._satisfaction_views_registered = False
         self._ban_info_lock = asyncio.Lock()
+        self._help_session_cache: Dict[tuple[int, int], Dict[str, Any]] = {}
+        self._help_session_locks: Dict[tuple[int, int], asyncio.Lock] = {}
+        self._help_session_tombstones: Dict[tuple[int, int], int] = {}
 
     def cog_unload(self) -> None:
         if self._ticket_scan_task and not self._ticket_scan_task.done():
@@ -803,8 +825,15 @@ class HelpCog(commands.Cog):
 
             if member is not None:
                 tracking = self.bot.get_cog("TrackingCog")
-                if tracking and await tracking.user_in_weekly_process(message.author.id):
-                    return
+                if tracking:
+                    try:
+                        if await tracking.user_in_weekly_process(message.author.id):
+                            return
+                    except Exception as e:
+                        await self._log_background_error(
+                            "dm_weekly_session_check",
+                            f"Weekly DM session check failed for user_id={message.author.id}: {e!r}",
+                        )
 
             if await self._handle_help_session_message(guild, message):
                 return
@@ -1138,9 +1167,16 @@ class HelpCog(commands.Cog):
                     else "What punishment are you appealing, and what happened? Attach screenshots if they help."
                 ),
             )
+            embed.set_footer(text="Press Start, or send your first answer as your next DM")
             return await interaction.channel.send(
                 embed=embed,
-                view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
+                view=HelpSessionControlView(
+                    self,
+                    interaction.user.id,
+                    guild.id,
+                    allow_back=False,
+                    show_start=True,
+                ),
                 allowed_mentions=no_mentions(),
             )
 
@@ -1157,9 +1193,16 @@ class HelpCog(commands.Cog):
 
             await self._start_help_session(interaction.user.id, guild.id, "report_details", {})
             embed = self._help_embed(title="Report a user", description=text, color="orange")
+            embed.set_footer(text="Press Start, or send the report as your next DM")
             return await interaction.channel.send(
                 embed=embed,
-                view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
+                view=HelpSessionControlView(
+                    self,
+                    interaction.user.id,
+                    guild.id,
+                    allow_back=False,
+                    show_start=True,
+                ),
                 allowed_mentions=no_mentions(),
             )
 
@@ -1174,9 +1217,16 @@ class HelpCog(commands.Cog):
                 title="Report a bot issue",
                 description="Describe what broke, where it happened, and the steps to reproduce it. Attach screenshots if useful. You will preview before staff sees it.",
             )
+            embed.set_footer(text="Press Start, or send the issue as your next DM")
             return await interaction.channel.send(
                 embed=embed,
-                view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
+                view=HelpSessionControlView(
+                    self,
+                    interaction.user.id,
+                    guild.id,
+                    allow_back=False,
+                    show_start=True,
+                ),
                 allowed_mentions=no_mentions(),
             )
 
@@ -1191,9 +1241,16 @@ class HelpCog(commands.Cog):
                 title="Request transcript",
                 description="Send your **ticket channel** (mention like <#123> or ID), or your **Ticket ID** (example: `T21`).\n\nType **cancel** to stop.",
             )
+            embed.set_footer(text="Press Start, or send the ticket reference as your next DM")
             return await interaction.channel.send(
                 embed=embed,
-                view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=False),
+                view=HelpSessionControlView(
+                    self,
+                    interaction.user.id,
+                    guild.id,
+                    allow_back=False,
+                    show_start=True,
+                ),
                 allowed_mentions=no_mentions(),
             )
 
@@ -1311,38 +1368,178 @@ class HelpCog(commands.Cog):
     # -----------------------------
     # Help sessions
     # -----------------------------
-    async def _start_help_session(self, user_id: int, guild_id: int, stage: str, data: Dict[str, Any]):
-        await self.bot.db.execute(
-            "INSERT INTO help_sessions(guild_id,user_id,stage,created_ts,data_json) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(guild_id,user_id) DO UPDATE SET stage=excluded.stage, created_ts=excluded.created_ts, data_json=excluded.data_json",
-            (guild_id, user_id, stage, int(time.time()), json.dumps(data)),
-        )
+    def _help_session_cache_store(self) -> Dict[tuple[int, int], Dict[str, Any]]:
+        cache = getattr(self, "_help_session_cache", None)
+        if cache is None:
+            cache = {}
+            self._help_session_cache = cache
+        return cache
 
-    async def _clear_help_session(self, user_id: int, guild_id: int):
-        await self.bot.db.execute("DELETE FROM help_sessions WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+    def _help_session_lock(self, guild_id: int, user_id: int) -> asyncio.Lock:
+        locks = getattr(self, "_help_session_locks", None)
+        if locks is None:
+            locks = {}
+            self._help_session_locks = locks
+        key = (int(guild_id), int(user_id))
+        lock = locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = lock
+        return lock
 
-    async def _get_help_session(self, user_id: int, guild_id: int) -> Optional[Dict[str, Any]]:
-        row = await self.bot.db.fetchone(
-            "SELECT stage, created_ts, data_json FROM help_sessions WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id),
-        )
-        if not row:
-            return None
+    def _help_session_tombstone_store(self) -> Dict[tuple[int, int], int]:
+        tombstones = getattr(self, "_help_session_tombstones", None)
+        if tombstones is None:
+            tombstones = {}
+            self._help_session_tombstones = tombstones
+        return tombstones
+
+    def _help_session_lifetime(self) -> int:
         try:
-            lifetime = max(
+            return max(
                 300,
                 min(24 * 3600, int(self.bot.config.get("help", "session_timeout_seconds", default=3600) or 3600)),
             )
         except Exception:
-            lifetime = 3600
-        if int(time.time()) - int(row["created_ts"] or 0) > lifetime:
+            return 3600
+
+    async def _log_help_session_storage_error(self, action: str, user_id: int, exc: Exception) -> None:
+        try:
+            await self._log_background_error(
+                f"help_session_{action}",
+                f"Help session {action} failed for user_id={user_id}; using live memory state: {exc!r}",
+            )
+        except Exception:
+            pass
+
+    async def _start_help_session(self, user_id: int, guild_id: int, stage: str, data: Dict[str, Any]):
+        user_id = int(user_id)
+        guild_id = int(guild_id)
+        created_ts = int(time.time())
+        payload = json.loads(json.dumps(data))
+        self._help_session_tombstone_store().pop((guild_id, user_id), None)
+        self._help_session_cache_store()[(guild_id, user_id)] = {
+            "stage": str(stage),
+            "created_ts": created_ts,
+            "data": payload,
+        }
+        try:
+            await self.bot.db.execute(
+                "INSERT INTO help_sessions(guild_id,user_id,stage,created_ts,data_json) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(guild_id,user_id) DO UPDATE SET stage=excluded.stage, created_ts=excluded.created_ts, data_json=excluded.data_json",
+                (guild_id, user_id, stage, created_ts, json.dumps(payload)),
+            )
+        except Exception as e:
+            await self._log_help_session_storage_error("save", user_id, e)
+
+    async def _clear_help_session(self, user_id: int, guild_id: int):
+        user_id = int(user_id)
+        guild_id = int(guild_id)
+        key = (guild_id, user_id)
+        self._help_session_cache_store().pop(key, None)
+        self._help_session_tombstone_store()[key] = int(time.time())
+        try:
+            await self.bot.db.execute(
+                "DELETE FROM help_sessions WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id),
+            )
+        except Exception as e:
+            await self._log_help_session_storage_error("clear", user_id, e)
+
+    async def _get_help_session(self, user_id: int, guild_id: int) -> Optional[Dict[str, Any]]:
+        user_id = int(user_id)
+        guild_id = int(guild_id)
+        key = (guild_id, user_id)
+        cleared_ts = self._help_session_tombstone_store().get(key)
+        if cleared_ts is not None:
+            if int(time.time()) - int(cleared_ts) <= self._help_session_lifetime():
+                return None
+            self._help_session_tombstone_store().pop(key, None)
+        cached = self._help_session_cache_store().get(key)
+        if cached is not None:
+            if int(time.time()) - int(cached.get("created_ts") or 0) <= self._help_session_lifetime():
+                return {
+                    "stage": str(cached.get("stage") or ""),
+                    "data": dict(cached.get("data") or {}),
+                }
+            await self._clear_help_session(user_id, guild_id)
+            return None
+
+        reader = getattr(self.bot.db, "fetchone_local", self.bot.db.fetchone)
+        try:
+            row = await reader(
+                "SELECT stage, created_ts, data_json FROM help_sessions WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id),
+            )
+        except Exception as e:
+            await self._log_help_session_storage_error("load", user_id, e)
+            return None
+        if not row:
+            return None
+        if int(time.time()) - int(row["created_ts"] or 0) > self._help_session_lifetime():
             await self._clear_help_session(user_id, guild_id)
             return None
         try:
             data = json.loads(row["data_json"] or "{}")
         except Exception:
             data = {}
-        return {"stage": str(row["stage"]), "data": data}
+        session = {
+            "stage": str(row["stage"]),
+            "created_ts": int(row["created_ts"] or 0),
+            "data": data,
+        }
+        self._help_session_cache_store()[key] = session
+        return {"stage": session["stage"], "data": dict(data)}
+
+    def _help_stage_prompt_embed(self, stage: str, data: Dict[str, Any]) -> discord.Embed:
+        if stage == "appeal_punishment":
+            ban_only = data.get("appeal_type") == "ban"
+            embed = self._help_embed(
+                "Appeal ban" if ban_only else "Appeal punishment",
+                (
+                    "Tell us what happened leading to your server ban. Attach screenshots if they help."
+                    if ban_only
+                    else "What punishment are you appealing, and what happened? Attach screenshots if they help."
+                ),
+                "gold",
+            )
+        elif stage == "appeal_reason":
+            embed = self._help_embed(
+                "Appeal punishment",
+                "Why should staff revoke this punishment? Add any context they should consider.",
+                "gold",
+            )
+        elif stage == "appeal_behavior":
+            embed = self._help_embed(
+                "One last question",
+                "What will change in your behavior if we revoke your punishment?",
+                "gold",
+            )
+        elif stage == "report_details":
+            text = (
+                "Send the message link if you have it, or the user ID/name, plus the reason and evidence. "
+                "Attach screenshots if useful. You will preview before staff sees it."
+            )
+            if bool(self.bot.config.get("help", "report_warning_enabled", default=True)):
+                text = "**False reports can lead to punishment.**\n\n" + text
+            embed = self._help_embed("Report a user", text, "orange")
+        elif stage == "bot_issue_details":
+            embed = self._help_embed(
+                "Report a bot issue",
+                "Describe what broke, where it happened, and the steps to reproduce it. "
+                "Attach screenshots if useful. You will preview before staff sees it.",
+                "blurple",
+            )
+        elif stage == "transcript_ticket":
+            embed = self._help_embed(
+                "Request transcript",
+                "Send your **ticket channel** (mention or channel ID), or your **Ticket ID** such as `T21`.",
+                "blurple",
+            )
+        else:
+            embed = self._help_embed("Continue support", "Send your answer as your next DM.", "blurple")
+        embed.set_footer(text="Send your answer as your next DM")
+        return embed
 
     def _preview_stage(self, kind: str) -> str:
         return f"preview_{kind}"
@@ -1516,6 +1713,11 @@ class HelpCog(commands.Cog):
             return 3000
 
     async def _handle_help_session_message(self, guild: discord.Guild, message: discord.Message) -> bool:
+        lock = self._help_session_lock(guild.id, message.author.id)
+        async with lock:
+            return await self._handle_help_session_message_locked(guild, message)
+
+    async def _handle_help_session_message_locked(self, guild: discord.Guild, message: discord.Message) -> bool:
         sess = await self._get_help_session(message.author.id, guild.id)
         if not sess:
             return False
@@ -1744,12 +1946,50 @@ class HelpCog(commands.Cog):
         if guild is None:
             return await interaction.response.send_message("Guild not found.")
         await self._ack_and_delete_source(interaction)
+        lock = self._help_session_lock(guild.id, interaction.user.id)
+        async with lock:
+            return await self._handle_help_session_control_locked(interaction, guild, action)
+
+    async def _handle_help_session_control_locked(
+        self,
+        interaction: discord.Interaction,
+        guild: discord.Guild,
+        action: str,
+    ) -> None:
         if action == "cancel":
             await self._clear_help_session(interaction.user.id, guild.id)
             return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
         if action == "start_over":
             await self._clear_help_session(interaction.user.id, guild.id)
             return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
+        if action == "start":
+            sess = await self._get_help_session(interaction.user.id, guild.id)
+            if not sess:
+                return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
+            stage = str(sess["stage"])
+            if stage.startswith("preview_"):
+                kind = stage.removeprefix("preview_")
+                return await interaction.channel.send(
+                    embed=self._submission_preview_embed(kind, sess["data"]),
+                    view=HelpSubmissionPreviewView(
+                        self,
+                        interaction.user.id,
+                        guild.id,
+                        kind,
+                    ),
+                    allowed_mentions=no_mentions(),
+                )
+            allow_back = stage in {"appeal_reason", "appeal_behavior"}
+            return await interaction.channel.send(
+                embed=self._help_stage_prompt_embed(stage, sess["data"]),
+                view=HelpSessionControlView(
+                    self,
+                    interaction.user.id,
+                    guild.id,
+                    allow_back=allow_back,
+                ),
+                allowed_mentions=no_mentions(),
+            )
         if action == "back":
             sess = await self._get_help_session(interaction.user.id, guild.id)
             if not sess:

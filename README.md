@@ -72,7 +72,8 @@ The bot is intentionally built around one configured server. Most behavior is co
 ### Help Menu And Staff Tickets
 - DMs members a compact help dashboard with active tickets, weekly activity, recent support, and their current-wave level request when one exists.
 - Shows the user's current level as pending, accepted, rejected, or rejected for a specific reason, with a direct link to the review message.
-- Supports Back, Cancel, and Start Over controls during active DM help flows.
+- Shows a clear Start button before appeals, reports, bot issues, and transcript requests, then provides Back, Cancel, and Start Over controls while the flow is active.
+- Keeps live DM workflow state in memory with a durable database fallback, so a temporary Turso synchronization delay does not turn a valid reply into a new dashboard.
 - Cleans up the previous DM help screen when members select a new option, press a flow button, cancel, or start over.
 - Hides the current help screen from the menu so members are not offered the same page they are already viewing.
 - Presents the configured FAQ as short paginated pages without intercepting normal DM text as a search query.

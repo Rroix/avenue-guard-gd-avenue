@@ -439,7 +439,8 @@ class TrackingCog(commands.Cog):
         allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
         if not allowed_guild_id:
             return False
-        row = await self.bot.db.fetchone(
+        reader = getattr(self.bot.db, "fetchone_local", self.bot.db.fetchone)
+        row = await reader(
             "SELECT 1 FROM weekly_sessions WHERE guild_id=? AND user_id=? AND active=1 LIMIT 1",
             (allowed_guild_id, user_id),
         )
