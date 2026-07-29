@@ -186,3 +186,31 @@ async def test_decline_confirmation_defers_before_database_work():
     await cog.handle_decline_confirm(interaction, confirmed=False)
 
     assert events == ["defer", "database", "followup"]
+
+
+@pytest.mark.asyncio
+async def test_weekly_dm_handler_yields_to_an_active_support_session():
+    guild = SimpleNamespace(id=717)
+    support = SimpleNamespace(should_yield_weekly_dm=AsyncMock(return_value=True))
+    db = SimpleNamespace(fetchall=AsyncMock(side_effect=AssertionError("weekly state must not be read")))
+    cog = object.__new__(TrackingCog)
+    cog.bot = SimpleNamespace(
+        db=db,
+        get_guild=lambda guild_id: guild if guild_id == guild.id else None,
+        get_cog=lambda name: support if name == "HelpCog" else None,
+    )
+    cog._cfg_int = lambda *args, **kwargs: 717
+    cog._resolve_member = AsyncMock(return_value=SimpleNamespace(id=42))
+    cog._log_background_error = AsyncMock()
+
+    await cog._handle_dm(
+        SimpleNamespace(
+            id=555,
+            author=SimpleNamespace(id=42),
+            channel=SimpleNamespace(),
+            content="This answer belongs to support",
+        )
+    )
+
+    support.should_yield_weekly_dm.assert_awaited_once_with(guild.id, 42, 555)
+    db.fetchall.assert_not_awaited()

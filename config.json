@@ -526,6 +526,17 @@
       "local_retention_count": 10
     }
   },
+  "release_updates": {
+    "_comment": "Owner-approved public Avenue Guard releases. A non-empty release.json manifest is proposed automatically after deployment; /bot release can also create a proposal. Only approved releases appear in the public API and website.",
+    "enabled": true,
+    "owner_user_ids": [
+      "1102884420207255653"
+    ],
+    "manifest_path": "release.json",
+    "public_release_limit": 20,
+    "website_url": "https://gdavenue.netlify.app/bot",
+    "public_api_url": "https://avenue-guard.onrender.com"
+  },
   "impact": {
     "_comment": "Persistent CV/community impact reports. /bot impact posts Markdown, CSV, trend CSV, breakdown CSV, and JSON attachments here and stores a DB snapshot.",
     "report_channel_id": "1445502925081284729",

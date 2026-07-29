@@ -651,7 +651,11 @@ class Database:
                 requester_id INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 created_ts INTEGER NOT NULL,
-                ticket_id INTEGER
+                updated_ts INTEGER,
+                ticket_id INTEGER,
+                reviewed_by INTEGER,
+                reviewed_ts INTEGER,
+                error_text TEXT
             );""",
             """CREATE TABLE IF NOT EXISTS rps_streaks(
                 guild_id INTEGER NOT NULL,
@@ -781,6 +785,21 @@ class Database:
                 value_json TEXT NOT NULL,
                 updated_ts INTEGER NOT NULL
             );""",
+            """CREATE TABLE IF NOT EXISTS bot_releases(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                changes_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending',
+                source TEXT NOT NULL DEFAULT 'command',
+                created_by INTEGER,
+                created_ts INTEGER NOT NULL,
+                approval_message_id INTEGER,
+                decided_by INTEGER,
+                decided_ts INTEGER,
+                error_text TEXT
+            );""",
             """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
                 ON activity_counts(guild_id, week_start, count DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry
@@ -820,6 +839,10 @@ class Database:
                 ON impact_snapshots(guild_id, snapshot_ts DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_database_backups_guild
                 ON database_backups(guild_id, backup_ts DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_bot_releases_status_time
+                ON bot_releases(status, decided_ts DESC, id DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_bot_releases_version
+                ON bot_releases(version, id DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_database_restore_log_guild
                 ON database_restore_log(guild_id, restore_ts DESC);""",
         ]
@@ -844,6 +867,13 @@ class Database:
         self._ensure_column_sync("tickets", "opening_message_id", "INTEGER")
         self._ensure_column_sync("weekly_sessions", "decline_prompt_message_id", "INTEGER")
         self._ensure_column_sync("transcript_requests", "ticket_id", "INTEGER")
+        self._ensure_column_sync("transcript_requests", "updated_ts", "INTEGER")
+        self._ensure_column_sync("transcript_requests", "reviewed_by", "INTEGER")
+        self._ensure_column_sync("transcript_requests", "reviewed_ts", "INTEGER")
+        self._ensure_column_sync("transcript_requests", "error_text", "TEXT")
+        self._conn.execute(
+            "UPDATE transcript_requests SET updated_ts=created_ts WHERE updated_ts IS NULL"
+        )
         self._ensure_column_sync("level_request_state", "request_channel_id", "INTEGER")
         self._ensure_column_sync("level_request_state", "request_message_id", "INTEGER")
         self._ensure_column_sync("level_request_state", "request_type", "TEXT")

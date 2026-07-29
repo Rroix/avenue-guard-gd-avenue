@@ -1,0 +1,7 @@
+{
+  "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
+  "version": "",
+  "title": "",
+  "summary": "",
+  "changes": []
+}

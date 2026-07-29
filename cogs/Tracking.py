@@ -832,6 +832,27 @@ class TrackingCog(commands.Cog):
         guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
         if guild is None:
             return
+
+        help_cog = self.bot.get_cog("HelpCog")
+        should_yield = (
+            getattr(help_cog, "should_yield_weekly_dm", None)
+            if help_cog
+            else None
+        )
+        if callable(should_yield):
+            try:
+                if await should_yield(
+                    guild.id,
+                    message.author.id,
+                    getattr(message, "id", 0),
+                ):
+                    return
+            except Exception as e:
+                await self._log_background_error(
+                    "weekly_help_session_check",
+                    f"Could not check support-flow ownership for user_id={message.author.id}: {e!r}",
+                )
+
         if await self._resolve_member(guild, message.author.id) is None:
             return
 

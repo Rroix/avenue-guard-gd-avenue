@@ -74,6 +74,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Shows the user's current level as pending, accepted, rejected, or rejected for a specific reason, with a direct link to the review message.
 - Shows a clear Start button before appeals, reports, bot issues, and transcript requests, then provides Back, Cancel, and Start Over controls while the flow is active.
 - Keeps live DM workflow state in memory with a durable database fallback, so a temporary Turso synchronization delay does not turn a valid reply into a new dashboard.
+- Gives an active support flow ownership of the user's next DM, preventing the weekly reward workflow from consuming an appeal, report, bug, or transcript answer.
 - Cleans up the previous DM help screen when members select a new option, press a flow button, cancel, or start over.
 - Hides the current help screen from the menu so members are not offered the same page they are already viewing.
 - Presents the configured FAQ as short paginated pages without intercepting normal DM text as a search query.
@@ -82,17 +83,18 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Gives staff a persistent ban-information control with optional reason, date, evidence links, notes, and modal file uploads, followed by a delivery preview and DM.
 - Routes partnership tickets only to the configured partnership role while retaining normal moderator visibility.
 - Appeals, reports, and bot issue reports show a preview before submission, keep attachment links, receive tracked IDs, and can be checked later from My submissions.
-- Staff can reply to a tracked appeal/report/bug log embed to relay a response back to the submitter by DM.
+- Editing a preview replaces its previous answers and attachment list, so removed evidence is not accidentally retained.
+- Staff can reply to a tracked appeal/report/bug log embed to relay a response back to the submitter by DM; requester IDs are cross-checked against the original staff embed and failed deliveries remain pending for retry.
 - Creates routed private ticket channels for the requester and staff, using the selected topic in the ticket name and opening message.
 - Uses atomic ticket IDs to avoid duplicate ticket numbers during simultaneous ticket creation.
 - Caches active ticket channels so normal server messages do not hit the database for ticket checks.
-- Tracks ticket inactivity and prompts staff to close stale tickets.
+- Tracks ticket inactivity and prompts staff to close stale tickets without allowing a stale scan to overwrite newly resumed activity.
 - Tracks ticket statuses: Waiting for user, Waiting for staff, and Resolved.
-- Keeps the ticket opening message status in sync when users or staff reply, when staff changes status, and before closure transcripts are saved.
-- Saves transcripts before deleting tickets.
+- Keeps the ticket opening message status in sync when users or staff reply, when staff changes status, and before closure transcripts are saved; a missing status message is recreated automatically.
+- Saves complete, chronological text transcripts before deleting tickets, including attachments, embeds, edits, and reply references.
 - Lets staff search saved ticket transcripts by user or ticket ID.
 - Sends a configurable satisfaction prompt after a ticket closes.
-- Lets staff approve or deny transcript requests.
+- Lets staff approve or deny transcript requests. Decisions store reviewer/timestamp/error details, and failed approval or denial DMs remain available for retry.
 - Posts appeals, reports, bot issues, transcript requests, ticket transcripts, and bot errors as structured staff-log embeds with safe mention behavior and audit logs.
 
 ### Forum And Sticky Automation
@@ -118,6 +120,8 @@ The bot is intentionally built around one configured server. Most behavior is co
 - `/bot impact` generates an owner-only community impact and forecast report, stores a database snapshot, and posts Markdown, CSV, trend CSV, breakdown CSV, and JSON exports to the configured impact/log channel.
 - `/bot backup` creates a zipped database backup and posts it to the configured backup/log channel.
 - `/bot storage` shows the active database path, whether it looks persistent, automatic backup status, and the latest backup record.
+- `/bot release` creates a private version proposal and DMs the configured owner an approval panel.
+- `/bot releases` shows the current public version and pending approval queue.
 - `/bot health` shows database, background task, request, ticket, and weekly workflow status.
 - `/bot config_check` validates configured channels, roles, request embed template variables, and `responses.json` rule shape/channel references.
 - `/bot doctor` runs deeper permission diagnostics for channels, ticket category access, managed role hierarchy, and request-button state.
@@ -127,6 +131,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Optional daily server summary embeds with highlights, day-over-day movement, active members/channels, moderation signals, command health, voice/presence, and top channels/members/commands.
 - Tracks daily messages, edits, deletes, reactions, joins, leaves, bans, boosts, voice minutes, command usage, and top channels/users.
 - Includes a small keepalive HTTP server for hosted environments.
+- Publishes sanitized live status at `/api/bot` and approved-only update history at `/api/releases` for the GD Avenue website.
 
 ### Fun Commands
 - `/dance` sends the configured GIF.
@@ -149,6 +154,8 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/bot impact` generates an owner-only community impact and forecast report with Markdown, CSV, trend CSV, breakdown CSV, and JSON exports.
 - `/bot backup` creates a zipped database backup in the configured backup channel.
 - `/bot storage` shows database storage and backup status.
+- `/bot release version:<x.y.z> title:<title> changes:<one per line> summary:<optional>` prepares a release and sends the owner an approval DM.
+- `/bot releases` shows the approved website version and any pending proposals. Running `/bot release` again with a pending version resends its DM.
 - `/server_icon status` shows the server icon rotation mode, interval, current image, and configured URLs.
 - `/server_icon mode mode:<random|linear|disabled>` changes automatic server icon rotation mode.
 - `/server_icon add url:<url>`, `/server_icon replace number:<n> url:<url>`, and `/server_icon remove number:<n>` manage configured server icon URLs.
@@ -221,9 +228,10 @@ Use `off`, `disable`, `none`, or `clear` as the word to disable enforcement for 
 
 ## Configuration Files
 
-- `config.json` controls guild IDs, roles, channels, live request waves, review-access agreement gating, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, server icon rotation, persistent database storage, automatic database backups, background summaries, and impact report exports.
+- `config.json` controls guild IDs, roles, channels, live request waves, review-access agreement gating, weekly tracking, tickets, sticky messages, forum reminders, role DMs, fun rewards, help menu FAQ, server icon rotation, persistent database storage, automatic database backups, background summaries, public release approval, and impact report exports.
+- `release.json` is an optional deployment manifest. A non-empty semantic version and change list are proposed automatically after startup but remain private until the configured owner approves the DM.
 - `responses.json` controls automatic message responses.
-- The configured database stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, help submissions, ban-information requests, tickets, cooldowns, transcript pointers, reminders, daily stats, impact snapshots, and database backup records.
+- The configured database stores persistent bot data such as live request waves, request submissions, request edit audits, GD validation cache, weekly counts, help submissions, ban-information requests, tickets, cooldowns, transcript pointers, reminders, daily stats, approved/pending bot releases, impact snapshots, and database backup records.
 
 ### Database And Backup Config
 
@@ -251,6 +259,22 @@ Impact reports live under `impact` in `config.json`.
 - `/bot impact` stores the same report payload in `impact_snapshots`, so the bot keeps a database copy even after posting the files.
 - The CSV exports are designed for direct import into Google Sheets.
 
+### Public Status And Release Config
+
+Public bot updates live under `release_updates` in `config.json`.
+
+- `owner_user_ids`: the Discord users allowed to approve or reject releases. The first user receives proposal DMs.
+- `manifest_path`: optional deployment manifest, normally `release.json`.
+- `public_release_limit`: approved releases retained in the public API response, from 1 to 50.
+- `website_url`: the public Avenue Guard page linked after approval.
+- `public_api_url`: the Render service base URL checked by `/bot config_check`.
+- Pending, approved, and rejected proposals are stored in `bot_releases`, including the approval message and decision audit fields.
+- `/api/bot` exposes operational state, current connected uptime, process uptime, latency, aggregate member count, avatar, and the latest approved version.
+- `/api/releases` exposes approved release titles, summaries, changes, versions, and publication timestamps. Pending and rejected proposals, owner IDs, errors, and database details are never returned.
+- Both endpoints allow read-only cross-origin requests so the static Netlify page can refresh without holding a secret.
+
+The complete workflow and deployment order are documented in `docs/BOT_STATUS_RELEASE_SYSTEM.md`.
+
 ### Server Icon Rotation Config
 
 Server icon rotation lives under `background.server_icon_rotation` in `config.json`.
@@ -269,9 +293,11 @@ DM support and ticket routing use the `help` and `tickets` sections in `config.j
 - `help.partnership.requirements_message`: the confirmation text shown before opening a partnership ticket.
 - `help.ban_info_max_evidence_mb`: the combined evidence-file memory limit while staff previews ban information.
 - `help.session_timeout_seconds`: how long an unfinished appeal, report, bug, or transcript flow remains active.
+- `help.max_submission_chars`, `help.duplicate_window_hours`, `help.flow_start_window_seconds`, and `help.max_flow_starts_per_window`: input and abuse-control limits validated by `/bot config_check`.
 - `tickets.partnership_ping_role_id`: the only role mentioned when a partnership ticket opens. The normal moderator role still receives channel access without being pinged.
 - `tickets.staff_ping_role_id`: the notification role used for ordinary staff tickets.
-- Ban-information requests and their delivery states are stored in `ban_info_requests`, so pending staff work survives restarts.
+- `tickets.ticket_creation_cooldown_hours`, `tickets.ticket_inactivity_hours`, and `tickets.satisfaction_prompt`: ticket timing and feedback settings validated by `/bot config_check`.
+- Ban-information requests and their delivery states are stored in `ban_info_requests`; transcript request decisions and retry diagnostics are stored in `transcript_requests`, so pending staff work survives restarts.
 
 ### Level Request Config
 
@@ -331,7 +357,7 @@ export STARTUP_ERROR_RETRY_SECONDS="300"
 
 These control how long the bot waits before retrying when Discord/Cloudflare temporarily rate-limits startup login, or when startup fails after login because a dependency such as the database is unavailable. The defaults are 15 minutes and 5 minutes.
 
-On Render Web Services, Avenue Guard binds the health-check port before Discord login starts. It also checks the database before Discord login, so a bad database token will show as `startup_error` instead of making the bot appear online briefly while commands are unusable. Open the Render service URL, or `/status`, to see whether the bot is checking the database, attempting Discord login, waiting on a rate limit, or fully online.
+On Render Web Services, Avenue Guard binds the health-check port before Discord login starts. It also checks the database before Discord login, so a bad database token will show as `startup_error` instead of making the bot appear online briefly while commands are unusable. Open the Render service URL, or `/status`, to see whether the bot is checking the database, attempting Discord login, waiting on a rate limit, or fully online. The public website should use `/api/bot`, which deliberately omits internal error details.
 
 3. Start Avenue Guard:
 
@@ -372,3 +398,5 @@ pip install -r requirements-dev.txt
 The suite checks migrations from an empty database, transaction rollback, concurrent ticket IDs, backup integrity, GD validation, request schedules and edit windows, cold-cache tracking ranks, runtime configuration persistence, URL and regex safety, daily-summary durability, lint, dependency vulnerabilities, and common security mistakes.
 
 Use `TEST_CHECKLIST.md` for the full Discord-side test flow. It covers startup, moderation, live request waves, tracking, help sessions, ticket closure, transcript requests, sticky messages, forum reminders, required-word deletion, and fun commands.
+
+The workflow-by-workflow support diagnosis, state model, corrected failure modes, and residual external risks are recorded in `docs/SUPPORT_WORKFLOW_AUDIT_2026-07-29.md`.

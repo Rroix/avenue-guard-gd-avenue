@@ -16,6 +16,8 @@ CID_FORMER_MEMBER_HELP_MENU = "former_member_help_menu_select"
 CID_TRANSCRIPT_APPROVE = "transcript_approve"
 CID_TRANSCRIPT_DENY = "transcript_deny"
 CID_BAN_INFO_GIVE = "ban_info_give"
+CID_RELEASE_APPROVE = "release_approve"
+CID_RELEASE_REJECT = "release_reject"
 
 CID_LEVEL_REQUEST_BUTTON = "level_request_button"
 CID_LEVEL_REQUEST_SEND = "level_request_send"
@@ -47,6 +49,49 @@ class TranscriptRequestView(discord.ui.View):
         else:
             await interaction.response.send_message(
                 "Transcript requests are temporarily unavailable.",
+                ephemeral=True,
+                allowed_mentions=no_mentions(),
+            )
+
+
+class ReleaseApprovalView(discord.ui.View):
+    def __init__(self, disabled: bool = False):
+        super().__init__(timeout=None)
+        approve = discord.ui.Button(
+            label="Approve and publish",
+            style=discord.ButtonStyle.success,
+            custom_id=CID_RELEASE_APPROVE,
+            disabled=disabled,
+        )
+        reject = discord.ui.Button(
+            label="Reject",
+            style=discord.ButtonStyle.danger,
+            custom_id=CID_RELEASE_REJECT,
+            disabled=disabled,
+        )
+        approve.callback = self.approve
+        reject.callback = self.reject
+        self.add_item(approve)
+        self.add_item(reject)
+
+    async def approve(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("ReleaseCog")
+        if cog:
+            await cog.handle_release_decision(interaction, approved=True)
+        else:
+            await interaction.response.send_message(
+                "Release publishing is temporarily unavailable.",
+                ephemeral=True,
+                allowed_mentions=no_mentions(),
+            )
+
+    async def reject(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("ReleaseCog")
+        if cog:
+            await cog.handle_release_decision(interaction, approved=False)
+        else:
+            await interaction.response.send_message(
+                "Release publishing is temporarily unavailable.",
                 ephemeral=True,
                 allowed_mentions=no_mentions(),
             )

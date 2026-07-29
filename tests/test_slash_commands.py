@@ -2,6 +2,7 @@ import ast
 import inspect
 import textwrap
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,6 +20,8 @@ DEFERRED_COMMAND_METHODS = (
     "bot_backup",
     "bot_restore",
     "bot_storage",
+    "bot_release",
+    "bot_releases",
     "tracking_top",
     "tracking_reset",
     "tracking_me",
@@ -79,8 +82,15 @@ def test_all_registered_slash_commands_serialize_with_descriptions(tmp_path, mon
 
     names = {name for name, _ in leaves}
     assert len(bot.pending_application_commands) == 17
-    assert len(names) == 39
-    assert {"tracking disable_reward", "tracking enable_reward", "open-requests", "edit-request"} <= names
+    assert len(names) == 41
+    assert {
+        "bot release",
+        "bot releases",
+        "tracking disable_reward",
+        "tracking enable_reward",
+        "open-requests",
+        "edit-request",
+    } <= names
 
     for name, data in leaves:
         description = str(data.get("description") or "")
@@ -193,3 +203,69 @@ async def test_reward_toggle_defers_before_database_and_log_work(method_name):
     assert any(event[0] == "database" for event in events)
     assert events[-1][0] == "respond"
     assert "Weekly request reward" in events[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_ticket_status_disables_an_existing_inactivity_prompt():
+    class Config:
+        def get_int(self, *path, default=0):
+            return 123 if path == ("roles", "MOD_ROLE_ID") else default
+
+        def get(self, *path, default=None):
+            if path == ("permissions", "manage_guild_counts_as_mod"):
+                return True
+            return default
+
+    row = {
+        "ticket_id": 3,
+        "creator_id": 42,
+        "status": "closing_prompted",
+        "closing_prompt_message_id": 1234,
+    }
+    db = SimpleNamespace(
+        fetchone=AsyncMock(return_value=row),
+        execute=AsyncMock(),
+    )
+    opening_status = AsyncMock()
+    help_cog = SimpleNamespace(update_ticket_opening_status=opening_status)
+    bot = SimpleNamespace(
+        config=Config(),
+        db=db,
+        get_cog=lambda name: help_cog if name == "HelpCog" else None,
+    )
+    cog = object.__new__(CommandsCog)
+    cog.bot = bot
+    cog.allowed_guild_id = 717
+    cog._resolve_member = AsyncMock(
+        return_value=SimpleNamespace(
+            roles=[SimpleNamespace(id=123)],
+            guild_permissions=SimpleNamespace(manage_guild=False),
+        )
+    )
+    cog._log_admin_action = AsyncMock()
+
+    prompt = SimpleNamespace(edit=AsyncMock())
+
+    class Context:
+        def __init__(self):
+            self.guild = SimpleNamespace(id=717)
+            self.user = SimpleNamespace(id=77, mention="<@77>")
+            self.channel_id = 999
+            self.channel = SimpleNamespace(fetch_message=AsyncMock(return_value=prompt))
+            self.interaction = SimpleNamespace(response=_ResponseState())
+            self.responses = []
+
+        async def defer(self, *, ephemeral):
+            self.interaction.response.done = True
+
+        async def respond(self, content=None, **kwargs):
+            self.responses.append((content, kwargs))
+
+    ctx = Context()
+    await cog.ticket_status(ctx, "waiting_user")
+
+    sql, params = db.execute.await_args.args
+    assert "closing_prompt_message_id=NULL" in sql
+    assert params[-1] == ctx.channel_id
+    assert prompt.edit.await_args.kwargs["view"] is None
+    opening_status.assert_awaited_once_with(ctx.guild, ctx.channel_id, "waiting_user")

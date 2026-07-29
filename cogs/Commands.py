@@ -34,6 +34,7 @@ from utils.runtime_config import (
     persist_forum_required_rules,
     persist_server_icon_config,
 )
+from utils.releases import ReleaseValidationError, load_release_manifest
 from utils.timeutils import now_madrid, week_start_sunday
 from utils.errors import log_error
 
@@ -54,6 +55,7 @@ AVENUE_GUARD_CORE_TABLES = {
     "daily_stats",
     "impact_snapshots",
     "database_backups",
+    "bot_releases",
 }
 
 TICKET_STATUS_LABELS = {
@@ -166,6 +168,8 @@ class CommandsCog(commands.Cog):
         self.bot_group.command(name="backup", description="Create a durable database backup")(self.bot_backup)
         self.bot_group.command(name="restore", description="Restore the database from an uploaded SQLite backup")(self.bot_restore)
         self.bot_group.command(name="storage", description="Show database storage and backup status")(self.bot_storage)
+        self.bot_group.command(name="release", description="Prepare a version update for private approval")(self.bot_release)
+        self.bot_group.command(name="releases", description="Show approved and pending bot releases")(self.bot_releases)
 
         self.tracking_group.command(name="top", description="Show the current week's top 20 active members")(self.tracking_top)
         self.tracking_group.command(name="reset", description="Reset current week's tracking stats")(self.tracking_reset)
@@ -262,6 +266,15 @@ class CommandsCog(commands.Cog):
         if owner_ids:
             return int(ctx.user.id) in owner_ids
         return await self._is_admin_ctx(ctx)
+
+    async def _is_release_owner_ctx(self, ctx: discord.ApplicationContext) -> bool:
+        if ctx.guild is None:
+            return False
+        release_cog = self.bot.get_cog("ReleaseCog")
+        is_owner = getattr(release_cog, "is_owner", None)
+        if callable(is_owner):
+            return bool(is_owner(int(ctx.user.id)))
+        return await self._is_impact_owner_ctx(ctx)
 
     def _backup_channel_id(self) -> int:
         channel_id = self.bot.config.get_int("database", "backups", "channel_id", default=0)
@@ -1454,6 +1467,129 @@ class CommandsCog(commands.Cog):
         await self._log_admin_action(ctx.guild, ctx.user.id, "impact_report_generated", f"message_id={int(getattr(sent, 'id', 0) or 0)}")
         await self._send(ctx, msg, ephemeral=True)
 
+    async def bot_release(
+        self,
+        ctx: discord.ApplicationContext,
+        version: discord.Option(str, "Semantic version such as 3.4.1"),
+        title: discord.Option(str, "Short public title for this update"),
+        changes: discord.Option(str, "Public changes with one item per line"),
+        summary: discord.Option(
+            str,
+            "Optional short overview shown above the changes",
+            required=False,
+            default="",
+        ),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        if not await self._is_release_owner_ctx(ctx):
+            return await self._send(ctx, "You don't have permission to use this.", ephemeral=True)
+
+        release_cog = self.bot.get_cog("ReleaseCog")
+        propose = getattr(release_cog, "propose_release", None)
+        if not callable(propose):
+            return await self._send(
+                ctx,
+                "Release publishing is unavailable right now.",
+                ephemeral=True,
+            )
+
+        try:
+            ok, message = await propose(
+                version=version,
+                title=title,
+                summary=summary,
+                changes=changes,
+                created_by=int(ctx.user.id),
+                source="slash_command",
+            )
+        except Exception as e:
+            await log_error(self.bot, f"Release proposal command failed: {e!r}")
+            return await self._send(
+                ctx,
+                "I couldn't prepare that release. Check the error log.",
+                ephemeral=True,
+            )
+
+        if ok:
+            await self._log_admin_action(
+                ctx.guild,
+                ctx.user.id,
+                "release_proposed",
+                f"version={str(version)[:40]}",
+            )
+        await self._send(ctx, message, ephemeral=True)
+
+    async def bot_releases(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        if not await self._is_release_owner_ctx(ctx):
+            return await self._send(ctx, "You don't have permission to use this.", ephemeral=True)
+
+        release_cog = self.bot.get_cog("ReleaseCog")
+        overview_fn = getattr(release_cog, "release_overview", None)
+        if not callable(overview_fn):
+            return await self._send(
+                ctx,
+                "Release publishing is unavailable right now.",
+                ephemeral=True,
+            )
+
+        try:
+            overview = await overview_fn()
+        except Exception as e:
+            await log_error(self.bot, f"Release overview command failed: {e!r}")
+            return await self._send(
+                ctx,
+                "I couldn't load the release history. Check the error log.",
+                ephemeral=True,
+            )
+
+        current = overview.get("current")
+        pending = list(overview.get("pending") or [])
+        embed = discord.Embed(
+            title="Avenue Guard Releases",
+            description="Private approval queue and current public website version.",
+            color=discord.Color.blurple(),
+            timestamp=now_madrid(),
+        )
+        if current:
+            published_ts = int(current.get("published_ts") or 0)
+            current_text = (
+                f"**{current.get('title') or 'Untitled release'}**\n"
+                f"Version `{current.get('version') or 'Unknown'}`"
+            )
+            if published_ts:
+                current_text += f"\nPublished <t:{published_ts}:R>"
+        else:
+            current_text = "No release has been approved yet"
+        embed.add_field(name="Current Public Release", value=current_text[:1024], inline=False)
+
+        if pending:
+            pending_lines = []
+            for proposal in pending[:10]:
+                delivery = (
+                    "DM sent"
+                    if int(proposal.get("approval_message_id") or 0)
+                    else "DM delivery needs attention"
+                )
+                pending_lines.append(
+                    f"`#{int(proposal.get('id') or 0)}` **v{proposal.get('version')}** "
+                    f"- {delivery} - <t:{int(proposal.get('created_ts') or 0)}:R>"
+                )
+            pending_text = "\n".join(pending_lines)
+        else:
+            pending_text = "No releases are waiting for approval"
+        embed.add_field(name="Pending Approval", value=pending_text[:1024], inline=False)
+
+        website_url = str(overview.get("website_url") or "").strip()
+        if website_url:
+            embed.add_field(name="Public Page", value=website_url[:1024], inline=False)
+        embed.set_footer(text="Run /bot release again to resend a pending version's approval DM")
+        await self._send(ctx, embed=embed, ephemeral=True)
+
     async def bot_backup(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -2152,6 +2288,7 @@ class CommandsCog(commands.Cog):
                 f"Weekly scan: `{self._task_state('TrackingCog', '_weekly_task')}`\n"
                 f"Activity flush: `{self._task_state('TrackingCog', '_activity_flush_task')}`\n"
                 f"Ticket scan: `{self._task_state('HelpCog', '_ticket_scan_task')}`\n"
+                f"Public status: `{self._task_state('ReleaseCog', '_metrics_task')}`\n"
                 f"Daily summary: `{self._task_state('BackgroundCog', 'daily_report')}`\n"
                 f"Icon rotation: `{self._task_state('BackgroundCog', 'rotate_server_icon')}`\n"
                 f"DB backups: `{self._task_state('BackgroundCog', 'database_backup')}`"
@@ -2251,6 +2388,7 @@ class CommandsCog(commands.Cog):
                 f"Weekly timeout/reminders: `{_task_state('TrackingCog', '_timeout_task')}`\n"
                 f"Activity flush: `{_task_state('TrackingCog', '_activity_flush_task')}`\n"
                 f"Ticket scan: `{_task_state('HelpCog', '_ticket_scan_task')}`\n"
+                f"Public status: `{_task_state('ReleaseCog', '_metrics_task')}`\n"
                 f"Daily snapshot: `{_task_state('BackgroundCog', 'update_snapshot')}`\n"
                 f"Status rotation: `{_task_state('BackgroundCog', 'rotate_status')}`\n"
                 f"Server icon rotation: `{_task_state('BackgroundCog', 'rotate_server_icon')}`\n"
@@ -2696,6 +2834,135 @@ class CommandsCog(commands.Cog):
             ok_count += 1
         except (TypeError, ValueError):
             issues.append("help.session_timeout_seconds: must be between 60 and 86400")
+
+        def check_number(
+            label: str,
+            value: object,
+            minimum: float,
+            maximum: float,
+            *,
+            integer: bool = True,
+        ) -> None:
+            nonlocal ok_count
+            try:
+                numeric_value = float(value)
+                if integer and not numeric_value.is_integer():
+                    raise ValueError
+                parsed = int(numeric_value) if integer else numeric_value
+                if not minimum <= parsed <= maximum:
+                    raise ValueError
+                ok_count += 1
+            except (TypeError, ValueError):
+                number_type = "whole number" if integer else "number"
+                issues.append(
+                    f"{label}: must be a {number_type} between {minimum:g} and {maximum:g}"
+                )
+
+        check_number(
+            "tickets.ticket_creation_cooldown_hours",
+            cfg.get("tickets", "ticket_creation_cooldown_hours", default=24),
+            0,
+            720,
+            integer=False,
+        )
+        check_number(
+            "tickets.ticket_inactivity_hours",
+            cfg.get("tickets", "ticket_inactivity_hours", default=24),
+            0.01,
+            8760,
+            integer=False,
+        )
+        check_number(
+            "help.ban_info_max_evidence_mb",
+            cfg.get("help", "ban_info_max_evidence_mb", default=20),
+            1,
+            25,
+        )
+        check_number(
+            "help.max_submission_chars",
+            cfg.get("help", "max_submission_chars", default=3000),
+            500,
+            5000,
+        )
+        check_number(
+            "help.duplicate_window_hours",
+            cfg.get("help", "duplicate_window_hours", default=24),
+            1,
+            720,
+        )
+        check_number(
+            "help.flow_start_window_seconds",
+            cfg.get("help", "flow_start_window_seconds", default=60),
+            10,
+            3600,
+        )
+        check_number(
+            "help.max_flow_starts_per_window",
+            cfg.get("help", "max_flow_starts_per_window", default=6),
+            1,
+            50,
+        )
+        satisfaction_prompt = str(
+            cfg.get("tickets", "satisfaction_prompt", default="") or ""
+        ).strip()
+        if not satisfaction_prompt or len(satisfaction_prompt) > 1000:
+            issues.append(
+                "tickets.satisfaction_prompt: must contain between 1 and 1000 characters"
+            )
+        else:
+            ok_count += 1
+
+        release_enabled = bool(cfg.get("release_updates", "enabled", default=True))
+        if release_enabled:
+            release_owners = cfg.get_int_list("release_updates", "owner_user_ids")
+            if not release_owners:
+                issues.append("release_updates.owner_user_ids: add at least one Discord user ID")
+            else:
+                ok_count += len(release_owners)
+
+            manifest_path = Path(
+                cfg.get_str(
+                    "release_updates",
+                    "manifest_path",
+                    default="release.json",
+                ).strip()
+                or "release.json"
+            )
+            if not manifest_path.exists():
+                issues.append(f"release_updates.manifest_path: missing `{manifest_path}`")
+            else:
+                try:
+                    load_release_manifest(manifest_path)
+                    ok_count += 1
+                except ReleaseValidationError as exc:
+                    issues.append(f"release_updates.manifest_path: {exc}")
+
+            website_url = cfg.get_str(
+                "release_updates",
+                "website_url",
+                default="",
+            ).strip()
+            api_url = cfg.get_str(
+                "release_updates",
+                "public_api_url",
+                default="",
+            ).strip()
+            for label, value in (
+                ("release_updates.website_url", website_url),
+                ("release_updates.public_api_url", api_url),
+            ):
+                parsed = urlparse(value)
+                if parsed.scheme != "https" or not parsed.netloc:
+                    issues.append(f"{label}: use a complete HTTPS URL")
+                else:
+                    ok_count += 1
+
+            check_number(
+                "release_updates.public_release_limit",
+                cfg.get("release_updates", "public_release_limit", default=20),
+                1,
+                50,
+            )
 
         validation_cfg = cfg.get("level_requests", "level_validation", default={}) or {}
         if not isinstance(validation_cfg, dict):
@@ -3321,16 +3588,35 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("Use `waiting_user`, `waiting_staff`, or `resolved`.", ephemeral=True)
 
         row = await self.bot.db.fetchone(
-            "SELECT ticket_id, creator_id, status FROM tickets WHERE channel_id=? AND status IN ('open','closing_prompted')",
+            "SELECT ticket_id, creator_id, status, closing_prompt_message_id "
+            "FROM tickets WHERE channel_id=? AND status IN ('open','closing_prompted')",
             (ctx.channel_id,),
         )
         if not row:
             return await ctx.respond("This isn't an active ticket channel.", ephemeral=True)
 
         await self.bot.db.execute(
-            "UPDATE tickets SET status='open', status_tag=? WHERE channel_id=?",
-            (status_key, ctx.channel_id),
+            "UPDATE tickets SET status='open', status_tag=?, last_user_activity_ts=?, "
+            "closing_prompt_message_id=NULL WHERE channel_id=?",
+            (status_key, int(time.time()), ctx.channel_id),
         )
+        prompt_message_id = int(row["closing_prompt_message_id"] or 0)
+        if prompt_message_id:
+            try:
+                prompt = await ctx.channel.fetch_message(prompt_message_id)
+                await prompt.edit(
+                    content="Ticket status was updated by staff.",
+                    view=None,
+                    allowed_mentions=no_mentions(),
+                )
+            except discord.NotFound:
+                pass
+            except Exception as e:
+                await log_error(
+                    self.bot,
+                    f"Could not disable ticket close prompt message_id={prompt_message_id} "
+                    f"channel_id={ctx.channel_id}: {e!r}",
+                )
         helpcog = self.bot.get_cog("HelpCog")
         update_status = getattr(helpcog, "update_ticket_opening_status", None) if helpcog else None
         if callable(update_status):

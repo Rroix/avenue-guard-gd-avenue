@@ -19,6 +19,7 @@ from utils.views import (
     FormerMemberHelpView,
     BanInfoGiveInfoView,
     TranscriptRequestView,
+    ReleaseApprovalView,
     LevelRequestButtonView,
     LevelRequestReviewView,
 )
@@ -250,6 +251,7 @@ def create_bot() -> discord.Bot:
         bot.load_extension("cogs.MessageResponses")
         bot.load_extension("cogs.Sticky")
         bot.load_extension("cogs.RequestLevels")
+        bot.load_extension("cogs.Release")
         bot.load_extension("cogs.Commands")
         bot.load_extension("cogs.Background")
 
@@ -298,7 +300,13 @@ def create_bot() -> discord.Bot:
             pass
 
         # Start background tasks in cogs
-        for cog_name in ("TrackingCog", "HelpCog", "RequestLevelsCog", "BackgroundCog"):
+        for cog_name in (
+            "TrackingCog",
+            "HelpCog",
+            "RequestLevelsCog",
+            "ReleaseCog",
+            "BackgroundCog",
+        ):
             cog = bot.get_cog(cog_name)
             start = getattr(cog, "start_background", None)
             if not callable(start):
@@ -316,6 +324,23 @@ def create_bot() -> discord.Bot:
         set_keepalive_status("online", f"Logged in as {bot.user}")
         startup_log(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
+    @bot.event
+    async def on_disconnect():
+        state = str(get_keepalive_status().get("state") or "")
+        if state not in {"startup_error", "fatal_login_error", "crashed", "stopped"}:
+            set_keepalive_status("reconnecting", "Discord gateway connection was interrupted")
+
+    @bot.event
+    async def on_resumed():
+        set_keepalive_status("online", f"Logged in as {bot.user}")
+        release_cog = bot.get_cog("ReleaseCog")
+        refresh_metrics = getattr(release_cog, "refresh_public_metrics", None)
+        if callable(refresh_metrics):
+            try:
+                await refresh_metrics()
+            except Exception as e:
+                await log_error(bot, f"Public bot status refresh after resume failed: {e!r}")
+
     async def register_persistent_views():
         bot.add_view(TrackingDeclineConfirmView())
         bot.add_view(TicketClosePromptView())
@@ -323,6 +348,7 @@ def create_bot() -> discord.Bot:
         bot.add_view(FormerMemberHelpView())
         bot.add_view(BanInfoGiveInfoView())
         bot.add_view(TranscriptRequestView())
+        bot.add_view(ReleaseApprovalView())
         bot.add_view(LevelRequestButtonView())
         bot.add_view(LevelRequestReviewView())
 

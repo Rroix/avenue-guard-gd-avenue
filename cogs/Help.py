@@ -278,9 +278,10 @@ class PartnershipConfirmView(discord.ui.View):
 
 
 class BanInfoModal(discord.ui.DesignerModal):
-    def __init__(self, cog, request_id: int):
+    def __init__(self, cog, request_id: int, requester_id: Optional[int] = None):
         self.cog = cog
         self.request_id = int(request_id)
+        self.requester_id = int(requester_id) if requester_id else None
         self.reason_input = discord.ui.InputText(
             custom_id="ban_info_reason",
             required=False,
@@ -353,6 +354,7 @@ class BanInfoModal(discord.ui.DesignerModal):
                 "notes": str(self.notes_input.value or "").strip(),
             },
             list(self.evidence_upload.values or []),
+            embedded_requester_id=self.requester_id,
         )
 
 
@@ -440,7 +442,6 @@ class HelpCog(commands.Cog):
         self._submission_reply_lock = asyncio.Lock()
         self._transcript_request_lock = asyncio.Lock()
         self._transcript_decision_lock = asyncio.Lock()
-        self._submission_preview_lock = asyncio.Lock()
         self._ticket_close_locks: Dict[int, asyncio.Lock] = {}
         self._satisfaction_lock = asyncio.Lock()
         self._satisfaction_views_registered = False
@@ -448,6 +449,7 @@ class HelpCog(commands.Cog):
         self._help_session_cache: Dict[tuple[int, int], Dict[str, Any]] = {}
         self._help_session_locks: Dict[tuple[int, int], asyncio.Lock] = {}
         self._help_session_tombstones: Dict[tuple[int, int], int] = {}
+        self._claimed_dm_messages: Dict[int, int] = {}
 
     def cog_unload(self) -> None:
         if self._ticket_scan_task and not self._ticket_scan_task.done():
@@ -476,9 +478,23 @@ class HelpCog(commands.Cog):
     def on_config_reload(self) -> None:
         pass
 
+    def _member_from_actor(self, guild: discord.Guild, actor) -> Optional[discord.Member]:
+        """Prefer the member object Discord already supplied before consulting cache."""
+        if actor is None:
+            return None
+        if isinstance(actor, discord.Member):
+            return actor
+        if hasattr(actor, "roles") and hasattr(actor, "guild_permissions"):
+            return actor
+        try:
+            return guild.get_member(int(getattr(actor, "id", actor)))
+        except (TypeError, ValueError):
+            return None
+
     async def _resolve_member(self, guild: discord.Guild, user_or_id) -> Optional[discord.Member]:
-        if isinstance(user_or_id, discord.Member):
-            return user_or_id
+        supplied_member = self._member_from_actor(guild, user_or_id)
+        if supplied_member is not None:
+            return supplied_member
         user_id = getattr(user_or_id, "id", user_or_id)
         try:
             user_id = int(user_id)
@@ -491,6 +507,37 @@ class HelpCog(commands.Cog):
             return await guild.fetch_member(user_id)
         except Exception:
             return None
+
+    async def _resolve_dm_recipient(self, guild: discord.Guild, user_id: int):
+        """Resolve a DM recipient from caches before using Discord's global endpoint."""
+        user_id = int(user_id)
+        if user_id <= 0 or user_id > (2**63 - 1):
+            raise ValueError(f"invalid Discord user ID: {user_id}")
+
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member
+
+        get_user = getattr(self.bot, "get_user", None)
+        if callable(get_user):
+            user = get_user(user_id)
+            if user is not None:
+                return user
+
+        member_error: Optional[Exception] = None
+        try:
+            member = await guild.fetch_member(user_id)
+            if member is not None:
+                return member
+        except Exception as e:
+            member_error = e
+
+        fetch_user = getattr(self.bot, "fetch_user", None)
+        if callable(fetch_user):
+            return await fetch_user(user_id)
+        if member_error is not None:
+            raise member_error
+        raise LookupError(f"Discord user {user_id} could not be resolved")
 
     def _help_color(self, name: str = "blurple") -> discord.Color:
         colors = {
@@ -505,9 +552,11 @@ class HelpCog(commands.Cog):
         return colors.get(str(name or "blurple").casefold(), discord.Color.blurple())
 
     def _help_embed(self, title: str, description: str = "", color: str = "blurple") -> discord.Embed:
+        safe_title = str(title or "Support")[:256]
+        safe_description = str(description or "").strip()[:4096]
         embed = discord.Embed(
-            title=title,
-            description=description or None,
+            title=safe_title,
+            description=safe_description or None,
             color=self._help_color(color),
         )
         embed.set_footer(text="Avenue Guard help desk")
@@ -715,8 +764,16 @@ class HelpCog(commands.Cog):
         if guild is None:
             return
 
-        inactivity_hours = int(cfg.get("tickets", "ticket_inactivity_hours", default=24) or 24)
-        cutoff = int(time.time()) - inactivity_hours * 3600
+        try:
+            inactivity_hours = float(
+                cfg.get("tickets", "ticket_inactivity_hours", default=24) or 24
+            )
+            if not 0.01 <= inactivity_hours <= 8760:
+                raise ValueError
+        except (TypeError, ValueError):
+            inactivity_hours = 24.0
+        inactivity_seconds = max(1, int(inactivity_hours * 3600))
+        cutoff = int(time.time()) - inactivity_seconds
 
         rows = await self.bot.db.fetchall(
             "SELECT channel_id FROM tickets WHERE guild_id=? AND status='open' AND last_user_activity_ts<=?",
@@ -752,12 +809,49 @@ class HelpCog(commands.Cog):
                     allowed_mentions=no_mentions(),
                 )
                 await self.bot.db.execute(
-                    "UPDATE tickets SET status='closing_prompted', closing_prompt_message_id=? WHERE channel_id=?",
-                    (prompt.id, channel_id),
+                    "UPDATE tickets SET status='closing_prompted', closing_prompt_message_id=? "
+                    "WHERE guild_id=? AND channel_id=? AND status='open' AND last_user_activity_ts<=?",
+                    (prompt.id, guild.id, channel_id, cutoff),
                 )
-                self._active_ticket_channels.add(channel_id)
+                current = await self.bot.db.fetchone(
+                    "SELECT status, last_user_activity_ts, closing_prompt_message_id "
+                    "FROM tickets WHERE guild_id=? AND channel_id=?",
+                    (guild.id, channel_id),
+                )
+                prompt_is_current = bool(
+                    current
+                    and str(current["status"]) == "closing_prompted"
+                    and int(current["last_user_activity_ts"] or 0) <= cutoff
+                    and int(current["closing_prompt_message_id"] or 0) == prompt.id
+                )
+                if prompt_is_current:
+                    self._active_ticket_channels.add(channel_id)
+                else:
+                    try:
+                        await prompt.delete()
+                    except discord.NotFound:
+                        pass
+                    except Exception as cleanup_error:
+                        await self._log_background_error(
+                            "ticket_scan_stale_prompt_cleanup",
+                            f"Could not remove superseded inactivity prompt message_id={prompt.id} "
+                            f"channel_id={channel_id}: {cleanup_error!r}",
+                        )
             except Exception as e:
                 if prompt is not None:
+                    try:
+                        await self.bot.db.execute(
+                            "UPDATE tickets SET status='open', closing_prompt_message_id=NULL "
+                            "WHERE guild_id=? AND channel_id=? AND status='closing_prompted' "
+                            "AND closing_prompt_message_id=?",
+                            (guild.id, channel_id, prompt.id),
+                        )
+                    except Exception as restore_error:
+                        await self._log_background_error(
+                            "ticket_scan_prompt_restore",
+                            f"Could not restore ticket state after inactivity prompt failure "
+                            f"channel_id={channel_id} message_id={prompt.id}: {restore_error!r}",
+                        )
                     try:
                         await prompt.delete()
                     except discord.NotFound:
@@ -821,8 +915,16 @@ class HelpCog(commands.Cog):
         if message.guild is None:
             if guild is None:
                 return
-            member = await self._resolve_member(guild, message.author.id)
 
+            # An explicitly started support flow owns the next DM. This keeps
+            # the weekly reward listener from interpreting support answers as
+            # level-request text.
+            if await self.has_active_help_session(guild.id, message.author.id):
+                self._claim_dm_message(getattr(message, "id", 0))
+                if await self._handle_help_session_message(guild, message):
+                    return
+
+            member = await self._resolve_member(guild, message.author.id)
             if member is not None:
                 tracking = self.bot.get_cog("TrackingCog")
                 if tracking:
@@ -834,9 +936,6 @@ class HelpCog(commands.Cog):
                             "dm_weekly_session_check",
                             f"Weekly DM session check failed for user_id={message.author.id}: {e!r}",
                         )
-
-            if await self._handle_help_session_message(guild, message):
-                return
 
             try:
                 await self._send_dm_dashboard(message.channel, guild, message.author.id)
@@ -888,11 +987,37 @@ class HelpCog(commands.Cog):
     def _flow_start_limit_message(self, user_id: int) -> str:
         now = int(time.time())
         try:
-            window = max(10, int(self.bot.config.get("help", "flow_start_window_seconds", default=60) or 60))
+            window = max(
+                10,
+                min(
+                    3600,
+                    int(
+                        self.bot.config.get(
+                            "help",
+                            "flow_start_window_seconds",
+                            default=60,
+                        )
+                        or 60
+                    ),
+                ),
+            )
         except Exception:
             window = 60
         try:
-            max_starts = max(1, int(self.bot.config.get("help", "max_flow_starts_per_window", default=6) or 6))
+            max_starts = max(
+                1,
+                min(
+                    50,
+                    int(
+                        self.bot.config.get(
+                            "help",
+                            "max_flow_starts_per_window",
+                            default=6,
+                        )
+                        or 6
+                    ),
+                ),
+            )
         except Exception:
             max_starts = 6
         attempts = [ts for ts in self._flow_start_attempts.get(user_id, []) if now - int(ts) < window]
@@ -989,23 +1114,41 @@ class HelpCog(commands.Cog):
         return "\n".join(lines)
 
     async def _recent_help_status_text(self, guild_id: int, user_id: int) -> str:
-        lines: list[str] = []
+        items: list[tuple[int, str]] = []
         rows = await self.bot.db.fetchall(
-            "SELECT id, kind, status, created_ts, responded_ts FROM help_submissions WHERE guild_id=? AND user_id=? ORDER BY created_ts DESC LIMIT 5",
+            "SELECT id, kind, status, created_ts, updated_ts, responded_ts "
+            "FROM help_submissions WHERE guild_id=? AND user_id=? "
+            "ORDER BY updated_ts DESC LIMIT 5",
             (guild_id, user_id),
         )
         for row in rows:
             code = self._submission_code(str(row["kind"]), int(row["id"]))
-            ts = int(row["responded_ts"] or row["created_ts"])
-            lines.append(f"`{code}` {self._submission_label(row['kind'])}: **{str(row['status']).title()}** (<t:{ts}:R>)")
+            ts = int(row["responded_ts"] or row["updated_ts"] or row["created_ts"])
+            items.append(
+                (
+                    ts,
+                    f"`{code}` {self._submission_label(row['kind'])}: "
+                    f"**{str(row['status']).replace('_', ' ').title()}** (<t:{ts}:R>)",
+                )
+            )
         t_rows = await self.bot.db.fetchall(
-            "SELECT ticket_id, status, created_ts FROM transcript_requests WHERE guild_id=? AND requester_id=? ORDER BY created_ts DESC LIMIT 3",
+            "SELECT ticket_id, status, created_ts, updated_ts "
+            "FROM transcript_requests WHERE guild_id=? AND requester_id=? "
+            "ORDER BY COALESCE(updated_ts, created_ts) DESC LIMIT 5",
             (guild_id, user_id),
         )
         for row in t_rows:
             ticket = f"T{int(row['ticket_id'])}" if row["ticket_id"] is not None else "ticket"
-            lines.append(f"`TR-{ticket}` Transcript: **{str(row['status']).title()}** (<t:{int(row['created_ts'])}:R>)")
-        return "\n".join(lines[:3]) or "No recent help submissions."
+            ts = int(row["updated_ts"] or row["created_ts"])
+            items.append(
+                (
+                    ts,
+                    f"`TR-{ticket}` Transcript: "
+                    f"**{str(row['status']).replace('_', ' ').title()}** (<t:{ts}:R>)",
+                )
+            )
+        items.sort(key=lambda item: item[0], reverse=True)
+        return "\n".join(text for _ts, text in items[:5]) or "No recent help submissions."
 
     async def _cooldown_status_text(self, guild_id: int, user_id: int) -> str:
         lines = []
@@ -1096,7 +1239,7 @@ class HelpCog(commands.Cog):
         if value == "partnership":
             embed = self._help_embed(
                 "Partnership Requirements",
-                str(
+                self._short_text(
                     cfg.get(
                         "help",
                         "partnership",
@@ -1108,7 +1251,8 @@ class HelpCog(commands.Cog):
                             "- Has more than 100 members\n"
                             "- Is approaching us respectfully"
                         ),
-                    )
+                    ),
+                    3900,
                 ),
                 "blurple",
             )
@@ -1394,6 +1538,67 @@ class HelpCog(commands.Cog):
             self._help_session_tombstones = tombstones
         return tombstones
 
+    def _claimed_dm_message_store(self) -> Dict[int, int]:
+        claims = getattr(self, "_claimed_dm_messages", None)
+        if claims is None:
+            claims = {}
+            self._claimed_dm_messages = claims
+        return claims
+
+    def _claim_dm_message(self, message_id: int) -> None:
+        message_id = int(message_id or 0)
+        if not message_id:
+            return
+        now = int(time.time())
+        claims = self._claimed_dm_message_store()
+        claims[message_id] = now
+        if len(claims) > 5000:
+            for claimed_id, claimed_ts in list(claims.items())[:1000]:
+                if now - int(claimed_ts or 0) > 120:
+                    claims.pop(claimed_id, None)
+
+    async def should_yield_weekly_dm(
+        self,
+        guild_id: int,
+        user_id: int,
+        message_id: int,
+    ) -> bool:
+        now = int(time.time())
+        claims = self._claimed_dm_message_store()
+        message_id = int(message_id or 0)
+        claimed_ts = int(claims.get(message_id, 0) or 0)
+        if claimed_ts and now - claimed_ts <= 120:
+            return True
+        if claimed_ts:
+            claims.pop(message_id, None)
+        return await self.has_active_help_session(guild_id, user_id)
+
+    def _prune_help_session_memory(self) -> None:
+        cache = self._help_session_cache_store()
+        tombstones = self._help_session_tombstone_store()
+        locks = getattr(self, "_help_session_locks", {})
+        if len(cache) + len(tombstones) + len(locks) <= 5000:
+            return
+        now = int(time.time())
+        lifetime = self._help_session_lifetime()
+        stale_cache_keys = [
+            key
+            for key, value in cache.items()
+            if now - int(value.get("created_ts") or 0) > lifetime
+        ]
+        stale_tombstone_keys = [
+            key
+            for key, cleared_ts in tombstones.items()
+            if now - int(cleared_ts or 0) > lifetime
+        ]
+        for key in stale_cache_keys[:1000]:
+            cache.pop(key, None)
+        for key in stale_tombstone_keys[:1000]:
+            tombstones.pop(key, None)
+        for key, lock in list(locks.items())[:1000]:
+            if key not in cache and key not in tombstones and not lock.locked():
+                locks.pop(key, None)
+
     def _help_session_lifetime(self) -> int:
         try:
             return max(
@@ -1417,6 +1622,7 @@ class HelpCog(commands.Cog):
         guild_id = int(guild_id)
         created_ts = int(time.time())
         payload = json.loads(json.dumps(data))
+        self._prune_help_session_memory()
         self._help_session_tombstone_store().pop((guild_id, user_id), None)
         self._help_session_cache_store()[(guild_id, user_id)] = {
             "stage": str(stage),
@@ -1438,6 +1644,7 @@ class HelpCog(commands.Cog):
         key = (guild_id, user_id)
         self._help_session_cache_store().pop(key, None)
         self._help_session_tombstone_store()[key] = int(time.time())
+        self._prune_help_session_memory()
         try:
             await self.bot.db.execute(
                 "DELETE FROM help_sessions WHERE guild_id=? AND user_id=?",
@@ -1490,6 +1697,9 @@ class HelpCog(commands.Cog):
         }
         self._help_session_cache_store()[key] = session
         return {"stage": session["stage"], "data": dict(data)}
+
+    async def has_active_help_session(self, guild_id: int, user_id: int) -> bool:
+        return await self._get_help_session(int(user_id), int(guild_id)) is not None
 
     def _help_stage_prompt_embed(self, stage: str, data: Dict[str, Any]) -> discord.Embed:
         if stage == "appeal_punishment":
@@ -1551,6 +1761,14 @@ class HelpCog(commands.Cog):
             "bot_issue": "bot_issue_details",
         }.get(kind, "")
 
+    def _fresh_edit_data(self, kind: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        if kind == "appeal":
+            return {
+                "appeal_type": str(data.get("appeal_type") or "punishment"),
+                "former_member": bool(data.get("former_member", False)),
+            }
+        return {}
+
     def _submission_core_text(self, kind: str, data: Dict[str, Any]) -> str:
         if kind == "report":
             return str(data.get("report") or "")
@@ -1577,7 +1795,7 @@ class HelpCog(commands.Cog):
             embed.add_field(name="Issue details", value=self._short_text(data.get("issue"), 1024), inline=False)
         if self._has_attachments(data):
             embed.add_field(name="Attachments", value=self._attachments_text(data), inline=False)
-        embed.set_footer(text="Submit sends this to staff. Edit rewrites the last answer.")
+        embed.set_footer(text="Submit sends this to staff. Edit replaces the answers and attachments.")
         return embed
 
     async def _show_submission_preview(self, channel, user_id: int, guild_id: int, kind: str, data: Dict[str, Any]) -> None:
@@ -1592,7 +1810,20 @@ class HelpCog(commands.Cog):
         if kind not in {"report", "bot_issue"}:
             return False
         try:
-            window_hours = max(1, int(self.bot.config.get("help", "duplicate_window_hours", default=24) or 24))
+            window_hours = max(
+                1,
+                min(
+                    720,
+                    int(
+                        self.bot.config.get(
+                            "help",
+                            "duplicate_window_hours",
+                            default=24,
+                        )
+                        or 24
+                    ),
+                ),
+            )
         except Exception:
             window_hours = 24
         cutoff = int(time.time()) - window_hours * 3600
@@ -1861,13 +2092,22 @@ class HelpCog(commands.Cog):
                 ticket_channel_id=ch_id,
                 ticket_id=t_id,
             )
-            await self._clear_help_session(message.author.id, guild.id)
 
             if ok:
+                await self._clear_help_session(message.author.id, guild.id)
                 await self._touch_help_cooldown(guild.id, message.author.id, "transcript")
                 await message.channel.send("Your transcript request has been sent to staff for approval, thanks for your patience!")
             else:
-                await message.channel.send(reason or "Transcript request failed.")
+                await message.channel.send(
+                    reason or "Transcript request failed. You can send another ticket reference.",
+                    view=HelpSessionControlView(
+                        self,
+                        message.author.id,
+                        guild.id,
+                        allow_back=False,
+                    ),
+                    allowed_mentions=no_mentions(),
+                )
             return True
 
         if stage.startswith("preview_"):
@@ -1918,7 +2158,12 @@ class HelpCog(commands.Cog):
             kind = stage.removeprefix("preview_")
             edit_stage = self._edit_stage_for_kind(kind)
             if edit_stage:
-                await self._start_help_session(message.author.id, guild.id, edit_stage, data)
+                await self._start_help_session(
+                    message.author.id,
+                    guild.id,
+                    edit_stage,
+                    self._fresh_edit_data(kind, data),
+                )
                 await message.channel.send(
                     embed=self._edit_prompt_embed(kind),
                     view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=True),
@@ -2026,7 +2271,12 @@ class HelpCog(commands.Cog):
                 kind = stage.removeprefix("preview_")
                 edit_stage = self._edit_stage_for_kind(kind)
                 if edit_stage:
-                    await self._start_help_session(interaction.user.id, guild.id, edit_stage, data)
+                    await self._start_help_session(
+                        interaction.user.id,
+                        guild.id,
+                        edit_stage,
+                        self._fresh_edit_data(kind, data),
+                    )
                     return await interaction.channel.send(
                         embed=self._edit_prompt_embed(kind),
                         view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=True),
@@ -2038,7 +2288,8 @@ class HelpCog(commands.Cog):
     async def handle_help_submission_preview(self, interaction: discord.Interaction, guild_id: int, kind: str, action: str) -> None:
         if not interaction.response.is_done():
             await interaction.response.defer()
-        async with self._submission_preview_lock:
+        lock = self._help_session_lock(int(guild_id), interaction.user.id)
+        async with lock:
             return await self._handle_help_submission_preview_locked(interaction, guild_id, kind, action)
 
     async def _handle_help_submission_preview_locked(
@@ -2073,7 +2324,12 @@ class HelpCog(commands.Cog):
             edit_stage = self._edit_stage_for_kind(kind)
             if not edit_stage:
                 return await interaction.channel.send("I don't know how to edit that submission.", allowed_mentions=no_mentions())
-            await self._start_help_session(interaction.user.id, guild.id, edit_stage, data)
+            await self._start_help_session(
+                interaction.user.id,
+                guild.id,
+                edit_stage,
+                self._fresh_edit_data(kind, data),
+            )
             return await interaction.channel.send(
                 embed=self._edit_prompt_embed(kind),
                 view=HelpSessionControlView(self, interaction.user.id, guild.id, allow_back=True),
@@ -2157,6 +2413,30 @@ class HelpCog(commands.Cog):
     def _ticket_label(self, ticket_id: Optional[int], fallback_channel_id: int) -> str:
         return f"`T{ticket_id}`" if ticket_id is not None else f"`{fallback_channel_id}`"
 
+    def _requester_id_from_help_log_message(self, message) -> Optional[int]:
+        texts: list[str] = []
+        for embed in getattr(message, "embeds", []) or []:
+            description = str(getattr(embed, "description", "") or "")
+            if description:
+                texts.append(description)
+            for field in getattr(embed, "fields", []) or []:
+                if str(getattr(field, "name", "") or "").strip().casefold() in {
+                    "submitter",
+                    "requester",
+                    "user",
+                }:
+                    texts.append(str(getattr(field, "value", "") or ""))
+
+        for text in texts:
+            mention = re.search(r"<@!?(\d{15,25})>", text)
+            if mention:
+                return int(mention.group(1))
+        for text in texts:
+            raw_id = re.search(r"(?<!\d)(\d{15,25})(?!\d)", text)
+            if raw_id:
+                return int(raw_id.group(1))
+        return None
+
     async def _handle_staff_help_reply(self, message: discord.Message) -> bool:
         if message.author.bot or message.guild is None:
             return False
@@ -2175,7 +2455,7 @@ class HelpCog(commands.Cog):
         if not row:
             return False
 
-        member = message.guild.get_member(message.author.id)
+        member = await self._resolve_member(message.guild, message.author)
         mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
         allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
         if member is None or not is_mod(member, mod_role_id, allow_manage_guild=allow_manage_guild):
@@ -2200,7 +2480,20 @@ class HelpCog(commands.Cog):
         kind = str(row["kind"])
         submission_id = int(row["id"])
         code = self._submission_code(kind, submission_id)
-        requester_id = int(row["user_id"])
+        stored_requester_id = int(row["user_id"])
+        original = None
+        try:
+            original = await message.channel.fetch_message(ref_message_id)
+        except Exception:
+            pass
+        embedded_requester_id = self._requester_id_from_help_log_message(original)
+        requester_id = embedded_requester_id or stored_requester_id
+        if embedded_requester_id and embedded_requester_id != stored_requester_id:
+            await log_error(
+                self.bot,
+                f"Requester ID mismatch for {code}: database={stored_requester_id} "
+                f"staff_embed={embedded_requester_id}; using the staff embed value",
+            )
         embed = self._help_embed(f"Staff response: {code}", color="blurple")
         embed.description = f"Staff responded to your {self._submission_label(kind).casefold()}."
         if response_text:
@@ -2209,24 +2502,38 @@ class HelpCog(commands.Cog):
             embed.add_field(name="Attachments", value=self._attachments_text({"attachments": attachments}), inline=False)
 
         try:
-            user = await self.bot.fetch_user(requester_id)
+            user = await self._resolve_dm_recipient(message.guild, requester_id)
             await user.send(embed=embed, allowed_mentions=no_mentions())
         except Exception as e:
-            await log_error(self.bot, f"Could not relay staff response for {code}: {repr(e)}")
+            await log_error(
+                self.bot,
+                f"Could not relay staff response for {code}: requester_id={requester_id} "
+                f"database_user_id={stored_requester_id} embedded_user_id={embedded_requester_id or 0} "
+                f"error={e!r}",
+            )
+            unknown_user = isinstance(e, discord.NotFound) or "10013" in repr(e)
+            failure_message = (
+                "I couldn't resolve the requester account. The submission is still pending and the lookup details were logged."
+                if unknown_user
+                else "I couldn't deliver the response. Their DMs may be closed or Discord may be temporarily unavailable. "
+                "The submission is still pending."
+            )
             try:
-                await message.reply("I couldn't DM the user. Their DMs may be closed.", allowed_mentions=no_mentions())
+                await message.reply(failure_message, allowed_mentions=no_mentions())
             except Exception:
                 pass
             return True
 
         now = int(time.time())
         await self.bot.db.execute(
-            "UPDATE help_submissions SET status='responded', response_text=?, responded_by=?, responded_ts=?, updated_ts=? WHERE id=?",
-            (response_text[:1500], message.author.id, now, now, submission_id),
+            "UPDATE help_submissions SET user_id=?, status='responded', response_text=?, "
+            "responded_by=?, responded_ts=?, updated_ts=? WHERE id=?",
+            (requester_id, response_text[:1500], message.author.id, now, now, submission_id),
         )
 
         try:
-            original = await message.channel.fetch_message(ref_message_id)
+            if original is None:
+                original = await message.channel.fetch_message(ref_message_id)
             if original.embeds:
                 original_embed = original.embeds[0]
                 replaced = False
@@ -2445,7 +2752,7 @@ class HelpCog(commands.Cog):
     def _can_handle_ban_info(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
             return False
-        member = interaction.guild.get_member(interaction.user.id)
+        member = self._member_from_actor(interaction.guild, interaction.user)
         if member is None:
             return False
         mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID", default=0)
@@ -2466,7 +2773,10 @@ class HelpCog(commands.Cog):
                 "I couldn't identify this ban information request.",
                 ephemeral=True,
             )
-        await interaction.response.send_modal(BanInfoModal(self, int(match.group(1))))
+        requester_id = self._requester_id_from_help_log_message(interaction.message)
+        await interaction.response.send_modal(
+            BanInfoModal(self, int(match.group(1)), requester_id=requester_id)
+        )
 
     async def handle_ban_info_modal(
         self,
@@ -2474,22 +2784,36 @@ class HelpCog(commands.Cog):
         request_id: int,
         draft: Dict[str, str],
         uploads: list[discord.Attachment],
+        *,
+        embedded_requester_id: Optional[int] = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         if not self._can_handle_ban_info(interaction):
             return await interaction.followup.send("Only staff can use this control.", ephemeral=True)
         row = await self.bot.db.fetchone(
-            "SELECT guild_id, status FROM ban_info_requests WHERE id=?",
+            "SELECT guild_id, user_id, status FROM ban_info_requests WHERE id=?",
             (int(request_id),),
         )
         if not row or int(row["guild_id"]) != int(interaction.guild_id or 0):
             return await interaction.followup.send("This request could not be found.", ephemeral=True)
         if str(row["status"]) == "delivered":
             return await interaction.followup.send("This information was already delivered.", ephemeral=True)
+        stored_requester_id = int(row["user_id"])
+        requester_id = int(embedded_requester_id or stored_requester_id)
+        if requester_id != stored_requester_id:
+            await log_error(
+                self.bot,
+                f"Requester ID mismatch for {self._ban_info_code(request_id)}: "
+                f"database={stored_requester_id} staff_embed={requester_id}; "
+                "repairing the database value",
+            )
 
-        max_total_bytes = max(
-            1,
-            self.bot.config.get_int("help", "ban_info_max_evidence_mb", default=20),
+        max_total_bytes = min(
+            25,
+            max(
+                1,
+                self.bot.config.get_int("help", "ban_info_max_evidence_mb", default=20),
+            ),
         ) * 1024 * 1024
         evidence_files: list[tuple[str, bytes]] = []
         total_bytes = 0
@@ -2518,9 +2842,10 @@ class HelpCog(commands.Cog):
 
         file_names = [filename for filename, _payload in evidence_files]
         await self.bot.db.execute(
-            "UPDATE ban_info_requests SET handled_by=?, reason=?, ban_date=?, evidence_text=?, "
+            "UPDATE ban_info_requests SET user_id=?, handled_by=?, reason=?, ban_date=?, evidence_text=?, "
             "evidence_files_json=?, notes=?, updated_ts=?, status='pending', error_text=NULL WHERE id=?",
             (
+                requester_id,
                 interaction.user.id,
                 draft.get("reason", "")[:1000],
                 draft.get("ban_date", "")[:100],
@@ -2683,7 +3008,7 @@ class HelpCog(commands.Cog):
                 return await interaction.followup.send("This information was already delivered.", ephemeral=True)
 
             try:
-                user = await self.bot.fetch_user(int(row["user_id"]))
+                user = await self._resolve_dm_recipient(interaction.guild, int(row["user_id"]))
                 files = [
                     discord.File(io.BytesIO(payload), filename=filename)
                     for filename, payload in evidence_files
@@ -2708,9 +3033,21 @@ class HelpCog(commands.Cog):
                     handled_by=interaction.user.id,
                     disabled=False,
                 )
-                await log_error(self.bot, f"Ban information DM failed request_id={request_id}: {e!r}")
+                requester_id = int(row["user_id"])
+                await log_error(
+                    self.bot,
+                    f"Ban information DM failed request_id={request_id} "
+                    f"requester_id={requester_id}: {e!r}",
+                )
+                unknown_user = isinstance(e, discord.NotFound) or "10013" in repr(e)
                 return await interaction.followup.send(
-                    "I couldn't DM the user. Their DMs may be closed; the staff button remains available to retry.",
+                    (
+                        "I couldn't resolve the requester account. The staff button remains available, "
+                        "and the requester ID was included in the error log."
+                        if unknown_user
+                        else "I couldn't DM the user. Their DMs may be closed or Discord may be unavailable; "
+                        "the staff button remains available to retry."
+                    ),
                     ephemeral=True,
                 )
 
@@ -2777,7 +3114,7 @@ class HelpCog(commands.Cog):
             except Exception:
                 channel = None
         if not isinstance(channel, discord.TextChannel):
-            return False, "Transcript requests channel is not configured, DM Average Hollow Knight Fan."
+            return False, "The transcript request channel is unavailable. Please contact an administrator."
 
         if ticket_id is not None:
             existing = await self.bot.db.fetchone(
@@ -2794,8 +3131,6 @@ class HelpCog(commands.Cog):
             status = str(existing["status"])
             if status == "pending":
                 return False, "There is already a **pending** transcript request for that ticket."
-            if status in ("approved", "denied"):
-                return False, f"That ticket's transcript request is already **{status}**."
             if status == "delivery_failed":
                 return False, "That transcript request is waiting for staff to retry delivery."
 
@@ -2815,10 +3150,22 @@ class HelpCog(commands.Cog):
         msg = await channel.send(embed=embed, view=TranscriptRequestView(), allowed_mentions=no_mentions())
 
         try:
+            now = int(time.time())
             await self.bot.db.execute(
-                "INSERT INTO transcript_requests(guild_id, request_message_id, ticket_channel_id, requester_id, status, created_ts, ticket_id) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (guild.id, msg.id, ticket_channel_id, requester_id, "pending", int(time.time()), ticket_id),
+                "INSERT INTO transcript_requests("
+                "guild_id, request_message_id, ticket_channel_id, requester_id, status, "
+                "created_ts, updated_ts, ticket_id"
+                ") VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    guild.id,
+                    msg.id,
+                    ticket_channel_id,
+                    requester_id,
+                    "pending",
+                    now,
+                    now,
+                    ticket_id,
+                ),
             )
         except Exception:
             try:
@@ -2841,7 +3188,7 @@ class HelpCog(commands.Cog):
             return await self._respond_interaction(interaction, "Wrong server.", ephemeral=True)
 
         mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID") or 0
-        member = interaction.guild.get_member(interaction.user.id)
+        member = await self._resolve_member(interaction.guild, interaction.user)
         allow_manage_guild = bool(cfg.get("permissions", "manage_guild_counts_as_mod", default=True))
         if member is None or not is_mod(member, mod_role_id, allow_manage_guild=allow_manage_guild):
             return await self._respond_interaction(interaction, "Only mods can do that.", ephemeral=True)
@@ -2858,11 +3205,71 @@ class HelpCog(commands.Cog):
             return await self._respond_interaction(interaction, "This request is already processed.", ephemeral=True)
 
         ticket_channel_id = int(row["ticket_channel_id"])
-        requester_id = int(row["requester_id"])
+        stored_requester_id = int(row["requester_id"])
+        embedded_requester_id = self._requester_id_from_help_log_message(interaction.message)
+        requester_id = int(embedded_requester_id or stored_requester_id)
+        if embedded_requester_id and requester_id != stored_requester_id:
+            await log_error(
+                self.bot,
+                f"Transcript requester ID mismatch message_id={interaction.message.id}: "
+                f"database={stored_requester_id} staff_embed={requester_id}; "
+                "using the staff embed value",
+            )
         ticket_id = int(row["ticket_id"]) if row["ticket_id"] is not None else None
+        now = int(time.time())
 
         if not approved:
-            await self.bot.db.execute("UPDATE transcript_requests SET status='denied' WHERE request_message_id=?", (interaction.message.id,))
+            try:
+                user = await self._resolve_dm_recipient(interaction.guild, requester_id)
+                await user.send(
+                    f"Your transcript request was **denied** by staff. "
+                    f"(Ticket {('T' + str(ticket_id)) if ticket_id else ticket_channel_id})",
+                    allowed_mentions=no_mentions(),
+                )
+            except Exception as e:
+                await self.bot.db.execute(
+                    "UPDATE transcript_requests SET error_text=?, updated_ts=? "
+                    "WHERE request_message_id=?",
+                    (str(e)[:1000], now, interaction.message.id),
+                )
+                try:
+                    await interaction.message.edit(
+                        content="Denial notification failed. Staff can press Deny to retry.",
+                        view=TranscriptRequestView(),
+                        allowed_mentions=no_mentions(),
+                    )
+                except Exception as edit_error:
+                    await log_error(
+                        self.bot,
+                        f"Could not restore transcript denial buttons "
+                        f"message_id={interaction.message.id}: {edit_error!r}",
+                    )
+                await log_error(
+                    self.bot,
+                    f"Could not notify transcript requester: requester_id={requester_id} "
+                    f"database_requester_id={stored_requester_id} "
+                    f"embedded_requester_id={embedded_requester_id or 0} "
+                    f"ticket={self._ticket_label(ticket_id, ticket_channel_id)} error={e!r}",
+                )
+                return await self._respond_interaction(
+                    interaction,
+                    "I couldn't notify the requester, so the denial was not finalized. "
+                    "The buttons remain available for retry.",
+                    ephemeral=True,
+                )
+
+            await self.bot.db.execute(
+                "UPDATE transcript_requests SET requester_id=?, status='denied', "
+                "reviewed_by=?, reviewed_ts=?, updated_ts=?, error_text=NULL "
+                "WHERE request_message_id=?",
+                (
+                    requester_id,
+                    interaction.user.id,
+                    now,
+                    now,
+                    interaction.message.id,
+                ),
+            )
             await self._log_help_action(
                 interaction.guild,
                 interaction.user.id,
@@ -2870,41 +3277,48 @@ class HelpCog(commands.Cog):
                 f"ticket={self._ticket_label(ticket_id, ticket_channel_id)} requester={requester_id}",
             )
             try:
-                await interaction.message.edit(content="Denied", view=None)
-            except Exception:
-                pass
-            await self._respond_interaction(interaction, "Denied", ephemeral=True)
-            try:
-                user = await self.bot.fetch_user(requester_id)
-                await user.send(
-                    f"Your transcript request was **denied** by staff. "
-                    f"(Ticket {('T'+str(ticket_id)) if ticket_id else ticket_channel_id})",
+                await interaction.message.edit(
+                    content=f"Denied by <@{interaction.user.id}>",
+                    view=None,
                     allowed_mentions=no_mentions(),
                 )
             except Exception as e:
                 await log_error(
                     self.bot,
-                    f"Could not notify requester_id={requester_id} of transcript denial: {repr(e)}",
+                    f"Could not finalize denied transcript request message: {e!r}",
                 )
-            return
+            return await self._respond_interaction(interaction, "Denied and requester notified.", ephemeral=True)
 
-        ok = await self._dm_transcript(interaction.guild, requester_id, ticket_channel_id, ticket_id)
+        ok, delivery_error = await self._dm_transcript(
+            interaction.guild,
+            requester_id,
+            ticket_channel_id,
+            ticket_id,
+        )
         if not ok:
             await self.bot.db.execute(
-                "UPDATE transcript_requests SET status='delivery_failed' WHERE request_message_id=?",
-                (interaction.message.id,),
+                "UPDATE transcript_requests SET requester_id=?, status='delivery_failed', "
+                "error_text=?, updated_ts=? WHERE request_message_id=?",
+                (
+                    requester_id,
+                    delivery_error[:1000],
+                    now,
+                    interaction.message.id,
+                ),
             )
             try:
                 await interaction.message.edit(
                     content="Delivery failed. Staff can press Approve to retry.",
                     view=TranscriptRequestView(),
+                    allowed_mentions=no_mentions(),
                 )
             except Exception as e:
                 await log_error(self.bot, f"Could not restore transcript retry buttons: {repr(e)}")
             await log_error(
                 self.bot,
                 f"Transcript delivery failed requester_id={requester_id} "
-                f"ticket={self._ticket_label(ticket_id, ticket_channel_id)}",
+                f"ticket={self._ticket_label(ticket_id, ticket_channel_id)} "
+                f"error={delivery_error}",
             )
             await self._respond_interaction(
                 interaction,
@@ -2914,8 +3328,15 @@ class HelpCog(commands.Cog):
             return
 
         await self.bot.db.execute(
-            "UPDATE transcript_requests SET status='approved' WHERE request_message_id=?",
-            (interaction.message.id,),
+            "UPDATE transcript_requests SET requester_id=?, status='approved', reviewed_by=?, "
+            "reviewed_ts=?, updated_ts=?, error_text=NULL WHERE request_message_id=?",
+            (
+                requester_id,
+                interaction.user.id,
+                now,
+                now,
+                interaction.message.id,
+            ),
         )
         await self._log_help_action(
             interaction.guild,
@@ -2929,12 +3350,21 @@ class HelpCog(commands.Cog):
             await log_error(self.bot, f"Could not finalize transcript request message: {repr(e)}")
         await self._respond_interaction(interaction, "Approved and delivered.", ephemeral=True)
 
-    async def _dm_transcript(self, guild: discord.Guild, requester_id: int, ticket_channel_id: int, ticket_id: Optional[int]) -> bool:
-        user: Optional[discord.User]
+    async def _dm_transcript(
+        self,
+        guild: discord.Guild,
+        requester_id: int,
+        ticket_channel_id: int,
+        ticket_id: Optional[int],
+    ) -> tuple[bool, str]:
         try:
-            user = await self.bot.fetch_user(requester_id)
-        except Exception:
-            return False
+            user = await self._resolve_dm_recipient(guild, requester_id)
+        except Exception as e:
+            await log_error(
+                self.bot,
+                f"Transcript requester resolution failed requester_id={requester_id}: {e!r}",
+            )
+            return False, f"Requester resolution failed: {type(e).__name__}: {e}"
 
         # If channel exists: build transcript live
         channel = guild.get_channel(ticket_channel_id)
@@ -2946,55 +3376,77 @@ class HelpCog(commands.Cog):
         if isinstance(channel, discord.TextChannel):
             try:
                 transcript_path = await build_text_transcript(channel)
-                await user.send(
-                    content=f"Here is your transcript for {channel.name} ({channel.id}).",
-                    file=discord.File(transcript_path, filename=f"transcript-{ticket_id or channel.id}.txt"),
-                )
-                return True
             except Exception as e:
                 await log_error(
                     self.bot,
-                    f"Live transcript delivery failed channel_id={ticket_channel_id} requester_id={requester_id}: {repr(e)}",
+                    f"Live transcript generation failed channel_id={ticket_channel_id}: {e!r}",
                 )
+            else:
+                try:
+                    await user.send(
+                        content=f"Here is your transcript for {channel.name} ({channel.id}).",
+                        file=discord.File(
+                            transcript_path,
+                            filename=f"transcript-{ticket_id or channel.id}.txt",
+                        ),
+                    )
+                    return True, ""
+                except Exception as e:
+                    await log_error(
+                        self.bot,
+                        f"Live transcript DM failed channel_id={ticket_channel_id} "
+                        f"requester_id={requester_id}: {e!r}",
+                    )
+                    return False, f"DM delivery failed: {type(e).__name__}: {e}"
 
         # Fallback: fetch stored transcript from log channel
         if ticket_id is None:
-            return False
+            return False, "Ticket channel is unavailable and there is no stored ticket ID"
 
-        ptr = await self.bot.db.fetchone(
-            "SELECT log_channel_id, log_message_id FROM ticket_transcripts WHERE guild_id=? AND ticket_id=?",
-            (guild.id, ticket_id),
-        )
+        try:
+            ptr = await self.bot.db.fetchone(
+                "SELECT log_channel_id, log_message_id FROM ticket_transcripts "
+                "WHERE guild_id=? AND ticket_id=?",
+                (guild.id, ticket_id),
+            )
+        except Exception as e:
+            await log_error(
+                self.bot,
+                f"Stored transcript index lookup failed ticket_id={ticket_id}: {e!r}",
+            )
+            return False, f"Stored transcript lookup failed: {type(e).__name__}: {e}"
         if not ptr:
-            return False
+            return False, "No saved transcript was found for this ticket"
 
         log_channel_id = int(ptr["log_channel_id"])
         log_ch = guild.get_channel(log_channel_id)
         if log_ch is None:
             try:
                 log_ch = await guild.fetch_channel(log_channel_id)
-            except Exception:
-                log_ch = None
+            except Exception as e:
+                return False, f"Transcript log channel lookup failed: {type(e).__name__}: {e}"
         if not isinstance(log_ch, discord.TextChannel):
-            return False
+            return False, "The saved transcript log channel is unavailable"
 
         try:
             msg = await log_ch.fetch_message(int(ptr["log_message_id"]))
             if not msg.attachments:
-                return False
+                return False, "The saved transcript message has no attachment"
             att = msg.attachments[0]
             data = await att.read()
+            filename = str(getattr(att, "filename", "") or f"transcript-T{ticket_id}.txt")
             await user.send(
                 content=f"Here is your transcript for Ticket T{ticket_id}.",
-                file=discord.File(fp=io.BytesIO(data), filename=f"transcript-T{ticket_id}.txt"),
+                file=discord.File(fp=io.BytesIO(data), filename=filename),
             )
-            return True
+            return True, ""
         except Exception as e:
             await log_error(
                 self.bot,
-                f"Stored transcript delivery failed ticket_id={ticket_id} requester_id={requester_id}: {repr(e)}",
+                f"Stored transcript delivery failed ticket_id={ticket_id} "
+                f"requester_id={requester_id}: {repr(e)}",
             )
-            return False
+            return False, f"Stored transcript delivery failed: {type(e).__name__}: {e}"
 
     # -----------------------------
     # Ticket creation (mod contact)
@@ -3038,25 +3490,76 @@ class HelpCog(commands.Cog):
 
     async def update_ticket_opening_status(self, guild: discord.Guild, channel_id: int, status_tag: str) -> None:
         row = await self.bot.db.fetchone(
-            "SELECT opening_message_id FROM tickets WHERE guild_id=? AND channel_id=?",
+            "SELECT ticket_id, creator_id, opening_message_id "
+            "FROM tickets WHERE guild_id=? AND channel_id=? "
+            "AND status IN ('open','closing_prompted')",
             (guild.id, channel_id),
         )
-        if not row or row["opening_message_id"] is None:
+        if not row:
             return
         channel = guild.get_channel(channel_id)
         if channel is None:
             try:
                 channel = await guild.fetch_channel(channel_id)
-            except Exception:
-                channel = None
+            except Exception as e:
+                await self._log_background_error(
+                    "ticket_opening_status_channel",
+                    f"Could not resolve ticket channel_id={channel_id} while updating status: {e!r}",
+                )
+                return
         if not isinstance(channel, discord.TextChannel):
-            return
-        try:
-            msg = await channel.fetch_message(int(row["opening_message_id"]))
-        except Exception:
             return
 
         label = _ticket_status_label(status_tag)
+        opening_message_id = int(row["opening_message_id"] or 0)
+        msg = None
+        if opening_message_id:
+            try:
+                msg = await channel.fetch_message(opening_message_id)
+            except discord.NotFound:
+                msg = None
+            except Exception as e:
+                await self._log_background_error(
+                    "ticket_opening_status_fetch",
+                    f"Could not fetch ticket opening message_id={opening_message_id} "
+                    f"channel_id={channel_id}: {e!r}",
+                )
+                return
+
+        if msg is None:
+            ticket_id = int(row["ticket_id"]) if row["ticket_id"] is not None else None
+            creator_id = int(row["creator_id"] or 0)
+            lines = ["Ticket status"]
+            if ticket_id is not None:
+                lines.append(f"Ticket: **T{ticket_id}**")
+            if creator_id:
+                lines.append(f"Requester: <@{creator_id}>")
+            lines.append(f"Status: **{label}**")
+            replacement = None
+            try:
+                replacement = await channel.send(
+                    "\n".join(lines),
+                    allowed_mentions=no_mentions(),
+                )
+                await self.bot.db.execute(
+                    "UPDATE tickets SET opening_message_id=? "
+                    "WHERE guild_id=? AND channel_id=? AND status IN ('open','closing_prompted')",
+                    (replacement.id, guild.id, channel_id),
+                )
+            except Exception as e:
+                if replacement is not None:
+                    try:
+                        await replacement.delete()
+                    except discord.NotFound:
+                        pass
+                    except Exception:
+                        pass
+                await self._log_background_error(
+                    "ticket_opening_status_repair",
+                    f"Could not recreate ticket status message channel_id={channel_id}: {e!r}",
+                )
+            return
+
         content = str(msg.content or "")
         status_text = f"Status: **{label}**"
         if re.search(r"Status:\s*\*\*[^*]+\*\*", content):
@@ -3107,14 +3610,27 @@ class HelpCog(commands.Cog):
         if member is None:
             return await self._respond_interaction(interaction, "You must be in the server to create a ticket", ephemeral=True)
 
-        cooldown_h = int(cfg.get("tickets", "ticket_creation_cooldown_hours", default=24) or 24)
+        try:
+            cooldown_h = float(
+                cfg.get(
+                    "tickets",
+                    "ticket_creation_cooldown_hours",
+                    default=24,
+                )
+                or 24
+            )
+            if not 0 <= cooldown_h <= 720:
+                raise ValueError
+        except (TypeError, ValueError):
+            cooldown_h = 24.0
         row = await self.bot.db.fetchone(
             "SELECT last_created_ts FROM ticket_cooldowns WHERE guild_id=? AND user_id=?",
             (guild.id, member.id),
         )
         now = int(time.time())
-        if row and now - int(row["last_created_ts"]) < cooldown_h * 3600:
-            remaining = cooldown_h * 3600 - (now - int(row["last_created_ts"]))
+        cooldown_seconds = int(cooldown_h * 3600)
+        if row and now - int(row["last_created_ts"]) < cooldown_seconds:
+            remaining = cooldown_seconds - (now - int(row["last_created_ts"]))
             until_ts = now + remaining
             return await self._respond_interaction(
                 interaction,
@@ -3132,6 +3648,13 @@ class HelpCog(commands.Cog):
             return await self._respond_interaction(interaction, "Ticket category is missing or invalid (please contact staff)", ephemeral=True)
 
         mod_role = guild.get_role(mod_role_id)
+        if mod_role is None:
+            return await self._respond_interaction(
+                interaction,
+                "The configured staff role is missing, so I did not create a private ticket. "
+                "Please contact an administrator.",
+                ephemeral=True,
+            )
         notification_role_id = (
             int(ping_role_id)
             if ping_role_id is not None
@@ -3159,7 +3682,12 @@ class HelpCog(commands.Cog):
 
         ticket_id = await self.bot.db.next_ticket_id(guild.id)
         topic_slug = re.sub(r"[^a-z0-9-]+", "-", str(topic_key or "help").casefold()).strip("-") or "help"
-        name = f"ticket-{ticket_id}-{topic_slug}-{member.name}".lower().replace(" ", "-")[:90]
+        member_slug = re.sub(
+            r"[^a-z0-9-]+",
+            "-",
+            str(member.name or "member").casefold(),
+        ).strip("-") or "member"
+        name = f"ticket-{ticket_id}-{topic_slug}-{member_slug}"[:90]
 
         try:
             channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites, reason=f"Ticket created: {topic_label}")
@@ -3237,14 +3765,23 @@ class HelpCog(commands.Cog):
         if interaction.guild is None or interaction.guild.id != allowed_guild_id:
             return await interaction.response.send_message("Wrong server.", ephemeral=True)
 
-        mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID")
-        if mod_role_id:
-            member = interaction.guild.get_member(interaction.user.id)
-            allow_manage_guild = bool(cfg.get("permissions", "manage_guild_counts_as_mod", default=True))
-            if member is None or not is_mod(member, mod_role_id, allow_manage_guild=allow_manage_guild):
-                return await interaction.response.send_message("Only staff can close tickets", ephemeral=True)
-
         await interaction.response.defer(ephemeral=True)
+        mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID") or 0
+        member = await self._resolve_member(interaction.guild, interaction.user)
+        allow_manage_guild = bool(
+            cfg.get("permissions", "manage_guild_counts_as_mod", default=True)
+        )
+        if member is None or not is_mod(
+            member,
+            mod_role_id,
+            allow_manage_guild=allow_manage_guild,
+        ):
+            return await self._respond_interaction(
+                interaction,
+                "Only staff can close tickets",
+                ephemeral=True,
+            )
+
         ticket_row = await self.bot.db.fetchone(
             "SELECT status, closing_prompt_message_id FROM tickets WHERE guild_id=? AND channel_id=?",
             (interaction.guild.id, interaction.channel_id),
@@ -3263,8 +3800,9 @@ class HelpCog(commands.Cog):
 
         if not confirmed:
             await self.bot.db.execute(
-                "UPDATE tickets SET status='open', closing_prompt_message_id=NULL WHERE channel_id=?",
-                (interaction.channel_id,),
+                "UPDATE tickets SET status='open', last_user_activity_ts=?, "
+                "closing_prompt_message_id=NULL WHERE channel_id=?",
+                (int(time.time()), interaction.channel_id),
             )
             try:
                 await interaction.message.edit(content="Ticket kept open.", view=None, allowed_mentions=no_mentions())
@@ -3296,14 +3834,15 @@ class HelpCog(commands.Cog):
             prompt = str(
                 self.bot.config.get("tickets", "satisfaction_prompt", default="How was your staff ticket experience?")
                 or "How was your staff ticket experience?"
-            )
-            user = await self._resolve_member(guild, creator_id) or self.bot.get_user(creator_id)
-            if user is None:
-                try:
-                    user = await self.bot.fetch_user(creator_id)
-                except Exception:
-                    user = None
-            if user is None:
+            )[:1000]
+            try:
+                user = await self._resolve_dm_recipient(guild, creator_id)
+            except Exception as e:
+                await log_error(
+                    self.bot,
+                    f"Ticket satisfaction recipient resolution failed ticket_id={ticket_id} "
+                    f"creator_id={creator_id}: {e!r}",
+                )
                 return
             embed = self._help_embed(
                 "Ticket Feedback",

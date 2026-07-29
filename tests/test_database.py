@@ -24,15 +24,95 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         "daily_stats",
         "impact_snapshots",
         "runtime_settings",
+        "bot_releases",
     } <= tables
 
     ticket_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(tickets)")}
     assert {"opening_message_id", "closing_prompt_message_id", "satisfaction_message_id"} <= ticket_columns
 
+    transcript_request_columns = {
+        str(row["name"])
+        for row in await db.fetchall("PRAGMA table_info(transcript_requests)")
+    }
+    assert {"updated_ts", "reviewed_by", "reviewed_ts", "error_text"} <= transcript_request_columns
+
     request_columns = {
         str(row["name"]) for row in await db.fetchall("PRAGMA table_info(level_request_submissions)")
     }
     assert "edit_deadline_ts" in request_columns
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_bot_releases_persist_approval_and_public_notes(tmp_path):
+    path = tmp_path / "releases.db"
+    db = Database(str(path))
+    await db.connect()
+    release_id = await db.execute_insert(
+        """
+        INSERT INTO bot_releases(
+            version,title,summary,changes_json,status,source,
+            created_by,created_ts,decided_by,decided_ts
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "3.2.1",
+            "Reliable support",
+            "Support delivery hardening",
+            '["Fixed retry handling"]',
+            "approved",
+            "test",
+            110,
+            1000,
+            110,
+            1100,
+        ),
+    )
+    await db.close()
+
+    reopened = Database(str(path))
+    await reopened.connect()
+    row = await reopened.fetchone(
+        "SELECT * FROM bot_releases WHERE id=?",
+        (release_id,),
+    )
+    assert row["version"] == "3.2.1"
+    assert row["status"] == "approved"
+    assert row["changes_json"] == '["Fixed retry handling"]'
+    assert row["decided_by"] == 110
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_existing_transcript_requests_gain_audit_columns_without_data_loss(tmp_path):
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE transcript_requests("
+            "guild_id INTEGER NOT NULL, request_message_id INTEGER PRIMARY KEY, "
+            "ticket_channel_id INTEGER NOT NULL, requester_id INTEGER NOT NULL, "
+            "status TEXT NOT NULL, created_ts INTEGER NOT NULL, ticket_id INTEGER"
+            ")"
+        )
+        conn.execute(
+            "INSERT INTO transcript_requests VALUES(?,?,?,?,?,?,?)",
+            (717, 555, 999, 42, "pending", 1234, 3),
+        )
+        conn.commit()
+
+    db = Database(str(path))
+    await db.connect()
+    row = await db.fetchone(
+        "SELECT status, created_ts, updated_ts, reviewed_by, reviewed_ts, error_text "
+        "FROM transcript_requests WHERE request_message_id=555"
+    )
+
+    assert row["status"] == "pending"
+    assert row["created_ts"] == 1234
+    assert row["updated_ts"] == 1234
+    assert row["reviewed_by"] is None
+    assert row["reviewed_ts"] is None
+    assert row["error_text"] is None
     await db.close()
 
 

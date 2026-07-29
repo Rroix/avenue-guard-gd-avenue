@@ -115,11 +115,14 @@
    - Expected: preview embed includes all three answers and Submit/Edit/Cancel/Start Over buttons.
 6. Press Edit.
    - Expected: the appeal restarts from its first question so all three answers can be corrected.
+   - Expected: old answers and attachments disappear; only the replacement answers/evidence appear in the next preview.
 7. Press Submit.
    - Expected: confirmation DM includes a tracked ID like `A-12`.
    - Expected: structured staff-log embed posted to `channels.appeals_log_channel_id` with the same ID and attachment links if included.
 8. As staff, reply to the staff-log embed.
    - Expected: bot DMs the response to the submitter and marks the log as responded.
+   - Expected: the original staff embed changes to Responded.
+   - If delivery fails, the appeal remains Pending and the error log includes the database and embedded requester IDs for diagnosis.
 
 ---
 
@@ -146,6 +149,7 @@
    - Expected: a modal accepts optional Reason, Date, Evidence links, Notes, and up to three evidence files.
 5. Submit the modal, inspect the confirmation, then press `Yes, send it`.
    - Expected: only populated fields are DMed to the user, attached evidence is included, and the staff button is disabled.
+   - If Discord cannot resolve or DM the requester, the button remains enabled and the error log identifies the requester ID for a retry.
 6. Repeat with every modal field empty.
    - Expected: the user receives the configured fallback explanation without empty field labels.
 
@@ -203,8 +207,11 @@
 ## 14) Tickets: inactivity prompt + close
 1. Temporarily set `tickets.ticket_inactivity_hours` to 0.01 for fast testing (optional)
 2. Wait until prompt appears: "Do you want to close the ticket?"
+   - Send a message at the same moment the inactivity scan runs.
+   - Expected: fresh activity wins, the stale close prompt is removed, and the ticket remains open.
 3. Press No
    - Expected: ticket remains open
+   - Expected: inactivity timing resets, so the next scanner pass does not immediately ask again.
 4. Press Yes
    - Expected: transcript file and structured ticket transcript embed posted to `channels.general_logging_channel_id`
    - Expected: the ticket opening message is marked `Resolved` before the transcript is saved.
@@ -222,12 +229,26 @@
    - Expected: structured transcript request embed posted in `channels.transcript_requests_channel_id` with Approve/Deny buttons.
 4. As a mod, press Approve
    - Expected: user receives transcript file in DM
+   - Expected: the transcript includes the complete chronological history, including attachment URLs and embed text.
    - Expected: request message updates to approved
    - Expected: approval is audit-logged.
 5. Press Deny (on another request)
    - Expected: user receives denial DM
    - Expected: the request message updates without creating duplicate transcript requests.
    - Expected: denial is audit-logged.
+6. Repeat approval and denial while the requester cannot receive DMs.
+   - Expected: delivery is not finalized, Approve/Deny remains available, and staff can retry.
+   - Expected: `transcript_requests` records the latest error without losing the pending request.
+7. Temporarily invalidate `channels.transcript_requests_channel_id`, then submit a ticket reference.
+   - Expected: the DM flow stays active so the user can retry after configuration is repaired.
+
+---
+
+## 15A) DM workflow ownership
+1. Start an appeal, report, bot issue, or transcript flow while a weekly reward DM session is also active.
+2. Send the next support answer.
+   - Expected: the support flow consumes it and advances normally.
+   - Expected: the weekly workflow does not parse or reject the support answer.
 
 ---
 
@@ -466,3 +487,33 @@
    - Expected: the manual force DM still sends if the user has no active/past non-resettable claim, and the override is logged.
 14. Temporarily misconfigure an appeal/report/bot-issue log channel, then complete that DM flow.
    - Expected: the user is told the submission could not be sent instead of receiving a false success message.
+
+---
+
+## 25) Public bot status and approved releases
+**Setup:** deploy the bot update first, keep `release_updates.owner_user_ids` set to the owner, and deploy the website files containing `bot.html` and `bot.js`.
+
+1. Open `https://avenue-guard.onrender.com/api/bot`.
+   - Expected: JSON reports `online`, operational state, uptime, latency, aggregate members, avatar, and the latest approved version.
+   - Expected: internal startup details, database paths, tokens, owner IDs, and pending notes are absent.
+2. Open `https://avenue-guard.onrender.com/api/releases`.
+   - Expected: only approved releases appear.
+3. Run `/bot release` with a new semantic version and two changes.
+   - Expected: the command defers successfully, saves a pending `bot_releases` row, and DMs the configured owner.
+   - Expected: the new version does not appear in either public endpoint yet.
+4. Restart the bot before deciding.
+   - Expected: the old approval buttons still work because the view and proposal are persistent.
+5. Press Reject.
+   - Expected: the DM becomes a disabled rejected panel and the release remains absent from the public API.
+6. Propose a different version, then press Approve and publish.
+   - Expected: the panel becomes disabled, the database records the decision, and both public endpoints show the approved version.
+7. Run `/bot release` again with an already pending version.
+   - Expected: Avenue Guard sends a newer approval DM and the old panel refuses the decision.
+8. Run `/bot releases`.
+   - Expected: the current approved version, pending queue, DM-delivery state, and public page link appear ephemerally.
+9. Put a new version and changes in `release.json`, then deploy/restart.
+   - Expected: Avenue Guard creates one automatic proposal and DMs the owner once; repeated restarts do not duplicate it.
+10. Open `https://gdavenue.netlify.app/bot` on desktop and mobile.
+   - Expected: status, metrics, bot avatar, and release cards fit without overlap or horizontal scrolling.
+11. Temporarily stop or restart the Render service while the page is open.
+   - Expected: the page shows a connecting, unavailable, or retry state without exposing the internal exception.
