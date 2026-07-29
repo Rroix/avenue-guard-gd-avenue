@@ -1,7 +1,16 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "",
-  "title": "",
-  "summary": "",
-  "changes": []
+  "version": "3.20.1",
+  "title": "Support and service visibility",
+  "summary": "Clearer support workflows and dependable public operational reporting for Avenue Guard.",
+  "changes": [
+    "Rebuilt DM support around clear menus, partnership tickets, and former-member appeals",
+    "Fixed appeal, report, transcript, and staff-response continuation workflows",
+    "Added live public service status, Discord uptime, latency, and recent update history",
+    "Limited the public member total to the configured GD Avenue server",
+    "Added a persistent measured uptime percentage that survives bot restarts",
+    "Added the live Avenue Guard profile picture and consistent semantic version checks",
+    "Changed the release changes field to use | between update bullets",
+    "Fixed valid newer approval DMs being mistaken for replaced panels"
+  ]
 }

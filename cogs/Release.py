@@ -12,15 +12,28 @@ import discord
 from discord.ext import commands
 
 from utils.errors import log_error
-from utils.keepalive import set_public_bot_metrics, set_public_release_data
+from utils.keepalive import (
+    get_keepalive_status,
+    set_public_bot_metrics,
+    set_public_release_data,
+)
 from utils.mentions import no_mentions
 from utils.releases import (
     ReleaseValidationError,
+    compare_versions,
     load_release_manifest,
+    newest_version,
+    normalize_version,
     row_to_public_release,
     validate_release_payload,
 )
 from utils.views import ReleaseApprovalView
+
+DEFAULT_BOT_AVATAR_URL = (
+    "https://cdn.discordapp.com/avatars/1454985687177887866/"
+    "d268221fd7a7a5529897730d18edd5a0.webp?size=2048"
+)
+UPTIME_HEARTBEAT_SECONDS = 60
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -53,6 +66,10 @@ class ReleaseCog(commands.Cog):
         self.bot = bot
         self._background_started = False
         self._metrics_task: asyncio.Task | None = None
+        self._uptime_lock = asyncio.Lock()
+        self._uptime_initialized = False
+        self._last_member_count = 0
+        self._last_member_fetch_attempt = 0.0
 
     def cog_unload(self) -> None:
         if self._metrics_task is not None:
@@ -96,6 +113,44 @@ class ReleaseCog(commands.Cog):
             "website_url",
             default="https://gdavenue.netlify.app/bot",
         ).strip()
+
+    def _version_floor(self) -> str:
+        value = self.bot.config.get_str(
+            "release_updates",
+            "version_floor",
+            default="3.18.7",
+        ).strip()
+        try:
+            return normalize_version(value)
+        except ReleaseValidationError:
+            return ""
+
+    async def _latest_recorded_version(self) -> str:
+        rows = await self.bot.db.fetchall(
+            "SELECT version FROM bot_releases WHERE status IN ('pending','approved')"
+        )
+        versions: list[str] = []
+        floor = self._version_floor()
+        if floor:
+            versions.append(floor)
+        for row in rows:
+            try:
+                versions.append(normalize_version(row["version"]))
+            except (KeyError, TypeError, ReleaseValidationError):
+                continue
+        return newest_version(versions) if versions else ""
+
+    async def _latest_approved_version(self) -> str:
+        rows = await self.bot.db.fetchall(
+            "SELECT version FROM bot_releases WHERE status='approved'"
+        )
+        versions: list[str] = []
+        for row in rows:
+            try:
+                versions.append(normalize_version(row["version"]))
+            except (KeyError, TypeError, ReleaseValidationError):
+                continue
+        return newest_version(versions) if versions else ""
 
     async def _resolve_owner(self) -> discord.User | discord.Member | None:
         owner_ids = self.owner_ids()
@@ -152,7 +207,7 @@ class ReleaseCog(commands.Cog):
             changes = []
         if not isinstance(changes, list):
             changes = []
-        chunks = _field_chunks([f"- {str(change)}" for change in changes])
+        chunks = _field_chunks([f"- {change!s}" for change in changes])
         for index, chunk in enumerate(chunks[:4]):
             embed.add_field(
                 name="Changes" if index == 0 else "Changes continued",
@@ -252,6 +307,16 @@ class ReleaseCog(commands.Cog):
                 return True, f"Pending version `{payload['version']}` was sent to your DMs again"
             return False, f"The proposal is still pending, but I could not DM you: {error}"
 
+        latest_version = await self._latest_recorded_version()
+        if (
+            latest_version
+            and compare_versions(payload["version"], latest_version) <= 0
+        ):
+            return False, (
+                f"Version `{payload['version']}` must be newer than the current "
+                f"version baseline `{latest_version}`"
+            )
+
         proposal_id = await self.bot.db.execute_insert(
             """
             INSERT INTO bot_releases(
@@ -328,22 +393,227 @@ class ReleaseCog(commands.Cog):
         )
         set_public_release_data([row_to_public_release(row) for row in rows])
 
-    async def refresh_public_metrics(self) -> None:
+    @staticmethod
+    def _uptime_snapshot_from_row(
+        row: Any,
+        *,
+        now: int,
+        online: bool,
+    ) -> dict[str, int | float | None]:
+        tracking_started_ts = int(_row_value(row, "tracking_started_ts", 0) or 0)
+        last_heartbeat_ts = int(_row_value(row, "last_heartbeat_ts", now) or now)
+        observed_seconds = max(
+            0,
+            int(_row_value(row, "observed_seconds", 0) or 0),
+        )
+        online_seconds = max(
+            0,
+            int(_row_value(row, "online_seconds", 0) or 0),
+        )
+        pending_seconds = max(0, now - last_heartbeat_ts)
+        live_observed = observed_seconds + pending_seconds
+        live_online = online_seconds + (pending_seconds if online else 0)
+        percentage = (
+            round((live_online / live_observed) * 100.0, 3)
+            if live_observed > 0
+            else None
+        )
+        return {
+            "percentage": percentage,
+            "tracking_started_ts": tracking_started_ts,
+            "observed_seconds": live_observed,
+            "online_seconds": live_online,
+        }
+
+    async def _initialize_uptime_tracker(self) -> None:
+        if self._uptime_initialized:
+            return
+        async with self._uptime_lock:
+            if self._uptime_initialized:
+                return
+            now = int(time.time())
+            row = await self.bot.db.fetchone(
+                "SELECT * FROM bot_uptime_tracker WHERE id=1"
+            )
+            if row is None:
+                await self.bot.db.execute(
+                    "INSERT INTO bot_uptime_tracker("
+                    "id,tracking_started_ts,last_heartbeat_ts,observed_seconds,online_seconds"
+                    ") VALUES(1,?,?,0,0)",
+                    (now, now),
+                )
+            else:
+                last_heartbeat_ts = int(
+                    _row_value(row, "last_heartbeat_ts", now) or now
+                )
+                offline_gap = max(0, now - last_heartbeat_ts)
+                await self.bot.db.execute(
+                    "UPDATE bot_uptime_tracker SET "
+                    "observed_seconds=observed_seconds+?,last_heartbeat_ts=? "
+                    "WHERE id=1",
+                    (offline_gap, now),
+                )
+            self._uptime_initialized = True
+
+    async def record_uptime_sample(
+        self,
+        *,
+        online: bool,
+        force: bool = False,
+    ) -> dict[str, int | float | None]:
+        await self._initialize_uptime_tracker()
+        async with self._uptime_lock:
+            now = int(time.time())
+            row = await self.bot.db.fetchone(
+                "SELECT * FROM bot_uptime_tracker WHERE id=1"
+            )
+            if row is None:
+                self._uptime_initialized = False
+                return {
+                    "percentage": None,
+                    "tracking_started_ts": 0,
+                    "observed_seconds": 0,
+                    "online_seconds": 0,
+                }
+
+            last_heartbeat_ts = int(
+                _row_value(row, "last_heartbeat_ts", now) or now
+            )
+            elapsed = max(0, now - last_heartbeat_ts)
+            if force or elapsed >= UPTIME_HEARTBEAT_SECONDS:
+                await self.bot.db.execute(
+                    "UPDATE bot_uptime_tracker SET "
+                    "observed_seconds=observed_seconds+?,"
+                    "online_seconds=online_seconds+?,"
+                    "last_heartbeat_ts=? WHERE id=1",
+                    (elapsed, elapsed if online else 0, now),
+                )
+                row = await self.bot.db.fetchone(
+                    "SELECT * FROM bot_uptime_tracker WHERE id=1"
+                )
+            return self._uptime_snapshot_from_row(
+                row,
+                now=now,
+                online=online,
+            )
+
+    async def record_uptime_transition(self, *, was_online: bool) -> None:
+        await self.record_uptime_sample(online=was_online, force=True)
+
+    async def uptime_snapshot(
+        self,
+        *,
+        online: bool,
+    ) -> dict[str, int | float | None]:
+        await self._initialize_uptime_tracker()
+        async with self._uptime_lock:
+            now = int(time.time())
+            row = await self.bot.db.fetchone(
+                "SELECT * FROM bot_uptime_tracker WHERE id=1"
+            )
+            return self._uptime_snapshot_from_row(
+                row,
+                now=now,
+                online=online,
+            )
+
+    async def _allowed_guild_metrics(self) -> tuple[int, int]:
+        guilds = list(getattr(self.bot, "guilds", []) or [])
+        allowed_guild_id = self.bot.config.get_int(
+            "guild",
+            "allowed_guild_id",
+            default=0,
+        )
+        guild = None
+        get_guild = getattr(self.bot, "get_guild", None)
+        if allowed_guild_id and callable(get_guild):
+            guild = get_guild(allowed_guild_id)
+        if guild is None and allowed_guild_id:
+            guild = next(
+                (
+                    candidate
+                    for candidate in guilds
+                    if int(getattr(candidate, "id", 0) or 0) == allowed_guild_id
+                ),
+                None,
+            )
+        if guild is None and not allowed_guild_id and guilds:
+            guild = guilds[0]
+
+        if guild is not None:
+            member_count = getattr(guild, "member_count", None)
+            if member_count is not None:
+                self._last_member_count = max(0, int(member_count))
+                return self._last_member_count, 1
+            self._last_member_count = len(
+                list(getattr(guild, "members", []) or [])
+            )
+
+        if (
+            allowed_guild_id
+            and time.monotonic() - self._last_member_fetch_attempt >= 300
+        ):
+            fetch_guild = getattr(self.bot, "fetch_guild", None)
+            if callable(fetch_guild):
+                self._last_member_fetch_attempt = time.monotonic()
+                try:
+                    fetched = await fetch_guild(
+                        allowed_guild_id,
+                        with_counts=True,
+                    )
+                    member_count = getattr(
+                        fetched,
+                        "approximate_member_count",
+                        None,
+                    )
+                    if member_count is None:
+                        member_count = getattr(fetched, "member_count", None)
+                    if member_count is not None:
+                        self._last_member_count = max(0, int(member_count))
+                        return self._last_member_count, 1
+                except Exception as exc:
+                    await log_error(
+                        self.bot,
+                        "Public member count REST fallback failed "
+                        f"guild_id={allowed_guild_id} "
+                        f"cached_member_count={self._last_member_count}: {exc!r}",
+                    )
+        return self._last_member_count, 1 if guild is not None else 0
+
+    async def refresh_public_metrics(
+        self,
+        *,
+        record_availability: bool = True,
+    ) -> None:
         latency = float(getattr(self.bot, "latency", 0.0) or 0.0)
         latency_ms = round(latency * 1000) if math.isfinite(latency) else None
-        guilds = list(getattr(self.bot, "guilds", []) or [])
-        member_count = sum(
-            max(0, int(getattr(guild, "member_count", 0) or len(getattr(guild, "members", []) or [])))
-            for guild in guilds
+        member_count, guild_count = await self._allowed_guild_metrics()
+        online = str(get_keepalive_status().get("state") or "") == "online"
+        uptime = (
+            await self.record_uptime_sample(
+                online=online,
+                force=False,
+            )
+            if record_availability
+            else await self.uptime_snapshot(online=online)
         )
         user = getattr(self.bot, "user", None)
         avatar = getattr(getattr(user, "display_avatar", None), "url", "")
+        fallback_avatar = self.bot.config.get_str(
+            "release_updates",
+            "bot_avatar_url",
+            default=DEFAULT_BOT_AVATAR_URL,
+        ).strip()
         set_public_bot_metrics(
             bot_name=str(user or "Avenue Guard"),
-            avatar_url=str(avatar or ""),
+            avatar_url=str(avatar or fallback_avatar or DEFAULT_BOT_AVATAR_URL),
             latency_ms=latency_ms,
-            guild_count=len(guilds),
+            guild_count=guild_count,
             member_count=member_count,
+            uptime_percentage=uptime["percentage"],
+            uptime_tracking_since_ts=int(
+                uptime["tracking_started_ts"] or 0
+            ),
         )
 
     async def _metrics_loop(self) -> None:
@@ -364,6 +634,10 @@ class ReleaseCog(commands.Cog):
         if self._background_started:
             return
         self._background_started = True
+        try:
+            await self._initialize_uptime_tracker()
+        except Exception as exc:
+            await log_error(self.bot, f"Initial uptime tracker setup failed: {exc!r}")
         try:
             await self.refresh_public_release_cache()
         except Exception as exc:
@@ -435,11 +709,39 @@ class ReleaseCog(commands.Cog):
 
         expected_message_id = int(_row_value(row, "approval_message_id", 0) or 0)
         actual_message_id = int(getattr(getattr(interaction, "message", None), "id", 0) or 0)
-        if expected_message_id and expected_message_id != actual_message_id:
+        if (
+            expected_message_id
+            and actual_message_id
+            and actual_message_id < expected_message_id
+            and (actual_message_id >> 22) < (expected_message_id >> 22)
+        ):
             return await interaction.followup.send(
                 "That approval panel was replaced by a newer one. Use the latest DM.",
                 ephemeral=True,
                 allowed_mentions=no_mentions(),
+            )
+        if (
+            actual_message_id
+            and expected_message_id != actual_message_id
+        ):
+            await self.bot.db.execute(
+                "UPDATE bot_releases SET approval_message_id=? "
+                "WHERE id=? AND status='pending'",
+                (actual_message_id, proposal_id),
+            )
+            reconciliation = {
+                "proposal_id": proposal_id,
+                "stored_message_id": expected_message_id,
+                "clicked_message_id": actual_message_id,
+                "ts": int(time.time()),
+            }
+            self.bot._last_release_panel_reconciliation = reconciliation
+            print(
+                "[Avenue Guard release] Approval panel ID reconciled "
+                f"proposal_id={proposal_id} "
+                f"stored_message_id={expected_message_id} "
+                f"clicked_message_id={actual_message_id}",
+                flush=True,
             )
         if str(row["status"]) != "pending":
             return await interaction.followup.send(
@@ -447,6 +749,47 @@ class ReleaseCog(commands.Cog):
                 ephemeral=True,
                 allowed_mentions=no_mentions(),
             )
+
+        if approved:
+            latest_approved = await self._latest_approved_version()
+            if (
+                latest_approved
+                and compare_versions(row["version"], latest_approved) <= 0
+            ):
+                decided_ts = int(time.time())
+                await self.bot.db.execute(
+                    "UPDATE bot_releases SET "
+                    "status='rejected',decided_by=?,decided_ts=?,error_text=? "
+                    "WHERE id=? AND status='pending'",
+                    (
+                        int(interaction.user.id),
+                        decided_ts,
+                        f"Superseded by published version {latest_approved}",
+                        proposal_id,
+                    ),
+                )
+                superseded = await self.bot.db.fetchone(
+                    "SELECT * FROM bot_releases WHERE id=?",
+                    (proposal_id,),
+                )
+                if superseded is not None:
+                    try:
+                        await interaction.message.edit(
+                            embed=self._approval_embed(superseded),
+                            view=ReleaseApprovalView(disabled=True),
+                        )
+                    except Exception as exc:
+                        await log_error(
+                            self.bot,
+                            "Superseded release panel edit failed "
+                            f"proposal_id={proposal_id}: {exc!r}",
+                        )
+                return await interaction.followup.send(
+                    f"Version `{row['version']}` cannot be published after "
+                    f"`{latest_approved}` and was marked as superseded.",
+                    ephemeral=True,
+                    allowed_mentions=no_mentions(),
+                )
 
         status = "approved" if approved else "rejected"
         decided_ts = int(time.time())
@@ -498,6 +841,15 @@ class ReleaseCog(commands.Cog):
             ephemeral=True,
             allowed_mentions=no_mentions(),
         )
+        if not approved:
+            try:
+                await self._ensure_manifest_proposal()
+            except Exception as exc:
+                await log_error(
+                    self.bot,
+                    "Release manifest proposal after rejection failed "
+                    f"proposal_id={proposal_id}: {exc!r}",
+                )
 
 
 def setup(bot: discord.Bot):

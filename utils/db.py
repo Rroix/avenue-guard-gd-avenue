@@ -800,6 +800,13 @@ class Database:
                 decided_ts INTEGER,
                 error_text TEXT
             );""",
+            """CREATE TABLE IF NOT EXISTS bot_uptime_tracker(
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                tracking_started_ts INTEGER NOT NULL,
+                last_heartbeat_ts INTEGER NOT NULL,
+                observed_seconds INTEGER NOT NULL DEFAULT 0,
+                online_seconds INTEGER NOT NULL DEFAULT 0
+            );""",
             """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
                 ON activity_counts(guild_id, week_start, count DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry

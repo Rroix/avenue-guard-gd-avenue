@@ -25,6 +25,7 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         "impact_snapshots",
         "runtime_settings",
         "bot_releases",
+        "bot_uptime_tracker",
     } <= tables
 
     ticket_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(tickets)")}

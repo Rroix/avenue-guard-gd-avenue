@@ -527,13 +527,15 @@
     }
   },
   "release_updates": {
-    "_comment": "Owner-approved public Avenue Guard releases. A non-empty release.json manifest is proposed automatically after deployment; /bot release can also create a proposal. Only approved releases appear in the public API and website.",
+    "_comment": "Reviewed public Avenue Guard releases. A non-empty release.json manifest is proposed automatically after deployment; /bot release can also create a proposal. Only published releases appear in the public API and website.",
     "enabled": true,
     "owner_user_ids": [
       "1102884420207255653"
     ],
     "manifest_path": "release.json",
+    "version_floor": "3.18.7",
     "public_release_limit": 20,
+    "bot_avatar_url": "https://cdn.discordapp.com/avatars/1454985687177887866/d268221fd7a7a5529897730d18edd5a0.webp?size=2048",
     "website_url": "https://gdavenue.netlify.app/bot",
     "public_api_url": "https://avenue-guard.onrender.com"
   },

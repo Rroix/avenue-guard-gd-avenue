@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
+from functools import cmp_to_key
 from pathlib import Path
-from typing import Any, Iterable
-
+from typing import Any
 
 SEMVER_RE = re.compile(
-    r"^(?:[vV])?(?P<version>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)"
-    r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+    r"^(?:[vV])?(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)"
+    r"(?:-(?P<prerelease>[0-9A-Za-z.-]+))?(?:\+(?P<build>[0-9A-Za-z.-]+))?$"
 )
 MAX_RELEASE_CHANGES = 20
 MAX_RELEASE_CHANGE_LENGTH = 300
@@ -28,9 +29,54 @@ def normalize_version(value: Any) -> str:
     return raw[1:] if raw.casefold().startswith("v") else raw
 
 
+def compare_versions(left: Any, right: Any) -> int:
+    """Compare two semantic versions according to SemVer precedence."""
+    normalized_left = normalize_version(left)
+    normalized_right = normalize_version(right)
+    left_match = SEMVER_RE.fullmatch(normalized_left)
+    right_match = SEMVER_RE.fullmatch(normalized_right)
+    assert left_match is not None and right_match is not None
+
+    left_core = tuple(int(left_match.group(name)) for name in ("major", "minor", "patch"))
+    right_core = tuple(int(right_match.group(name)) for name in ("major", "minor", "patch"))
+    if left_core != right_core:
+        return 1 if left_core > right_core else -1
+
+    left_pre = left_match.group("prerelease")
+    right_pre = right_match.group("prerelease")
+    if left_pre is None or right_pre is None:
+        if left_pre == right_pre:
+            return 0
+        return 1 if left_pre is None else -1
+
+    left_parts = left_pre.split(".")
+    right_parts = right_pre.split(".")
+    for left_part, right_part in zip(left_parts, right_parts):
+        if left_part == right_part:
+            continue
+        left_numeric = left_part.isdigit()
+        right_numeric = right_part.isdigit()
+        if left_numeric and right_numeric:
+            return 1 if int(left_part) > int(right_part) else -1
+        if left_numeric != right_numeric:
+            return -1 if left_numeric else 1
+        return 1 if left_part > right_part else -1
+    if len(left_parts) == len(right_parts):
+        return 0
+    return 1 if len(left_parts) > len(right_parts) else -1
+
+
+def newest_version(values: Iterable[Any]) -> str:
+    normalized = [normalize_version(value) for value in values if str(value or "").strip()]
+    if not normalized:
+        return ""
+    return max(normalized, key=cmp_to_key(compare_versions))
+
+
 def normalize_release_changes(value: str | Iterable[Any]) -> list[str]:
     if isinstance(value, str):
-        items = value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+        items = re.split(r"[|\n]", normalized)
     else:
         items = list(value or [])
 

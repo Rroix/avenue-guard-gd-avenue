@@ -66,7 +66,7 @@ Behind the scenes, Avenue Guard has several tools for keeping itself healthy. It
 
 This is important because our bot depends on many moving parts like channels, roles, permissions, messages, buttons, background tasks, and persistent data. If any of those drift, we can at least know what is missing and how to fix it.
 
-Avenue Guard also powers its own public status and update page on the GD Avenue website. The page shows whether its Discord connection is operational, its current uptime and latency, the size of the community it serves, and a readable version history. Update notes are never published automatically without review: the bot privately DMs the configured owner an approval panel, and only approved versions enter the public feed.
+Avenue Guard also powers its own public status and update page on the GD Avenue website. The page shows whether its Discord connection is operational, its current uptime and measured availability, latency, the current GD Avenue member count, and a readable recent version history.
 
 The bot stores important workflow state persistently. In production, Avenue Guard uses **Turso/libSQL** as its durable database layer. Turso is SQLite-compatible, which means the bot can keep the simplicity of SQLite while syncing important state to remote storage instead of relying on a host's temporary filesystem. This matters a lot on platforms where clearing cache or restarting a service could otherwise wipe local files.
 
@@ -74,7 +74,7 @@ The implementation uses a local embedded replica for fast reads and writes, then
 
 Production also refuses to silently switch to disposable local storage when Turso is configured but its token or replica path is unavailable. The health endpoint reports the startup problem until storage is repaired, while local development can explicitly opt into a temporary fallback.
 
-That persistent storage includes request waves, ticket data, transcripts, weekly tracking, help submissions, request reviews, validation cache, public release approvals, backups, restore history, and impact snapshots. So basically, the bot should not forget the important parts of the server's operations.
+That persistent storage includes request waves, ticket data, transcripts, weekly tracking, help submissions, request reviews, validation cache, release history, uptime measurements, backups, restore history, and impact snapshots. So basically, the bot should not forget the important parts of the server's operations.
 
 Some of the reliability methods behind Avenue Guard include:
 

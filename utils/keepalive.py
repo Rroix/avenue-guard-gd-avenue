@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -30,6 +31,8 @@ _public_metrics = {
     "latency_ms": None,
     "guild_count": 0,
     "member_count": 0,
+    "uptime_percentage": None,
+    "uptime_tracking_since_ts": 0,
     "updated_ts": _process_started_ts,
 }
 _public_releases: list[dict] = []
@@ -75,7 +78,14 @@ def set_public_bot_metrics(
     latency_ms: int | None = None,
     guild_count: int = 0,
     member_count: int = 0,
+    uptime_percentage: float | None = None,
+    uptime_tracking_since_ts: int = 0,
 ) -> None:
+    normalized_uptime_percentage = None
+    if uptime_percentage is not None:
+        value = float(uptime_percentage)
+        if math.isfinite(value):
+            normalized_uptime_percentage = round(max(0.0, min(100.0, value)), 3)
     with _status_lock:
         _public_metrics.update(
             {
@@ -88,6 +98,11 @@ def set_public_bot_metrics(
                 ),
                 "guild_count": max(0, int(guild_count or 0)),
                 "member_count": max(0, int(member_count or 0)),
+                "uptime_percentage": normalized_uptime_percentage,
+                "uptime_tracking_since_ts": max(
+                    0,
+                    int(uptime_tracking_since_ts or 0),
+                ),
                 "updated_ts": int(time.time()),
             }
         )
@@ -140,7 +155,7 @@ def get_public_bot_payload() -> dict:
     state = str(status.get("state") or "unknown")
     online_since_ts = int(status.get("online_since_ts") or 0)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "service": "Avenue Guard",
         "bot_name": str(metrics.get("bot_name") or "Avenue Guard"),
         "avatar_url": str(metrics.get("avatar_url") or ""),
@@ -150,7 +165,7 @@ def get_public_bot_payload() -> dict:
         "version": (
             str(current_release.get("version") or "")
             if current_release
-            else "Awaiting first approved release"
+            else "Version unavailable"
         ),
         "process_started_ts": _process_started_ts,
         "process_uptime_seconds": max(0, now - _process_started_ts),
@@ -163,6 +178,10 @@ def get_public_bot_payload() -> dict:
         "latency_ms": metrics.get("latency_ms"),
         "guild_count": int(metrics.get("guild_count") or 0),
         "member_count": int(metrics.get("member_count") or 0),
+        "uptime_percentage": metrics.get("uptime_percentage"),
+        "uptime_tracking_since_ts": int(
+            metrics.get("uptime_tracking_since_ts") or 0
+        ),
         "updated_ts": max(
             int(status.get("updated_ts") or 0),
             int(metrics.get("updated_ts") or 0),

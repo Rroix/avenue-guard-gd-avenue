@@ -34,7 +34,11 @@ from utils.runtime_config import (
     persist_forum_required_rules,
     persist_server_icon_config,
 )
-from utils.releases import ReleaseValidationError, load_release_manifest
+from utils.releases import (
+    ReleaseValidationError,
+    load_release_manifest,
+    normalize_version,
+)
 from utils.timeutils import now_madrid, week_start_sunday
 from utils.errors import log_error
 
@@ -56,6 +60,7 @@ AVENUE_GUARD_CORE_TABLES = {
     "impact_snapshots",
     "database_backups",
     "bot_releases",
+    "bot_uptime_tracker",
 }
 
 TICKET_STATUS_LABELS = {
@@ -1472,7 +1477,10 @@ class CommandsCog(commands.Cog):
         ctx: discord.ApplicationContext,
         version: discord.Option(str, "Semantic version such as 3.4.1"),
         title: discord.Option(str, "Short public title for this update"),
-        changes: discord.Option(str, "Public changes with one item per line"),
+        changes: discord.Option(
+            str,
+            "Separate changes with | such as Fixed tickets | Added status page",
+        ),
         summary: discord.Option(
             str,
             "Optional short overview shown above the changes",
@@ -2947,15 +2955,33 @@ class CommandsCog(commands.Cog):
                 "public_api_url",
                 default="",
             ).strip()
+            avatar_url = cfg.get_str(
+                "release_updates",
+                "bot_avatar_url",
+                default="",
+            ).strip()
             for label, value in (
                 ("release_updates.website_url", website_url),
                 ("release_updates.public_api_url", api_url),
+                ("release_updates.bot_avatar_url", avatar_url),
             ):
                 parsed = urlparse(value)
                 if parsed.scheme != "https" or not parsed.netloc:
                     issues.append(f"{label}: use a complete HTTPS URL")
                 else:
                     ok_count += 1
+
+            try:
+                normalize_version(
+                    cfg.get_str(
+                        "release_updates",
+                        "version_floor",
+                        default="3.18.7",
+                    )
+                )
+                ok_count += 1
+            except ReleaseValidationError as exc:
+                issues.append(f"release_updates.version_floor: {exc}")
 
             check_number(
                 "release_updates.public_release_limit",

@@ -490,30 +490,37 @@
 
 ---
 
-## 25) Public bot status and approved releases
+## 25) Public bot status and recent releases
 **Setup:** deploy the bot update first, keep `release_updates.owner_user_ids` set to the owner, and deploy the website files containing `bot.html` and `bot.js`.
 
 1. Open `https://avenue-guard.onrender.com/api/bot`.
-   - Expected: JSON reports `online`, operational state, uptime, latency, aggregate members, avatar, and the latest approved version.
+   - Expected: JSON reports `online`, operational state, connection uptime, persisted uptime percentage, latency, the configured GD Avenue guild's member total, actual bot avatar, and latest published version.
+   - Expected: `member_count` does not include any other guild even if the bot is accidentally connected elsewhere.
    - Expected: internal startup details, database paths, tokens, owner IDs, and pending notes are absent.
 2. Open `https://avenue-guard.onrender.com/api/releases`.
    - Expected: only approved releases appear.
-3. Run `/bot release` with a new semantic version and two changes.
+3. Run `/bot release` with a new semantic version and two changes separated by `|`.
    - Expected: the command defers successfully, saves a pending `bot_releases` row, and DMs the configured owner.
+   - Expected: each side of `|` appears as its own bullet in the approval panel and public update card.
    - Expected: the new version does not appear in either public endpoint yet.
 4. Restart the bot before deciding.
    - Expected: the old approval buttons still work because the view and proposal are persistent.
 5. Press Reject.
    - Expected: the DM becomes a disabled rejected panel and the release remains absent from the public API.
+   - Expected: when that panel used an old placeholder number and `release.json` contains `3.20.1`, the corrected manifest proposal arrives automatically.
 6. Propose a different version, then press Approve and publish.
    - Expected: the panel becomes disabled, the database records the decision, and both public endpoints show the approved version.
 7. Run `/bot release` again with an already pending version.
    - Expected: Avenue Guard sends a newer approval DM and the old panel refuses the decision.
+   - Expected: if Turso momentarily exposes the previous saved message ID, clicking the newer DM reconciles that ID and still records the decision.
 8. Run `/bot releases`.
    - Expected: the current approved version, pending queue, DM-delivery state, and public page link appear ephemerally.
 9. Put a new version and changes in `release.json`, then deploy/restart.
    - Expected: Avenue Guard creates one automatic proposal and DMs the owner once; repeated restarts do not duplicate it.
+   - Expected: a version equal to or older than `3.18.7` or the newest recorded release is rejected.
 10. Open `https://gdavenue.netlify.app/bot` on desktop and mobile.
-   - Expected: status, metrics, bot avatar, and release cards fit without overlap or horizontal scrolling.
+   - Expected: status, current uptime with its percentage, metrics, real bot avatar, and update cards fit without overlap or horizontal scrolling.
 11. Temporarily stop or restart the Render service while the page is open.
    - Expected: the page shows a connecting, unavailable, or retry state without exposing the internal exception.
+12. Leave the bot online for at least one minute, restart it, then inspect `/api/bot`.
+   - Expected: `uptime_tracking_since_ts` remains unchanged, the percentage survives, and the restart gap is counted as unavailable time.

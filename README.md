@@ -154,7 +154,7 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/bot impact` generates an owner-only community impact and forecast report with Markdown, CSV, trend CSV, breakdown CSV, and JSON exports.
 - `/bot backup` creates a zipped database backup in the configured backup channel.
 - `/bot storage` shows database storage and backup status.
-- `/bot release version:<x.y.z> title:<title> changes:<one per line> summary:<optional>` prepares a release and sends the owner an approval DM.
+- `/bot release version:<x.y.z> title:<title> changes:<item | item> summary:<optional>` prepares a release and sends the owner an approval DM.
 - `/bot releases` shows the approved website version and any pending proposals. Running `/bot release` again with a pending version resends its DM.
 - `/server_icon status` shows the server icon rotation mode, interval, current image, and configured URLs.
 - `/server_icon mode mode:<random|linear|disabled>` changes automatic server icon rotation mode.
@@ -265,11 +265,14 @@ Public bot updates live under `release_updates` in `config.json`.
 
 - `owner_user_ids`: the Discord users allowed to approve or reject releases. The first user receives proposal DMs.
 - `manifest_path`: optional deployment manifest, normally `release.json`.
+- `version_floor`: the agreed semantic-version baseline. New proposals must be newer than this and every pending or published release.
 - `public_release_limit`: approved releases retained in the public API response, from 1 to 50.
+- `bot_avatar_url`: stable HTTPS fallback for the public Avenue Guard profile picture.
 - `website_url`: the public Avenue Guard page linked after approval.
 - `public_api_url`: the Render service base URL checked by `/bot config_check`.
 - Pending, approved, and rejected proposals are stored in `bot_releases`, including the approval message and decision audit fields.
-- `/api/bot` exposes operational state, current connected uptime, process uptime, latency, aggregate member count, avatar, and the latest approved version.
+- `bot_uptime_tracker` stores the availability measurement start, latest heartbeat, observed time, and online time in Turso.
+- `/api/bot` exposes operational state, current connected uptime, process uptime, measured availability, latency, the configured GD Avenue guild's member count, avatar, and latest published version.
 - `/api/releases` exposes approved release titles, summaries, changes, versions, and publication timestamps. Pending and rejected proposals, owner IDs, errors, and database details are never returned.
 - Both endpoints allow read-only cross-origin requests so the static Netlify page can refresh without holding a secret.
 

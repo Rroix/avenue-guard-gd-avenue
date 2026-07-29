@@ -18,6 +18,7 @@ flowchart LR
     M["release.json deployment manifest"] --> P["Pending release proposal"]
     C["/bot release"] --> P
     P --> T[("Turso: bot_releases")]
+    G["Discord gateway heartbeat"] --> U[("Turso: bot_uptime_tracker")]
     T --> D["Owner approval DM"]
     D -->|Approve| A["Approved release"]
     D -->|Reject| R["Private rejected release"]
@@ -48,6 +49,12 @@ The table is part of the normal SQLite migration and Turso synchronization.
 It survives Render restarts and cache clears. Approved releases are restored
 into the public snapshot during startup.
 
+`bot_uptime_tracker` is a one-row durable availability accumulator. It stores
+when measurement began, the most recent heartbeat, total observed seconds, and
+seconds during which the Discord gateway was operational. This is deliberately
+separate from process uptime: a responsive Render web service does not prove
+that Discord commands are working.
+
 ## Proposal Methods
 
 ### Slash Command
@@ -56,17 +63,37 @@ The configured owner can run:
 
 ```text
 /bot release
-  version: 4.2.0
+  version: 3.20.2
   title: Public service status
-  changes:
-    Added live status
-    Added owner-approved release notes
+  changes: Added live status | Added recent release notes
   summary: Optional short overview
 ```
 
 The version must follow semantic versioning. A leading `v` is accepted and
-normalized away. Changes are entered one per line. Markdown-style bullets and
-number prefixes are removed before storage.
+normalized away. In the slash command, changes are separated with `|` because
+Discord's single-line option cannot contain line breaks. Newlines remain
+supported for manifests and internal calls. Markdown-style bullets and number
+prefixes are removed before storage.
+
+The configured version floor is `3.18.7`, matching the version established
+during the original bot evolution review. Avenue Guard compares semantic
+versions correctly, including prereleases, and rejects any proposal that is
+not newer than the floor and every pending or published version.
+If two increasing proposals are pending and the newer one is published first,
+the older panel can no longer regress the public version. An attempted
+approval marks that older proposal as superseded and disables its controls.
+
+The maintained sequence is:
+
+| Version | Meaning |
+|---|---|
+| `3.18.7` | Agreed baseline before the July workflow revisions |
+| `3.18.8` | Review-access cleanup |
+| `3.18.9` | Slash-command response reliability fixes |
+| `3.19.0` | DM support redesign |
+| `3.19.1` | Support continuation and response-delivery fixes |
+| `3.20.0` | Public status and release system |
+| `3.20.1` | Accurate guild metrics, persistent availability, identity, and wording refinements |
 
 The command saves the proposal first and then DMs the owner. If the DM fails,
 the proposal remains pending with a private error. Running the same command
@@ -79,12 +106,12 @@ not create a proposal. For a new release, use:
 
 ```json
 {
-  "version": "4.2.0",
+  "version": "3.20.2",
   "title": "Public service status",
   "summary": "A clearer view of Avenue Guard",
   "changes": [
     "Added live operational status",
-    "Added owner-approved release history"
+    "Added recent release history"
   ]
 }
 ```
@@ -119,8 +146,9 @@ This endpoint returns:
 - Current approved version
 - Render process start and uptime
 - Current Discord connection start and uptime
+- Persistent measured Discord availability percentage and measurement start
 - Discord latency
-- Connected guild count and aggregate member count
+- Configured GD Avenue guild member count
 - Bot name and avatar URL
 - Latest approved release
 - Public snapshot update time
@@ -144,14 +172,19 @@ diagnosis and Render health checks.
 
 ## Uptime Meaning
 
-The page shows the current Discord connection uptime while the bot is online.
-If Discord is unavailable but the Render process still responds, it shows
-process uptime and a non-operational state. This distinction prevents a
-successful HTTP response from being mistaken for a healthy Discord bot.
+The large duration shows the current Discord connection uptime while the bot
+is online. If Discord is unavailable but the Render process still responds, it
+shows process uptime and a non-operational state. This prevents a successful
+HTTP response from being mistaken for a healthy Discord bot.
 
-Uptime resets when the process or gateway connection restarts. Historical
-availability percentages still belong to an external monitor such as
-UptimeRobot; no public monitor key is required for the current page.
+The percentage beside it is Avenue Guard's persisted Discord availability,
+measured from `uptime_tracking_since_ts`. While running, a heartbeat commits
+at one-minute resolution. Gateway disconnect and resume events commit their
+transition immediately. On the next successful start, time since the previous
+heartbeat is conservatively counted as downtime. The measurement therefore
+survives restarts and unclean process exits through Turso. It begins when this
+schema is first deployed; it does not fabricate uptime for time before that
+date. UptimeRobot can remain as an independent outside-in monitor.
 
 ## Website Behavior
 
@@ -163,7 +196,8 @@ The page:
 - Refreshes status and release data every 30 seconds
 - Refreshes immediately when the tab becomes visible again
 - Uses text-only DOM construction for release data instead of injecting HTML
-- Accepts only HTTPS avatar URLs and falls back to the site icon
+- Uses the current Avenue Guard Discord avatar as its stable first render and
+  accepts only HTTPS avatar updates from the bot API
 - Keeps stale content visible while clearly reporting refresh failure
 - Works with an empty release history
 - Uses the existing site navigation, palette, surfaces, and mobile layout
@@ -175,7 +209,8 @@ The page:
 3. Deploy the `gdav_website` repository containing `bot.html`, `bot.js`, the
    shared CSS update, navigation links, and privacy disclosure.
 4. Open `/bot` on desktop and mobile.
-5. Run `/bot release` with the real current version.
+5. Confirm the `3.20.1` deployment proposal in `release.json` arrived by DM,
+   or run `/bot release` with the next real semantic version.
 6. Approve the DM and verify the version appears within 30 seconds.
 
 Deploying the website first is safe: it shows a retryable unavailable state
@@ -185,11 +220,17 @@ until the bot API is live.
 
 - **Owner DM failed:** open DMs and rerun `/bot release` with the same version.
 - **Old panel clicked:** use the latest DM; old message IDs are rejected.
+- **Latest panel has a stale stored ID:** Avenue Guard accepts a newer Discord
+  message, reconciles its ID into Turso, records the IDs in runtime diagnostics
+  and the Render log, and continues the decision. A genuinely older message
+  timestamp remains blocked.
 - **Turso temporarily unavailable:** the proposal remains in local committed
   state and normal database retry/synchronization behavior applies.
 - **Website cannot fetch:** it retains any visible status, marks the refresh
   failure, and retries automatically.
 - **Release notes were rejected:** change the version or submit a corrected
-  proposal manually.
+  proposal manually. If `release.json` already contains a different valid
+  version, rejection immediately checks it and sends the corrected proposal
+  without waiting for another restart.
 - **Approval happened but page is stale:** wait up to 30 seconds, then use the
   page's Refresh button.

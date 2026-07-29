@@ -94,6 +94,17 @@ def _run_preflight_database_check(bot: discord.Bot) -> None:
 
 async def _close_runtime_storage(bot: discord.Bot) -> None:
     """Best-effort flush on Discord's event loop before it is torn down."""
+    release = bot.get_cog("ReleaseCog")
+    record_uptime = getattr(release, "record_uptime_transition", None)
+    if callable(record_uptime):
+        try:
+            await record_uptime(
+                was_online=str(get_keepalive_status().get("state") or "")
+                == "online"
+            )
+        except Exception as e:
+            startup_log(f"Final uptime sample failed: {type(e).__name__}: {e}")
+
     tracking = bot.get_cog("TrackingCog")
     flush_activity = getattr(tracking, "flush_activity_counts", None)
     if callable(flush_activity):
@@ -257,6 +268,9 @@ def create_bot() -> discord.Bot:
 
     @bot.event
     async def on_ready():
+        previous_gateway_state = str(
+            get_keepalive_status().get("state") or ""
+        )
         try:
             await bot.db.connect()
         except Exception as e:
@@ -321,7 +335,26 @@ def create_bot() -> discord.Bot:
             await bot.register_persistent_views()
             bot._persistent_views_registered = True
 
+        release_cog = bot.get_cog("ReleaseCog")
+        record_uptime = getattr(release_cog, "record_uptime_transition", None)
+        if previous_gateway_state != "online" and callable(record_uptime):
+            try:
+                await record_uptime(was_online=False)
+            except Exception as e:
+                await log_error(
+                    bot,
+                    f"Uptime transition record before ready failed: {e!r}",
+                )
         set_keepalive_status("online", f"Logged in as {bot.user}")
+        refresh_metrics = getattr(release_cog, "refresh_public_metrics", None)
+        if callable(refresh_metrics):
+            try:
+                await refresh_metrics(record_availability=False)
+            except Exception as e:
+                await log_error(
+                    bot,
+                    f"Public bot status refresh after ready failed: {e!r}",
+                )
         startup_log(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
     @bot.event
@@ -329,15 +362,52 @@ def create_bot() -> discord.Bot:
         state = str(get_keepalive_status().get("state") or "")
         if state not in {"startup_error", "fatal_login_error", "crashed", "stopped"}:
             set_keepalive_status("reconnecting", "Discord gateway connection was interrupted")
+            release_cog = bot.get_cog("ReleaseCog")
+            record_uptime = getattr(
+                release_cog,
+                "record_uptime_transition",
+                None,
+            )
+            if state == "online" and callable(record_uptime):
+                try:
+                    await record_uptime(was_online=True)
+                except Exception as e:
+                    await log_error(
+                        bot,
+                        f"Uptime transition record after disconnect failed: {e!r}",
+                    )
+            refresh_metrics = getattr(
+                release_cog,
+                "refresh_public_metrics",
+                None,
+            )
+            if callable(refresh_metrics):
+                try:
+                    await refresh_metrics(record_availability=False)
+                except Exception as e:
+                    await log_error(
+                        bot,
+                        f"Public bot status refresh after disconnect failed: {e!r}",
+                    )
 
     @bot.event
     async def on_resumed():
+        previous_state = str(get_keepalive_status().get("state") or "")
         set_keepalive_status("online", f"Logged in as {bot.user}")
         release_cog = bot.get_cog("ReleaseCog")
+        record_uptime = getattr(release_cog, "record_uptime_transition", None)
+        if previous_state != "online" and callable(record_uptime):
+            try:
+                await record_uptime(was_online=False)
+            except Exception as e:
+                await log_error(
+                    bot,
+                    f"Uptime transition record after resume failed: {e!r}",
+                )
         refresh_metrics = getattr(release_cog, "refresh_public_metrics", None)
         if callable(refresh_metrics):
             try:
-                await refresh_metrics()
+                await refresh_metrics(record_availability=False)
             except Exception as e:
                 await log_error(bot, f"Public bot status refresh after resume failed: {e!r}")
 
