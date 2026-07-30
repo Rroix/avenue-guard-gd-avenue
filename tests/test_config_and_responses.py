@@ -1,5 +1,9 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from cogs.MessageResponses import MessageResponsesCog
 from utils.config import Config
@@ -56,3 +60,42 @@ def test_response_rule_validator_rejects_a_matching_rule_with_no_output():
     cog._load_error = ""
     cog._rules = [{"Content": "hello", "Embed": False, "Message": False}]
     assert "neither Embed nor Message output is enabled" in cog.validate_rules()[0]
+
+
+@pytest.mark.asyncio
+async def test_response_rules_can_send_every_match_after_one_cooldown_claim():
+    class ResponseConfig:
+        def get_int(self, *path, default=0):
+            return 717 if path == ("guild", "allowed_guild_id") else default
+
+        def get(self, *path, default=None):
+            values = {
+                ("responses", "first_match_only"): False,
+                ("responses", "cooldown_seconds"): 15,
+                ("responses", "max_response_chars"): 1600,
+            }
+            return values.get(path, default)
+
+    channel = SimpleNamespace(id=99, send=AsyncMock())
+    message = SimpleNamespace(
+        author=SimpleNamespace(id=42, bot=False),
+        guild=SimpleNamespace(id=717),
+        channel=channel,
+        content="hello there",
+        reply=AsyncMock(),
+    )
+    cog = object.__new__(MessageResponsesCog)
+    cog.bot = SimpleNamespace(config=ResponseConfig())
+    cog._rules = [
+        {"Content": "hello", "Message": True, "Message_text": "First"},
+        {"Content": "there", "Message": True, "Message_text": "Second"},
+    ]
+    cog._cooldown = {}
+    cog._last_rule_error_log = {}
+
+    await cog.on_message(message)
+
+    assert [call.args[0] for call in channel.send.await_args_list] == [
+        "First",
+        "Second",
+    ]

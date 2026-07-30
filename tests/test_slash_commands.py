@@ -8,7 +8,7 @@ import pytest
 
 from cogs.Commands import AdminDashboardView, CommandsCog
 from cogs.RequestLevels import RequestLevelsCog, ScheduledOpeningsView
-from main import create_bot
+from main import _close_event_loop, _prepare_fresh_event_loop, create_bot
 
 
 DEFERRED_COMMAND_METHODS = (
@@ -75,31 +75,38 @@ def test_all_registered_slash_commands_serialize_with_descriptions(tmp_path, mon
     monkeypatch.delenv("TURSO_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("LIBSQL_AUTH_TOKEN", raising=False)
 
-    bot = create_bot()
-    leaves = []
-    for root in bot.pending_application_commands:
-        leaves.extend(_leaf_command_data(root.to_dict()))
+    loop = _prepare_fresh_event_loop()
+    bot = None
+    try:
+        bot = create_bot()
+        leaves = []
+        for root in bot.pending_application_commands:
+            leaves.extend(_leaf_command_data(root.to_dict()))
 
-    names = {name for name, _ in leaves}
-    assert len(bot.pending_application_commands) == 17
-    assert len(names) == 41
-    assert {
-        "bot release",
-        "bot releases",
-        "tracking disable_reward",
-        "tracking enable_reward",
-        "open-requests",
-        "edit-request",
-    } <= names
+        names = {name for name, _ in leaves}
+        assert len(bot.pending_application_commands) == 17
+        assert len(names) == 41
+        assert {
+            "bot release",
+            "bot releases",
+            "tracking disable_reward",
+            "tracking enable_reward",
+            "open-requests",
+            "edit-request",
+        } <= names
 
-    for name, data in leaves:
-        description = str(data.get("description") or "")
-        assert description, name
-        assert len(description) <= 100, name
-        assert not description.endswith("."), name
-        for option in data.get("options", []):
-            if option.get("type") not in {1, 2}:
-                assert str(option.get("description") or ""), f"{name} {option.get('name')}"
+        for name, data in leaves:
+            description = str(data.get("description") or "")
+            assert description, name
+            assert len(description) <= 100, name
+            assert not description.endswith("."), name
+            for option in data.get("options", []):
+                if option.get("type") not in {1, 2}:
+                    assert str(option.get("description") or ""), f"{name} {option.get('name')}"
+    finally:
+        if bot is not None:
+            loop.run_until_complete(bot.close())
+        _close_event_loop(loop)
 
 
 def test_every_slow_slash_command_declares_early_defer_contract():

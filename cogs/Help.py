@@ -443,6 +443,7 @@ class HelpCog(commands.Cog):
         self._transcript_request_lock = asyncio.Lock()
         self._transcript_decision_lock = asyncio.Lock()
         self._ticket_close_locks: Dict[int, asyncio.Lock] = {}
+        self._ticket_close_lock_users: Dict[int, int] = {}
         self._satisfaction_lock = asyncio.Lock()
         self._satisfaction_views_registered = False
         self._ban_info_lock = asyncio.Lock()
@@ -700,7 +701,7 @@ class HelpCog(commands.Cog):
                 await self._log_background_error("ticket_scan", f"Ticket scan loop error: {repr(e)}")
 
     async def _log_background_error(self, key: str, message: str) -> None:
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_error_log.get(key, 0.0) < 300:
             return
         self._last_error_log[key] = now
@@ -1031,6 +1032,16 @@ class HelpCog(commands.Cog):
             return f"You're starting help flows too quickly. Try again <t:{retry_ts}:R>."
         attempts.append(now)
         self._flow_start_attempts[user_id] = attempts
+        while len(self._flow_start_attempts) > 5000:
+            oldest_user_id = min(
+                self._flow_start_attempts,
+                key=lambda uid: int(self._flow_start_attempts[uid][-1])
+                if self._flow_start_attempts[uid]
+                else 0,
+            )
+            if oldest_user_id == user_id and len(self._flow_start_attempts) == 1:
+                break
+            self._flow_start_attempts.pop(oldest_user_id, None)
         return ""
 
     async def _weekly_status_text(self, guild: discord.Guild, user_id: int) -> str:
@@ -1556,6 +1567,9 @@ class HelpCog(commands.Cog):
             for claimed_id, claimed_ts in list(claims.items())[:1000]:
                 if now - int(claimed_ts or 0) > 120:
                     claims.pop(claimed_id, None)
+        while len(claims) > 5000:
+            oldest_message_id = min(claims, key=claims.get)
+            claims.pop(oldest_message_id, None)
 
     async def should_yield_weekly_dm(
         self,
@@ -2069,7 +2083,7 @@ class HelpCog(commands.Cog):
 
             if not row:
                 await message.channel.send(
-                    "I couldn't find that ticket :/",
+                    "I couldn't find that ticket. Check the ticket ID or channel reference and try again.",
                     view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=False),
                     allowed_mentions=no_mentions(),
                 )
@@ -2077,7 +2091,7 @@ class HelpCog(commands.Cog):
 
             if int(row["creator_id"]) != message.author.id:
                 await message.channel.send(
-                    "That is not your ticket though",
+                    "That ticket belongs to another member, so you cannot request its transcript.",
                     view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=False),
                     allowed_mentions=no_mentions(),
                 )
@@ -3641,7 +3655,11 @@ class HelpCog(commands.Cog):
         category_id = cfg.get_int("tickets", "ticket_category_id")
         mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID")
         if not category_id or not mod_role_id:
-            return await self._respond_interaction(interaction, "Ticket system is not configured (Average's fault, please contact him)", ephemeral=True)
+            return await self._respond_interaction(
+                interaction,
+                "The ticket system is missing a required channel or role. Please contact an administrator.",
+                ephemeral=True,
+            )
 
         category = guild.get_channel(category_id)
         if not isinstance(category, discord.CategoryChannel):
@@ -3940,8 +3958,18 @@ class HelpCog(commands.Cog):
     async def close_ticket_channel(self, guild: discord.Guild, channel_id: int) -> bool:
         channel_id = int(channel_id)
         lock = self._ticket_close_locks.setdefault(channel_id, asyncio.Lock())
-        async with lock:
-            return await self._close_ticket_channel_locked(guild, channel_id)
+        self._ticket_close_lock_users[channel_id] = self._ticket_close_lock_users.get(channel_id, 0) + 1
+        try:
+            async with lock:
+                return await self._close_ticket_channel_locked(guild, channel_id)
+        finally:
+            remaining = self._ticket_close_lock_users.get(channel_id, 1) - 1
+            if remaining > 0:
+                self._ticket_close_lock_users[channel_id] = remaining
+            else:
+                self._ticket_close_lock_users.pop(channel_id, None)
+                if self._ticket_close_locks.get(channel_id) is lock:
+                    self._ticket_close_locks.pop(channel_id, None)
 
     async def _close_ticket_channel_locked(self, guild: discord.Guild, channel_id: int) -> bool:
         cfg = self.bot.config

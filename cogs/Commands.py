@@ -11,6 +11,7 @@ import time
 import re
 import string
 import zipfile
+from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
@@ -241,6 +242,36 @@ class CommandsCog(commands.Cog):
         # follow-up webhook depending on whether the command was deferred.
         return await ctx.respond(*args, **kwargs)
 
+    @staticmethod
+    def _claim_fun_cooldown(
+        cache: dict[int, float],
+        user_id: int,
+        *,
+        cooldown_seconds: float = 10.0,
+        max_entries: int = 5000,
+    ) -> int:
+        """Claim a monotonic cooldown and keep its per-user cache bounded."""
+        now = time.monotonic()
+        last = cache.get(int(user_id), 0.0)
+        elapsed = now - last
+        if elapsed < cooldown_seconds:
+            return max(1, int(cooldown_seconds - elapsed + 0.999))
+
+        cache[int(user_id)] = now
+        if len(cache) > max_entries:
+            stale_before = now - max(60.0, cooldown_seconds * 2)
+            for stale_user in [
+                key for key, claimed_at in cache.items() if claimed_at < stale_before
+            ]:
+                cache.pop(stale_user, None)
+            if len(cache) > max_entries:
+                for stale_user, _ in sorted(
+                    cache.items(),
+                    key=lambda item: item[1],
+                )[: len(cache) - max_entries]:
+                    cache.pop(stale_user, None)
+        return 0
+
     async def _log_admin_action(self, guild: discord.Guild, user_id: int, action: str, detail: str = "") -> None:
         channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
         channel = guild.get_channel(channel_id) if channel_id else None
@@ -377,13 +408,13 @@ class CommandsCog(commands.Cog):
         try:
             size_bytes = await self.bot.db.backup_to(raw_path)
             await self._validate_restore_database(raw_path)
-            zip_path = self._zip_backup_file(raw_path, slug)
+            zip_path = await asyncio.to_thread(self._zip_backup_file, raw_path, slug)
         finally:
             try:
                 raw_path.unlink()
             except FileNotFoundError:
                 pass
-        self._prune_local_backups()
+        await asyncio.to_thread(self._prune_local_backups)
         channel_id = self._backup_channel_id()
         channel = guild.get_channel(channel_id) if channel_id else None
         if channel is None and channel_id:
@@ -498,7 +529,9 @@ class CommandsCog(commands.Cog):
         def _run() -> dict:
             if not db_path.exists() or not db_path.is_file():
                 raise ValueError("The uploaded database file could not be found after upload.")
-            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            with closing(
+                sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            ) as conn:
                 integrity_row = conn.execute("PRAGMA integrity_check;").fetchone()
                 integrity = str(integrity_row[0] if integrity_row else "")
                 if integrity.casefold() != "ok":
@@ -1475,17 +1508,19 @@ class CommandsCog(commands.Cog):
     async def bot_release(
         self,
         ctx: discord.ApplicationContext,
-        version: discord.Option(str, "Semantic version such as 3.4.1"),
-        title: discord.Option(str, "Short public title for this update"),
+        version: discord.Option(str, "Semantic version such as 3.4.1", max_length=64),
+        title: discord.Option(str, "Short public title for this update", max_length=100),
         changes: discord.Option(
             str,
             "Separate changes with | such as Fixed tickets | Added status page",
+            max_length=6000,
         ),
         summary: discord.Option(
             str,
             "Optional short overview shown above the changes",
             required=False,
             default="",
+            max_length=600,
         ),
     ):
         if not self._in_allowed_guild(ctx):
@@ -1643,7 +1678,10 @@ class CommandsCog(commands.Cog):
         original_name = str(getattr(archive, "filename", "uploaded.sqlite3") or "uploaded.sqlite3")
         try:
             uploaded_path, original_name = await self._save_restore_attachment(archive)
-            restore_path = self._extract_sqlite_restore_file(uploaded_path)
+            restore_path = await asyncio.to_thread(
+                self._extract_sqlite_restore_file,
+                uploaded_path,
+            )
             validation = await self._validate_restore_database(restore_path)
         except Exception as e:
             await log_error(self.bot, f"Database restore upload validation failed: {repr(e)}")
@@ -1875,6 +1913,14 @@ class CommandsCog(commands.Cog):
         lock = getattr(background, "_server_icon_lock", None)
         return lock if isinstance(lock, asyncio.Lock) else self._server_icon_config_lock
 
+    def _config_write_lock(self) -> asyncio.Lock:
+        lock = getattr(self.bot, "config_write_lock", None)
+        if isinstance(lock, asyncio.Lock):
+            return lock
+        lock = asyncio.Lock()
+        self.bot.config_write_lock = lock
+        return lock
+
     async def _save_server_icon_config(self, ctx: discord.ApplicationContext, action: str, detail: str) -> bool:
         try:
             cfg = ensure_server_icon_config(self.bot.config)
@@ -1908,7 +1954,15 @@ class CommandsCog(commands.Cog):
     async def server_icon_mode(
         self,
         ctx: discord.ApplicationContext,
-        mode: discord.Option(str, "Mode to use: random, linear, or disabled"),
+        mode: discord.Option(
+            str,
+            "Rotation mode to use",
+            choices=[
+                discord.OptionChoice("Random", "random"),
+                discord.OptionChoice("Linear", "linear"),
+                discord.OptionChoice("Disabled", "disabled"),
+            ],
+        ),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -1919,7 +1973,7 @@ class CommandsCog(commands.Cog):
         raw_mode = str(mode or "").strip().casefold()
         if raw_mode not in VALID_SERVER_ICON_MODES:
             return await ctx.respond("Mode must be `random`, `linear`, or `disabled`.", ephemeral=True)
-        async with self._server_icon_operation_lock():
+        async with self._server_icon_operation_lock(), self._config_write_lock():
             cfg = ensure_server_icon_config(self.bot.config)
             cfg["mode"] = raw_mode
             if not await self._save_server_icon_config(ctx, "server_icon_mode_updated", f"mode={raw_mode}"):
@@ -1929,7 +1983,7 @@ class CommandsCog(commands.Cog):
     async def server_icon_add(
         self,
         ctx: discord.ApplicationContext,
-        url: discord.Option(str, "Direct image URL to add to the rotation list"),
+        url: discord.Option(str, "Direct image URL to add to the rotation list", max_length=2000),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -1942,7 +1996,7 @@ class CommandsCog(commands.Cog):
         if warning:
             return await ctx.respond(f"I can't use that URL for rotation: {warning}", ephemeral=True)
 
-        async with self._server_icon_operation_lock():
+        async with self._server_icon_operation_lock(), self._config_write_lock():
             cfg = ensure_server_icon_config(self.bot.config)
             urls = list(cfg.get("urls", []) or [])
             cleaned = str(url).strip()
@@ -1959,8 +2013,13 @@ class CommandsCog(commands.Cog):
     async def server_icon_replace(
         self,
         ctx: discord.ApplicationContext,
-        number: discord.Option(int, "One-based icon number to replace from /server_icon status"),
-        url: discord.Option(str, "New direct image URL"),
+        number: discord.Option(
+            int,
+            "One-based icon number to replace from /server_icon status",
+            min_value=1,
+            max_value=25,
+        ),
+        url: discord.Option(str, "New direct image URL", max_length=2000),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -1973,7 +2032,7 @@ class CommandsCog(commands.Cog):
         if warning:
             return await ctx.respond(f"I can't use that URL for rotation: {warning}", ephemeral=True)
 
-        async with self._server_icon_operation_lock():
+        async with self._server_icon_operation_lock(), self._config_write_lock():
             cfg = ensure_server_icon_config(self.bot.config)
             urls = list(cfg.get("urls", []) or [])
             idx = int(number) - 1
@@ -1992,7 +2051,12 @@ class CommandsCog(commands.Cog):
     async def server_icon_remove(
         self,
         ctx: discord.ApplicationContext,
-        number: discord.Option(int, "One-based icon number to remove from /server_icon status"),
+        number: discord.Option(
+            int,
+            "One-based icon number to remove from /server_icon status",
+            min_value=1,
+            max_value=25,
+        ),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -2000,7 +2064,7 @@ class CommandsCog(commands.Cog):
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
-        async with self._server_icon_operation_lock():
+        async with self._server_icon_operation_lock(), self._config_write_lock():
             cfg = ensure_server_icon_config(self.bot.config)
             urls = list(cfg.get("urls", []) or [])
             idx = int(number) - 1
@@ -2023,7 +2087,12 @@ class CommandsCog(commands.Cog):
     async def server_icon_set(
         self,
         ctx: discord.ApplicationContext,
-        number: discord.Option(int, "One-based icon number from /server_icon status"),
+        number: discord.Option(
+            int,
+            "One-based icon number from /server_icon status",
+            min_value=1,
+            max_value=25,
+        ),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -3171,9 +3240,27 @@ class CommandsCog(commands.Cog):
     async def requests_history(
         self,
         ctx: discord.ApplicationContext,
-        message_id: discord.Option(str, "Request message ID or message link to inspect", required=False, default=""),
-        user_id: discord.Option(str, "Requester ID or mention to inspect when no message ID is given", required=False, default=""),
-        wave: discord.Option(int, "Optional wave number to narrow a user history search", required=False, default=0),
+        message_id: discord.Option(
+            str,
+            "Request message ID or message link to inspect",
+            required=False,
+            default="",
+            max_length=120,
+        ),
+        user_id: discord.Option(
+            str,
+            "Requester ID or mention to inspect when no message ID is given",
+            required=False,
+            default="",
+            max_length=40,
+        ),
+        wave: discord.Option(
+            int,
+            "Optional wave number to narrow a user history search",
+            required=False,
+            default=0,
+            min_value=0,
+        ),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -3265,9 +3352,35 @@ class CommandsCog(commands.Cog):
     async def requests_pending(
         self,
         ctx: discord.ApplicationContext,
-        scope: discord.Option(str, "What to show: current_wave, all, weekly, or weekly_only", required=False, default="current_wave"),
-        status: discord.Option(str, "Review status to show: pending, reviewed, or all", required=False, default="pending"),
-        wave: discord.Option(int, "Specific live request wave to show; leave 0 for the current wave", required=False, default=0),
+        scope: discord.Option(
+            str,
+            "Request queue to show",
+            required=False,
+            default="current_wave",
+            choices=[
+                discord.OptionChoice("Current live wave", "current_wave"),
+                discord.OptionChoice("All live and weekly", "all"),
+                discord.OptionChoice("Weekly requests only", "weekly_only"),
+            ],
+        ),
+        status: discord.Option(
+            str,
+            "Review status to show",
+            required=False,
+            default="pending",
+            choices=[
+                discord.OptionChoice("Pending", "pending"),
+                discord.OptionChoice("Reviewed", "reviewed"),
+                discord.OptionChoice("All statuses", "all"),
+            ],
+        ),
+        wave: discord.Option(
+            int,
+            "Specific live request wave; leave 0 for the current wave",
+            required=False,
+            default=0,
+            min_value=0,
+        ),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -3597,7 +3710,15 @@ class CommandsCog(commands.Cog):
     async def ticket_status(
         self,
         ctx: discord.ApplicationContext,
-        status: discord.Option(str, "Status to set: waiting_user, waiting_staff, or resolved"),
+        status: discord.Option(
+            str,
+            "Status to set",
+            choices=[
+                discord.OptionChoice("Waiting for user", "waiting_user"),
+                discord.OptionChoice("Waiting for staff", "waiting_staff"),
+                discord.OptionChoice("Resolved", "resolved"),
+            ],
+        ),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -3664,7 +3785,13 @@ class CommandsCog(commands.Cog):
         self,
         ctx: discord.ApplicationContext,
         user: discord.Option(discord.Member, "User whose ticket transcripts to search", required=False, default=None),
-        ticket_id: discord.Option(int, "Ticket ID number, for example 21 for T21", required=False, default=0),
+        ticket_id: discord.Option(
+            int,
+            "Ticket ID number, for example 21 for T21",
+            required=False,
+            default=0,
+            min_value=0,
+        ),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -3807,9 +3934,31 @@ class CommandsCog(commands.Cog):
     async def forum_required_word(
         self,
         ctx: discord.ApplicationContext,
-        word: discord.Option(str, "New required word; leave blank to view, or use off/none/clear to disable", required=False, default=""),
-        forum_channel_id: discord.Option(str, "Forum channel ID or mention; needed when more than one forum is configured", required=False, default=""),
-        match_mode: discord.Option(str, "Match mode: contains, whole_word, or regex", required=False, default=""),
+        word: discord.Option(
+            str,
+            "New required word; leave blank to view, or use off to disable",
+            required=False,
+            default="",
+            max_length=256,
+        ),
+        forum_channel_id: discord.Option(
+            str,
+            "Forum channel ID or mention; needed when more than one forum is configured",
+            required=False,
+            default="",
+            max_length=40,
+        ),
+        match_mode: discord.Option(
+            str,
+            "How the required word is matched",
+            required=False,
+            default="",
+            choices=[
+                discord.OptionChoice("Contains", "contains"),
+                discord.OptionChoice("Whole word", "whole_word"),
+                discord.OptionChoice("Regular expression", "regex"),
+            ],
+        ),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
@@ -3817,7 +3966,10 @@ class CommandsCog(commands.Cog):
         await self._defer(ctx, ephemeral=True)
         member = await self._resolve_member(ctx.guild, ctx.user)
         if member is None or not member.guild_permissions.administrator:
-            return await ctx.respond("Nah, you can't use this", ephemeral=True)
+            return await ctx.respond(
+                "You don't have permission to use this.",
+                ephemeral=True,
+            )
 
         entry, forum_id, error = self._resolve_forum_entry(ctx, forum_channel_id)
         if entry is None:
@@ -3848,7 +4000,7 @@ class CommandsCog(commands.Cog):
                     ephemeral=True,
                 )
 
-        async with self._forum_config_lock:
+        async with self._forum_config_lock, self._config_write_lock():
             had_word = "required_word" in entry
             old_word = entry.get("required_word")
             had_mode = "required_word_match_mode" in entry
@@ -3909,11 +4061,12 @@ class CommandsCog(commands.Cog):
         if member is None or not is_admin_or_owner(member, admin_roles):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
-        self.bot.config.reload()
-        try:
-            await load_runtime_config_overrides(self.bot)
-        except Exception as e:
-            await log_error(self.bot, f"Runtime config override reload failed: {repr(e)}")
+        async with self._config_write_lock():
+            self.bot.config.reload()
+            try:
+                await load_runtime_config_overrides(self.bot)
+            except Exception as e:
+                await log_error(self.bot, f"Runtime config override reload failed: {repr(e)}")
 
         # notify cogs
         for cog in self.bot.cogs.values():
@@ -3966,12 +4119,9 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
         # Anti-spam: hardcoded 10s cooldown per user for /rock-paper-scissors
-        now_ts = time.time()
-        last_ts = self._rps_last_ts.get(ctx.user.id, 0.0)
-        if now_ts - last_ts < 10.0:
-            remaining = int(10 - (now_ts - last_ts) + 0.999)
+        remaining = self._claim_fun_cooldown(self._rps_last_ts, ctx.user.id)
+        if remaining:
             return await ctx.respond(f"Slow down... try again in {remaining}s", ephemeral=True)
-        self._rps_last_ts[ctx.user.id] = now_ts
 
         parent = self
         options = ["Rock", "Paper", "Scissors"]
@@ -4106,12 +4256,9 @@ class CommandsCog(commands.Cog):
             return await ctx.respond("Wrong server.", ephemeral=True)
 
         # Anti-spam: hardcoded 10s cooldown per user for /gambling
-        now_ts = time.time()
-        last_ts = self._gamble_last_ts.get(ctx.user.id, 0.0)
-        if now_ts - last_ts < 10.0:
-            remaining = int(10 - (now_ts - last_ts) + 0.999)
+        remaining = self._claim_fun_cooldown(self._gamble_last_ts, ctx.user.id)
+        if remaining:
             return await ctx.respond(f"Slow down... try again in {remaining}s", ephemeral=True)
-        self._gamble_last_ts[ctx.user.id] = now_ts
         cfg = self.bot.config
         gcfg = cfg.get("fun", "gambling", default={}) or {}
         emojis = gcfg.get("emojis", ["🍒","🍋","🍇","⭐","💎"])

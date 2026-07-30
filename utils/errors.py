@@ -126,6 +126,9 @@ async def log_error(bot: discord.Client, message: str) -> None:
         if now - last_sent < _ERROR_DEDUPE_SECONDS:
             return
         _recent_error_logs[key] = now
+        while len(_recent_error_logs) > 1000:
+            oldest_key = min(_recent_error_logs, key=_recent_error_logs.get)
+            _recent_error_logs.pop(oldest_key, None)
         safe_message = message.replace("```", "` ` `")
         embed = discord.Embed(
             title="Bot Error",

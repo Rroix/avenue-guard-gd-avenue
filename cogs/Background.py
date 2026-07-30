@@ -110,6 +110,7 @@ class BackgroundCog(commands.Cog):
         self._completed_day_stats: Dict[str, DailyStats] = {}
         self._persist_tasks: set[asyncio.Task] = set()
         self._server_icon_lock = asyncio.Lock()
+        self._daily_summary_lock = asyncio.Lock()
 
     def cog_unload(self) -> None:
         for loop in (
@@ -426,6 +427,14 @@ class BackgroundCog(commands.Cog):
         except Exception as e:
             await log_error(self.bot, f"Server icon error state could not be persisted: {repr(e)}")
 
+    def _config_write_lock(self) -> asyncio.Lock:
+        lock = getattr(self.bot, "config_write_lock", None)
+        if isinstance(lock, asyncio.Lock):
+            return lock
+        lock = asyncio.Lock()
+        self.bot.config_write_lock = lock
+        return lock
+
     async def rotate_server_icon_once(
         self,
         guild: discord.Guild,
@@ -434,7 +443,7 @@ class BackgroundCog(commands.Cog):
         actor_id: int = 0,
         target_index: int = -1,
     ) -> tuple[bool, str]:
-        async with self._server_icon_lock:
+        async with self._server_icon_lock, self._config_write_lock():
             return await self._rotate_server_icon_once_locked(
                 guild,
                 force=force,
@@ -580,6 +589,13 @@ class BackgroundCog(commands.Cog):
 
     def _daily_reset_after_report(self) -> bool:
         return bool(self.bot.config.get("background", "daily_summary", "reset_after_report", default=True))
+
+    def _daily_summary_due(self, current: Optional[datetime] = None) -> bool:
+        current = current or now_madrid()
+        hh, mm = _parse_hhmm(
+            str(self.bot.config.get("background", "daily_summary", "time", default="00:00") or "00:00")
+        )
+        return (current.hour, current.minute) >= (hh, mm)
 
     async def _daily_summary_already_sent(self, guild_id: int, day_key: str) -> bool:
         row = await self.bot.db.fetchone(
@@ -922,6 +938,12 @@ class BackgroundCog(commands.Cog):
             await self._persist_current_day()
         except Exception as e:
             await self._log_snapshot_failure(e)
+        if self._daily_summary_enabled() and self._daily_summary_due():
+            report_day = _day_key(now_madrid() - timedelta(days=1))
+            try:
+                await self._send_daily_summary_for_day(guild, report_day)
+            except Exception as e:
+                await log_error(self.bot, f"Daily summary retry failed for {report_day}: {repr(e)}")
 
     async def _log_snapshot_failure(self, error: Exception) -> None:
         await log_error(self.bot, f"Daily snapshot persist failed: {repr(error)}")
@@ -1104,6 +1126,18 @@ class BackgroundCog(commands.Cog):
         return discord.Color.blurple()
 
     async def _send_daily_summary_for_day(self, guild: discord.Guild, report_day: Optional[str] = None) -> bool:
+        lock = getattr(self, "_daily_summary_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._daily_summary_lock = lock
+        async with lock:
+            return await self._send_daily_summary_for_day_locked(guild, report_day)
+
+    async def _send_daily_summary_for_day_locked(
+        self,
+        guild: discord.Guild,
+        report_day: Optional[str] = None,
+    ) -> bool:
         today = _day_key()
         report_day = report_day or (self._current_day if self._current_day != today else _day_key(now_madrid() - timedelta(days=1)))
         if await self._daily_summary_already_sent(guild.id, report_day):

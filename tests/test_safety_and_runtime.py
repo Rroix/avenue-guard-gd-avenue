@@ -1,10 +1,12 @@
 from copy import deepcopy
 from types import SimpleNamespace
 
+import discord
 import pytest
 
 from cogs.Mod import _review_access_text, _within_one_edit
 from cogs.Sticky import StickyCog
+from utils.checks import basic_color
 from utils.errors import _command_error_record, _compact_error_message, _redact_secrets
 from utils.runtime_config import (
     FORUM_RULES_SETTING,
@@ -37,6 +39,11 @@ class MemoryDatabase:
 class ConfigObject:
     def __init__(self, data):
         self.data = data
+
+
+def test_embed_color_parser_accepts_rgb_but_rejects_alpha_values():
+    assert basic_color("#123456").value == 0x123456
+    assert basic_color("#11223344").value == discord.Color.default().value
 
 
 def test_review_access_phrase_is_case_insensitive_with_one_character_variation():

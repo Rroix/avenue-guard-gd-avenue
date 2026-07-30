@@ -1,9 +1,12 @@
 from types import SimpleNamespace
+from datetime import datetime
 
 import pytest
+from unittest.mock import AsyncMock
 
 import cogs.Background as background_module
 from cogs.Background import BackgroundCog, DailyStats
+from utils.timeutils import TZ
 
 
 class FakeTextChannel:
@@ -96,6 +99,46 @@ async def test_daily_summary_is_not_sent_when_snapshot_persistence_fails(monkeyp
     monkeypatch.setattr(background_module, "log_error", ignore_log_error)
     assert await cog._send_daily_summary_for_day(guild, "2026-07-12") is False
     assert events == []
+
+
+def test_daily_summary_due_uses_configured_local_time():
+    class Config:
+        def get(self, *path, default=None):
+            if path == ("background", "daily_summary", "time"):
+                return "09:30"
+            return default
+
+    cog = object.__new__(BackgroundCog)
+    cog.bot = SimpleNamespace(config=Config())
+
+    assert cog._daily_summary_due(datetime(2026, 7, 12, 9, 29, tzinfo=TZ)) is False
+    assert cog._daily_summary_due(datetime(2026, 7, 12, 9, 30, tzinfo=TZ)) is True
+
+
+@pytest.mark.asyncio
+async def test_snapshot_loop_retries_previous_daily_summary_after_due_time(monkeypatch):
+    guild = SimpleNamespace(id=717, members=[])
+    cog = object.__new__(BackgroundCog)
+    cog.bot = SimpleNamespace(
+        config=SimpleNamespace(get_int=lambda *args, **kwargs: 717),
+        get_guild=lambda guild_id: guild if guild_id == 717 else None,
+    )
+    cog.stats = DailyStats()
+    cog._rollover_if_needed = lambda current_guild: None
+    cog._persist_current_day = AsyncMock()
+    cog._daily_summary_enabled = lambda: True
+    cog._daily_summary_due = lambda: True
+    cog._send_daily_summary_for_day = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        background_module,
+        "now_madrid",
+        lambda: datetime(2026, 7, 13, 10, 0, tzinfo=TZ),
+    )
+
+    await BackgroundCog.update_snapshot.coro(cog)
+
+    cog._persist_current_day.assert_awaited_once()
+    cog._send_daily_summary_for_day.assert_awaited_once_with(guild, "2026-07-12")
 
 
 async def _async_value(value):

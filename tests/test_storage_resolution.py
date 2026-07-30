@@ -81,9 +81,14 @@ def test_valid_remote_configuration_selects_embedded_replica(tmp_path, monkeypat
 async def test_shutdown_flushes_once_on_the_discord_event_loop():
     tracking = SimpleNamespace(flush_activity_counts=AsyncMock())
     background = SimpleNamespace(_persist_current_day=AsyncMock())
+    requests = SimpleNamespace(close_resources=AsyncMock())
     original_close = AsyncMock()
     database = SimpleNamespace(sync_remote=AsyncMock(), close=AsyncMock())
-    cogs = {"TrackingCog": tracking, "BackgroundCog": background}
+    cogs = {
+        "TrackingCog": tracking,
+        "BackgroundCog": background,
+        "RequestLevelsCog": requests,
+    }
     bot = SimpleNamespace(
         close=original_close,
         db=database,
@@ -96,6 +101,7 @@ async def test_shutdown_flushes_once_on_the_discord_event_loop():
 
     tracking.flush_activity_counts.assert_awaited_once()
     background._persist_current_day.assert_awaited_once()
+    requests.close_resources.assert_awaited_once()
     database.sync_remote.assert_awaited_once()
     database.close.assert_awaited_once()
     assert original_close.await_count == 2

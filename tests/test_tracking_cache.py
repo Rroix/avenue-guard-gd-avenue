@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import asyncio
+import time
 
 import pytest
 
@@ -90,6 +91,8 @@ async def test_weekly_reward_disable_and_enable_persist_and_restore_workflow_sta
     cog = object.__new__(TrackingCog)
     cog.bot = SimpleNamespace(db=db)
     cog._log_weekly = AsyncMock()
+    cog._notify_reenabled_weekly_claims = AsyncMock()
+    cog._cfg_int = lambda *args, **kwargs: 48
     guild = SimpleNamespace(id=717)
 
     week_start = week_start_sunday(now_madrid()).isoformat()
@@ -99,7 +102,11 @@ async def test_weekly_reward_disable_and_enable_persist_and_restore_workflow_sta
     )
     await db.execute(
         "INSERT INTO weekly_sessions(guild_id,week_start,user_id,stage,expires_ts,active) VALUES(?,?,?,?,?,?)",
-        (guild.id, week_start, 99, "awaiting_request", 9_999_999_999, 1),
+        (guild.id, week_start, 99, "awaiting_request", 1, 1),
+    )
+    await db.execute(
+        "INSERT INTO weekly_claims(guild_id,week_start,user_id,rank,status,contacted_ts) VALUES(?,?,?,?,?,?)",
+        (guild.id, week_start, 100, 2, "contacting", 1),
     )
 
     disabled_week = await cog.disable_weekly_reward_for_current_week(guild, 42)
@@ -126,8 +133,16 @@ async def test_weekly_reward_disable_and_enable_persist_and_restore_workflow_sta
         (guild.id, week_start, 99),
     )
     session = await db.fetchone(
-        "SELECT active,stage FROM weekly_sessions WHERE guild_id=? AND week_start=? AND user_id=?",
+        "SELECT active,stage,expires_ts FROM weekly_sessions WHERE guild_id=? AND week_start=? AND user_id=?",
         (guild.id, week_start, 99),
+    )
+    recovered_claim = await db.fetchone(
+        "SELECT status FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
+        (guild.id, week_start, 100),
+    )
+    recovered_session = await db.fetchone(
+        "SELECT active,stage,expires_ts FROM weekly_sessions WHERE guild_id=? AND week_start=? AND user_id=?",
+        (guild.id, week_start, 100),
     )
 
     assert enabled_week == week_start
@@ -136,6 +151,12 @@ async def test_weekly_reward_disable_and_enable_persist_and_restore_workflow_sta
     assert claim["status"] == "pending"
     assert int(session["active"]) == 1
     assert session["stage"] == "awaiting_request"
+    assert int(session["expires_ts"]) > int(time.time())
+    assert recovered_claim["status"] == "pending"
+    assert int(recovered_session["active"]) == 1
+    assert recovered_session["stage"] == "awaiting_request"
+    assert int(recovered_session["expires_ts"]) > int(time.time())
+    cog._notify_reenabled_weekly_claims.assert_awaited_once()
     assert cog._log_weekly.await_count == 2
     await db.close()
 

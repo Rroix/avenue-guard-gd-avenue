@@ -485,7 +485,7 @@
    - Expected: the request is not recorded, and the bot tells the user which required field is missing.
 15. Disable this week's reward with `/tracking disable_reward`, then run `/tracking force_dm`.
    - Expected: the manual force DM still sends if the user has no active/past non-resettable claim, and the override is logged.
-14. Temporarily misconfigure an appeal/report/bot-issue log channel, then complete that DM flow.
+16. Temporarily misconfigure an appeal/report/bot-issue log channel, then complete that DM flow.
    - Expected: the user is told the submission could not be sent instead of receiving a false success message.
 
 ---
@@ -524,3 +524,25 @@
    - Expected: the page shows a connecting, unavailable, or retry state without exposing the internal exception.
 12. Leave the bot online for at least one minute, restart it, then inspect `/api/bot`.
    - Expected: `uptime_tracking_since_ts` remains unchanged, the percentage survives, and the restart gap is counted as unavailable time.
+
+---
+
+## 26) Reliability regressions
+**Setup:** use a staging bot or a maintenance window for tests that intentionally interrupt Turso or change the clock-sensitive configuration.
+
+1. Make Turso return a temporary invalid-transaction error immediately after a committed write, then allow the next sync.
+   - Expected: the committed operation is not replayed, the remote connection is reopened, and pending data syncs on the next attempt.
+2. Temporarily make the daily-summary channel unavailable at the configured report time, restore it, and wait for the five-minute snapshot cycle.
+   - Expected: the missing summary is retried once the channel is usable and is never sent twice for the same guild and day.
+3. Disable the current weekly reward after winners are selected, then run `/tracking enable_reward`.
+   - Expected: missing weekly sessions are recreated, every pending winner receives a fresh deadline, stale reminders are removed, and a new DM is attempted.
+4. Open a timed request wave and submit a request shortly before its scheduled close.
+   - Expected: the user can edit from the request button or `/edit-request` until five minutes after the scheduled close, even if the auto-close loop runs late.
+5. Schedule an opening during a daylight-saving time that does not exist locally.
+   - Expected: the command rejects the time clearly instead of silently shifting the opening.
+6. Trigger `/bot backup` and validate a restore upload while the bot is otherwise active.
+   - Expected: Discord interactions and background loops remain responsive while ZIP compression or extraction runs.
+7. Set `responses.json` to `first_match_only: false` and create two valid rules for the same message.
+   - Expected: both replies are sent and the shared per-user cooldown is claimed only once.
+8. Stop a health-check client while the HTTP response is being written.
+   - Expected: the monitor can reconnect normally and no misleading keepalive error is logged.

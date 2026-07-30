@@ -112,7 +112,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Supports whole-message or contains matching.
 - Supports plain messages or embeds.
 - Supports channel filters and per-user cooldowns.
-- Stops after the first matching rule.
+- Can stop after the first matching rule or send every valid match, depending on `first_match_only`.
 - Blocks mass mentions from configured auto-responses and caps configured response length.
 
 ### Background Utilities
@@ -333,6 +333,8 @@ Validated live requests also expose compact GD details for embeds:
 
 ## Running The Bot
 
+The production runtime is pinned by `.python-version` to Python 3.13.14.
+
 1. Install dependencies:
 
 ```bash
@@ -373,6 +375,7 @@ python main.py
 Enable these in the Discord Developer Portal:
 - Server Members Intent
 - Message Content Intent
+- Presence Intent
 
 Useful bot permissions:
 - Administrator, or at minimum:

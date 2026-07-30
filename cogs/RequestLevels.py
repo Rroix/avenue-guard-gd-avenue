@@ -41,6 +41,15 @@ REQUEST_TYPE_LABELS = {
     "long_level": "Long or XL levels",
 }
 
+REQUEST_TYPE_CHOICES = [
+    discord.OptionChoice("Any level", "any"),
+    *[
+        discord.OptionChoice(label, key)
+        for key, label in REQUEST_TYPE_LABELS.items()
+        if key
+    ],
+]
+
 REQUEST_TYPE_ALIASES = {
     "": "",
     "any": "",
@@ -416,12 +425,51 @@ class RequestLevelsCog(commands.Cog):
         @bot.slash_command(name="open-requests", description="Open level requests now or schedule them", guild_ids=guild_ids)
         async def open_requests(
             ctx: discord.ApplicationContext,
-            number: discord.Option(int, "Maximum successful requests to accept; leave 0 for no limit", required=False, default=0),
-            time: discord.Option(int, "Minutes requests stay open after opening; leave 0 for no timer", required=False, default=0),
-            when: discord.Option(str, "Optional scheduled opening time, like 18:30", required=False, default=""),
-            day: discord.Option(int, "Optional day of the month for the scheduled opening; leave 0 for next matching time", required=False, default=0),
-            type: discord.Option(str, "Optional wave type, like only demons, only plats, needs showcase, or long level", required=False, default=""),
-            message: discord.Option(str, "Custom opening announcement; leave blank for the default role ping", required=False, default=""),
+            number: discord.Option(
+                int,
+                "Maximum successful requests to accept; leave 0 for no limit",
+                required=False,
+                default=0,
+                min_value=0,
+                max_value=10000,
+            ),
+            time: discord.Option(
+                int,
+                "Minutes requests stay open after opening; leave 0 for no timer",
+                required=False,
+                default=0,
+                min_value=0,
+                max_value=43200,
+            ),
+            when: discord.Option(
+                str,
+                "Optional scheduled opening time, like 18:30",
+                required=False,
+                default="",
+                max_length=5,
+            ),
+            day: discord.Option(
+                int,
+                "Optional day of the month for the scheduled opening; leave 0 for next matching time",
+                required=False,
+                default=0,
+                min_value=0,
+                max_value=31,
+            ),
+            type: discord.Option(
+                str,
+                "Optional wave type",
+                required=False,
+                default="",
+                choices=REQUEST_TYPE_CHOICES,
+            ),
+            message: discord.Option(
+                str,
+                "Custom opening announcement; leave blank for the default role ping",
+                required=False,
+                default="",
+                max_length=1500,
+            ),
         ):
             await self.open_requests(ctx, number, time, when, day, type, message)
 
@@ -440,14 +488,69 @@ class RequestLevelsCog(commands.Cog):
         @bot.slash_command(name="pending-openings", description="List, edit, or delete scheduled request openings", guild_ids=guild_ids)
         async def pending_openings(
             ctx: discord.ApplicationContext,
-            action: discord.Option(str, "Action to run: list shows the interactive panel", required=False, default="list"),
-            opening_id: discord.Option(int, "Scheduled opening ID to edit or delete", required=False, default=0),
-            number: discord.Option(int, "New request limit; use 0 for no limit and -1 to keep current value", required=False, default=-1),
-            time: discord.Option(int, "New close timer in minutes; use 0 for no timer and -1 to keep current value", required=False, default=-1),
-            when: discord.Option(str, "New opening time, like 18:30", required=False, default=""),
-            day: discord.Option(int, "Optional day of the month for the new opening time", required=False, default=0),
-            type: discord.Option(str, "New request type; leave blank to keep current value, use any to clear", required=False, default=""),
-            message: discord.Option(str, "New announcement; blank keeps current, default resets it", required=False, default=""),
+            action: discord.Option(
+                str,
+                "Action to run; list shows the interactive panel",
+                required=False,
+                default="list",
+                choices=[
+                    discord.OptionChoice("List openings", "list"),
+                    discord.OptionChoice("Edit an opening", "edit"),
+                    discord.OptionChoice("Delete an opening", "delete"),
+                ],
+            ),
+            opening_id: discord.Option(
+                int,
+                "Scheduled opening ID to edit or delete",
+                required=False,
+                default=0,
+                min_value=0,
+            ),
+            number: discord.Option(
+                int,
+                "New request limit; use 0 for no limit and -1 to keep current value",
+                required=False,
+                default=-1,
+                min_value=-1,
+                max_value=10000,
+            ),
+            time: discord.Option(
+                int,
+                "New close timer in minutes; use 0 for no timer and -1 to keep current value",
+                required=False,
+                default=-1,
+                min_value=-1,
+                max_value=43200,
+            ),
+            when: discord.Option(
+                str,
+                "New opening time, like 18:30",
+                required=False,
+                default="",
+                max_length=5,
+            ),
+            day: discord.Option(
+                int,
+                "Optional day of the month for the new opening time",
+                required=False,
+                default=0,
+                min_value=0,
+                max_value=31,
+            ),
+            type: discord.Option(
+                str,
+                "New request type; omit to keep the current value",
+                required=False,
+                default="",
+                choices=REQUEST_TYPE_CHOICES,
+            ),
+            message: discord.Option(
+                str,
+                "New announcement; blank keeps current, default resets it",
+                required=False,
+                default="",
+                max_length=1500,
+            ),
         ):
             await self.pending_openings(ctx, action, opening_id, number, time, when, day, type, message)
 
@@ -458,13 +561,28 @@ class RequestLevelsCog(commands.Cog):
             self._scheduled_open_task.cancel()
         for task in tuple(self._background_tasks):
             task.cancel()
+        try:
+            cleanup_task = asyncio.create_task(self.close_resources())
+            self._background_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            pass
+
+    async def close_resources(self) -> None:
+        """Close reusable HTTP resources before Pycord tears down the loop."""
+        inflight = [
+            task for task in self._validation_inflight.values() if not task.done()
+        ]
+        for task in inflight:
+            task.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+        self._validation_inflight.clear()
+
         session = self._validation_session
         self._validation_session = None
-        if session and not session.closed:
-            try:
-                asyncio.create_task(session.close())
-            except Exception:
-                pass
+        if session is not None and not session.closed:
+            await session.close()
 
     async def start_background(self):
         close_running = self._close_task is not None and not self._close_task.done()
@@ -550,7 +668,12 @@ class RequestLevelsCog(commands.Cog):
                     int(submission_row["wave_id"]) == int(state_row["wave_id"])
                     and str(state_row["state"]) == STATE_OPEN
                 ):
-                    return True
+                    close_ts = self._row_value(state_row, "close_ts", None)
+                    if close_ts is None:
+                        return True
+                    return int(time_module.time()) <= (
+                        int(close_ts) + self._post_close_edit_seconds()
+                    )
             except Exception:
                 pass
         deadline_ts = self._row_value(submission_row, "edit_deadline_ts", None)
@@ -595,9 +718,16 @@ class RequestLevelsCog(commands.Cog):
             "(s.edit_deadline_ts IS NOT NULL AND s.edit_deadline_ts>=?) OR EXISTS ("
             "SELECT 1 FROM level_request_state st WHERE st.guild_id=s.guild_id "
             "AND st.wave_id=s.wave_id AND st.state=? "
-            "AND (st.close_ts IS NULL OR st.close_ts>?))) "
+            "AND (st.close_ts IS NULL OR st.close_ts+?>=?))) "
             "ORDER BY s.wave_id DESC LIMIT 1",
-            (guild_id, user_id, now_ts, STATE_OPEN, now_ts),
+            (
+                guild_id,
+                user_id,
+                now_ts,
+                STATE_OPEN,
+                self._post_close_edit_seconds(),
+                now_ts,
+            ),
         )
 
     async def _state_after_timed_close_check(self, guild: discord.Guild, state_row):
@@ -852,6 +982,14 @@ class RequestLevelsCog(commands.Cog):
             return "You are trying too many level IDs too quickly. Please wait a bit and try again."
         attempts.append(now_ts)
         self._validation_attempts[key] = attempts
+        while len(self._validation_attempts) > 5000:
+            oldest_key = min(
+                self._validation_attempts,
+                key=lambda attempt_key: int(self._validation_attempts[attempt_key][-1])
+                if self._validation_attempts[attempt_key]
+                else 0,
+            )
+            self._validation_attempts.pop(oldest_key, None)
         return ""
 
     def _provider_failure_cfg(self) -> tuple[int, int]:
@@ -1168,12 +1306,6 @@ class RequestLevelsCog(commands.Cog):
     def _has_reviewer_role(self, member: discord.Member) -> bool:
         role_ids = self._reviewer_role_ids()
         return member_has_any_role(member, role_ids) or self._is_admin(member)
-
-    async def _is_reviewer_interaction(self, interaction: discord.Interaction) -> bool:
-        if interaction.guild is None:
-            return False
-        member = await self._resolve_member(interaction.guild, interaction.user)
-        return member is not None and self._has_reviewer_role(member)
 
     def _embed_from_template(self, template: Dict[str, Any], variables: Dict[str, Any], default_color: str = "blurple") -> discord.Embed:
         if not isinstance(template, dict):
@@ -1534,6 +1666,22 @@ class RequestLevelsCog(commands.Cog):
             return year + 1, 1
         return year, month
 
+    def _scheduled_local_time_exists(self, candidate: datetime) -> bool:
+        round_trip = datetime.fromtimestamp(candidate.timestamp(), TZ)
+        return (
+            round_trip.year,
+            round_trip.month,
+            round_trip.day,
+            round_trip.hour,
+            round_trip.minute,
+        ) == (
+            candidate.year,
+            candidate.month,
+            candidate.day,
+            candidate.hour,
+            candidate.minute,
+        )
+
     def _parse_scheduled_open_ts(self, when: str, day: int = 0) -> tuple[Optional[int], str]:
         when_text = str(when or "").strip()
         if not when_text:
@@ -1557,6 +1705,11 @@ class RequestLevelsCog(commands.Cog):
                 if target_day <= self._days_in_month(year, month):
                     candidate = datetime(year, month, target_day, hour, minute, tzinfo=TZ)
                     if candidate > now:
+                        if not self._scheduled_local_time_exists(candidate):
+                            return (
+                                None,
+                                "That local time does not exist because of a daylight-saving clock change. Choose another time.",
+                            )
                         return int(candidate.timestamp()), ""
                 year, month = self._add_month(year, month)
             return None, "I couldn't find that day in the next 24 months."
@@ -1564,6 +1717,11 @@ class RequestLevelsCog(commands.Cog):
         candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if candidate <= now:
             candidate = candidate + timedelta(days=1)
+        if not self._scheduled_local_time_exists(candidate):
+            return (
+                None,
+                "That local time does not exist because of a daylight-saving clock change. Choose another time.",
+            )
         return int(candidate.timestamp()), ""
 
     async def _scheduled_opening_rows(self, guild_id: int, limit: int = 15):
@@ -1889,7 +2047,12 @@ class RequestLevelsCog(commands.Cog):
                 row = await self._get_state(guild.id)
                 wave_id = int(row["wave_id"]) if row else 0
                 if row and str(row["state"]) != STATE_CLOSED:
-                    closed_ts = int(time_module.time())
+                    scheduled_close_ts = self._row_value(row, "close_ts", None)
+                    closed_ts = (
+                        int(scheduled_close_ts)
+                        if reason == "time limit" and scheduled_close_ts is not None
+                        else int(time_module.time())
+                    )
                     await self.bot.db.execute_transaction(
                         (
                             (
@@ -2441,20 +2604,39 @@ class RequestLevelsCog(commands.Cog):
                 ephemeral=True,
             )
 
+        now_ts = int(time_module.time())
         close_ts = self._row_value(row, "close_ts", None)
-        if str(row["state"]) == STATE_OPEN and close_ts is not None and int(close_ts) <= int(time_module.time()):
-            await interaction.response.send_message(self._message("closed", "Requests are closed :/"), ephemeral=True)
-            self._start_background_task(
-                self._set_state_closed(interaction.guild, reason="time limit"),
-                label=f"Timed request close guild_id={interaction.guild.id}",
-            )
-            return
+        timed_out = (
+            str(row["state"]) == STATE_OPEN
+            and close_ts is not None
+            and int(close_ts) <= now_ts
+        )
 
         request_row = await self._current_user_submission_local(
             interaction.guild.id,
             int(row["wave_id"]),
             interaction.user.id,
         )
+        if timed_out:
+            self._start_background_task(
+                self._set_state_closed(interaction.guild, reason="time limit"),
+                label=f"Timed request close guild_id={interaction.guild.id}",
+            )
+            if request_row and self._can_edit_submission(row, request_row):
+                return await interaction.response.send_modal(
+                    LevelRequestModal(
+                        self,
+                        interaction.user.id,
+                        edit=True,
+                        initial=self._request_initial_values(request_row),
+                        edit_wave_id=int(request_row["wave_id"]),
+                    )
+                )
+            return await interaction.response.send_message(
+                self._message("closed", "Requests are closed :/"),
+                ephemeral=True,
+            )
+
         if request_row:
             if self._can_edit_submission(row, request_row):
                 return await interaction.response.send_modal(
@@ -2580,7 +2762,7 @@ class RequestLevelsCog(commands.Cog):
             if str(row["state"]) != STATE_OPEN:
                 closed_before_submit = True
             elif row["close_ts"] is not None and int(row["close_ts"]) <= int(time_module.time()):
-                closed_ts = int(time_module.time())
+                closed_ts = int(row["close_ts"])
                 await self.bot.db.execute_transaction(
                     (
                         (
@@ -2797,7 +2979,7 @@ class RequestLevelsCog(commands.Cog):
                 and int(state_row["close_ts"]) <= int(time_module.time())
             ):
                 closing_wave_id = int(state_row["wave_id"])
-                closed_ts = int(time_module.time())
+                closed_ts = int(state_row["close_ts"])
                 await self.bot.db.execute_transaction(
                     (
                         (

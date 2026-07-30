@@ -153,6 +153,21 @@ class ModCog(commands.Cog):
                     self.bot,
                     f"Review access role grant failed for user_id={member.id} role_id={role.id}: {repr(e)}",
                 )
+                try:
+                    await member.send(
+                        "I couldn't grant review access right now. Please contact staff so they can check the role.",
+                        allowed_mentions=no_mentions(),
+                    )
+                except Exception:
+                    pass
+                try:
+                    await message.delete()
+                except Exception as delete_error:
+                    await log_error(
+                        self.bot,
+                        "Review access cleanup failed after role grant error "
+                        f"message_id={message.id} user_id={member.id}: {delete_error!r}",
+                    )
                 return True
             await self._send_role_dm(member, role, source="review_access")
         try:
@@ -216,6 +231,9 @@ class ModCog(commands.Cog):
             try:
                 await member.send(txt[:2000], allowed_mentions=no_mentions())
                 self._recent_role_dms[key] = now
+                while len(self._recent_role_dms) > 5000:
+                    oldest_key = min(self._recent_role_dms, key=self._recent_role_dms.get)
+                    self._recent_role_dms.pop(oldest_key, None)
             except Exception as e:
                 await log_error(
                     self.bot,

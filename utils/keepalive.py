@@ -252,7 +252,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         body, content_type, cache_control, public_api = self._health_response()
         self._send_health_headers(body, content_type, cache_control, public_api)
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Health monitors may disconnect as soon as they receive headers.
+            return
 
     def do_HEAD(self) -> None:
         body, content_type, cache_control, public_api = self._health_response()

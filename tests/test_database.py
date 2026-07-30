@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import closing
 import sqlite3
 
 import pytest
@@ -87,7 +88,7 @@ async def test_bot_releases_persist_approval_and_public_notes(tmp_path):
 @pytest.mark.asyncio
 async def test_existing_transcript_requests_gain_audit_columns_without_data_loss(tmp_path):
     path = tmp_path / "legacy.db"
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         conn.execute(
             "CREATE TABLE transcript_requests("
             "guild_id INTEGER NOT NULL, request_message_id INTEGER PRIMARY KEY, "
@@ -162,7 +163,7 @@ async def test_backup_is_transactionally_valid_and_contains_latest_write(tmp_pat
     size = await db.backup_to(backup)
 
     assert size > 0
-    with sqlite3.connect(backup) as conn:
+    with closing(sqlite3.connect(backup)) as conn:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         payload = conn.execute(
             "SELECT value_json FROM runtime_settings WHERE setting_key='audit.test'"
@@ -188,3 +189,41 @@ async def test_local_interaction_read_skips_pending_remote_sync(tmp_path):
 
     assert row["value_json"] == '{"ready":true}'
     await db.close()
+
+
+def test_recoverable_remote_sync_marks_connection_for_reopen(tmp_path):
+    class Connection:
+        def commit(self):
+            return None
+
+    db = Database(str(tmp_path / "replica.db"))
+    db.uses_remote = True
+    db._conn = Connection()
+
+    def fail_sync():
+        raise ValueError("connection has reached an invalid state, started with Txn")
+
+    db._sync_remote_with_retry_sync = fail_sync
+    db._commit_and_sync_sync()
+
+    assert db._remote_dirty is True
+    assert db._remote_reconnect_required is True
+
+
+def test_pending_sync_reopens_invalid_connection_before_backoff(tmp_path):
+    db = Database(str(tmp_path / "replica.db"))
+    db.uses_remote = True
+    db._remote_dirty = True
+    db._remote_reconnect_required = True
+    db._remote_sync_retry_after = float("inf")
+    reopened = []
+
+    def reopen():
+        reopened.append(True)
+        db._remote_reconnect_required = False
+
+    db._reopen_connection_sync = reopen
+    db._try_pending_remote_sync_sync()
+
+    assert reopened == [True]
+    assert db._remote_dirty is True

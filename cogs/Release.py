@@ -67,6 +67,8 @@ class ReleaseCog(commands.Cog):
         self._background_started = False
         self._metrics_task: asyncio.Task | None = None
         self._uptime_lock = asyncio.Lock()
+        self._proposal_lock = asyncio.Lock()
+        self._decision_lock = asyncio.Lock()
         self._uptime_initialized = False
         self._last_member_count = 0
         self._last_member_fetch_attempt = 0.0
@@ -277,6 +279,26 @@ class ReleaseCog(commands.Cog):
         return True, ""
 
     async def propose_release(
+        self,
+        *,
+        version: Any,
+        title: Any,
+        summary: Any,
+        changes: Any,
+        created_by: int,
+        source: str = "command",
+    ) -> tuple[bool, str]:
+        async with self._proposal_lock:
+            return await self._propose_release_locked(
+                version=version,
+                title=title,
+                summary=summary,
+                changes=changes,
+                created_by=created_by,
+                source=source,
+            )
+
+    async def _propose_release_locked(
         self,
         *,
         version: Any,
@@ -695,6 +717,18 @@ class ReleaseCog(commands.Cog):
             )
         await interaction.response.defer(ephemeral=True)
 
+        async with self._decision_lock:
+            await self._handle_release_decision_locked(
+                interaction,
+                approved=approved,
+            )
+
+    async def _handle_release_decision_locked(
+        self,
+        interaction: discord.Interaction,
+        *,
+        approved: bool,
+    ) -> None:
         proposal_id = self._proposal_id_from_interaction(interaction)
         row = await self.bot.db.fetchone(
             "SELECT * FROM bot_releases WHERE id=?",

@@ -317,7 +317,7 @@
       "validation_error": "Please fix your request before submitting: {errors}",
       "already_submitted": "You already submitted a level during this request wave...",
       "duplicate_level": "This level has already been requested in this wave",
-      "not_configured": "The request system is not fully configured yet or is faulty... mb, contact Average."
+      "not_configured": "The request system is temporarily unavailable because part of its configuration is missing. Please contact staff."
     },
     "colors": {
       "opened": "green",

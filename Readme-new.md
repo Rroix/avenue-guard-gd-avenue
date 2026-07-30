@@ -96,15 +96,15 @@ Avenue Guard through multiple analytics also generates a combined community impa
 
 ## Fun
 
-Not everything in the bot is automatization and QOL. Avenue Guard also includes small community features, like fun commands and server icon rotation. These features originated from community polls and weren't a planned part of the system, but they help the bot feel like part of the server rather than just a background rotating mechanical machine.
+Not everything in the bot is automation and administration. Avenue Guard also includes small community features, such as fun commands and server icon rotation. Some came directly from community polls, helping the bot feel like part of the server rather than just another background utility.
 
 That balance is part of the idea behind Avenue Guard. It should be useful, dependable, and structured, but it should still feel like it belongs in GD Avenue.
 
-The server icon changes following different themes in a 5 min rotation period, we also add server art made by members to the cicles! 
+When enabled, the server icon can rotate through different themes every five minutes. Member-made server art can also be added to the rotation. Automatic rotation is disabled by default, so staff stays in control.
 
 ## How the bot is built (out for the curious)
 
-The public version of this repository does not include the source code, but the architecture can still be explained pretty thoughrouly.
+The public version of this repository does not include the source code, but the architecture can still be explained clearly.
 
 Avenue Guard is built as a modular Discord bot. Each major feature area is separated into its own internal component: requests, tracking, help and tickets, forum reminders, moderation, background summaries, admin tools, and shared utilities. Those components communicate with a persistent database and a central configuration system.
 

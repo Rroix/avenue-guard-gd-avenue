@@ -34,7 +34,7 @@ def basic_color(name: str) -> discord.Color:
     }
     if n in mapping:
         return mapping[n]
-    if n.startswith("#") and len(n) in (7, 9):
+    if n.startswith("#") and len(n) == 7:
         try:
             return discord.Color(int(n.lstrip("#"), 16))
         except Exception:

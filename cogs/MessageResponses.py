@@ -99,6 +99,9 @@ class MessageResponsesCog(commands.Cog):
         if now - last < cd:
             return False
         self._cooldown[user_id] = now
+        while len(self._cooldown) > 5000:
+            oldest_user_id = min(self._cooldown, key=self._cooldown.get)
+            self._cooldown.pop(oldest_user_id, None)
         return True
 
     @commands.Cog.listener()
@@ -121,6 +124,7 @@ class MessageResponsesCog(commands.Cog):
         content = (message.content or "").strip()
         lowered = content.casefold()
         first_match_only = bool(cfg.get("responses", "first_match_only", default=True))
+        cooldown_claimed = False
 
         for rule in self._rules:
             try:
@@ -162,8 +166,9 @@ class MessageResponsesCog(commands.Cog):
                     if not title and not desc:
                         await self._log_rule_error(trigger[:80], f"Message response rule {trigger!r} has an empty embed")
                         continue
-                    if not self._cooldown_ok(message.author.id):
+                    if not cooldown_claimed and not self._cooldown_ok(message.author.id):
                         return
+                    cooldown_claimed = True
                     color = basic_color(str(et.get("color", "") or ""))
                     embed = discord.Embed(title=title or None, description=desc or None, color=color)
                     if respond:
@@ -176,8 +181,9 @@ class MessageResponsesCog(commands.Cog):
                     if not text:
                         await self._log_rule_error(trigger[:80], f"Message response rule {trigger!r} has empty text")
                         continue
-                    if not self._cooldown_ok(message.author.id):
+                    if not cooldown_claimed and not self._cooldown_ok(message.author.id):
                         return
+                    cooldown_claimed = True
                     if respond:
                         await message.reply(text, mention_author=False, allowed_mentions=no_mentions())
                     else:

@@ -51,7 +51,7 @@ def compare_versions(left: Any, right: Any) -> int:
 
     left_parts = left_pre.split(".")
     right_parts = right_pre.split(".")
-    for left_part, right_part in zip(left_parts, right_parts):
+    for left_part, right_part in zip(left_parts, right_parts, strict=False):
         if left_part == right_part:
             continue
         left_numeric = left_part.isdigit()

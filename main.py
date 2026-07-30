@@ -60,8 +60,17 @@ def _startup_error_retry_seconds() -> int:
         return DEFAULT_STARTUP_ERROR_RETRY_SECONDS
 
 
-def _prepare_fresh_event_loop() -> None:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+def _prepare_fresh_event_loop() -> asyncio.AbstractEventLoop:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop
+
+
+def _close_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Close an unused startup loop without relying on implicit loop lookup."""
+    if not loop.is_closed():
+        loop.close()
+    asyncio.set_event_loop(None)
 
 
 def _compact_startup_exception(exc: Exception) -> str:
@@ -86,14 +95,26 @@ def _is_discord_startup_rate_limit(exc: Exception) -> bool:
     return status == 429 or "error 1015" in text or "you are being rate limited" in text or "too many requests" in text
 
 
-def _run_preflight_database_check(bot: discord.Bot) -> None:
+def _run_preflight_database_check(
+    bot: discord.Bot,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
     """Connect and migrate storage before Discord login advertises the bot online."""
-    loop = asyncio.get_event_loop()
     loop.run_until_complete(bot.db.connect())
 
 
 async def _close_runtime_storage(bot: discord.Bot) -> None:
     """Best-effort flush on Discord's event loop before it is torn down."""
+    requests = bot.get_cog("RequestLevelsCog")
+    close_request_resources = getattr(requests, "close_resources", None)
+    if callable(close_request_resources):
+        try:
+            await close_request_resources()
+        except Exception as e:
+            startup_log(
+                f"Request validation session shutdown failed: {type(e).__name__}: {e}"
+            )
+
     release = bot.get_cog("ReleaseCog")
     record_uptime = getattr(release, "record_uptime_transition", None)
     if callable(record_uptime):
@@ -246,6 +267,7 @@ def create_bot() -> discord.Bot:
         if hasattr(intents, intent_name):
             setattr(intents, intent_name, True)
     bot = discord.Bot(intents=intents)
+    bot.config_write_lock = asyncio.Lock()
 
     bot.config = Config("config.json")
     bot.db_path, bot.db_path_source, bot.db_path_warning, bot.db_remote_url, bot.db_remote_token = resolve_db_path(bot.config)
@@ -309,7 +331,7 @@ def create_bot() -> discord.Bot:
             # start once
             if not getattr(bot, "_keepalive_started", False):
                 bot._keepalive_started = True
-                bot.loop.create_task(start_keepalive())
+                asyncio.create_task(start_keepalive())
         except Exception:
             pass
 
@@ -437,11 +459,12 @@ def run_bot_with_startup_backoff(token: str) -> None:
     set_keepalive_status("starting", "Starting health server")
     start_keepalive_thread()
     while True:
-        _prepare_fresh_event_loop()
+        loop = _prepare_fresh_event_loop()
         set_keepalive_status("discord_login", "Attempting Discord login")
         try:
             bot = create_bot()
         except PersistenceConfigurationError as exc:
+            _close_event_loop(loop)
             seconds = _startup_error_retry_seconds()
             next_retry_ts = int(time.time()) + seconds
             set_keepalive_status(
@@ -455,12 +478,15 @@ def run_bot_with_startup_backoff(token: str) -> None:
             continue
         try:
             set_keepalive_status("database_check", "Checking database before Discord login")
-            _run_preflight_database_check(bot)
+            _run_preflight_database_check(bot, loop)
         except Exception as exc:
             try:
-                asyncio.get_event_loop().run_until_complete(bot.db.close())
+                if not loop.is_closed():
+                    loop.run_until_complete(bot.db.close())
             except Exception:
                 pass
+            finally:
+                _close_event_loop(loop)
             seconds = _startup_error_retry_seconds()
             next_retry_ts = int(time.time()) + seconds
             detail = f"Database setup failed before Discord login: {type(exc).__name__}"

@@ -1,3 +1,4 @@
+import asyncio
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -62,6 +63,34 @@ def make_cog(db=None):
     cog._last_error_log = {}
     cog._active_ticket_channels = set()
     return cog
+
+
+@pytest.mark.asyncio
+async def test_ticket_close_lock_serializes_and_cleans_up_without_private_asyncio_state():
+    cog = make_cog()
+    cog._ticket_close_locks = {}
+    cog._ticket_close_lock_users = {}
+    active = 0
+    max_active = 0
+
+    async def close_once(_guild, _channel_id):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return True
+
+    cog._close_ticket_channel_locked = close_once
+    results = await asyncio.gather(
+        cog.close_ticket_channel(SimpleNamespace(), 999),
+        cog.close_ticket_channel(SimpleNamespace(), 999),
+    )
+
+    assert results == [True, True]
+    assert max_active == 1
+    assert cog._ticket_close_locks == {}
+    assert cog._ticket_close_lock_users == {}
 
 
 @pytest.mark.asyncio

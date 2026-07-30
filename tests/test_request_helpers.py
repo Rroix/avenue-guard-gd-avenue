@@ -1,5 +1,6 @@
 from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -70,6 +71,19 @@ def test_request_form_validation_rejects_bad_ids_and_non_urls():
     assert cog._valid_url("https://user:secret@example.com/video") is False
 
 
+def test_level_validation_rate_limit_cache_has_a_hard_ceiling(monkeypatch):
+    cog = make_cog()
+    cog._validation_attempts = {
+        (717, user_id): [999]
+        for user_id in range(5001)
+    }
+    monkeypatch.setattr(request_module.time_module, "time", lambda: 1_000)
+
+    assert cog._level_validation_rate_limit_message(717, 9999) == ""
+    assert len(cog._validation_attempts) == 5000
+    assert (717, 9999) in cog._validation_attempts
+
+
 def test_edit_window_uses_persisted_deadline_for_a_closed_or_old_wave(monkeypatch):
     cog = make_cog()
     monkeypatch.setattr(request_module.time_module, "time", lambda: 1_000)
@@ -78,8 +92,22 @@ def test_edit_window_uses_persisted_deadline_for_a_closed_or_old_wave(monkeypatc
     current = {"wave_id": 3, "status": "pending", "edit_deadline_ts": None}
     old_valid = {"wave_id": 2, "status": "pending", "edit_deadline_ts": 1_001}
     old_expired = {"wave_id": 2, "status": "pending", "edit_deadline_ts": 999}
+    just_closed = {
+        "wave_id": 3,
+        "state": "open",
+        "close_ts": 900,
+        "closed_ts": None,
+    }
+    long_closed = {
+        "wave_id": 3,
+        "state": "open",
+        "close_ts": 699,
+        "closed_ts": None,
+    }
 
     assert cog._can_edit_submission(open_state, current) is True
+    assert cog._can_edit_submission(just_closed, current) is True
+    assert cog._can_edit_submission(long_closed, current) is False
     assert cog._can_edit_submission(open_state, old_valid) is True
     assert cog._can_edit_submission(open_state, old_expired) is False
     assert cog._can_edit_submission(open_state, {**current, "status": "reviewed"}) is False
@@ -100,6 +128,17 @@ def test_scheduled_opening_parses_local_time_and_future_month(monkeypatch):
 
     assert cog._parse_scheduled_open_ts("25:00")[0] is None
     assert cog._parse_scheduled_open_ts("18:99")[0] is None
+
+
+def test_scheduled_opening_rejects_nonexistent_daylight_saving_time(monkeypatch):
+    cog = make_cog()
+    fixed_now = datetime(2026, 3, 1, 12, 0, tzinfo=TZ)
+    monkeypatch.setattr(request_module, "now_madrid", lambda: fixed_now)
+
+    open_ts, error = cog._parse_scheduled_open_ts("02:30", 29)
+
+    assert open_ts is None
+    assert "daylight-saving" in error
 
 
 @pytest.mark.asyncio
@@ -123,6 +162,18 @@ async def test_modal_edit_lookup_uses_open_wave_or_persisted_grace_deadline(tmp_
     assert await cog._editable_user_submission_for_modal(717, 42) is not None
 
     await db.execute(
+        "UPDATE level_request_state SET close_ts=? WHERE guild_id=?",
+        (now_ts - 60, 717),
+    )
+    assert await cog._editable_user_submission_for_modal(717, 42) is not None
+
+    await db.execute(
+        "UPDATE level_request_state SET close_ts=? WHERE guild_id=?",
+        (now_ts - 301, 717),
+    )
+    assert await cog._editable_user_submission_for_modal(717, 42) is None
+
+    await db.execute(
         "UPDATE level_request_state SET state='closed', close_ts=?, closed_ts=? WHERE guild_id=?",
         (now_ts - 1, now_ts - 1, 717),
     )
@@ -134,6 +185,49 @@ async def test_modal_edit_lookup_uses_open_wave_or_persisted_grace_deadline(tmp_
     )
     assert await cog._editable_user_submission_for_modal(717, 42) is not None
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_request_button_opens_edit_modal_during_timed_close_grace(monkeypatch):
+    now_ts = 2_000
+    monkeypatch.setattr(request_module.time_module, "time", lambda: now_ts)
+    state = {
+        "state": "open",
+        "wave_id": 4,
+        "close_ts": now_ts - 60,
+        "closed_ts": None,
+    }
+    submission = {
+        "wave_id": 4,
+        "status": "pending",
+        "edit_deadline_ts": None,
+        "data_json": '{"level_id":"111111111","level_name":"Test","creators":"Creator"}',
+    }
+    response = SimpleNamespace(
+        send_modal=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=717),
+        user=SimpleNamespace(id=42),
+        response=response,
+    )
+    cog = make_cog()
+    cog._get_state_local = AsyncMock(return_value=state)
+    cog._current_user_submission_local = AsyncMock(return_value=submission)
+    scheduled = []
+
+    def capture_background(coroutine, *, label):
+        scheduled.append(label)
+        coroutine.close()
+
+    cog._start_background_task = capture_background
+
+    await cog.handle_request_button(interaction)
+
+    response.send_modal.assert_awaited_once()
+    response.send_message.assert_not_awaited()
+    assert scheduled == ["Timed request close guild_id=717"]
 
 
 @pytest.mark.asyncio

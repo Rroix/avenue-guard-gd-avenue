@@ -25,7 +25,7 @@ REQUEST_DM_TEXT = (
     "> Video (required for demons and platformers):\n"
     "> Notes (Optional):\n"
     "If you don’t want to claim this request, please answer with “I do not want this request”\n"
-    "If you have any problems, please contact any of the Admins/Owners.\n"
+    "If you have any problems, please contact staff.\n"
     "Thanks for bringing so much dedication to our community!"
 )
 
@@ -263,7 +263,7 @@ class TrackingCog(commands.Cog):
         return channel if isinstance(channel, discord.TextChannel) else None
 
     async def _log_background_error(self, key: str, message: str) -> None:
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_error_log.get(key, 0.0) < 300:
             return
         self._last_error_log[key] = now
@@ -478,34 +478,83 @@ class TrackingCog(commands.Cog):
     async def enable_weekly_reward_for_current_week(self, guild: discord.Guild, enabled_by: int) -> tuple[str, bool]:
         week_start_iso = week_start_sunday(now_madrid()).isoformat()
         was_disabled = await self.weekly_reward_disabled(guild.id, week_start_iso)
-
-        await self.bot.db.execute_transaction(
+        disabled_claims = await self.bot.db.fetchall(
+            "SELECT user_id,rank FROM weekly_claims "
+            "WHERE guild_id=? AND week_start=? AND status='disabled' ORDER BY rank ASC",
+            (guild.id, week_start_iso),
+        )
+        timeout_hours = max(1, self._cfg_int("tracking", "dm_timeout_hours", 48))
+        now_ts = int(time.time())
+        expires_ts = now_ts + timeout_hours * 3600
+        statements: list[tuple[str, tuple]] = [
+            (
+                "DELETE FROM weekly_reward_disabled WHERE guild_id=? AND week_start=?",
+                (guild.id, week_start_iso),
+            ),
+        ]
+        for row in disabled_claims:
+            statements.append(
+                (
+                    "INSERT INTO weekly_sessions(guild_id,week_start,user_id,stage,expires_ts,active) "
+                    "VALUES(?,?,?,?,?,1) "
+                    "ON CONFLICT(guild_id,week_start,user_id) DO UPDATE SET "
+                    "stage='awaiting_request',expires_ts=excluded.expires_ts,active=1,decline_prompt_message_id=NULL",
+                    (guild.id, week_start_iso, int(row["user_id"]), "awaiting_request", expires_ts),
+                )
+            )
+        statements.extend(
             (
                 (
-                    "DELETE FROM weekly_reward_disabled WHERE guild_id=? AND week_start=?",
+                    "DELETE FROM weekly_reminders WHERE guild_id=? AND week_start=?",
                     (guild.id, week_start_iso),
                 ),
                 (
-                    "UPDATE weekly_sessions SET active=1, stage='awaiting_request' "
-                    "WHERE guild_id=? AND week_start=? AND EXISTS ("
-                    "SELECT 1 FROM weekly_claims c "
-                    "WHERE c.guild_id=weekly_sessions.guild_id "
-                    "AND c.week_start=weekly_sessions.week_start "
-                    "AND c.user_id=weekly_sessions.user_id "
-                    "AND c.status='disabled'"
-                    ")",
-                    (guild.id, week_start_iso),
+                    "UPDATE weekly_claims SET status='pending',contacted_ts=? "
+                    "WHERE guild_id=? AND week_start=? AND status='disabled'",
+                    (now_ts, guild.id, week_start_iso),
                 ),
-                (
-                    "UPDATE weekly_claims SET status='pending' WHERE guild_id=? AND week_start=? AND status='disabled'",
-                    (guild.id, week_start_iso),
-                ),
-            ),
-            retry_safe=True,
+            )
         )
+        await self.bot.db.execute_transaction(statements, retry_safe=True)
+
+        if was_disabled and disabled_claims:
+            await self._notify_reenabled_weekly_claims(
+                guild,
+                week_start_iso,
+                disabled_claims,
+                timeout_hours,
+                expires_ts,
+            )
 
         await self._log_weekly(guild, week_start_iso, enabled_by, "weekly_reward_enabled", "Reward enabled for this tracking week")
         return week_start_iso, was_disabled
+
+    async def _notify_reenabled_weekly_claims(
+        self,
+        guild: discord.Guild,
+        week_start_iso: str,
+        claims,
+        timeout_hours: int,
+        expires_ts: int,
+    ) -> None:
+        for row in claims:
+            user_id = int(row["user_id"])
+            try:
+                user = await self.bot.fetch_user(user_id)
+                content, embed = self._build_request_dm_message(timeout_hours, expires_ts)
+                await user.send(content=content or None, embed=embed, allowed_mentions=no_mentions())
+                await self._log_weekly(
+                    guild,
+                    week_start_iso,
+                    user_id,
+                    "dm_sent",
+                    "weekly_reward_reenabled=true",
+                )
+            except Exception as e:
+                await self._log_background_error(
+                    "weekly_reenable_dm",
+                    f"Re-enabled weekly request DM failed for user_id={user_id}: {repr(e)}",
+                )
 
     # ----------------------------
     # Logging helpers
@@ -649,6 +698,14 @@ class TrackingCog(commands.Cog):
         repeat_count = 1 + sum(1 for _ts, sig in history if sig == signature)
         history.append((now, signature))
         self._anti_farm_cache[key] = history[-25:]
+        while len(self._anti_farm_cache) > 5000:
+            oldest_key = min(
+                self._anti_farm_cache,
+                key=lambda cache_key: int(self._anti_farm_cache[cache_key][-1][0])
+                if self._anti_farm_cache[cache_key]
+                else 0,
+            )
+            self._anti_farm_cache.pop(oldest_key, None)
 
         if low_effort and repeat_count >= threshold:
             return "repeated_low_effort"
@@ -665,6 +722,9 @@ class TrackingCog(commands.Cog):
         if last_log and now - last_log < 300:
             return
         self._anti_farm_last_log[log_key] = now
+        while len(self._anti_farm_last_log) > 5000:
+            oldest_key = min(self._anti_farm_last_log, key=self._anti_farm_last_log.get)
+            self._anti_farm_last_log.pop(oldest_key, None)
         try:
             await self.bot.db.execute(
                 "INSERT INTO anti_farm_events(guild_id,user_id,channel_id,reason,sample,ts) VALUES(?,?,?,?,?,?)",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import closing
 import json
 import os
 import shutil
@@ -144,6 +145,7 @@ class Database:
         self._conn: Optional[Any] = None
         self._ready = False
         self._remote_dirty = False
+        self._remote_reconnect_required = False
         self._remote_sync_retry_after = 0.0
         self._last_remote_sync_error = ""
         self._last_remote_sync_error_ts = 0
@@ -162,6 +164,7 @@ class Database:
         self._close_connection_sync()
         self._conn = self._open_connection_sync()
         self._ready = True
+        self._remote_reconnect_required = False
 
     def _open_connection_sync(self) -> Any:
         if self.uses_remote:
@@ -217,17 +220,23 @@ class Database:
         """Retry a previously deferred remote sync without blocking every query."""
         if not self.uses_remote or not self._remote_dirty:
             return
+        if self._remote_reconnect_required:
+            # A failed Hrana transaction can leave the local connection unable
+            # to serve even local work. Reopen it before honoring sync backoff.
+            self._reopen_connection_sync()
         if time.monotonic() < self._remote_sync_retry_after:
             return
         try:
             self._sync_remote_with_retry_sync()
         except Exception as exc:
+            self._remote_reconnect_required = _is_recoverable_remote_error(exc)
             self._last_remote_sync_error = f"{type(exc).__name__}: {exc}"[:1000]
             self._last_remote_sync_error_ts = int(time.time())
             retry_delay = 5.0 if _is_recoverable_remote_error(exc) else 60.0
             self._remote_sync_retry_after = time.monotonic() + retry_delay
             return
         self._remote_dirty = False
+        self._remote_reconnect_required = False
         self._remote_sync_retry_after = 0.0
         self._last_remote_sync_error = ""
         self._last_remote_sync_error_ts = 0
@@ -245,6 +254,7 @@ class Database:
             # running as local-only storage.
             if self.uses_remote:
                 self._remote_dirty = True
+                self._remote_reconnect_required = _is_recoverable_remote_error(exc)
                 self._last_remote_sync_error = f"{type(exc).__name__}: {exc}"[:1000]
                 self._last_remote_sync_error_ts = int(time.time())
                 retry_delay = 5.0 if _is_recoverable_remote_error(exc) else 60.0
@@ -252,6 +262,7 @@ class Database:
                 return
             raise
         self._remote_dirty = False
+        self._remote_reconnect_required = False
         self._remote_sync_retry_after = 0.0
         self._last_remote_sync_error = ""
         self._last_remote_sync_error_ts = 0
@@ -301,6 +312,7 @@ class Database:
                 assert self._conn is not None
                 self._migrate_sync()
                 self._sync_remote_with_retry_sync()
+                self._remote_reconnect_required = False
 
             await asyncio.to_thread(_connect_and_migrate)
             self._ready = True
@@ -338,14 +350,18 @@ class Database:
                     # backup API produces a transactionally consistent file;
                     # copying only the main file can omit committed pages.
                     source_uri = f"file:{self.path}?mode=ro"
-                    with sqlite3.connect(source_uri, uri=True) as source, sqlite3.connect(str(target)) as dest:
+                    with closing(sqlite3.connect(source_uri, uri=True)) as source, closing(
+                        sqlite3.connect(str(target))
+                    ) as dest:
                         source.backup(dest)
                 else:
                     self._conn.execute("PRAGMA wal_checkpoint(FULL);")
-                    with sqlite3.connect(str(target)) as dest:
+                    with closing(sqlite3.connect(str(target))) as dest:
                         self._conn.backup(dest)
 
-                with sqlite3.connect(f"file:{target}?mode=ro", uri=True) as check:
+                with closing(
+                    sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+                ) as check:
                     row = check.execute("PRAGMA integrity_check;").fetchone()
                     result = str(row[0] if row else "")
                     if result.casefold() != "ok":
@@ -1075,6 +1091,7 @@ class Database:
         def _run() -> bool:
             self._sync_remote_with_retry_sync()
             self._remote_dirty = False
+            self._remote_reconnect_required = False
             self._remote_sync_retry_after = 0.0
             self._last_remote_sync_error = ""
             self._last_remote_sync_error_ts = 0
