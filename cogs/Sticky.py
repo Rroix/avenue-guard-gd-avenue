@@ -8,6 +8,7 @@ import discord
 from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, basic_color
+from utils.discord_refs import fetch_persisted_message
 from utils.errors import log_error
 from utils.mentions import no_mentions
 
@@ -235,8 +236,17 @@ class StickyCog(commands.Cog):
         previous_missing = last_id is None
         if last_id:
             try:
-                msg = await channel.fetch_message(last_id)
-                await msg.delete()
+                msg, _recovered = await fetch_persisted_message(
+                    channel,
+                    last_id,
+                    author_id=int(
+                        getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                    ),
+                )
+                if msg is None:
+                    previous_missing = True
+                else:
+                    await msg.delete()
             except discord.NotFound:
                 previous_missing = True
             except Exception as e:
@@ -248,7 +258,9 @@ class StickyCog(commands.Cog):
         if previous_missing or channel.id not in self._sticky_recovery_scanned:
             self._sticky_recovery_scanned.add(channel.id)
             try:
-                me_id = int(getattr(self.bot.user, "id", 0) or 0)
+                me_id = int(
+                    getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                )
                 async for old in channel.history(limit=50):
                     if old.id == last_id:
                         continue
@@ -268,11 +280,21 @@ class StickyCog(commands.Cog):
         sent = None
         try:
             sent = await channel.send(text, allowed_mentions=no_mentions())
-            await db.execute(
-                "INSERT INTO sticky_state(guild_id, channel_id, last_sticky_message_id) VALUES(?,?,?) "
-                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET last_sticky_message_id=excluded.last_sticky_message_id",
-                (guild.id, channel.id, sent.id),
-            )
+            if row:
+                # UPDATE lets the database compatibility layer locate a row
+                # whose guild/channel keys were rounded by old libsql builds
+                # and rewrite those keys with Discord's exact values.
+                await db.execute(
+                    "UPDATE sticky_state SET guild_id=?, channel_id=?, last_sticky_message_id=? "
+                    "WHERE guild_id=? AND channel_id=?",
+                    (guild.id, channel.id, sent.id, guild.id, channel.id),
+                )
+            else:
+                await db.execute(
+                    "INSERT INTO sticky_state(guild_id, channel_id, last_sticky_message_id) "
+                    "VALUES(?,?,?)",
+                    (guild.id, channel.id, sent.id),
+                )
         except Exception as e:
             if sent is not None:
                 try:

@@ -242,14 +242,41 @@ class ReleaseCog(commands.Cog):
                     return int(match.group(0))
         return 0
 
-    async def _send_approval_dm(self, row: Any) -> tuple[bool, str]:
+    async def _send_approval_dm(
+        self,
+        row: Any,
+        *,
+        force: bool = False,
+    ) -> tuple[bool, str]:
         proposal_id = int(_row_value(row, "id", 0) or 0)
+        delivery_status = str(
+            _row_value(row, "approval_delivery_status", "pending") or "pending"
+        )
+        if not force and delivery_status == "sending":
+            return False, "An approval DM delivery is already recorded as in progress"
+
         owner = await self._resolve_owner()
         if owner is None:
             error = "Configured release owner could not be resolved"
             await self.bot.db.execute(
-                "UPDATE bot_releases SET error_text=? WHERE id=? AND status='pending'",
-                (error, proposal_id),
+                "UPDATE bot_releases SET approval_delivery_status='delivery_failed', "
+                "approval_attempted_ts=?, error_text=? WHERE id=? AND status='pending'",
+                (int(time.time()), error, proposal_id),
+            )
+            return False, error
+
+        attempted_ts = int(time.time())
+        try:
+            await self.bot.db.execute(
+                "UPDATE bot_releases SET approval_delivery_status='sending', "
+                "approval_attempted_ts=?, error_text=NULL WHERE id=? AND status='pending'",
+                (attempted_ts, proposal_id),
+            )
+        except Exception as exc:
+            error = f"Could not reserve approval delivery: {type(exc).__name__}: {exc}"[:1000]
+            await log_error(
+                self.bot,
+                f"Release approval delivery reservation failed proposal_id={proposal_id}: {exc!r}",
             )
             return False, error
 
@@ -262,8 +289,9 @@ class ReleaseCog(commands.Cog):
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"[:1000]
             await self.bot.db.execute(
-                "UPDATE bot_releases SET error_text=? WHERE id=? AND status='pending'",
-                (error, proposal_id),
+                "UPDATE bot_releases SET approval_delivery_status='delivery_failed', "
+                "approval_attempted_ts=?, error_text=? WHERE id=? AND status='pending'",
+                (int(time.time()), error, proposal_id),
             )
             await log_error(
                 self.bot,
@@ -271,11 +299,23 @@ class ReleaseCog(commands.Cog):
             )
             return False, error
 
-        await self.bot.db.execute(
-            "UPDATE bot_releases SET approval_message_id=?, error_text=NULL "
-            "WHERE id=? AND status='pending'",
-            (int(message.id), proposal_id),
-        )
+        try:
+            await self.bot.db.execute(
+                "UPDATE bot_releases SET approval_message_id=?, "
+                "approval_delivery_status='sent', approval_attempted_ts=?, error_text=NULL "
+                "WHERE id=? AND status='pending'",
+                (int(message.id), int(time.time()), proposal_id),
+            )
+        except Exception as exc:
+            # The durable `sending` claim deliberately remains. The delivered
+            # panel contains its proposal ID and repairs this pointer when the
+            # owner clicks it, while startup will not send a duplicate.
+            await log_error(
+                self.bot,
+                f"Release approval DM sent but pointer save failed "
+                f"proposal_id={proposal_id} message_id={message.id}: {exc!r}",
+            )
+            return True, "Approval DM sent; its message pointer will reconcile when used"
         return True, ""
 
     async def propose_release(
@@ -324,7 +364,7 @@ class ReleaseCog(commands.Cog):
             status = str(existing["status"])
             if status == "approved":
                 return False, f"Version `{payload['version']}` is already published"
-            sent, error = await self._send_approval_dm(existing)
+            sent, error = await self._send_approval_dm(existing, force=True)
             if sent:
                 return True, f"Pending version `{payload['version']}` was sent to your DMs again"
             return False, f"The proposal is still pending, but I could not DM you: {error}"
@@ -393,6 +433,11 @@ class ReleaseCog(commands.Cog):
             if (
                 str(existing["status"]) == "pending"
                 and not int(_row_value(existing, "approval_message_id", 0) or 0)
+                and str(
+                    _row_value(existing, "approval_delivery_status", "pending")
+                    or "pending"
+                )
+                != "sending"
             ):
                 await self._send_approval_dm(existing)
             return
@@ -759,9 +804,10 @@ class ReleaseCog(commands.Cog):
             and expected_message_id != actual_message_id
         ):
             await self.bot.db.execute(
-                "UPDATE bot_releases SET approval_message_id=? "
+                "UPDATE bot_releases SET approval_message_id=?, "
+                "approval_delivery_status='sent', approval_attempted_ts=? "
                 "WHERE id=? AND status='pending'",
-                (actual_message_id, proposal_id),
+                (actual_message_id, int(time.time()), proposal_id),
             )
             reconciliation = {
                 "proposal_id": proposal_id,
@@ -793,7 +839,8 @@ class ReleaseCog(commands.Cog):
                 decided_ts = int(time.time())
                 await self.bot.db.execute(
                     "UPDATE bot_releases SET "
-                    "status='rejected',decided_by=?,decided_ts=?,error_text=? "
+                    "status='rejected',approval_delivery_status='completed',"
+                    "decided_by=?,decided_ts=?,error_text=? "
                     "WHERE id=? AND status='pending'",
                     (
                         int(interaction.user.id),
@@ -828,7 +875,8 @@ class ReleaseCog(commands.Cog):
         status = "approved" if approved else "rejected"
         decided_ts = int(time.time())
         await self.bot.db.execute(
-            "UPDATE bot_releases SET status=?,decided_by=?,decided_ts=?,error_text=NULL "
+            "UPDATE bot_releases SET status=?,approval_delivery_status='completed',"
+            "decided_by=?,decided_ts=?,error_text=NULL "
             "WHERE id=? AND status='pending'",
             (status, int(interaction.user.id), decided_ts, proposal_id),
         )

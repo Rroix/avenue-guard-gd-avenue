@@ -35,6 +35,12 @@ def _redact_secrets(message: str) -> str:
 def _compact_error_message(message: str, limit: int = 3600) -> str:
     text = str(message or "")
     lower = text.casefold()
+    if "file is not a database" in lower or "sqlite_notadb" in lower:
+        return (
+            f"{_strip_trace_context(text)}\n\n"
+            "Operational note: the local Turso replica was unreadable. The database wrapper "
+            "will quarantine it and rebuild from the remote primary; persistent cloud data is not deleted."
+        )
     if "turso-diskless-wal" in lower or "s3 error" in lower or "hrana" in lower or "connection has reached an invalid state" in lower:
         if "connection has reached an invalid state" in lower or "started with txn" in lower:
             detail = "The local libSQL replica connection entered an invalid transaction state and should recover after reconnect/retry."

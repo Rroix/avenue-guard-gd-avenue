@@ -494,7 +494,7 @@
 **Setup:** deploy the bot update first, keep `release_updates.owner_user_ids` set to the owner, and deploy the website files containing `bot.html` and `bot.js`.
 
 1. Open `https://avenue-guard.onrender.com/api/bot`.
-   - Expected: JSON reports `online`, operational state, connection uptime, persisted uptime percentage, latency, the configured GD Avenue guild's member total, actual bot avatar, and latest published version.
+   - Expected: schema v3 JSON reports `online`, operational state, service-process uptime, separate Discord connection uptime, persisted uptime percentage, latency, the configured GD Avenue guild's member total, actual bot avatar, and latest published version.
    - Expected: `member_count` does not include any other guild even if the bot is accidentally connected elsewhere.
    - Expected: internal startup details, database paths, tokens, owner IDs, and pending notes are absent.
 2. Open `https://avenue-guard.onrender.com/api/releases`.
@@ -519,7 +519,8 @@
    - Expected: Avenue Guard creates one automatic proposal and DMs the owner once; repeated restarts do not duplicate it.
    - Expected: a version equal to or older than `3.18.7` or the newest recorded release is rejected.
 10. Open `https://gdavenue.netlify.app/bot` on desktop and mobile.
-   - Expected: status, current uptime with its percentage, metrics, real bot avatar, and update cards fit without overlap or horizontal scrolling.
+   - Expected: status, current service uptime with its percentage, metrics, real bot avatar, and update cards fit without overlap or horizontal scrolling.
+   - Expected: a Discord reconnect changes only the connection-uptime API fields; the large website uptime does not reset unless the Render service process restarts.
 11. Temporarily stop or restart the Render service while the page is open.
    - Expected: the page shows a connecting, unavailable, or retry state without exposing the internal exception.
 12. Leave the bot online for at least one minute, restart it, then inspect `/api/bot`.
@@ -530,19 +531,27 @@
 ## 26) Reliability regressions
 **Setup:** use a staging bot or a maintenance window for tests that intentionally interrupt Turso or change the clock-sensitive configuration.
 
-1. Make Turso return a temporary invalid-transaction error immediately after a committed write, then allow the next sync.
-   - Expected: the committed operation is not replayed, the remote connection is reopened, and pending data syncs on the next attempt.
-2. Temporarily make the daily-summary channel unavailable at the configured report time, restore it, and wait for the five-minute snapshot cycle.
+1. Before the deployment, preserve a database backup and note one known user, channel, request message, sticky message, and closed ticket from before the Turso migration.
+   - Expected: after startup, every exact Discord ID remains unchanged; a historical rounded ID is repaired only when Discord or a saved transcript provides one unambiguous exact match.
+   - Expected: ticket `T6` either resolves its exact creator from the guild/transcript and sends one satisfaction prompt, or records one terminal `recipient_unavailable` result without repeating the same error after each restart.
+
+2. Make Turso return a temporary invalid-transaction error immediately after a committed write, then allow the next sync.
+   - Expected: the committed operation is not replayed, the connection is reopened when necessary, and the next explicit pull succeeds without duplicating the Discord action.
+3. Replace the local replica with a non-SQLite file while the remote Turso database remains intact, then restart the staging bot.
+   - Expected: startup quarantines the corrupt replica and sidecars, creates a clean local replica, pulls the remote state, and preserves the request, ticket, tracking, and sticky records.
+4. Interrupt Turso immediately after Discord accepts a weekly reminder, offer, satisfaction prompt, or release approval.
+   - Expected: the delivery remains in `sending` state and is not automatically sent again after restart; staff can reconcile or deliberately recreate it.
+5. Temporarily make the daily-summary channel unavailable at the configured report time, restore it, and wait for the five-minute snapshot cycle.
    - Expected: the missing summary is retried once the channel is usable and is never sent twice for the same guild and day.
-3. Disable the current weekly reward after winners are selected, then run `/tracking enable_reward`.
+6. Disable the current weekly reward after winners are selected, then run `/tracking enable_reward`.
    - Expected: missing weekly sessions are recreated, every pending winner receives a fresh deadline, stale reminders are removed, and a new DM is attempted.
-4. Open a timed request wave and submit a request shortly before its scheduled close.
+7. Open a timed request wave and submit a request shortly before its scheduled close.
    - Expected: the user can edit from the request button or `/edit-request` until five minutes after the scheduled close, even if the auto-close loop runs late.
-5. Schedule an opening during a daylight-saving time that does not exist locally.
+8. Schedule an opening during a daylight-saving time that does not exist locally.
    - Expected: the command rejects the time clearly instead of silently shifting the opening.
-6. Trigger `/bot backup` and validate a restore upload while the bot is otherwise active.
+9. Trigger `/bot backup` and validate a restore upload while the bot is otherwise active.
    - Expected: Discord interactions and background loops remain responsive while ZIP compression or extraction runs.
-7. Set `responses.json` to `first_match_only: false` and create two valid rules for the same message.
+10. Set `responses.json` to `first_match_only: false` and create two valid rules for the same message.
    - Expected: both replies are sent and the shared per-user cooldown is claimed only once.
-8. Stop a health-check client while the HTTP response is being written.
+11. Stop a health-check client while the HTTP response is being written.
    - Expected: the monitor can reconnect normally and no misleading keepalive error is logged.

@@ -94,6 +94,7 @@ The maintained sequence is:
 | `3.19.1` | Support continuation and response-delivery fixes |
 | `3.20.0` | Public status and release system |
 | `3.20.1` | Accurate guild metrics, persistent availability, identity, and wording refinements |
+| `3.20.2` | Turso persistence recovery, exact Discord IDs, and service-uptime correction |
 
 The command saves the proposal first and then DMs the owner. If the DM fails,
 the proposal remains pending with a private error. Running the same command
@@ -139,13 +140,14 @@ cannot approve a proposal after `/bot release` has sent a replacement.
 
 ### `GET /api/bot`
 
-This endpoint returns:
+This schema-v3 endpoint returns:
 
 - Public service state and a human-readable status
 - Whether the Discord gateway is currently online
 - Current approved version
-- Render process start and uptime
-- Current Discord connection start and uptime
+- Canonical service-process start and uptime fields
+- Current Discord gateway connection start and uptime fields
+- Schema-v2 process and online uptime aliases for older website deployments
 - Persistent measured Discord availability percentage and measurement start
 - Discord latency
 - Configured GD Avenue guild member count
@@ -172,10 +174,16 @@ diagnosis and Render health checks.
 
 ## Uptime Meaning
 
-The large duration shows the current Discord connection uptime while the bot
-is online. If Discord is unavailable but the Render process still responds, it
-shows process uptime and a non-operational state. This prevents a successful
-HTTP response from being mistaken for a healthy Discord bot.
+The large duration shows the lifetime of the current Avenue Guard service
+process. A Discord gateway connection can be transparently resumed or replaced
+without Render restarting the process, so gateway-session uptime is not a
+stable definition of current service uptime. The public API still exposes that
+shorter connection lifetime as a separate diagnostic metric.
+
+The status label remains the source of truth for whether Discord commands are
+currently operational. In other words, a long service uptime does not conceal a
+gateway outage: the duration stays stable while the status changes to
+reconnecting or unavailable.
 
 The percentage beside it is Avenue Guard's persisted Discord availability,
 measured from `uptime_tracking_since_ts`. While running, a heartbeat commits
@@ -209,7 +217,7 @@ The page:
 3. Deploy the `gdav_website` repository containing `bot.html`, `bot.js`, the
    shared CSS update, navigation links, and privacy disclosure.
 4. Open `/bot` on desktop and mobile.
-5. Confirm the `3.20.1` deployment proposal in `release.json` arrived by DM,
+5. Confirm the `3.20.2` deployment proposal in `release.json` arrived by DM,
    or run `/bot release` with the next real semantic version.
 6. Approve the DM and verify the version appears within 30 seconds.
 

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import cogs.Release as release_module
+import utils.keepalive as keepalive_module
 from cogs.Release import ReleaseCog
 from utils.db import Database
 from utils.keepalive import (
@@ -78,6 +79,7 @@ class _Owner:
             id=9000 + len(self.messages),
             embeds=[kwargs["embed"]],
             edit=AsyncMock(),
+            delete=AsyncMock(),
         )
         self.messages.append((message, kwargs))
         return message
@@ -172,7 +174,14 @@ def test_public_status_payload_is_sanitized_and_versioned():
     assert payload["member_count"] == 2500
     assert payload["uptime_percentage"] == 99.875
     assert payload["uptime_tracking_since_ts"] == 1200
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
+    assert payload["service_started_ts"] == payload["process_started_ts"]
+    assert payload["service_uptime_seconds"] == payload["process_uptime_seconds"]
+    assert payload["discord_connected_since_ts"] == payload["online_since_ts"]
+    assert (
+        payload["discord_connection_uptime_seconds"]
+        == payload["online_uptime_seconds"]
+    )
     assert "detail" not in payload
 
     body, content_type, cache_control, public_api = _response_for_path(
@@ -183,6 +192,29 @@ def test_public_status_payload_is_sanitized_and_versioned():
     assert content_type.startswith("application/json")
     assert cache_control == "no-store"
     assert public_api is True
+
+
+def test_service_uptime_survives_discord_gateway_reconnect(monkeypatch):
+    clock = [2_000]
+    monkeypatch.setattr(keepalive_module, "_process_started_ts", 1_000)
+    monkeypatch.setattr(keepalive_module.time, "time", lambda: clock[0])
+
+    set_keepalive_status("reconnecting")
+    set_keepalive_status("online")
+    clock[0] = 2_060
+    first = get_public_bot_payload()
+
+    set_keepalive_status("reconnecting")
+    clock[0] = 2_075
+    set_keepalive_status("online")
+    reconnected = get_public_bot_payload()
+
+    assert first["service_uptime_seconds"] == 1_060
+    assert first["discord_connection_uptime_seconds"] == 60
+    assert reconnected["service_uptime_seconds"] == 1_075
+    assert reconnected["discord_connection_uptime_seconds"] == 0
+    assert reconnected["service_started_ts"] == first["service_started_ts"]
+    set_keepalive_status("starting")
 
 
 @pytest.mark.asyncio
@@ -216,12 +248,57 @@ async def test_release_only_enters_public_feed_after_owner_approval(tmp_path):
     await cog.handle_release_decision(interaction, approved=True)
 
     row = await db.fetchone(
-        "SELECT status,decided_by FROM bot_releases WHERE version='3.20.1'"
+        "SELECT status,decided_by,approval_delivery_status "
+        "FROM bot_releases WHERE version='3.20.1'"
     )
     assert row["status"] == "approved"
     assert row["decided_by"] == OWNER_ID
+    assert row["approval_delivery_status"] == "completed"
     assert get_public_bot_payload()["version"] == "3.20.1"
     approval_message.edit.assert_awaited_once()
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_manifest_startup_does_not_repeat_ambiguous_approval_delivery(tmp_path):
+    manifest = tmp_path / "release.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "3.20.1",
+                "title": "No duplicate approval",
+                "summary": "",
+                "changes": ["Durable delivery claim"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    db = Database(str(tmp_path / "bot.db"))
+    await db.connect()
+    await db.execute(
+        "INSERT INTO bot_releases("
+        "version,title,summary,changes_json,status,source,created_by,created_ts,"
+        "approval_delivery_status,approval_attempted_ts"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (
+            "3.20.1",
+            "No duplicate approval",
+            "",
+            '["Durable delivery claim"]',
+            "pending",
+            "deployment_manifest",
+            OWNER_ID,
+            1,
+            "sending",
+            1,
+        ),
+    )
+    owner = _Owner()
+    cog = ReleaseCog(_Bot(db, _Config(manifest), owner))
+
+    await cog._ensure_manifest_proposal()
+
+    assert owner.messages == []
     await db.close()
 
 

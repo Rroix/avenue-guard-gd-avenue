@@ -7,7 +7,12 @@ import discord
 import pytest
 
 import cogs.Help as help_module
-from cogs.Help import BanInfoModal, HelpCog, HelpSessionControlView
+from cogs.Help import (
+    BanInfoModal,
+    DMRecipientUnavailable,
+    HelpCog,
+    HelpSessionControlView,
+)
 from utils.db import Database
 from utils.views import FormerMemberHelpView, HelpMenuView
 
@@ -59,9 +64,14 @@ def make_cog(db=None):
         db=db,
         get_channel=lambda _channel_id: None,
         fetch_channel=AsyncMock(return_value=None),
+        get_user=lambda _user_id: None,
+        users=[],
+        user=SimpleNamespace(id=1454985687177887866),
     )
     cog._last_error_log = {}
     cog._active_ticket_channels = set()
+    cog._satisfaction_lock = asyncio.Lock()
+    cog._satisfaction_views_registered = False
     return cog
 
 
@@ -448,6 +458,51 @@ async def test_transcript_session_accepts_short_ticket_code(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_transcript_session_repairs_rounded_ticket_owner(tmp_path):
+    db = Database(str(tmp_path / "transcript-rounded-owner.db"))
+    await db.connect()
+    exact_creator_id = 1129311352628990017
+    rounded_creator_id = int(float(exact_creator_id))
+    assert rounded_creator_id != exact_creator_id
+    await db.execute(
+        "INSERT INTO tickets(guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,ticket_id) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (717, 999, rounded_creator_id, 1, 1, "closed", 6),
+    )
+    cog = make_cog(db)
+    cog._create_transcript_request = AsyncMock(return_value=(True, ""))
+    cog._touch_help_cooldown = AsyncMock()
+    guild = SimpleNamespace(id=717)
+    channel = SimpleNamespace(send=AsyncMock())
+    author = SimpleNamespace(id=exact_creator_id)
+
+    await cog._start_help_session(author.id, guild.id, "transcript_ticket", {})
+    handled = await cog._handle_help_session_message(
+        guild,
+        SimpleNamespace(
+            author=author,
+            content="T6",
+            attachments=[],
+            channel=channel,
+        ),
+    )
+    row = await db.fetchone(
+        "SELECT creator_id FROM tickets WHERE guild_id=? AND ticket_id=?",
+        (guild.id, 6),
+    )
+
+    assert handled is True
+    assert int(row["creator_id"]) == exact_creator_id
+    cog._create_transcript_request.assert_awaited_once_with(
+        guild,
+        requester_id=exact_creator_id,
+        ticket_channel_id=999,
+        ticket_id=6,
+    )
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_partnership_confirmation_uses_only_partnership_ping_override():
     class Response:
         def __init__(self):
@@ -656,8 +711,8 @@ async def test_successful_transcript_denial_records_reviewer_and_repairs_request
     tmp_path,
     monkeypatch,
 ):
-    stored_requester_id = 1102884420207255652
     requester_id = 1102884420207255653
+    stored_requester_id = int(float(requester_id))
     db = Database(str(tmp_path / "transcript-denied.db"))
     await db.connect()
     await db.execute(
@@ -703,6 +758,222 @@ async def test_successful_transcript_denial_records_reviewer_and_repairs_request
     assert row["reviewed_ts"] is not None
     assert row["error_text"] is None
     assert request_message.edit.await_args.kwargs["view"] is None
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_satisfaction_recipient_uses_exact_cached_alias_and_repairs_ticket(tmp_path):
+    requester_id = 1102884420207255653
+    stored_requester_id = int(float(requester_id))
+    message = SimpleNamespace(id=1548671314074673201, delete=AsyncMock())
+    requester = SimpleNamespace(id=requester_id, send=AsyncMock(return_value=message))
+    db = Database(str(tmp_path / "satisfaction-alias.db"))
+    await db.connect()
+    await db.execute(
+        "INSERT INTO tickets("
+        "guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,"
+        "ticket_id,closed_ts"
+        ") VALUES(?,?,?,?,?,?,?,?)",
+        (717, 999, stored_requester_id, 1, 1, "closed", 6, int(time.time())),
+    )
+    cog = make_cog(db)
+    cog.bot.users = [requester]
+    guild = SimpleNamespace(
+        id=717,
+        members=[],
+        get_member=lambda _user_id: None,
+        fetch_member=AsyncMock(side_effect=AssertionError("cache alias should resolve first")),
+    )
+
+    await cog._send_ticket_satisfaction_prompt(guild, stored_requester_id, 6)
+    row = await db.fetchone(
+        "SELECT creator_id,satisfaction_message_id,satisfaction_delivery_status "
+        "FROM tickets WHERE guild_id=717 AND ticket_id=6"
+    )
+
+    requester.send.assert_awaited_once()
+    assert int(row["creator_id"]) == requester_id
+    assert int(row["satisfaction_message_id"]) == message.id
+    assert row["satisfaction_delivery_status"] == "sent"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_satisfaction_recovers_exact_creator_from_saved_transcript(tmp_path):
+    requester_id = 1129311352628989999
+    stored_requester_id = int(float(requester_id))
+    transcript_message_id = 1548671314074673201
+    feedback_message = SimpleNamespace(id=1548671314074673301, delete=AsyncMock())
+    requester = SimpleNamespace(id=requester_id, send=AsyncMock(return_value=feedback_message))
+    attachment = SimpleNamespace(
+        size=512,
+        read=AsyncMock(
+            return_value=(
+                "[2026-07-03 12:00:00 UTC] Avenue Guard "
+                f"(1454985687177887866): Welcome <@{requester_id}>."
+            ).encode("utf-8")
+        ),
+    )
+    transcript_message = SimpleNamespace(
+        id=transcript_message_id,
+        author=SimpleNamespace(id=1454985687177887866),
+        embeds=[
+            SimpleNamespace(
+                title="Ticket Transcript",
+                fields=[SimpleNamespace(name="Ticket", value="`T6`")],
+            )
+        ],
+        attachments=[attachment],
+    )
+    log_channel = SimpleNamespace(
+        id=1445502925081284729,
+        fetch_message=AsyncMock(return_value=transcript_message),
+    )
+    db = Database(str(tmp_path / "satisfaction-transcript.db"))
+    await db.connect()
+    await db.execute(
+        "INSERT INTO tickets("
+        "guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,"
+        "ticket_id,closed_ts"
+        ") VALUES(?,?,?,?,?,?,?,?)",
+        (717, 999, stored_requester_id, 1, 1, "closed", 6, int(time.time())),
+    )
+    await db.execute(
+        "INSERT INTO ticket_transcripts("
+        "guild_id,ticket_id,log_channel_id,log_message_id,created_ts"
+        ") VALUES(?,?,?,?,?)",
+        (717, 6, log_channel.id, transcript_message_id, int(time.time())),
+    )
+    cog = make_cog(db)
+    cog.bot.users = [requester]
+    guild = SimpleNamespace(
+        id=717,
+        channels=[log_channel],
+        threads=[],
+        members=[],
+        get_channel=lambda channel_id: log_channel if channel_id == log_channel.id else None,
+        fetch_channel=AsyncMock(return_value=log_channel),
+        get_member=lambda _user_id: None,
+        fetch_member=AsyncMock(side_effect=AssertionError("transcript should recover the cache alias")),
+    )
+
+    await cog._send_ticket_satisfaction_prompt(guild, stored_requester_id, 6)
+    row = await db.fetchone(
+        "SELECT creator_id,satisfaction_message_id,satisfaction_delivery_status "
+        "FROM tickets WHERE guild_id=717 AND ticket_id=6"
+    )
+
+    attachment.read.assert_awaited_once()
+    requester.send.assert_awaited_once()
+    assert int(row["creator_id"]) == requester_id
+    assert int(row["satisfaction_message_id"]) == feedback_message.id
+    assert row["satisfaction_delivery_status"] == "sent"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_satisfaction_recovers_reported_t6_creator_from_transcript_embed(tmp_path):
+    stored_requester_id = 1129311352628989952
+    exact_requester_id = stored_requester_id + 31
+    transcript_message_id = 1548671314074673201
+    feedback_message = SimpleNamespace(id=1548671314074673301, delete=AsyncMock())
+    requester = SimpleNamespace(
+        id=exact_requester_id,
+        send=AsyncMock(return_value=feedback_message),
+    )
+    transcript_embed = discord.Embed(title="Ticket Transcript")
+    transcript_embed.add_field(name="Ticket", value="`T6`")
+    transcript_embed.add_field(
+        name="Created by",
+        value=f"<@{exact_requester_id}>\n`{exact_requester_id}`",
+    )
+    transcript_message = SimpleNamespace(
+        id=transcript_message_id,
+        author=SimpleNamespace(id=1454985687177887866),
+        embeds=[transcript_embed],
+        attachments=[],
+    )
+    log_channel = SimpleNamespace(
+        id=1445502925081284729,
+        fetch_message=AsyncMock(return_value=transcript_message),
+    )
+    db = Database(str(tmp_path / "satisfaction-t6-embed.db"))
+    await db.connect()
+    await db.execute(
+        "INSERT INTO tickets("
+        "guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,"
+        "ticket_id,closed_ts"
+        ") VALUES(?,?,?,?,?,?,?,?)",
+        (717, 999, stored_requester_id, 1, 1, "closed", 6, int(time.time())),
+    )
+    await db.execute(
+        "INSERT INTO ticket_transcripts("
+        "guild_id,ticket_id,log_channel_id,log_message_id,created_ts"
+        ") VALUES(?,?,?,?,?)",
+        (717, 6, log_channel.id, transcript_message_id, int(time.time())),
+    )
+    cog = make_cog(db)
+    cog.bot.users = [requester]
+    guild = SimpleNamespace(
+        id=717,
+        channels=[log_channel],
+        threads=[],
+        members=[],
+        get_channel=lambda channel_id: log_channel if channel_id == log_channel.id else None,
+        fetch_channel=AsyncMock(return_value=log_channel),
+        get_member=lambda _user_id: None,
+        fetch_member=AsyncMock(
+            side_effect=AssertionError("transcript embed should recover the exact user")
+        ),
+    )
+
+    await cog._send_ticket_satisfaction_prompt(guild, stored_requester_id, 6)
+    row = await db.fetchone(
+        "SELECT creator_id,satisfaction_message_id,satisfaction_delivery_status "
+        "FROM tickets WHERE guild_id=717 AND ticket_id=6"
+    )
+
+    requester.send.assert_awaited_once()
+    log_channel.fetch_message.assert_awaited_once()
+    assert int(row["creator_id"]) == exact_requester_id
+    assert int(row["satisfaction_message_id"]) == feedback_message.id
+    assert row["satisfaction_delivery_status"] == "sent"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_satisfaction_recipient_is_recorded_once(tmp_path):
+    requester_id = 1129311352628989952
+    db = Database(str(tmp_path / "satisfaction-unavailable.db"))
+    await db.connect()
+    await db.execute(
+        "INSERT INTO tickets("
+        "guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,"
+        "ticket_id,closed_ts"
+        ") VALUES(?,?,?,?,?,?,?,?)",
+        (717, 999, requester_id, 1, 1, "closed", 6, int(time.time())),
+    )
+    cog = make_cog(db)
+    cog._resolve_dm_recipient = AsyncMock(
+        side_effect=DMRecipientUnavailable(requester_id)
+    )
+    cog._log_help_action = AsyncMock()
+    guild = SimpleNamespace(id=717)
+
+    await cog._send_ticket_satisfaction_prompt(guild, requester_id, 6)
+    await cog._send_ticket_satisfaction_prompt(guild, requester_id, 6)
+    row = await db.fetchone(
+        "SELECT satisfaction_delivery_status,satisfaction_delivery_error,"
+        "satisfaction_attempted_ts,satisfaction_resolution_version "
+        "FROM tickets WHERE guild_id=717 AND ticket_id=6"
+    )
+
+    assert row["satisfaction_delivery_status"] == "recipient_unavailable"
+    assert "unavailable" in row["satisfaction_delivery_error"]
+    assert row["satisfaction_attempted_ts"] is not None
+    assert row["satisfaction_resolution_version"] == 1
+    assert cog._resolve_dm_recipient.await_count == 1
+    cog._log_help_action.assert_awaited_once()
     await db.close()
 
 

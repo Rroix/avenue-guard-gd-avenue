@@ -11,6 +11,11 @@ import discord
 from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, is_mod
+from utils.discord_refs import (
+    fetch_persisted_channel,
+    fetch_persisted_message,
+    snowflake_matches_legacy,
+)
 from utils.errors import log_error
 from utils.mentions import no_mentions, user_and_role_mentions, user_mentions
 from utils.views import (
@@ -43,6 +48,15 @@ TICKET_STATUS_LABELS = {
     "waiting_staff": "Waiting for staff",
     "resolved": "Resolved",
 }
+TICKET_SATISFACTION_RESOLUTION_VERSION = 1
+
+
+class DMRecipientUnavailable(LookupError):
+    """The Discord account no longer resolves through the global user API."""
+
+    def __init__(self, user_id: int):
+        self.user_id = int(user_id)
+        super().__init__(f"Discord user {self.user_id} is unavailable")
 
 
 def _ticket_status_key(value: Any) -> str:
@@ -421,7 +435,7 @@ class TicketSatisfactionView(discord.ui.View):
 
     def _make_callback(self, score: int):
         async def _callback(interaction: discord.Interaction):
-            if interaction.user.id != self.user_id:
+            if not snowflake_matches_legacy(self.user_id, interaction.user.id):
                 return await interaction.response.send_message("This rating prompt is not for you.", ephemeral=True)
             await self.cog.handle_ticket_satisfaction(interaction, self.guild_id, self.ticket_id, score)
         return _callback
@@ -525,6 +539,20 @@ class HelpCog(commands.Cog):
             if user is not None:
                 return user
 
+        # libsql-python 0.1.x used to round 64-bit Python integers through a
+        # float. Before asking Discord for that invalid ID, compare it with the
+        # exact IDs Discord has already supplied in the member/user caches.
+        cached_candidates = {}
+        for candidate in (
+            *tuple(getattr(guild, "members", ()) or ()),
+            *tuple(getattr(self.bot, "users", ()) or ()),
+        ):
+            candidate_id = int(getattr(candidate, "id", 0) or 0)
+            if candidate_id and snowflake_matches_legacy(user_id, candidate_id):
+                cached_candidates[candidate_id] = candidate
+        if len(cached_candidates) == 1:
+            return next(iter(cached_candidates.values()))
+
         member_error: Optional[Exception] = None
         try:
             member = await guild.fetch_member(user_id)
@@ -535,10 +563,18 @@ class HelpCog(commands.Cog):
 
         fetch_user = getattr(self.bot, "fetch_user", None)
         if callable(fetch_user):
-            return await fetch_user(user_id)
+            try:
+                user = await fetch_user(user_id)
+            except discord.NotFound as exc:
+                if int(getattr(exc, "code", 0) or 0) == 10013:
+                    raise DMRecipientUnavailable(user_id) from exc
+                raise
+            if user is not None:
+                return user
+            raise DMRecipientUnavailable(user_id)
         if member_error is not None:
             raise member_error
-        raise LookupError(f"Discord user {user_id} could not be resolved")
+        raise DMRecipientUnavailable(user_id)
 
     def _help_color(self, name: str = "blurple") -> discord.Color:
         colors = {
@@ -717,8 +753,52 @@ class HelpCog(commands.Cog):
             "SELECT channel_id FROM tickets WHERE guild_id=? AND status IN ('open','closing_prompted')",
             (allowed_guild_id,),
         )
-        self._active_ticket_channels = {int(row["channel_id"]) for row in rows}
+        active_channels: set[int] = set()
+        for row in rows:
+            stored_channel_id = int(row["channel_id"])
+            try:
+                channel = await self._ticket_channel_from_stored_id(
+                    self.bot.get_guild(allowed_guild_id),
+                    stored_channel_id,
+                )
+            except Exception as e:
+                await self._log_background_error(
+                    "ticket_cache_channel",
+                    f"Active ticket cache could not resolve channel_id={stored_channel_id}: {e!r}",
+                )
+                continue
+            if isinstance(channel, discord.TextChannel):
+                active_channels.add(int(channel.id))
+        self._active_ticket_channels = active_channels
         self._ticket_cache_ready = True
+
+    async def _ticket_channel_from_stored_id(
+        self,
+        guild: Optional[discord.Guild],
+        stored_channel_id: int,
+    ) -> Optional[discord.abc.GuildChannel]:
+        if guild is None:
+            return None
+        channel, recovered = await fetch_persisted_channel(guild, stored_channel_id)
+        if recovered and channel is not None:
+            exact_channel_id = int(channel.id)
+            await self.bot.db.execute_transaction(
+                (
+                    (
+                        "UPDATE tickets SET guild_id=?, channel_id=? WHERE channel_id=?",
+                        (guild.id, exact_channel_id, int(stored_channel_id)),
+                    ),
+                    (
+                        "UPDATE transcript_requests SET guild_id=?, ticket_channel_id=? "
+                        "WHERE ticket_channel_id=?",
+                        (guild.id, exact_channel_id, int(stored_channel_id)),
+                    ),
+                ),
+                retry_safe=True,
+            )
+            self._active_ticket_channels.discard(int(stored_channel_id))
+            self._active_ticket_channels.add(exact_channel_id)
+        return channel
 
     async def _reconcile_missing_ticket_channels(self) -> None:
         """Close DB ticket rows whose Discord channels no longer exist."""
@@ -733,18 +813,14 @@ class HelpCog(commands.Cog):
         missing: list[int] = []
         for row in rows:
             channel_id = int(row["channel_id"])
-            channel = guild.get_channel(channel_id)
-            if channel is None:
-                try:
-                    channel = await guild.fetch_channel(channel_id)
-                except discord.NotFound:
-                    channel = None
-                except Exception as e:
-                    await self._log_background_error(
-                        "ticket_reconcile_fetch",
-                        f"Ticket reconciliation could not fetch channel_id={channel_id}: {repr(e)}",
-                    )
-                    continue
+            try:
+                channel = await self._ticket_channel_from_stored_id(guild, channel_id)
+            except Exception as e:
+                await self._log_background_error(
+                    "ticket_reconcile_fetch",
+                    f"Ticket reconciliation could not fetch channel_id={channel_id}: {repr(e)}",
+                )
+                continue
             if not isinstance(channel, discord.TextChannel):
                 missing.append(channel_id)
         if not missing:
@@ -782,18 +858,16 @@ class HelpCog(commands.Cog):
         )
         for r in rows:
             channel_id = int(r["channel_id"])
-            channel = guild.get_channel(channel_id)
-            if channel is None:
-                try:
-                    channel = await guild.fetch_channel(channel_id)
-                except discord.NotFound:
-                    channel = None
-                except Exception as e:
-                    await self._log_background_error(
-                        "ticket_scan_channel_fetch",
-                        f"Ticket scan could not fetch channel_id={channel_id}: {repr(e)}",
-                    )
-                    continue
+            try:
+                channel = await self._ticket_channel_from_stored_id(guild, channel_id)
+            except Exception as e:
+                await self._log_background_error(
+                    "ticket_scan_channel_fetch",
+                    f"Ticket scan could not fetch channel_id={channel_id}: {repr(e)}",
+                )
+                continue
+            if channel is not None:
+                channel_id = int(channel.id)
             if not isinstance(channel, discord.TextChannel):
                 self._active_ticket_channels.discard(channel_id)
                 await self.bot.db.execute(
@@ -889,19 +963,34 @@ class HelpCog(commands.Cog):
                 (message.channel.id,),
             )
             if row and row["status"] in ("open", "closing_prompted"):
-                status_tag = "waiting_staff" if int(row["creator_id"] or 0) == message.author.id else "waiting_user"
+                stored_creator_id = int(row["creator_id"] or 0)
+                author_is_creator = snowflake_matches_legacy(
+                    stored_creator_id,
+                    int(message.author.id),
+                )
+                creator_id = int(message.author.id) if author_is_creator else stored_creator_id
+                status_tag = "waiting_staff" if author_is_creator else "waiting_user"
                 await self.bot.db.execute(
-                    "UPDATE tickets SET last_user_activity_ts=?, status='open', status_tag=?, "
+                    "UPDATE tickets SET creator_id=?, last_user_activity_ts=?, status='open', status_tag=?, "
                     "closing_prompt_message_id=NULL WHERE channel_id=?",
-                    (int(time.time()), status_tag, message.channel.id),
+                    (creator_id, int(time.time()), status_tag, message.channel.id),
                 )
                 prompt_message_id = int(row["closing_prompt_message_id"] or 0)
                 if prompt_message_id:
                     try:
-                        prompt = await message.channel.fetch_message(prompt_message_id)
-                        await prompt.edit(content="Ticket activity resumed.", view=None, allowed_mentions=no_mentions())
-                    except discord.NotFound:
-                        pass
+                        prompt, _recovered = await fetch_persisted_message(
+                            message.channel,
+                            prompt_message_id,
+                            author_id=int(
+                                getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                            ),
+                        )
+                        if prompt is not None:
+                            await prompt.edit(
+                                content="Ticket activity resumed.",
+                                view=None,
+                                allowed_mentions=no_mentions(),
+                            )
                     except Exception as e:
                         await self._log_background_error(
                             "ticket_prompt_cleanup",
@@ -2089,13 +2178,20 @@ class HelpCog(commands.Cog):
                 )
                 return True
 
-            if int(row["creator_id"]) != message.author.id:
+            stored_creator_id = int(row["creator_id"])
+            if not snowflake_matches_legacy(stored_creator_id, message.author.id):
                 await message.channel.send(
                     "That ticket belongs to another member, so you cannot request its transcript.",
                     view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=False),
                     allowed_mentions=no_mentions(),
                 )
                 return True
+
+            if stored_creator_id != int(message.author.id):
+                await self.bot.db.execute(
+                    "UPDATE tickets SET creator_id=? WHERE guild_id=? AND channel_id=?",
+                    (message.author.id, guild.id, row["channel_id"]),
+                )
 
             t_id = int(row["ticket_id"]) if row["ticket_id"] is not None else None
             ch_id = int(row["channel_id"])
@@ -2435,6 +2531,9 @@ class HelpCog(commands.Cog):
                 texts.append(description)
             for field in getattr(embed, "fields", []) or []:
                 if str(getattr(field, "name", "") or "").strip().casefold() in {
+                    "created by",
+                    "creator",
+                    "member",
                     "submitter",
                     "requester",
                     "user",
@@ -2450,6 +2549,51 @@ class HelpCog(commands.Cog):
             if raw_id:
                 return int(raw_id.group(1))
         return None
+
+    def _is_ticket_transcript_message(self, message, ticket_id: int) -> bool:
+        """Identify the transcript artifact for one ticket, not a nearby log."""
+        ticket_id = int(ticket_id)
+        for embed in getattr(message, "embeds", ()) or ():
+            if str(getattr(embed, "title", "") or "").strip().casefold() != "ticket transcript":
+                continue
+            for field in getattr(embed, "fields", ()) or ():
+                if str(getattr(field, "name", "") or "").strip().casefold() != "ticket":
+                    continue
+                value = str(getattr(field, "value", "") or "")
+                if re.search(rf"(?<!\d)T?{ticket_id}(?!\d)", value, flags=re.I):
+                    return True
+        expected_names = {
+            f"transcript-{ticket_id}.txt",
+            f"transcript-t{ticket_id}.txt",
+        }
+        return any(
+            str(getattr(attachment, "filename", "") or "").casefold()
+            in expected_names
+            for attachment in getattr(message, "attachments", ()) or ()
+        )
+
+    def _reconcile_requester_id(
+        self,
+        stored_id: int,
+        embedded_id: Optional[int],
+    ) -> tuple[int, bool, bool]:
+        """Return (authoritative ID, precision repaired, evidence conflict)."""
+        stored_id = int(stored_id)
+        if not embedded_id:
+            return stored_id, False, False
+        embedded_id = int(embedded_id)
+        if embedded_id == stored_id:
+            return stored_id, False, False
+        if snowflake_matches_legacy(stored_id, embedded_id):
+            return embedded_id, True, False
+        if snowflake_matches_legacy(embedded_id, stored_id):
+            return stored_id, False, False
+        return stored_id, False, True
+
+    def _requester_id_from_message_content(self, message) -> Optional[int]:
+        content = str(getattr(message, "content", "") or "")
+        mention = re.search(r"<@!?(\d{15,25})>", content)
+        return int(mention.group(1)) if mention else None
 
     async def _handle_staff_help_reply(self, message: discord.Message) -> bool:
         if message.author.bot or message.guild is None:
@@ -2468,6 +2612,16 @@ class HelpCog(commands.Cog):
         )
         if not row:
             return False
+        stored_log_message_id = int(row["log_message_id"] or 0)
+        if (
+            stored_log_message_id
+            and stored_log_message_id != ref_message_id
+            and snowflake_matches_legacy(stored_log_message_id, ref_message_id)
+        ):
+            await self.bot.db.execute(
+                "UPDATE help_submissions SET log_message_id=?, updated_ts=? WHERE id=?",
+                (ref_message_id, int(time.time()), int(row["id"])),
+            )
 
         member = await self._resolve_member(message.guild, message.author)
         mod_role_id = self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0
@@ -2501,12 +2655,16 @@ class HelpCog(commands.Cog):
         except Exception:
             pass
         embedded_requester_id = self._requester_id_from_help_log_message(original)
-        requester_id = embedded_requester_id or stored_requester_id
-        if embedded_requester_id and embedded_requester_id != stored_requester_id:
+        requester_id, precision_repaired, evidence_conflict = self._reconcile_requester_id(
+            stored_requester_id,
+            embedded_requester_id,
+        )
+        if evidence_conflict:
             await log_error(
                 self.bot,
                 f"Requester ID mismatch for {code}: database={stored_requester_id} "
-                f"staff_embed={embedded_requester_id}; using the staff embed value",
+                f"staff_embed={embedded_requester_id}; values are not a recognized precision alias, "
+                "so the database value was retained",
             )
         embed = self._help_embed(f"Staff response: {code}", color="blurple")
         embed.description = f"Staff responded to your {self._submission_label(kind).casefold()}."
@@ -2518,6 +2676,9 @@ class HelpCog(commands.Cog):
         try:
             user = await self._resolve_dm_recipient(message.guild, requester_id)
             await user.send(embed=embed, allowed_mentions=no_mentions())
+            resolved_requester_id = int(getattr(user, "id", requester_id) or requester_id)
+            if snowflake_matches_legacy(requester_id, resolved_requester_id):
+                requester_id = resolved_requester_id
         except Exception as e:
             await log_error(
                 self.bot,
@@ -2525,7 +2686,9 @@ class HelpCog(commands.Cog):
                 f"database_user_id={stored_requester_id} embedded_user_id={embedded_requester_id or 0} "
                 f"error={e!r}",
             )
-            unknown_user = isinstance(e, discord.NotFound) or "10013" in repr(e)
+            unknown_user = isinstance(e, DMRecipientUnavailable) or (
+                isinstance(e, discord.NotFound) and int(getattr(e, "code", 0) or 0) == 10013
+            )
             failure_message = (
                 "I couldn't resolve the requester account. The submission is still pending and the lookup details were logged."
                 if unknown_user
@@ -2544,6 +2707,13 @@ class HelpCog(commands.Cog):
             "responded_by=?, responded_ts=?, updated_ts=? WHERE id=?",
             (requester_id, response_text[:1500], message.author.id, now, now, submission_id),
         )
+        if precision_repaired:
+            await self._log_help_action(
+                message.guild,
+                message.author.id,
+                "legacy_requester_id_repaired",
+                f"id={code} old={stored_requester_id} exact={requester_id}",
+            )
 
         try:
             if original is None:
@@ -2813,13 +2983,16 @@ class HelpCog(commands.Cog):
         if str(row["status"]) == "delivered":
             return await interaction.followup.send("This information was already delivered.", ephemeral=True)
         stored_requester_id = int(row["user_id"])
-        requester_id = int(embedded_requester_id or stored_requester_id)
-        if requester_id != stored_requester_id:
+        requester_id, precision_repaired, evidence_conflict = self._reconcile_requester_id(
+            stored_requester_id,
+            embedded_requester_id,
+        )
+        if evidence_conflict:
             await log_error(
                 self.bot,
                 f"Requester ID mismatch for {self._ban_info_code(request_id)}: "
-                f"database={stored_requester_id} staff_embed={requester_id}; "
-                "repairing the database value",
+                f"database={stored_requester_id} staff_embed={embedded_requester_id}; "
+                "values are not a recognized precision alias, so the database value was retained",
             )
 
         max_total_bytes = min(
@@ -2870,6 +3043,13 @@ class HelpCog(commands.Cog):
                 request_id,
             ),
         )
+        if precision_repaired:
+            await self._log_help_action(
+                interaction.guild,
+                interaction.user.id,
+                "legacy_requester_id_repaired",
+                f"id={self._ban_info_code(request_id)} old={stored_requester_id} exact={requester_id}",
+            )
         preview = self._ban_info_delivery_embed(
             interaction.user,
             draft,
@@ -2953,16 +3133,32 @@ class HelpCog(commands.Cog):
             return
         channel_id = int(row["log_channel_id"] or 0)
         message_id = int(row["log_message_id"] or 0)
-        channel = guild.get_channel(channel_id) if channel_id else None
-        if channel is None and channel_id:
-            try:
-                channel = await guild.fetch_channel(channel_id)
-            except Exception:
-                channel = None
+        try:
+            channel, recovered_channel = await fetch_persisted_channel(guild, channel_id)
+        except Exception as e:
+            await log_error(
+                self.bot,
+                f"Ban information staff channel lookup failed request_id={row['id']}: {e!r}",
+            )
+            return
         if not isinstance(channel, discord.TextChannel) or not message_id:
             return
         try:
-            message = await channel.fetch_message(message_id)
+            message, recovered_message = await fetch_persisted_message(
+                channel,
+                message_id,
+                author_id=int(
+                    getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                ),
+            )
+            if message is None:
+                return
+            if recovered_message or recovered_channel:
+                await self.bot.db.execute(
+                    "UPDATE ban_info_requests SET log_channel_id=?, log_message_id=?, updated_ts=? "
+                    "WHERE id=?",
+                    (channel.id, message.id, int(time.time()), int(row["id"])),
+                )
             if not message.embeds:
                 return
             embed = message.embeds[0]
@@ -3036,6 +3232,9 @@ class HelpCog(commands.Cog):
                     files=files,
                     allowed_mentions=no_mentions(),
                 )
+                requester_id = int(
+                    getattr(user, "id", int(row["user_id"])) or int(row["user_id"])
+                )
             except Exception as e:
                 await self.bot.db.execute(
                     "UPDATE ban_info_requests SET status='delivery_failed', error_text=?, updated_ts=? WHERE id=?",
@@ -3053,7 +3252,10 @@ class HelpCog(commands.Cog):
                     f"Ban information DM failed request_id={request_id} "
                     f"requester_id={requester_id}: {e!r}",
                 )
-                unknown_user = isinstance(e, discord.NotFound) or "10013" in repr(e)
+                unknown_user = isinstance(e, DMRecipientUnavailable) or (
+                    isinstance(e, discord.NotFound)
+                    and int(getattr(e, "code", 0) or 0) == 10013
+                )
                 return await interaction.followup.send(
                     (
                         "I couldn't resolve the requester account. The staff button remains available, "
@@ -3067,10 +3269,11 @@ class HelpCog(commands.Cog):
 
             delivered_ts = int(time.time())
             await self.bot.db.execute(
-                "UPDATE ban_info_requests SET status='delivered', handled_by=?, reason=?, ban_date=?, "
+                "UPDATE ban_info_requests SET user_id=?, status='delivered', handled_by=?, reason=?, ban_date=?, "
                 "evidence_text=?, evidence_files_json=?, notes=?, delivered_ts=?, updated_ts=?, error_text=NULL "
                 "WHERE id=?",
                 (
+                    requester_id,
                     interaction.user.id,
                     draft.get("reason", "")[:1000],
                     draft.get("ban_date", "")[:100],
@@ -3208,7 +3411,8 @@ class HelpCog(commands.Cog):
             return await self._respond_interaction(interaction, "Only mods can do that.", ephemeral=True)
 
         row = await self.bot.db.fetchone(
-            "SELECT ticket_channel_id, requester_id, status, ticket_id FROM transcript_requests WHERE request_message_id=?",
+            "SELECT request_message_id, ticket_channel_id, requester_id, status, ticket_id "
+            "FROM transcript_requests WHERE request_message_id=?",
             (interaction.message.id,),
         )
         if not row:
@@ -3221,13 +3425,39 @@ class HelpCog(commands.Cog):
         ticket_channel_id = int(row["ticket_channel_id"])
         stored_requester_id = int(row["requester_id"])
         embedded_requester_id = self._requester_id_from_help_log_message(interaction.message)
-        requester_id = int(embedded_requester_id or stored_requester_id)
-        if embedded_requester_id and requester_id != stored_requester_id:
+        requester_id, precision_repaired, evidence_conflict = self._reconcile_requester_id(
+            stored_requester_id,
+            embedded_requester_id,
+        )
+        if evidence_conflict:
             await log_error(
                 self.bot,
                 f"Transcript requester ID mismatch message_id={interaction.message.id}: "
-                f"database={stored_requester_id} staff_embed={requester_id}; "
-                "using the staff embed value",
+                f"database={stored_requester_id} staff_embed={embedded_requester_id}; "
+                "values are not a recognized precision alias, so the database value was retained",
+            )
+        stored_request_message_id = int(row["request_message_id"] or 0)
+        if (
+            stored_request_message_id != int(interaction.message.id)
+            and snowflake_matches_legacy(
+                stored_request_message_id,
+                int(interaction.message.id),
+            )
+        ):
+            await self.bot.db.execute(
+                "UPDATE transcript_requests SET request_message_id=?, requester_id=?, updated_ts=? "
+                "WHERE request_message_id=?",
+                (
+                    interaction.message.id,
+                    requester_id,
+                    int(time.time()),
+                    interaction.message.id,
+                ),
+            )
+        elif precision_repaired:
+            await self.bot.db.execute(
+                "UPDATE transcript_requests SET requester_id=?, updated_ts=? WHERE request_message_id=?",
+                (requester_id, int(time.time()), interaction.message.id),
             )
         ticket_id = int(row["ticket_id"]) if row["ticket_id"] is not None else None
         now = int(time.time())
@@ -3240,6 +3470,11 @@ class HelpCog(commands.Cog):
                     f"(Ticket {('T' + str(ticket_id)) if ticket_id else ticket_channel_id})",
                     allowed_mentions=no_mentions(),
                 )
+                resolved_requester_id = int(
+                    getattr(user, "id", requester_id) or requester_id
+                )
+                if snowflake_matches_legacy(requester_id, resolved_requester_id):
+                    requester_id = resolved_requester_id
             except Exception as e:
                 await self.bot.db.execute(
                     "UPDATE transcript_requests SET error_text=?, updated_ts=? "
@@ -3381,12 +3616,20 @@ class HelpCog(commands.Cog):
             return False, f"Requester resolution failed: {type(e).__name__}: {e}"
 
         # If channel exists: build transcript live
-        channel = guild.get_channel(ticket_channel_id)
-        if channel is None:
-            try:
-                channel = await guild.fetch_channel(ticket_channel_id)
-            except Exception:
-                channel = None
+        try:
+            channel = await self._ticket_channel_from_stored_id(
+                guild,
+                ticket_channel_id,
+            )
+        except Exception as e:
+            await log_error(
+                self.bot,
+                f"Live transcript channel resolution failed "
+                f"channel_id={ticket_channel_id}: {e!r}",
+            )
+            channel = None
+        if channel is not None:
+            ticket_channel_id = int(channel.id)
         if isinstance(channel, discord.TextChannel):
             try:
                 transcript_path = await build_text_transcript(channel)
@@ -3433,17 +3676,36 @@ class HelpCog(commands.Cog):
             return False, "No saved transcript was found for this ticket"
 
         log_channel_id = int(ptr["log_channel_id"])
-        log_ch = guild.get_channel(log_channel_id)
-        if log_ch is None:
-            try:
-                log_ch = await guild.fetch_channel(log_channel_id)
-            except Exception as e:
-                return False, f"Transcript log channel lookup failed: {type(e).__name__}: {e}"
+        try:
+            log_ch, recovered_channel = await fetch_persisted_channel(
+                guild,
+                log_channel_id,
+            )
+        except Exception as e:
+            return False, f"Transcript log channel lookup failed: {type(e).__name__}: {e}"
         if not isinstance(log_ch, discord.TextChannel):
             return False, "The saved transcript log channel is unavailable"
 
         try:
-            msg = await log_ch.fetch_message(int(ptr["log_message_id"]))
+            msg, recovered_message = await fetch_persisted_message(
+                log_ch,
+                int(ptr["log_message_id"]),
+                author_id=int(
+                    getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                ),
+                predicate=lambda candidate: self._is_ticket_transcript_message(
+                    candidate,
+                    ticket_id,
+                ),
+            )
+            if msg is None:
+                return False, "The saved transcript message no longer exists"
+            if recovered_message or recovered_channel:
+                await self.bot.db.execute(
+                    "UPDATE ticket_transcripts SET log_channel_id=?, log_message_id=? "
+                    "WHERE guild_id=? AND ticket_id=?",
+                    (log_ch.id, msg.id, guild.id, ticket_id),
+                )
             if not msg.attachments:
                 return False, "The saved transcript message has no attachment"
             att = msg.attachments[0]
@@ -3502,6 +3764,175 @@ class HelpCog(commands.Cog):
             ping_role_id=partnership_role_id,
         )
 
+    async def _recover_ticket_creator_id(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        stored_creator_id: int,
+        opening_message_id: int,
+    ) -> int:
+        """Recover an exact creator ID from live Discord ticket evidence."""
+        stored_creator_id = int(stored_creator_id or 0)
+        exact_creator_id = 0
+        opening_message = None
+        recovered_opening = False
+
+        if opening_message_id:
+            try:
+                opening_message, recovered_opening = await fetch_persisted_message(
+                    channel,
+                    int(opening_message_id),
+                    author_id=int(
+                        getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                    ),
+                )
+            except Exception as e:
+                await self._log_background_error(
+                    "ticket_creator_evidence",
+                    f"Ticket creator evidence lookup failed channel_id={channel.id}: {e!r}",
+                )
+            embedded_id = self._requester_id_from_message_content(opening_message)
+            if embedded_id and snowflake_matches_legacy(stored_creator_id, embedded_id):
+                exact_creator_id = embedded_id
+
+        if not exact_creator_id:
+            candidates = {
+                int(member.id)
+                for member in getattr(channel, "members", ())
+                if getattr(member, "id", None)
+                and snowflake_matches_legacy(stored_creator_id, int(member.id))
+            }
+            if len(candidates) == 1:
+                exact_creator_id = candidates.pop()
+
+        if not exact_creator_id:
+            # Ticket channels have a user-specific permission overwrite. It
+            # remains useful evidence even when that member has left the guild
+            # and no longer appears in guild.members/channel.members.
+            candidates = {
+                int(target.id)
+                for target in getattr(channel, "overwrites", {})
+                if getattr(target, "id", None)
+                and not isinstance(target, discord.Role)
+                and snowflake_matches_legacy(stored_creator_id, int(target.id))
+            }
+            if len(candidates) == 1:
+                exact_creator_id = candidates.pop()
+
+        exact_creator_id = exact_creator_id or stored_creator_id
+        if exact_creator_id != stored_creator_id or recovered_opening:
+            await self.bot.db.execute(
+                "UPDATE tickets SET creator_id=?, opening_message_id=COALESCE(?, opening_message_id) "
+                "WHERE guild_id=? AND channel_id=?",
+                (
+                    exact_creator_id,
+                    int(opening_message.id) if recovered_opening and opening_message else None,
+                    guild.id,
+                    channel.id,
+                ),
+            )
+        return exact_creator_id
+
+    async def _recover_closed_ticket_creator_id(
+        self,
+        guild: discord.Guild,
+        ticket_id: int,
+        stored_creator_id: int,
+    ) -> int:
+        """Recover an exact former ticket creator from the saved transcript."""
+        stored_creator_id = int(stored_creator_id or 0)
+        if not stored_creator_id:
+            return stored_creator_id
+
+        try:
+            pointer = await self.bot.db.fetchone(
+                "SELECT log_channel_id, log_message_id FROM ticket_transcripts "
+                "WHERE guild_id=? AND ticket_id=?",
+                (guild.id, int(ticket_id)),
+            )
+            if not pointer:
+                return stored_creator_id
+
+            stored_channel_id = int(pointer["log_channel_id"] or 0)
+            log_channel, _recovered_channel = await fetch_persisted_channel(
+                guild,
+                stored_channel_id,
+            )
+            if log_channel is None:
+                return stored_creator_id
+
+            transcript_message, recovered_message = await fetch_persisted_message(
+                log_channel,
+                int(pointer["log_message_id"] or 0),
+                author_id=int(
+                    getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                ),
+                predicate=lambda candidate: self._is_ticket_transcript_message(
+                    candidate,
+                    ticket_id,
+                ),
+                scan_limit=50,
+            )
+            if transcript_message is None:
+                return stored_creator_id
+
+            candidates: set[int] = set()
+            embedded_id = self._requester_id_from_help_log_message(transcript_message)
+            if embedded_id and snowflake_matches_legacy(stored_creator_id, embedded_id):
+                candidates.add(int(embedded_id))
+
+            for attachment in getattr(transcript_message, "attachments", ()) or ():
+                # Avoid pulling an unexpectedly large artifact during startup.
+                if int(getattr(attachment, "size", 0) or 0) > 16 * 1024 * 1024:
+                    continue
+                payload = await attachment.read()
+                transcript = bytes(payload).decode("utf-8", errors="replace")
+                raw_ids = {
+                    int(value)
+                    for value in re.findall(
+                        r"(?:<@!?|\()(\d{15,25})(?:>|\))",
+                        transcript,
+                    )
+                }
+                candidates.update(
+                    candidate
+                    for candidate in raw_ids
+                    if snowflake_matches_legacy(stored_creator_id, candidate)
+                )
+
+            exact_candidates = {
+                candidate for candidate in candidates if candidate != stored_creator_id
+            }
+            if len(exact_candidates) != 1:
+                return stored_creator_id
+            exact_creator_id = next(iter(exact_candidates))
+            await self.bot.db.execute_transaction(
+                (
+                    (
+                        "UPDATE tickets SET creator_id=? WHERE guild_id=? AND ticket_id=?",
+                        (exact_creator_id, guild.id, int(ticket_id)),
+                    ),
+                    (
+                        "UPDATE ticket_transcripts SET log_channel_id=?, log_message_id=? "
+                        "WHERE guild_id=? AND ticket_id=?",
+                        (
+                            int(log_channel.id),
+                            int(transcript_message.id),
+                            guild.id,
+                            int(ticket_id),
+                        ),
+                    ),
+                ),
+                retry_safe=True,
+            )
+            return exact_creator_id
+        except Exception as e:
+            await self._log_background_error(
+                "ticket_satisfaction_transcript_recovery",
+                f"Ticket creator transcript recovery failed ticket_id={ticket_id}: {e!r}",
+            )
+            return stored_creator_id
+
     async def update_ticket_opening_status(self, guild: discord.Guild, channel_id: int, status_tag: str) -> None:
         row = await self.bot.db.fetchone(
             "SELECT ticket_id, creator_id, opening_message_id "
@@ -3527,11 +3958,16 @@ class HelpCog(commands.Cog):
         label = _ticket_status_label(status_tag)
         opening_message_id = int(row["opening_message_id"] or 0)
         msg = None
+        recovered_message = False
         if opening_message_id:
             try:
-                msg = await channel.fetch_message(opening_message_id)
-            except discord.NotFound:
-                msg = None
+                msg, recovered_message = await fetch_persisted_message(
+                    channel,
+                    opening_message_id,
+                    author_id=int(
+                        getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                    ),
+                )
             except Exception as e:
                 await self._log_background_error(
                     "ticket_opening_status_fetch",
@@ -3539,6 +3975,12 @@ class HelpCog(commands.Cog):
                     f"channel_id={channel_id}: {e!r}",
                 )
                 return
+
+        if msg is not None and recovered_message:
+            await self.bot.db.execute(
+                "UPDATE tickets SET opening_message_id=? WHERE guild_id=? AND channel_id=?",
+                (msg.id, guild.id, channel_id),
+            )
 
         if msg is None:
             ticket_id = int(row["ticket_id"]) if row["ticket_id"] is not None else None
@@ -3808,7 +4250,10 @@ class HelpCog(commands.Cog):
         if (
             not ticket_row
             or str(ticket_row["status"]) != "closing_prompted"
-            or int(ticket_row["closing_prompt_message_id"] or 0) != interaction_message_id
+            or not snowflake_matches_legacy(
+                int(ticket_row["closing_prompt_message_id"] or 0),
+                interaction_message_id,
+            )
         ):
             return await self._respond_interaction(
                 interaction,
@@ -3843,25 +4288,96 @@ class HelpCog(commands.Cog):
             return
         async with self._satisfaction_lock:
             existing = await self.bot.db.fetchone(
-                "SELECT satisfaction_score, satisfaction_message_id FROM tickets "
-                "WHERE guild_id=? AND ticket_id=? AND creator_id=?",
-                (guild.id, int(ticket_id), creator_id),
+                "SELECT creator_id, satisfaction_score, satisfaction_message_id, "
+                "satisfaction_delivery_status "
+                "FROM tickets "
+                "WHERE guild_id=? AND ticket_id=?",
+                (guild.id, int(ticket_id)),
             )
-            if not existing or existing["satisfaction_score"] is not None or existing["satisfaction_message_id"] is not None:
+            delivery_status = (
+                str(existing["satisfaction_delivery_status"] or "pending")
+                if existing
+                else ""
+            )
+            if (
+                not existing
+                or existing["satisfaction_score"] is not None
+                or existing["satisfaction_message_id"] is not None
+                or delivery_status
+                in {"sending", "sent", "completed", "recipient_unavailable", "dm_blocked"}
+            ):
                 return
+            stored_creator_id = int(existing["creator_id"] or 0)
+            creator_id, precision_repaired, evidence_conflict = self._reconcile_requester_id(
+                stored_creator_id,
+                creator_id,
+            )
+            if evidence_conflict:
+                creator_id = stored_creator_id
+            elif precision_repaired:
+                await self.bot.db.execute(
+                    "UPDATE tickets SET creator_id=? WHERE guild_id=? AND ticket_id=?",
+                    (creator_id, guild.id, int(ticket_id)),
+                )
+            creator_id = await self._recover_closed_ticket_creator_id(
+                guild,
+                int(ticket_id),
+                creator_id,
+            )
             prompt = str(
                 self.bot.config.get("tickets", "satisfaction_prompt", default="How was your staff ticket experience?")
                 or "How was your staff ticket experience?"
             )[:1000]
             try:
                 user = await self._resolve_dm_recipient(guild, creator_id)
-            except Exception as e:
-                await log_error(
-                    self.bot,
-                    f"Ticket satisfaction recipient resolution failed ticket_id={ticket_id} "
-                    f"creator_id={creator_id}: {e!r}",
+            except DMRecipientUnavailable as e:
+                attempted_ts = int(time.time())
+                await self.bot.db.execute(
+                    "UPDATE tickets SET satisfaction_delivery_status='recipient_unavailable', "
+                    "satisfaction_delivery_error=?, satisfaction_attempted_ts=?, "
+                    "satisfaction_resolution_version=? "
+                    "WHERE guild_id=? AND ticket_id=?",
+                    (
+                        str(e)[:500],
+                        attempted_ts,
+                        TICKET_SATISFACTION_RESOLUTION_VERSION,
+                        guild.id,
+                        int(ticket_id),
+                    ),
+                )
+                await self._log_help_action(
+                    guild,
+                    0,
+                    "ticket_feedback_skipped",
+                    f"ticket=T{ticket_id} creator={creator_id} reason=recipient_unavailable",
                 )
                 return
+            except Exception as e:
+                await self.bot.db.execute(
+                    "UPDATE tickets SET satisfaction_delivery_status='delivery_failed', "
+                    "satisfaction_delivery_error=?, satisfaction_attempted_ts=? "
+                    "WHERE guild_id=? AND ticket_id=?",
+                    (str(e)[:500], int(time.time()), guild.id, int(ticket_id)),
+                )
+                await self._log_background_error(
+                    "ticket_satisfaction_recipient",
+                    f"Ticket satisfaction recipient lookup temporarily failed "
+                    f"ticket_id={ticket_id} creator_id={creator_id}: {e!r}",
+                )
+                return
+            resolved_creator_id = int(getattr(user, "id", creator_id) or creator_id)
+            if snowflake_matches_legacy(creator_id, resolved_creator_id):
+                creator_id = resolved_creator_id
+
+            # Claim delivery before touching Discord. If the process stops
+            # after the DM succeeds but before its message ID is recorded, the
+            # durable `sending` state prevents a duplicate prompt on restart.
+            await self.bot.db.execute(
+                "UPDATE tickets SET creator_id=?, satisfaction_delivery_status='sending', "
+                "satisfaction_delivery_error=NULL, satisfaction_attempted_ts=? "
+                "WHERE guild_id=? AND ticket_id=?",
+                (creator_id, int(time.time()), guild.id, int(ticket_id)),
+            )
             embed = self._help_embed(
                 "Ticket Feedback",
                 f"{prompt}\n\nTicket: `T{int(ticket_id)}`\nChoose a score from **1** to **5**.",
@@ -3875,8 +4391,22 @@ class HelpCog(commands.Cog):
                     allowed_mentions=no_mentions(),
                 )
                 await self.bot.db.execute(
-                    "UPDATE tickets SET satisfaction_message_id=? WHERE guild_id=? AND ticket_id=? AND creator_id=?",
-                    (msg.id, guild.id, int(ticket_id), creator_id),
+                    "UPDATE tickets SET satisfaction_message_id=?, satisfaction_delivery_status='sent', "
+                    "satisfaction_delivery_error=NULL, satisfaction_attempted_ts=? "
+                    "WHERE guild_id=? AND ticket_id=?",
+                    (msg.id, int(time.time()), guild.id, int(ticket_id)),
+                )
+            except discord.Forbidden as e:
+                if msg is not None:
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
+                await self.bot.db.execute(
+                    "UPDATE tickets SET satisfaction_delivery_status='dm_blocked', "
+                    "satisfaction_delivery_error=?, satisfaction_attempted_ts=? "
+                    "WHERE guild_id=? AND ticket_id=?",
+                    (str(e)[:500], int(time.time()), guild.id, int(ticket_id)),
                 )
             except Exception as e:
                 if msg is not None:
@@ -3884,6 +4414,12 @@ class HelpCog(commands.Cog):
                         await msg.delete()
                     except Exception:
                         pass
+                await self.bot.db.execute(
+                    "UPDATE tickets SET satisfaction_delivery_status='delivery_failed', "
+                    "satisfaction_delivery_error=?, satisfaction_attempted_ts=? "
+                    "WHERE guild_id=? AND ticket_id=?",
+                    (str(e)[:500], int(time.time()), guild.id, int(ticket_id)),
+                )
                 await self._log_background_error(
                     "ticket_satisfaction_prompt",
                     f"Ticket satisfaction prompt failed ticket_id={ticket_id} creator_id={creator_id}: {repr(e)}",
@@ -3898,16 +4434,67 @@ class HelpCog(commands.Cog):
             return
         cutoff = int(time.time()) - 7 * 24 * 3600
         rows = await self.bot.db.fetchall(
-            "SELECT ticket_id, creator_id, satisfaction_message_id FROM tickets "
+            "SELECT ticket_id, creator_id, satisfaction_message_id, satisfaction_delivery_status "
+            "FROM tickets "
             "WHERE guild_id=? AND closed_ts>=? AND satisfaction_score IS NULL "
-            "AND satisfaction_message_id IS NOT NULL AND ticket_id IS NOT NULL",
+            "AND ticket_id IS NOT NULL "
+            "AND satisfaction_delivery_status IN ('sending','sent')",
             (guild_id, cutoff),
         )
         for row in rows:
-            self.bot.add_view(
-                TicketSatisfactionView(self, guild_id, int(row["ticket_id"]), int(row["creator_id"])),
-                message_id=int(row["satisfaction_message_id"]),
-            )
+            try:
+                self.bot.add_view(
+                    TicketSatisfactionView(
+                        self,
+                        guild_id,
+                        int(row["ticket_id"]),
+                        int(row["creator_id"]),
+                    ),
+                )
+            except Exception as e:
+                await self._log_background_error(
+                    "ticket_satisfaction_view_restore",
+                    f"Ticket feedback view restore failed ticket_id={row['ticket_id']}: {e!r}",
+                )
+
+        # Releases before transcript-based identity recovery treated a rounded
+        # snowflake as permanently unavailable. Upgrade those rows exactly once
+        # so historical tickets can use their saved transcript as evidence.
+        await self.bot.db.execute(
+            "UPDATE tickets SET satisfaction_delivery_status='pending', "
+            "satisfaction_delivery_error=NULL "
+            "WHERE guild_id=? AND closed_ts>=? AND satisfaction_score IS NULL "
+            "AND satisfaction_message_id IS NULL AND ticket_id IS NOT NULL "
+            "AND satisfaction_delivery_status='recipient_unavailable' "
+            "AND COALESCE(satisfaction_resolution_version, 0)<?",
+            (guild_id, cutoff, TICKET_SATISFACTION_RESOLUTION_VERSION),
+        )
+
+        # Retry only deliveries known not to have produced a DM. A `sending`
+        # row is deliberately left alone because a crash may have happened
+        # immediately after Discord accepted the message.
+        retry_rows = await self.bot.db.fetchall(
+            "SELECT ticket_id, creator_id FROM tickets "
+            "WHERE guild_id=? AND closed_ts>=? AND satisfaction_score IS NULL "
+            "AND satisfaction_message_id IS NULL AND ticket_id IS NOT NULL "
+            "AND satisfaction_delivery_status IN ('pending','delivery_failed') "
+            "ORDER BY closed_ts ASC LIMIT 20",
+            (guild_id, cutoff),
+        )
+        guild = self.bot.get_guild(guild_id)
+        if guild is not None:
+            for row in retry_rows:
+                try:
+                    await self._send_ticket_satisfaction_prompt(
+                        guild,
+                        int(row["creator_id"]),
+                        int(row["ticket_id"]),
+                    )
+                except Exception as e:
+                    await self._log_background_error(
+                        "ticket_satisfaction_retry",
+                        f"Ticket feedback retry failed ticket_id={row['ticket_id']}: {e!r}",
+                    )
         self._satisfaction_views_registered = True
 
     async def handle_ticket_satisfaction(self, interaction: discord.Interaction, guild_id: int, ticket_id: int, score: int):
@@ -3915,10 +4502,14 @@ class HelpCog(commands.Cog):
         await interaction.response.defer()
         async with self._satisfaction_lock:
             row = await self.bot.db.fetchone(
-                "SELECT closed_ts, satisfaction_score FROM tickets WHERE guild_id=? AND ticket_id=? AND creator_id=?",
-                (int(guild_id), int(ticket_id), interaction.user.id),
+                "SELECT creator_id, closed_ts, satisfaction_score FROM tickets "
+                "WHERE guild_id=? AND ticket_id=?",
+                (int(guild_id), int(ticket_id)),
             )
-            if not row:
+            if not row or not snowflake_matches_legacy(
+                int(row["creator_id"] or 0),
+                int(interaction.user.id),
+            ):
                 return await interaction.followup.send(
                     "That ticket feedback request could not be found.",
                     ephemeral=True,
@@ -3941,9 +4532,18 @@ class HelpCog(commands.Cog):
                         ephemeral=True,
                     )
             await self.bot.db.execute(
-                "UPDATE tickets SET satisfaction_score=?, satisfaction_user_id=?, satisfaction_ts=?, satisfaction_message_id=NULL "
-                "WHERE guild_id=? AND ticket_id=? AND creator_id=?",
-                (score, interaction.user.id, int(time.time()), int(guild_id), int(ticket_id), interaction.user.id),
+                "UPDATE tickets SET creator_id=?, satisfaction_score=?, satisfaction_user_id=?, "
+                "satisfaction_ts=?, satisfaction_message_id=NULL, "
+                "satisfaction_delivery_status='completed', satisfaction_delivery_error=NULL "
+                "WHERE guild_id=? AND ticket_id=?",
+                (
+                    interaction.user.id,
+                    score,
+                    interaction.user.id,
+                    int(time.time()),
+                    int(guild_id),
+                    int(ticket_id),
+                ),
             )
         embed = self._help_embed(
             "Feedback Saved",
@@ -3990,11 +4590,22 @@ class HelpCog(commands.Cog):
         if not isinstance(channel, discord.TextChannel):
             return False
 
-        row = await self.bot.db.fetchone("SELECT ticket_id, creator_id, created_ts, status_tag FROM tickets WHERE channel_id=?", (channel_id,))
+        row = await self.bot.db.fetchone(
+            "SELECT ticket_id, creator_id, created_ts, status_tag, opening_message_id "
+            "FROM tickets WHERE channel_id=?",
+            (channel_id,),
+        )
         ticket_id = int(row["ticket_id"]) if row and row["ticket_id"] is not None else None
         creator_id = int(row["creator_id"]) if row and row["creator_id"] is not None else 0
         created_ts = int(row["created_ts"]) if row and row["created_ts"] is not None else 0
         previous_status_tag = str(row["status_tag"] or "waiting_staff") if row else "waiting_staff"
+        if row and creator_id:
+            creator_id = await self._recover_ticket_creator_id(
+                guild,
+                channel,
+                creator_id,
+                int(row["opening_message_id"] or 0),
+            )
 
         async def _restore_open_status() -> None:
             try:

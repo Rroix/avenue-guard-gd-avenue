@@ -126,10 +126,11 @@ class BackgroundCog(commands.Cog):
             except Exception:
                 pass
         try:
-            task = asyncio.create_task(self._persist_current_day())
-            self._track_background_persist(task)
-        except Exception:
-            pass
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._persist_current_day())
+        self._track_background_persist(task)
 
     async def start_background(self):
         try:
@@ -269,6 +270,20 @@ class BackgroundCog(commands.Cog):
             elif isinstance(it, str) and it.strip():
                 out.append({"type": "playing", "text": it.strip()})
         return out
+
+    def _presence_transport_is_closing(self, error: Exception) -> bool:
+        if self.bot.is_closed() or not self.bot.is_ready():
+            return True
+        text = repr(error).casefold()
+        return any(
+            marker in text
+            for marker in (
+                "cannot write to closing transport",
+                "clientconnectionreseterror",
+                "connection is closed",
+                "websocket is closed",
+            )
+        )
 
     def _server_icon_rotation_enabled(self) -> bool:
         cfg = ensure_server_icon_config(self.bot.config)
@@ -1034,6 +1049,11 @@ class BackgroundCog(commands.Cog):
         try:
             await self.bot.change_presence(activity=discord.Activity(type=atype, name=txt))
         except Exception as e:
+            if self._presence_transport_is_closing(e):
+                # A reconnect or shutdown can close the gateway transport
+                # between is_ready() and the write. Retry on the next tick.
+                self._last_status_swap = 0.0
+                return
             await log_error(self.bot, f"Status rotation update failed: {repr(e)}")
 
     @rotate_status.before_loop

@@ -11,6 +11,7 @@ import discord
 from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, basic_color
+from utils.discord_refs import fetch_persisted_message, snowflake_matches_legacy
 from utils.errors import log_error
 from utils.mentions import no_mentions
 from utils.timeutils import now_madrid, week_start_sunday, TZ
@@ -237,7 +238,30 @@ class TrackingCog(commands.Cog):
         except Exception:
             return 3000
 
-    async def _resolve_member(self, guild: discord.Guild, user_or_id) -> Optional[discord.Member]:
+    def _cached_member_for_persisted_id(
+        self,
+        guild: discord.Guild,
+        user_id: int,
+    ) -> Optional[discord.Member]:
+        member = guild.get_member(int(user_id))
+        if member is not None:
+            return member
+        candidates = {
+            int(candidate.id): candidate
+            for candidate in getattr(guild, "members", ()) or ()
+            if getattr(candidate, "id", None)
+            and snowflake_matches_legacy(int(user_id), int(candidate.id))
+        }
+        return next(iter(candidates.values())) if len(candidates) == 1 else None
+
+    async def _resolve_member(
+        self,
+        guild: discord.Guild,
+        user_or_id,
+        *,
+        allow_fetch: bool = True,
+        raise_transient: bool = False,
+    ) -> Optional[discord.Member]:
         if isinstance(user_or_id, discord.Member):
             return user_or_id
         user_id = getattr(user_or_id, "id", user_or_id)
@@ -245,12 +269,18 @@ class TrackingCog(commands.Cog):
             user_id = int(user_id)
         except Exception:
             return None
-        member = guild.get_member(user_id)
+        member = self._cached_member_for_persisted_id(guild, user_id)
         if member is not None:
             return member
+        if not allow_fetch:
+            return None
         try:
             return await guild.fetch_member(user_id)
+        except discord.NotFound:
+            return None
         except Exception:
+            if raise_transient:
+                raise
             return None
 
     async def _configured_channel(self, guild: discord.Guild, channel_id: int) -> Optional[discord.TextChannel]:
@@ -262,6 +292,113 @@ class TrackingCog(commands.Cog):
                 channel = None
         return channel if isinstance(channel, discord.TextChannel) else None
 
+    async def _resolve_dm_user(self, guild: discord.Guild, user_id: int):
+        """Resolve exact Discord identity before a DM based on persisted state."""
+        user_id = int(user_id)
+        member = await self._resolve_member(guild, user_id)
+        if member is not None:
+            return member
+        get_user = getattr(self.bot, "get_user", None)
+        cached = get_user(user_id) if callable(get_user) else None
+        if cached is not None:
+            return cached
+        candidates = {
+            int(candidate.id): candidate
+            for candidate in getattr(self.bot, "users", ()) or ()
+            if getattr(candidate, "id", None)
+            and snowflake_matches_legacy(user_id, int(candidate.id))
+        }
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        return await self.bot.fetch_user(user_id)
+
+    async def _weekly_offer_dm_channel(self, user):
+        create_dm = getattr(user, "create_dm", None)
+        if callable(create_dm):
+            return await create_dm()
+        return None
+
+    def _weekly_offer_message_matches(
+        self,
+        message,
+        *,
+        contacted_ts: int,
+        expected_content: str,
+        expected_embed: Optional[discord.Embed],
+    ) -> bool:
+        bot_user_id = int(
+            getattr(getattr(self.bot, "user", None), "id", 0) or 0
+        )
+        if bot_user_id and int(
+            getattr(getattr(message, "author", None), "id", 0) or 0
+        ) != bot_user_id:
+            return False
+        created_at = getattr(message, "created_at", None)
+        if created_at is not None:
+            try:
+                if int(created_at.timestamp()) < int(contacted_ts) - 5:
+                    return False
+            except Exception:
+                pass
+        if expected_content and str(getattr(message, "content", "") or "") == expected_content:
+            return True
+        expected_title = str(getattr(expected_embed, "title", "") or "")
+        expected_description = str(getattr(expected_embed, "description", "") or "")
+        for embed in getattr(message, "embeds", ()) or ():
+            if expected_title and str(getattr(embed, "title", "") or "") != expected_title:
+                continue
+            if expected_description and str(
+                getattr(embed, "description", "") or ""
+            ) != expected_description:
+                continue
+            if expected_title or expected_description:
+                return True
+        return False
+
+    async def _find_existing_weekly_offer(
+        self,
+        dm_channel,
+        *,
+        contacted_ts: int,
+        expected_content: str,
+        expected_embed: Optional[discord.Embed],
+    ):
+        history = getattr(dm_channel, "history", None)
+        if not callable(history):
+            return None
+        async for message in history(limit=30, oldest_first=False):
+            if self._weekly_offer_message_matches(
+                message,
+                contacted_ts=contacted_ts,
+                expected_content=expected_content,
+                expected_embed=expected_embed,
+            ):
+                return message
+        return None
+
+    async def _send_weekly_offer_message(
+        self,
+        user,
+        *,
+        timeout_hours: int,
+        expires_ts: int,
+    ):
+        content, embed = self._build_request_dm_message(timeout_hours, expires_ts)
+        dm_channel = await self._weekly_offer_dm_channel(user)
+        if dm_channel is not None:
+            message = await dm_channel.send(
+                content=content or None,
+                embed=embed,
+                allowed_mentions=no_mentions(),
+            )
+            return message, dm_channel
+        message = await user.send(
+            content=content or None,
+            embed=embed,
+            allowed_mentions=no_mentions(),
+        )
+        return message, getattr(message, "channel", None)
+
     async def _log_background_error(self, key: str, message: str) -> None:
         now = time.monotonic()
         if now - self._last_error_log.get(key, 0.0) < 300:
@@ -269,9 +406,9 @@ class TrackingCog(commands.Cog):
         self._last_error_log[key] = now
         await log_error(self.bot, message)
 
-    async def _dm_user(self, user_id: int, message: str) -> None:
+    async def _dm_user(self, guild: discord.Guild, user_id: int, message: str) -> None:
         try:
-            user = await self.bot.fetch_user(int(user_id))
+            user = await self._resolve_dm_user(guild, int(user_id))
             await user.send(str(message)[:2000], allowed_mentions=no_mentions())
         except Exception as e:
             await self._log_background_error(
@@ -304,7 +441,7 @@ class TrackingCog(commands.Cog):
         if validation_errors:
             reason = " ".join(validation_errors)
             await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=validation_error detail={reason[:180]}")
-            await self._dm_user(user_id, f"Please fix your weekly request before submitting it: {reason}")
+            await self._dm_user(guild, user_id, f"Please fix your weekly request before submitting it: {reason}")
             return False, review_data
 
         try:
@@ -316,7 +453,7 @@ class TrackingCog(commands.Cog):
         if external_errors:
             reason = " ".join(external_errors)
             await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=external_validation detail={reason[:180]}")
-            await self._dm_user(user_id, f"Please fix your weekly request before submitting it: {reason}")
+            await self._dm_user(guild, user_id, f"Please fix your weekly request before submitting it: {reason}")
             return False, review_data
 
         try:
@@ -362,9 +499,10 @@ class TrackingCog(commands.Cog):
             if task and not task.done():
                 task.cancel()
         try:
-            asyncio.create_task(self.flush_activity_counts())
-        except Exception:
-            pass
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self.flush_activity_counts())
 
     async def _recover_contacting_claims(self) -> None:
         """Finish weekly offers interrupted between reservation and DM setup."""
@@ -373,7 +511,8 @@ class TrackingCog(commands.Cog):
         if guild is None:
             return
         rows = await self.bot.db.fetchall(
-            "SELECT week_start,user_id,rank,contacted_ts FROM weekly_claims "
+            "SELECT week_start,user_id,rank,contacted_ts,offer_channel_id,"
+            "offer_message_id,offer_expires_ts FROM weekly_claims "
             "WHERE guild_id=? AND status='contacting' ORDER BY contacted_ts ASC LIMIT 50",
             (guild.id,),
         )
@@ -388,27 +527,80 @@ class TrackingCog(commands.Cog):
                     (guild.id, week_start_iso, user_id),
                 )
                 continue
+            user_id = int(member.id)
             now_ts = int(time.time())
-            expires = now_ts + timeout_h * 3600
+            contacted_ts = int(row["contacted_ts"] or now_ts)
+            expires = int(row["offer_expires_ts"] or 0)
+            if expires <= contacted_ts:
+                expires = contacted_ts + timeout_h * 3600
+            content, embed = self._build_request_dm_message(timeout_h, expires)
+            offer_message = None
+            dm_channel = None
             try:
-                user = await self.bot.fetch_user(user_id)
-                content, embed = self._build_request_dm_message(timeout_h, expires)
-                await user.send(content=content or None, embed=embed, allowed_mentions=no_mentions())
+                dm_channel = await self._weekly_offer_dm_channel(member)
+                stored_message_id = int(row["offer_message_id"] or 0)
+                if stored_message_id and dm_channel is not None:
+                    offer_message, _recovered = await fetch_persisted_message(
+                        dm_channel,
+                        stored_message_id,
+                        author_id=int(
+                            getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                        ),
+                        predicate=lambda message,
+                        contacted_ts=contacted_ts,
+                        content=content,
+                        embed=embed: self._weekly_offer_message_matches(
+                            message,
+                            contacted_ts=contacted_ts,
+                            expected_content=content,
+                            expected_embed=embed,
+                        ),
+                        scan_limit=30,
+                    )
+                elif dm_channel is not None:
+                    offer_message = await self._find_existing_weekly_offer(
+                        dm_channel,
+                        contacted_ts=contacted_ts,
+                        expected_content=content,
+                        expected_embed=embed,
+                    )
+
+                if offer_message is None and not stored_message_id:
+                    # A very old pointer-less `contacting` row has ambiguous
+                    # delivery. Finalize it without a surprise repeat DM; a
+                    # current interrupted attempt can be proven absent from
+                    # recent DM history and is delivered once here.
+                    if now_ts - contacted_ts <= 15 * 60:
+                        offer_message, dm_channel = await self._send_weekly_offer_message(
+                            member,
+                            timeout_hours=timeout_h,
+                            expires_ts=expires,
+                        )
             except Exception as e:
-                await self.bot.db.execute(
-                    "UPDATE weekly_claims SET status='dm_closed' WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
-                    (guild.id, week_start_iso, user_id),
+                await self._log_background_error(
+                    "weekly_offer_recovery_lookup",
+                    f"Weekly offer recovery could not verify DM user_id={user_id}: {e!r}",
                 )
-                await self._log_weekly(guild, week_start_iso, user_id, "dm_failed", f"recovery_error={type(e).__name__}")
                 continue
 
             try:
+                exact_message_id = int(getattr(offer_message, "id", 0) or 0) or None
+                exact_channel_id = int(getattr(dm_channel, "id", 0) or 0) or None
                 await self.bot.db.execute_transaction(
                     (
                         (
-                            "UPDATE weekly_claims SET status='pending', contacted_ts=? "
+                            "UPDATE weekly_claims SET user_id=?,status='pending',offer_channel_id=?,"
+                            "offer_message_id=?,offer_expires_ts=? "
                             "WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
-                            (now_ts, guild.id, week_start_iso, user_id),
+                            (
+                                user_id,
+                                exact_channel_id,
+                                exact_message_id,
+                                expires,
+                                guild.id,
+                                week_start_iso,
+                                int(row["user_id"]),
+                            ),
                         ),
                         (
                             "INSERT INTO weekly_sessions(guild_id,week_start,user_id,stage,expires_ts,active) VALUES(?,?,?,?,?,1) "
@@ -419,7 +611,19 @@ class TrackingCog(commands.Cog):
                     ),
                     retry_safe=True,
                 )
-                await self._log_weekly(guild, week_start_iso, user_id, "dm_sent", "recovered_interrupted_offer=true")
+                event = "dm_sent" if offer_message is not None else "dm_recovery_ambiguous"
+                event_detail = (
+                    "recovered_existing_offer=true"
+                    if offer_message is not None
+                    else "old_delivery_finalized_without_resend=true"
+                )
+                await self._log_weekly(
+                    guild,
+                    week_start_iso,
+                    user_id,
+                    event,
+                    event_detail,
+                )
             except Exception as e:
                 # The DM was delivered. Keep the reservation so another member
                 # is not offered the same reward while storage recovers.
@@ -540,7 +744,8 @@ class TrackingCog(commands.Cog):
         for row in claims:
             user_id = int(row["user_id"])
             try:
-                user = await self.bot.fetch_user(user_id)
+                user = await self._resolve_dm_user(guild, user_id)
+                user_id = int(user.id)
                 content, embed = self._build_request_dm_message(timeout_hours, expires_ts)
                 await user.send(content=content or None, embed=embed, allowed_mentions=no_mentions())
                 await self._log_weekly(
@@ -566,6 +771,10 @@ class TrackingCog(commands.Cog):
             "dm_sent": ("Request DM sent", discord.Color.green()),
             "dm_failed": ("Request DM failed", discord.Color.red()),
             "dm_closed": ("DMs closed", discord.Color.red()),
+            "dm_recovery_ambiguous": (
+                "Old DM state recovered without a repeat",
+                discord.Color.gold(),
+            ),
             "timeout_dm_sent": ("Timeout notice sent", discord.Color.orange()),
             "timed_out": ("Request timed out", discord.Color.orange()),
             "reminder_sent": ("Reminder sent", discord.Color.gold()),
@@ -1006,7 +1215,7 @@ class TrackingCog(commands.Cog):
             await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", "reason=weekly_request_channel_missing")
             await log_error(self.bot, f"Weekly request from user_id={user_id} could not be recorded: weekly_request_channel_ID is missing or invalid.")
             try:
-                user = await self.bot.fetch_user(user_id)
+                user = await self._resolve_dm_user(guild, user_id)
                 await user.send("I couldn't record your request because the staff request channel is not configured correctly. Please contact staff.")
             except Exception:
                 pass
@@ -1055,7 +1264,7 @@ class TrackingCog(commands.Cog):
             await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=weekly_request_send_failed error={type(e).__name__}")
             await log_error(self.bot, f"Weekly request from user_id={user_id} could not be sent to staff channel {channel.id}: {repr(e)}")
             try:
-                user = await self.bot.fetch_user(user_id)
+                user = await self._resolve_dm_user(guild, user_id)
                 await user.send("I couldn't record your request right now because I could not send it to the staff channel. Please contact staff.")
             except Exception:
                 pass
@@ -1104,7 +1313,7 @@ class TrackingCog(commands.Cog):
             await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=weekly_review_db_failed error={type(e).__name__}")
             await log_error(self.bot, f"Weekly request review row could not be saved for message_id={msg.id}: {repr(e)}")
             try:
-                user = await self.bot.fetch_user(user_id)
+                user = await self._resolve_dm_user(guild, user_id)
                 await user.send("I couldn't finish recording your request because of a database issue. Please try again or contact staff.")
             except Exception:
                 pass
@@ -1113,7 +1322,7 @@ class TrackingCog(commands.Cog):
         await self._log_weekly(guild, week_start_iso, user_id, "request_recorded", f"rank={rank if rank is not None else 'unknown'}")
 
         try:
-            user = await self.bot.fetch_user(user_id)
+            user = await self._resolve_dm_user(guild, user_id)
             await user.send(
                 f"Thanks! Your request has been recorded: {msg.jump_url}",
                 allowed_mentions=no_mentions(),
@@ -1320,7 +1529,7 @@ class TrackingCog(commands.Cog):
                 )
 
             try:
-                user = await self.bot.fetch_user(user_id)
+                user = await self._resolve_dm_user(guild, user_id)
                 await user.send("Request timed out", allowed_mentions=no_mentions())
                 await self._log_weekly(guild, week_start_iso, user_id, "timeout_dm_sent", "")
             except Exception as e:
@@ -1497,33 +1706,23 @@ class TrackingCog(commands.Cog):
         include_unresolved: bool = True,
     ) -> list:
         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
-        sql = "SELECT user_id, count FROM activity_counts WHERE guild_id=? AND week_start=? ORDER BY count DESC"
-        params: tuple = (guild.id, week_start_iso)
-        if limit is not None:
-            sql += " LIMIT ?"
-            params = (guild.id, week_start_iso, int(limit))
-        rows = await self.bot.db.fetchall(sql, params)
-        ranked_rows = []
+        rows = await self.bot.db.fetchall(
+            "SELECT user_id, count FROM activity_counts "
+            "WHERE guild_id=? AND week_start=? ORDER BY count DESC",
+            (guild.id, week_start_iso),
+        )
+        totals: dict[int, int] = {}
         for row in rows:
             uid = int(row["user_id"])
             # Member intent keeps the guild cache populated. Ranking from that
             # cache avoids one REST request per tracked user and prevents a
             # large leaderboard from exhausting Discord's rate limit.
-            member = guild.get_member(uid)
-            if member is None and not include_unresolved:
-                # The weekly reward run happens once per week, so resolving
-                # its bounded candidate set is worth the REST calls. A cold
-                # member cache must never turn a valid top member into an
-                # empty reward list after a restart.
-                try:
-                    member = await guild.fetch_member(uid)
-                except discord.NotFound:
-                    continue
-                except Exception:
-                    # Let the weekly scheduler retry before writing its run
-                    # marker instead of permanently completing with an empty
-                    # ranking during a transient Discord API failure.
-                    raise
+            member = await self._resolve_member(
+                guild,
+                uid,
+                allow_fetch=not include_unresolved,
+                raise_transient=not include_unresolved,
+            )
             if member is not None:
                 if member.bot:
                     continue
@@ -1531,7 +1730,18 @@ class TrackingCog(commands.Cog):
                     continue
             elif not include_unresolved:
                 continue
-            ranked_rows.append(row)
+            if member is not None:
+                uid = int(member.id)
+            totals[uid] = totals.get(uid, 0) + int(row["count"])
+        ranked_rows = [
+            {"user_id": user_id, "count": count}
+            for user_id, count in sorted(
+                totals.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ]
+        if limit is not None:
+            ranked_rows = ranked_rows[: max(0, int(limit))]
         return ranked_rows
 
     async def _send_missing_weekly_recap_once(self) -> None:
@@ -1646,14 +1856,28 @@ class TrackingCog(commands.Cog):
                 )
                 return False
             await self.bot.db.execute(
-                "INSERT INTO weekly_claims(guild_id,week_start,user_id,rank,status,contacted_ts) VALUES(?,?,?,?,?,?)",
-                (guild.id, week_start_iso, user_id, rank, "contacting", now_ts),
+                "INSERT INTO weekly_claims("
+                "guild_id,week_start,user_id,rank,status,contacted_ts,offer_expires_ts"
+                ") VALUES(?,?,?,?,?,?,?)",
+                (
+                    guild.id,
+                    week_start_iso,
+                    user_id,
+                    rank,
+                    "contacting",
+                    now_ts,
+                    expires,
+                ),
             )
 
+        offer_message = None
+        dm_channel = None
         try:
-            user = await self.bot.fetch_user(user_id)
-            content, embed = self._build_request_dm_message(timeout_hours, expires)
-            await user.send(content=content or None, embed=embed, allowed_mentions=no_mentions())
+            offer_message, dm_channel = await self._send_weekly_offer_message(
+                member,
+                timeout_hours=timeout_hours,
+                expires_ts=expires,
+            )
         except Exception as e:
             await self.bot.db.execute(
                 "UPDATE weekly_claims SET status='dm_closed' "
@@ -1686,13 +1910,44 @@ class TrackingCog(commands.Cog):
                     await self._log_background_error("weekly_dm_fail_channel", f"Weekly DM failure log send failed: {repr(log_error_exc)}")
             return False
 
+        offer_message_id = int(getattr(offer_message, "id", 0) or 0) or None
+        offer_channel_id = int(getattr(dm_channel, "id", 0) or 0) or None
+        try:
+            await self.bot.db.execute(
+                "UPDATE weekly_claims SET offer_channel_id=?,offer_message_id=?,offer_expires_ts=? "
+                "WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
+                (
+                    offer_channel_id,
+                    offer_message_id,
+                    expires,
+                    guild.id,
+                    week_start_iso,
+                    user_id,
+                ),
+            )
+        except Exception as e:
+            # Recovery scans the DM before sending anything else, so leaving
+            # this claim in `contacting` cannot create a repeat message.
+            await self._log_background_error(
+                "weekly_offer_pointer",
+                f"Weekly DM sent but pointer save failed for user_id={user_id}: {e!r}",
+            )
+
         try:
             await self.bot.db.execute_transaction(
                 (
                     (
-                        "UPDATE weekly_claims SET status='pending' "
+                        "UPDATE weekly_claims SET status='pending',offer_channel_id=?,"
+                        "offer_message_id=?,offer_expires_ts=? "
                         "WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
-                        (guild.id, week_start_iso, user_id),
+                        (
+                            offer_channel_id,
+                            offer_message_id,
+                            expires,
+                            guild.id,
+                            week_start_iso,
+                            user_id,
+                        ),
                     ),
                     (
                         "INSERT INTO weekly_sessions(guild_id,week_start,user_id,stage,expires_ts,active) VALUES(?,?,?,?,?,1) "
@@ -1739,6 +1994,7 @@ class TrackingCog(commands.Cog):
             if member is None or member.bot:
                 skipped_missing += 1
                 continue
+            uid = int(member.id)
             if excluded_role_ids and any(role.id in excluded_role_ids for role in member.roles):
                 skipped_excluded += 1
                 continue
@@ -1851,27 +2107,106 @@ class TrackingCog(commands.Cog):
             if now_ts < contacted_ts + reminder_after_h * 3600:
                 continue
 
-            prev = await self.bot.db.fetchone(
-                "SELECT reminded_ts FROM weekly_reminders WHERE guild_id=? AND week_start=? AND user_id=?",
-                (guild.id, week_start_iso, user_id),
-            )
+            try:
+                prev = await self.bot.db.fetchone(
+                    "SELECT reminded_ts,delivery_status FROM weekly_reminders "
+                    "WHERE guild_id=? AND week_start=? AND user_id=?",
+                    (guild.id, week_start_iso, user_id),
+                )
+            except Exception as e:
+                await self._log_background_error(
+                    "weekly_reminder_state",
+                    f"Weekly reminder state lookup failed user_id={user_id}: {e!r}",
+                )
+                continue
             if prev is not None:
-                if repeat_h <= 0:
+                delivery_status = str(prev["delivery_status"] or "sent")
+                if delivery_status == "sending":
                     continue
-                if now_ts < int(prev["reminded_ts"]) + repeat_h * 3600:
+                retry_hours = repeat_h if delivery_status == "sent" else max(1, repeat_h)
+                if delivery_status == "sent" and repeat_h <= 0:
+                    continue
+                if now_ts < int(prev["reminded_ts"]) + retry_hours * 3600:
                     continue
 
             try:
-                user = await self.bot.fetch_user(user_id)
-                content, embed = self._build_reminder_message(expires_ts)
-                await user.send(content=content or None, embed=embed, allowed_mentions=no_mentions())
                 await self.bot.db.execute(
-                    "INSERT OR REPLACE INTO weekly_reminders(guild_id,week_start,user_id,reminded_ts) VALUES(?,?,?,?)",
-                    (guild.id, week_start_iso, user_id, now_ts),
+                    "INSERT INTO weekly_reminders("
+                    "guild_id,week_start,user_id,reminded_ts,delivery_status,attempted_ts,error_text"
+                    ") VALUES(?,?,?,?,?,?,NULL) "
+                    "ON CONFLICT(guild_id,week_start,user_id) DO UPDATE SET "
+                    "reminded_ts=excluded.reminded_ts,delivery_status='sending',"
+                    "attempted_ts=excluded.attempted_ts,error_text=NULL",
+                    (
+                        guild.id,
+                        week_start_iso,
+                        user_id,
+                        now_ts,
+                        "sending",
+                        now_ts,
+                    ),
                 )
-                await self._log_weekly(guild, week_start_iso, user_id, "reminder_sent", f"expires={self._format_deadline(expires_ts)}")
             except Exception as e:
+                await self._log_background_error(
+                    "weekly_reminder_reserve",
+                    f"Weekly reminder delivery reservation failed user_id={user_id}: {e!r}",
+                )
+                continue
+            reminder_message = None
+            try:
+                user = await self._resolve_dm_user(guild, user_id)
+                content, embed = self._build_reminder_message(expires_ts)
+                reminder_message = await user.send(
+                    content=content or None,
+                    embed=embed,
+                    allowed_mentions=no_mentions(),
+                )
+            except Exception as e:
+                try:
+                    await self.bot.db.execute(
+                        "UPDATE weekly_reminders SET delivery_status='delivery_failed',error_text=? "
+                        "WHERE guild_id=? AND week_start=? AND user_id=? AND delivery_status='sending'",
+                        (type(e).__name__, guild.id, week_start_iso, user_id),
+                    )
+                except Exception as state_error:
+                    await self._log_background_error(
+                        "weekly_reminder_failure_state",
+                        f"Weekly reminder failed and its failure state could not be saved "
+                        f"user_id={user_id}: send={e!r}; save={state_error!r}",
+                    )
                 await self._log_weekly(guild, week_start_iso, user_id, "reminder_failed", type(e).__name__)
+                continue
+
+            try:
+                await self.bot.db.execute(
+                    "UPDATE weekly_reminders SET delivery_status='sent',channel_id=?,message_id=?,"
+                    "error_text=NULL WHERE guild_id=? AND week_start=? AND user_id=? "
+                    "AND delivery_status='sending'",
+                    (
+                        int(getattr(getattr(reminder_message, "channel", None), "id", 0) or 0)
+                        or None,
+                        int(getattr(reminder_message, "id", 0) or 0) or None,
+                        guild.id,
+                        week_start_iso,
+                        user_id,
+                    ),
+                )
+            except Exception as e:
+                # The reservation intentionally remains `sending`: Discord may
+                # have accepted the DM, so retrying would risk duplicate mail.
+                await self._log_background_error(
+                    "weekly_reminder_finalize",
+                    f"Weekly reminder sent but delivery pointer save failed "
+                    f"user_id={user_id}: {e!r}",
+                )
+                continue
+            await self._log_weekly(
+                guild,
+                week_start_iso,
+                user_id,
+                "reminder_sent",
+                f"expires={self._format_deadline(expires_ts)}",
+            )
 
     # ----------------------------
     # Public helpers used by Commands.py
@@ -1880,38 +2215,63 @@ class TrackingCog(commands.Cog):
         await self.flush_activity_counts()
         limit = max(1, min(500, int(limit)))
         rows = await self.bot.db.fetchall(
-            "SELECT user_id, count FROM activity_counts WHERE guild_id=? AND week_start=? ORDER BY count DESC LIMIT ?",
-            (guild_id, week_start_iso, limit),
+            "SELECT user_id, count FROM activity_counts "
+            "WHERE guild_id=? AND week_start=? ORDER BY count DESC",
+            (guild_id, week_start_iso),
         )
-        return [(int(r["user_id"]), int(r["count"])) for r in rows]
+        guild = self.bot.get_guild(int(guild_id))
+        totals: dict[int, int] = {}
+        for row in rows:
+            user_id = int(row["user_id"])
+            if guild is not None:
+                member = await self._resolve_member(
+                    guild,
+                    user_id,
+                    allow_fetch=False,
+                )
+                if member is not None:
+                    user_id = int(member.id)
+            totals[user_id] = totals.get(user_id, 0) + int(row["count"])
+        return sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:limit]
 
     async def get_member_stats(self, guild: discord.Guild, week_start_iso: str, user_id: int) -> tuple[int, Optional[int], int]:
         """Return (count, rank among eligible, eligible_total). Rank is 1-based, or None if not ranked/eligible."""
         await self.flush_activity_counts()
         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
 
-        row = await self.bot.db.fetchone(
-            "SELECT count FROM activity_counts WHERE guild_id=? AND week_start=? AND user_id=?",
-            (guild.id, week_start_iso, user_id),
-        )
-        count = int(row["count"]) if row else 0
-
         member = await self._resolve_member(guild, user_id)
-        if member is None or member.bot:
-            return count, None, 0
-        if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
-            return count, None, 0
-
         rows = await self.bot.db.fetchall(
             "SELECT user_id, count FROM activity_counts WHERE guild_id=? AND week_start=? ORDER BY count DESC",
             (guild.id, week_start_iso),
         )
 
+        totals: dict[int, int] = {}
+        members: dict[int, Optional[discord.Member]] = {}
+        for row in rows:
+            stored_id = int(row["user_id"])
+            row_member = (
+                member
+                if snowflake_matches_legacy(stored_id, user_id)
+                else self._cached_member_for_persisted_id(guild, stored_id)
+            )
+            exact_id = int(row_member.id) if row_member is not None else stored_id
+            totals[exact_id] = totals.get(exact_id, 0) + int(row["count"])
+            if exact_id not in members or row_member is not None:
+                members[exact_id] = row_member
+
+        count = totals.get(int(user_id), 0)
+        if member is None or member.bot:
+            return count, None, 0
+        if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
+            return count, None, 0
+
         rank = None
         eligible_total = 0
-        for r in rows:
-            uid = int(r["user_id"])
-            m = member if uid == user_id else guild.get_member(uid)
+        for uid, _total in sorted(
+            totals.items(),
+            key=lambda item: (-item[1], item[0]),
+        ):
+            m = members.get(uid)
             # Activity rows are only created by on_message after bot and role
             # eligibility checks. Keep uncached rows in the ranking; known
             # members are re-checked so current exclusions still apply.

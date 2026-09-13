@@ -7,6 +7,7 @@ import argparse
 import ast
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 
@@ -289,7 +290,7 @@ def _markdown(root: Path, records: list[FunctionRecord], test_count: int) -> str
     out = [
         "# Avenue Guard Function-by-Function Diagnosis",
         "",
-        "**Audit date:** 2026-07-29  ",
+        f"**Audit date:** {date.today().isoformat()}  ",
         f"**Runtime scope:** {runtime_modules} Python modules, {len(records)} definitions, {runtime_lines:,} physical lines",
         "**Method:** AST inventory, per-function control-flow scoring, interaction-order review, persistence/Discord I/O mapping, compile, tests, Ruff, Bandit, and dependency audit",
         "",
@@ -318,19 +319,18 @@ def _markdown(root: Path, records: list[FunctionRecord], test_count: int) -> str
         "- Pinned the Render runtime to Python 3.13 and refreshed production dependency bounds.",
         "- Replaced implicit event-loop lookup during startup with explicit loop ownership and cleanup.",
         "- Restored the Discord presence intent required for accurate daily online-member summaries.",
-        "- Added Turso connection recovery after a post-commit sync leaves a transaction invalid.",
-        "- Added a retry path and same-process lock for daily summaries without weakening database idempotency.",
-        "- Rebuilt missing weekly reward sessions and deadlines when an admin re-enables the current week.",
-        "- Corrected request edit grace, scheduled-close timestamps, DST validation, and HTTP-task cleanup.",
-        "- Serialized shared configuration writes across resync, forum, and server-icon operations.",
-        "- Added native Discord choices, lengths, and numeric bounds to ambiguous slash-command options.",
-        "- Moved backup compression and restore extraction off the event loop and streamed transcript generation.",
-        "- Explicitly closed temporary SQLite backup/validation handles and added strict resource/deprecation checks.",
-        "- Bounded long-lived caches and used monotonic clocks for cooldowns and error suppression.",
-        "- Serialized release decisions and help-ticket creation, and hardened review-access role failures.",
-        "- Allowed all configured auto-response matches to run when `first_match_only` is disabled.",
-        "- Tightened Discord color validation and silenced harmless keepalive client disconnect noise.",
-        "- Removed dead code and refreshed public documentation, maintenance scripts, and regression coverage.",
+        "- Preserved every Discord snowflake exactly when using the legacy libSQL Python binding; large integers are never routed through floating point.",
+        "- Added compatible reads and in-place repair for historical IDs that Turso/libSQL rounded before this release.",
+        "- Reconciled message and channel pointers against live Discord evidence instead of trusting a rounded database value.",
+        "- Recovered closed-ticket recipients from exact guild membership, transcript embeds, and transcript attachments before declaring them unavailable.",
+        "- Made ticket satisfaction outcomes durable so deleted or inaccessible users are logged once instead of retried on every restart.",
+        "- Reserved weekly offers, reminders, and release approvals before sending Discord messages to prevent duplicates after uncertain writes.",
+        "- Removed a redundant remote pull after every embedded-replica write; startup and explicit resync remain authoritative pull points.",
+        "- Quarantined and rebuilt corrupt local replica files when Turso reports `file is not a database`.",
+        "- Kept scheduled openings and auto-closes transactional, restart-safe, and isolated from transient Turso failures.",
+        "- Suppressed expected Discord 404s for genuinely deleted saved messages while retaining actionable diagnostics.",
+        "- Made presence rotation tolerate a transport that is closing during reconnect or shutdown.",
+        "- Expanded migration, 64-bit ID, recovery, restart-idempotency, and notification-delivery regression coverage.",
         "",
         "## Attention Summary",
         "",
@@ -403,7 +403,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output",
-        default="docs/BOT_FUNCTION_DIAGNOSIS_2026-07-29.md",
+        default=None,
         help="Markdown report path relative to the repository root",
     )
     parser.add_argument(
@@ -415,7 +415,8 @@ def main() -> None:
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     records = collect(root)
-    output = root / args.output
+    output_name = args.output or f"docs/BOT_FUNCTION_DIAGNOSIS_{date.today().isoformat()}.md"
+    output = root / output_name
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(_markdown(root, records, max(0, int(args.test_count))), encoding="utf-8")
     print(f"Wrote {len(records)} function records to {output.relative_to(root)}")

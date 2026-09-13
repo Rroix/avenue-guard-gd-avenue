@@ -12,6 +12,7 @@ import discord
 from discord.ext import commands
 
 from utils.checks import basic_color, is_admin_or_owner, is_mod, member_has_any_role
+from utils.discord_refs import fetch_persisted_channel, fetch_persisted_message
 from utils.errors import log_error
 from utils.gd_validation import combine_level_validation, fetch_boomlings_level, fetch_gdbrowser_level, validation_notice
 from utils.mentions import no_mentions, user_and_role_mentions, user_mentions
@@ -562,11 +563,12 @@ class RequestLevelsCog(commands.Cog):
         for task in tuple(self._background_tasks):
             task.cancel()
         try:
-            cleanup_task = asyncio.create_task(self.close_resources())
-            self._background_tasks.add(cleanup_task)
-            cleanup_task.add_done_callback(self._background_tasks.discard)
-        except Exception:
-            pass
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        cleanup_task = loop.create_task(self.close_resources())
+        self._background_tasks.add(cleanup_task)
+        cleanup_task.add_done_callback(self._background_tasks.discard)
 
     async def close_resources(self) -> None:
         """Close reusable HTTP resources before Pycord tears down the loop."""
@@ -1538,19 +1540,21 @@ class RequestLevelsCog(commands.Cog):
             (guild.id, wave_id),
         )
         if row:
-            old_channel = guild.get_channel(int(row["channel_id"]))
-            if old_channel is None:
-                try:
-                    old_channel = await guild.fetch_channel(int(row["channel_id"]))
-                except discord.NotFound:
-                    old_channel = None
-                except Exception as e:
-                    raise RuntimeError(f"Could not fetch the saved wave summary channel: {e}") from e
+            try:
+                old_channel, _recovered_channel = await fetch_persisted_channel(
+                    guild,
+                    int(row["channel_id"]),
+                )
+            except Exception as e:
+                raise RuntimeError(f"Could not fetch the saved wave summary channel: {e}") from e
             if isinstance(old_channel, discord.TextChannel):
-                try:
-                    msg = await old_channel.fetch_message(int(row["message_id"]))
-                except discord.NotFound:
-                    msg = None
+                msg, _recovered = await fetch_persisted_message(
+                    old_channel,
+                    int(row["message_id"]),
+                    author_id=int(
+                        getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                    ),
+                )
                 if msg is not None and old_channel.id == channel.id:
                     await msg.edit(embed=embed, allowed_mentions=no_mentions())
                     await self.bot.db.execute(
@@ -2302,21 +2306,28 @@ class RequestLevelsCog(commands.Cog):
         current_channel_id = row["request_channel_id"]
 
         if message_id and current_channel_id:
-            old_channel = guild.get_channel(int(current_channel_id))
-            if old_channel is None:
-                try:
-                    old_channel = await guild.fetch_channel(int(current_channel_id))
-                except discord.NotFound:
-                    old_channel = None
-                except Exception as e:
-                    raise RuntimeError(f"Could not fetch the saved request channel: {e}") from e
+            try:
+                old_channel, recovered_channel = await fetch_persisted_channel(
+                    guild,
+                    int(current_channel_id),
+                )
+            except Exception as e:
+                raise RuntimeError(f"Could not fetch the saved request channel: {e}") from e
             if isinstance(old_channel, discord.TextChannel):
-                try:
-                    msg = await old_channel.fetch_message(int(message_id))
-                except discord.NotFound:
-                    msg = None
+                msg, recovered = await fetch_persisted_message(
+                    old_channel,
+                    int(message_id),
+                    author_id=int(
+                        getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                    ),
+                )
                 if msg is not None and old_channel.id == channel.id:
                     await msg.edit(embed=embed, view=view, allowed_mentions=no_mentions())
+                    if recovered or recovered_channel:
+                        await self.bot.db.execute(
+                            "UPDATE level_request_state SET request_channel_id=?, request_message_id=? WHERE guild_id=?",
+                            (old_channel.id, msg.id, guild.id),
+                        )
                     return msg
 
                 if msg is not None and old_channel.id != channel.id:
@@ -3035,13 +3046,27 @@ class RequestLevelsCog(commands.Cog):
 
             message_id = int(row["request_message_id"] or 0)
             target_channel = await self._configured_channel(interaction.guild, "level_requested")
-            if target_channel is None or not message_id:
+            if target_channel is None:
                 return await self._reply_ephemeral(interaction, "I couldn't find the original request message.")
+            msg = None
             try:
-                msg = await target_channel.fetch_message(message_id)
+                if message_id:
+                    msg, _recovered_message = await fetch_persisted_message(
+                        target_channel,
+                        message_id,
+                        author_id=int(
+                            getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                        ),
+                    )
             except Exception as e:
-                await log_error(self.bot, f"Could not fetch request for edit message_id={message_id}: {repr(e)}")
-                return await self._reply_ephemeral(interaction, "I couldn't find the original request message.")
+                await log_error(
+                    self.bot,
+                    f"Could not resolve request message for edit message_id={message_id}: {repr(e)}",
+                )
+                return await self._reply_ephemeral(
+                    interaction,
+                    "I couldn't reach the request channel to update your request.",
+                )
 
             try:
                 edit_count = int(old_data.get("edit_count") or 0) + 1
@@ -3070,12 +3095,40 @@ class RequestLevelsCog(commands.Cog):
                 default_color=self._color_name("pending", "blurple"),
             )
 
+            created_replacement = False
+            if msg is None:
+                try:
+                    msg = await target_channel.send(
+                        embed=embed,
+                        view=LevelRequestReviewView(),
+                        allowed_mentions=no_mentions(),
+                    )
+                    created_replacement = True
+                except Exception as e:
+                    await log_error(
+                        self.bot,
+                        f"Could not recreate missing request message_id={message_id}: {repr(e)}",
+                    )
+                    return await self._reply_ephemeral(
+                        interaction,
+                        "I couldn't recreate the missing request message right now.",
+                    )
+            exact_message_id = int(msg.id)
+
             try:
                 await self.bot.db.execute_transaction(
                     (
                         (
-                            "UPDATE level_request_submissions SET level_id=?, data_json=? WHERE guild_id=? AND wave_id=? AND user_id=? AND status='pending'",
-                            (normalized_level_id, data_json, interaction.guild.id, wave_id, interaction.user.id),
+                            "UPDATE level_request_submissions SET level_id=?, data_json=?, request_message_id=? "
+                            "WHERE guild_id=? AND wave_id=? AND user_id=? AND status='pending'",
+                            (
+                                normalized_level_id,
+                                data_json,
+                                exact_message_id,
+                                interaction.guild.id,
+                                wave_id,
+                                interaction.user.id,
+                            ),
                         ),
                         (
                             "INSERT INTO level_request_edit_audit(guild_id,wave_id,user_id,request_message_id,old_level_id,new_level_id,old_data_json,new_data_json,edited_ts) "
@@ -3084,7 +3137,7 @@ class RequestLevelsCog(commands.Cog):
                                 interaction.guild.id,
                                 wave_id,
                                 interaction.user.id,
-                                message_id,
+                                exact_message_id,
                                 str(row["level_id"] or ""),
                                 normalized_level_id,
                                 old_data_json,
@@ -3096,15 +3149,59 @@ class RequestLevelsCog(commands.Cog):
                     retry_safe=True,
                 )
             except Exception as e:
-                await log_error(self.bot, f"Could not save level request edit message_id={message_id}: {repr(e)}")
+                if created_replacement:
+                    try:
+                        await msg.delete()
+                    except discord.NotFound:
+                        pass
+                    except Exception:
+                        pass
+                await log_error(
+                    self.bot,
+                    f"Could not save level request edit message_id={exact_message_id}: {repr(e)}",
+                )
                 return await self._reply_ephemeral(interaction, "I couldn't update your request right now.")
 
             try:
-                await msg.edit(embed=embed, view=LevelRequestReviewView())
+                if not created_replacement:
+                    await msg.edit(embed=embed, view=LevelRequestReviewView())
+            except discord.NotFound:
+                replacement = None
+                try:
+                    replacement = await target_channel.send(
+                        embed=embed,
+                        view=LevelRequestReviewView(),
+                        allowed_mentions=no_mentions(),
+                    )
+                    await self.bot.db.execute(
+                        "UPDATE level_request_submissions SET request_message_id=? "
+                        "WHERE guild_id=? AND wave_id=? AND user_id=? AND status='pending'",
+                        (
+                            replacement.id,
+                            interaction.guild.id,
+                            wave_id,
+                            interaction.user.id,
+                        ),
+                    )
+                except Exception as e:
+                    if replacement is not None:
+                        try:
+                            await replacement.delete()
+                        except Exception:
+                            pass
+                    await log_error(
+                        self.bot,
+                        f"Level request edit was saved but its deleted card could not be recreated "
+                        f"message_id={exact_message_id}: {repr(e)}",
+                    )
+                    return await self._reply_ephemeral(
+                        interaction,
+                        "Your changes were saved, but the request card could not be recreated. Staff can run `/requests repair`.",
+                    )
             except Exception as e:
                 await log_error(
                     self.bot,
-                    f"Level request edit was saved but its embed could not refresh message_id={message_id}: {repr(e)}",
+                    f"Level request edit was saved but its embed could not refresh message_id={exact_message_id}: {repr(e)}",
                 )
                 return await self._reply_ephemeral(
                     interaction,
@@ -3168,17 +3265,29 @@ class RequestLevelsCog(commands.Cog):
         return str(row["target_kind"]), row
 
     async def _channel_by_id(self, guild: discord.Guild, channel_id: int) -> Optional[discord.TextChannel]:
-        channel = guild.get_channel(channel_id) if channel_id else None
-        if channel is None and channel_id:
-            try:
-                channel = await guild.fetch_channel(channel_id)
-            except Exception:
-                channel = None
+        if not channel_id:
+            return None
+        try:
+            channel, _recovered = await fetch_persisted_channel(guild, channel_id)
+        except discord.NotFound:
+            channel = None
         return channel if isinstance(channel, discord.TextChannel) else None
 
     async def _review_target_channel(self, guild: discord.Guild, target_kind: str, row) -> Optional[discord.TextChannel]:
         if target_kind == "weekly":
-            return await self._channel_by_id(guild, int(self._row_value(row, "channel_id", 0) or 0))
+            stored_channel_id = int(self._row_value(row, "channel_id", 0) or 0)
+            channel = await self._channel_by_id(guild, stored_channel_id)
+            if channel is not None and channel.id != stored_channel_id:
+                await self.bot.db.execute(
+                    "UPDATE weekly_request_reviews SET channel_id=? "
+                    "WHERE guild_id=? AND request_message_id=?",
+                    (
+                        channel.id,
+                        guild.id,
+                        int(self._row_value(row, "request_message_id", 0) or 0),
+                    ),
+                )
+            return channel
         return await self._configured_channel(guild, "level_requested")
 
     async def handle_review_button(self, interaction: discord.Interaction, action: str):
@@ -3268,13 +3377,33 @@ class RequestLevelsCog(commands.Cog):
             try:
                 if target_kind == "weekly":
                     await self.bot.db.execute(
-                        "UPDATE weekly_request_reviews SET status='reviewed', result=?, review_text=?, reviewed_by=?, reviewed_ts=? WHERE guild_id=? AND request_message_id=? AND status='pending'",
-                        (result_key, review, reviewer_id, reviewed_ts, interaction.guild.id, message_id),
+                        "UPDATE weekly_request_reviews SET request_message_id=?, status='reviewed', result=?, "
+                        "review_text=?, reviewed_by=?, reviewed_ts=? "
+                        "WHERE guild_id=? AND request_message_id=? AND status='pending'",
+                        (
+                            message_id,
+                            result_key,
+                            review,
+                            reviewer_id,
+                            reviewed_ts,
+                            interaction.guild.id,
+                            message_id,
+                        ),
                     )
                 else:
                     await self.bot.db.execute(
-                        "UPDATE level_request_submissions SET status='reviewed', result=?, review_text=?, reviewed_by=?, reviewed_ts=? WHERE guild_id=? AND request_message_id=? AND status='pending'",
-                        (result_key, review, reviewer_id, reviewed_ts, interaction.guild.id, message_id),
+                        "UPDATE level_request_submissions SET request_message_id=?, status='reviewed', result=?, "
+                        "review_text=?, reviewed_by=?, reviewed_ts=? "
+                        "WHERE guild_id=? AND request_message_id=? AND status='pending'",
+                        (
+                            message_id,
+                            result_key,
+                            review,
+                            reviewer_id,
+                            reviewed_ts,
+                            interaction.guild.id,
+                            message_id,
+                        ),
                     )
             except Exception as e:
                 try:
@@ -3420,12 +3549,26 @@ class RequestLevelsCog(commands.Cog):
                 default_color=self._color_name("pending", "blurple"),
             )
             msg = None
+            recovered_message = False
             message_id = int(row["request_message_id"] or 0)
             if message_id:
                 try:
-                    msg = await target_channel.fetch_message(message_id)
-                except Exception:
-                    msg = None
+                    msg, recovered_message = await fetch_persisted_message(
+                        target_channel,
+                        message_id,
+                        author_id=int(
+                            getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                        ),
+                    )
+                except Exception as e:
+                    result["errors"].append(
+                        f"pending message {message_id}: {type(e).__name__}"
+                    )
+                    await log_error(
+                        self.bot,
+                        f"Request repair could not resolve pending request {message_id}: {repr(e)}",
+                    )
+                    continue
 
             try:
                 if msg is None:
@@ -3446,9 +3589,16 @@ class RequestLevelsCog(commands.Cog):
                             pass
                         raise
                     result["pending_messages_recreated"] += 1
-                elif refreshed_validation:
-                    await msg.edit(embed=embed, view=LevelRequestReviewView())
-                    result["pending_messages_refreshed"] += 1
+                else:
+                    if recovered_message:
+                        await self.bot.db.execute(
+                            "UPDATE level_request_submissions SET request_message_id=? "
+                            "WHERE guild_id=? AND wave_id=? AND user_id=? AND status='pending'",
+                            (msg.id, guild.id, int(row["wave_id"]), int(row["user_id"])),
+                        )
+                    if refreshed_validation or recovered_message:
+                        await msg.edit(embed=embed, view=LevelRequestReviewView())
+                        result["pending_messages_refreshed"] += 1
             except Exception as e:
                 result["errors"].append(f"pending message {message_id or 'new'}: {type(e).__name__}")
                 await log_error(self.bot, f"Request repair could not refresh pending request {message_id}: {repr(e)}")
@@ -3464,12 +3614,23 @@ class RequestLevelsCog(commands.Cog):
                 result["errors"].append(f"weekly channel {row['channel_id']}: missing")
                 continue
             try:
-                await channel.fetch_message(message_id)
-                continue
-            except discord.NotFound:
-                pass
+                existing_message, recovered_message = await fetch_persisted_message(
+                    channel,
+                    message_id,
+                    author_id=int(
+                        getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                    ),
+                )
             except Exception as e:
                 result["errors"].append(f"weekly pending {message_id}: {type(e).__name__}")
+                continue
+            if existing_message is not None:
+                if recovered_message or int(channel.id) != int(row["channel_id"] or 0):
+                    await self.bot.db.execute(
+                        "UPDATE weekly_request_reviews SET channel_id=?, request_message_id=? "
+                        "WHERE guild_id=? AND request_message_id=? AND status='pending'",
+                        (channel.id, existing_message.id, guild.id, message_id),
+                    )
                 continue
             data = self._safe_json_loads(row["data_json"], {})
             if not isinstance(data, dict):
@@ -3487,8 +3648,9 @@ class RequestLevelsCog(commands.Cog):
                     allowed_mentions=no_mentions(),
                 )
                 await self.bot.db.execute(
-                    "UPDATE weekly_request_reviews SET request_message_id=? WHERE guild_id=? AND request_message_id=? AND status='pending'",
-                    (new_msg.id, guild.id, message_id),
+                    "UPDATE weekly_request_reviews SET channel_id=?, request_message_id=? "
+                    "WHERE guild_id=? AND request_message_id=? AND status='pending'",
+                    (channel.id, new_msg.id, guild.id, message_id),
                 )
                 result["weekly_pending_messages_recreated"] += 1
             except Exception as e:
@@ -3506,7 +3668,21 @@ class RequestLevelsCog(commands.Cog):
         )
         for row in reviewed_rows:
             try:
-                msg = await target_channel.fetch_message(int(row["request_message_id"]))
+                msg, recovered_message = await fetch_persisted_message(
+                    target_channel,
+                    int(row["request_message_id"]),
+                    author_id=int(
+                        getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                    ),
+                )
+                if msg is None:
+                    continue
+                if recovered_message or int(channel.id) != int(row["channel_id"] or 0):
+                    await self.bot.db.execute(
+                        "UPDATE level_request_submissions SET request_message_id=? "
+                        "WHERE guild_id=? AND wave_id=? AND user_id=? AND status='reviewed'",
+                        (msg.id, guild.id, int(row["wave_id"]), int(row["user_id"])),
+                    )
                 data = self._safe_json_loads(row["data_json"], {})
                 embed = self._embed_from_template(
                     self._cfg("level_reviewed_embed", default={}) or {},
@@ -3540,7 +3716,26 @@ class RequestLevelsCog(commands.Cog):
                 channel = await self._channel_by_id(guild, int(row["channel_id"] or 0))
                 if not isinstance(channel, discord.TextChannel):
                     continue
-                msg = await channel.fetch_message(int(row["request_message_id"]))
+                msg, recovered_message = await fetch_persisted_message(
+                    channel,
+                    int(row["request_message_id"]),
+                    author_id=int(
+                        getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                    ),
+                )
+                if msg is None:
+                    continue
+                if recovered_message:
+                    await self.bot.db.execute(
+                        "UPDATE weekly_request_reviews SET channel_id=?, request_message_id=? "
+                        "WHERE guild_id=? AND request_message_id=? AND status='reviewed'",
+                        (
+                            channel.id,
+                            msg.id,
+                            guild.id,
+                            int(row["request_message_id"]),
+                        ),
+                    )
                 data = self._safe_json_loads(row["data_json"], {})
                 embed = self._embed_from_template(
                     self._cfg("level_reviewed_embed", default={}) or {},

@@ -5,6 +5,7 @@ import base64
 from contextlib import closing
 import json
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -123,8 +124,126 @@ def _is_recoverable_remote_error(exc: Exception) -> bool:
         "service unavailable",
         "connection reset",
         "timed out",
+        "file is not a database",
+        "sqlite_notadb",
+        "database disk image is malformed",
     )
     return any(marker in text for marker in markers)
+
+
+def _is_replica_corruption_error(exc: Exception) -> bool:
+    text = repr(exc).casefold()
+    markers = (
+        "file is not a database",
+        "sqlite_notadb",
+        "database disk image is malformed",
+        "sqlite_corrupt",
+        "malformed database schema",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _requires_libsql_integer_workaround(value: Any) -> bool:
+    # libsql-python 0.1.x extracts i32 first and falls back to f64. Binding
+    # larger Python ints directly therefore rounds Discord's 64-bit IDs.
+    return type(value) is int and not (-(2**31) <= value <= 2**31 - 1)
+
+
+def _exact_libsql_params(params: Sequence[Any]) -> tuple[Any, ...]:
+    return tuple(str(value) if _requires_libsql_integer_workaround(value) else value for value in params)
+
+
+def _legacy_libsql_value(value: Any) -> Any:
+    if _requires_libsql_integer_workaround(value):
+        return float(value)
+    return value
+
+
+def _legacy_where_params(sql: str, params: Sequence[Any]) -> Optional[tuple[Any, ...]]:
+    """Build a compatibility parameter set for rows written by old releases.
+
+    For UPDATE statements, values assigned before WHERE stay exact while only
+    lookup parameters are rounded. This lets a successful compatibility write
+    repair the row instead of storing another imprecise snowflake.
+    """
+    values = tuple(params)
+    if not any(_requires_libsql_integer_workaround(value) for value in values):
+        return None
+
+    statement = str(sql or "").lstrip()
+    match = re.search(r"\bWHERE\b", statement, flags=re.I)
+    if statement.upper().startswith("UPDATE"):
+        if match is None:
+            return None
+        where_param_start = statement[: match.start()].count("?")
+        return tuple(
+            value if index < where_param_start else _legacy_libsql_value(value)
+            for index, value in enumerate(values)
+        )
+    if statement.upper().startswith(("SELECT", "DELETE", "WITH")):
+        return tuple(_legacy_libsql_value(value) for value in values)
+    return None
+
+
+_USER_SNOWFLAKE_COLUMNS = {
+    "created_by",
+    "creator_id",
+    "decided_by",
+    "disabled_by",
+    "handled_by",
+    "requested_by",
+    "requester_id",
+    "responded_by",
+    "reviewed_by",
+    "satisfaction_user_id",
+    "uploaded_by",
+    "user_id",
+}
+_CHANNEL_SNOWFLAKE_COLUMNS = {
+    "channel_id",
+    "log_channel_id",
+    "offer_channel_id",
+    "pre_restore_backup_channel_id",
+    "report_channel_id",
+    "request_channel_id",
+    "ticket_channel_id",
+}
+_SNOWFLAKE_REPAIR_TABLES = {
+    "activity_counts",
+    "activity_last_counted",
+    "anti_farm_events",
+    "ban_info_requests",
+    "bot_releases",
+    "daily_stats",
+    "daily_summary_reports",
+    "database_backups",
+    "database_restore_log",
+    "help_cooldowns",
+    "help_sessions",
+    "help_submissions",
+    "impact_snapshots",
+    "level_request_edit_audit",
+    "level_request_scheduled_openings",
+    "level_request_state",
+    "level_request_submissions",
+    "level_request_wave_summaries",
+    "rps_streaks",
+    "sticky_state",
+    "ticket_cooldowns",
+    "ticket_sequences",
+    "ticket_transcripts",
+    "tickets",
+    "transcript_requests",
+    "weekly_claims",
+    "weekly_dm_log",
+    "weekly_recaps",
+    "weekly_reminders",
+    "weekly_request_reviews",
+    "weekly_reward_disabled",
+    "weekly_runs",
+    "weekly_sessions",
+    "weekly_streaks",
+}
 
 
 class Database:
@@ -146,9 +265,13 @@ class Database:
         self._ready = False
         self._remote_dirty = False
         self._remote_reconnect_required = False
+        self._replica_rebuild_required = False
         self._remote_sync_retry_after = 0.0
         self._last_remote_sync_error = ""
         self._last_remote_sync_error_ts = 0
+        self._replica_rebuild_count = 0
+        self._last_replica_rebuild_ts = 0
+        self._last_replica_rebuild_reason = ""
 
     def _close_connection_sync(self) -> None:
         if self._conn is None:
@@ -165,6 +288,73 @@ class Database:
         self._conn = self._open_connection_sync()
         self._ready = True
         self._remote_reconnect_required = False
+
+    def _adapt_params(self, params: Sequence[Any]) -> tuple[Any, ...]:
+        values = tuple(params)
+        return _exact_libsql_params(values) if self.uses_remote else values
+
+    def _execute_sync(self, sql: str, params: Sequence[Any] = ()) -> Any:
+        assert self._conn is not None
+        return self._conn.execute(sql, self._adapt_params(params))
+
+    def _execute_write_compat_sync(self, sql: str, params: Sequence[Any] = ()) -> Any:
+        cursor = self._execute_sync(sql, params)
+        if not self.uses_remote or int(getattr(cursor, "rowcount", -1) or 0) != 0:
+            return cursor
+        legacy_params = _legacy_where_params(sql, params)
+        if legacy_params is None or legacy_params == tuple(params):
+            return cursor
+        assert self._conn is not None
+        return self._conn.execute(sql, self._adapt_params(legacy_params))
+
+    def _quarantine_replica_files_sync(self) -> list[Path]:
+        stamp = f"{int(time.time())}-{os.getpid()}"
+        quarantined: list[Path] = []
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            source = self.path.parent / f"{self.path.name}{suffix}"
+            if not source.exists():
+                continue
+            target = self.path.parent / f".{self.path.name}{suffix}.corrupt-{stamp}"
+            try:
+                os.replace(source, target)
+                quarantined.append(target)
+            except FileNotFoundError:
+                continue
+
+        old_files = sorted(
+            self.path.parent.glob(f".{self.path.name}*.corrupt-*"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        for old_file in old_files[12:]:
+            try:
+                old_file.unlink()
+            except OSError:
+                pass
+        return quarantined
+
+    def _rebuild_remote_replica_sync(self, reason: Exception | str) -> None:
+        if not self.uses_remote:
+            raise RuntimeError("A local SQLite database cannot be rebuilt from a remote primary.")
+        self._close_connection_sync()
+        self._quarantine_replica_files_sync()
+        self._conn = self._open_connection_sync()
+        self._sync_remote_with_retry_sync()
+        self._ready = True
+        self._remote_dirty = False
+        self._remote_reconnect_required = False
+        self._replica_rebuild_required = False
+        self._remote_sync_retry_after = 0.0
+        self._last_remote_sync_error = ""
+        self._last_remote_sync_error_ts = 0
+        self._replica_rebuild_count += 1
+        self._last_replica_rebuild_ts = int(time.time())
+        self._last_replica_rebuild_reason = f"{type(reason).__name__}: {reason}"[:500]
+        print(
+            "[Avenue Guard database] Rebuilt the local Turso replica from the remote primary "
+            f"after {self._last_replica_rebuild_reason}",
+            flush=True,
+        )
 
     def _open_connection_sync(self) -> Any:
         if self.uses_remote:
@@ -220,6 +410,11 @@ class Database:
         """Retry a previously deferred remote sync without blocking every query."""
         if not self.uses_remote or not self._remote_dirty:
             return
+        if self._replica_rebuild_required:
+            self._rebuild_remote_replica_sync(
+                self._last_remote_sync_error or "local replica corruption"
+            )
+            return
         if self._remote_reconnect_required:
             # A failed Hrana transaction can leave the local connection unable
             # to serve even local work. Reopen it before honoring sync backoff.
@@ -229,6 +424,7 @@ class Database:
         try:
             self._sync_remote_with_retry_sync()
         except Exception as exc:
+            self._replica_rebuild_required = _is_replica_corruption_error(exc)
             self._remote_reconnect_required = _is_recoverable_remote_error(exc)
             self._last_remote_sync_error = f"{type(exc).__name__}: {exc}"[:1000]
             self._last_remote_sync_error_ts = int(time.time())
@@ -237,35 +433,22 @@ class Database:
             return
         self._remote_dirty = False
         self._remote_reconnect_required = False
+        self._replica_rebuild_required = False
         self._remote_sync_retry_after = 0.0
         self._last_remote_sync_error = ""
         self._last_remote_sync_error_ts = 0
 
     def _commit_and_sync_sync(self) -> None:
+        """Commit a transaction without forcing a full replica pull.
+
+        Embedded-replica writes are forwarded to Turso's primary and reflected
+        into the local file as part of the write path. Calling ``sync()`` after
+        every transaction only performs an extra pull, amplifies S3 traffic,
+        and exposes unrelated commands to transient replica-sync failures.
+        Explicit pulls remain at startup, backup, shutdown, and ``sync_remote``.
+        """
         assert self._conn is not None
         self._conn.commit()
-        try:
-            self._sync_remote_with_retry_sync()
-        except Exception as exc:
-            # The local commit already succeeded. A replication failure must
-            # not make callers re-run a non-idempotent write such as an
-            # activity increment. Initial connection still performs a strict
-            # sync, so invalid credentials prevent startup rather than silently
-            # running as local-only storage.
-            if self.uses_remote:
-                self._remote_dirty = True
-                self._remote_reconnect_required = _is_recoverable_remote_error(exc)
-                self._last_remote_sync_error = f"{type(exc).__name__}: {exc}"[:1000]
-                self._last_remote_sync_error_ts = int(time.time())
-                retry_delay = 5.0 if _is_recoverable_remote_error(exc) else 60.0
-                self._remote_sync_retry_after = time.monotonic() + retry_delay
-                return
-            raise
-        self._remote_dirty = False
-        self._remote_reconnect_required = False
-        self._remote_sync_retry_after = 0.0
-        self._last_remote_sync_error = ""
-        self._last_remote_sync_error_ts = 0
 
     async def _run_locked_with_retry(
         self,
@@ -290,7 +473,10 @@ class Database:
                     last_error = exc
                     should_recover = self.uses_remote and _is_recoverable_remote_error(exc)
                     if should_recover:
-                        await asyncio.to_thread(self._reopen_connection_sync)
+                        if _is_replica_corruption_error(exc):
+                            await asyncio.to_thread(self._rebuild_remote_replica_sync, exc)
+                        else:
+                            await asyncio.to_thread(self._reopen_connection_sync)
                     if not should_recover or attempt >= attempts - 1:
                         raise
 
@@ -306,13 +492,25 @@ class Database:
                 return
 
             def _connect_and_migrate():
-                if self._conn is None:
-                    self._conn = self._open_connection_sync()
+                try:
+                    if self._conn is None:
+                        self._conn = self._open_connection_sync()
 
-                assert self._conn is not None
-                self._migrate_sync()
-                self._sync_remote_with_retry_sync()
+                    assert self._conn is not None
+                    if self.uses_remote:
+                        # Pull the durable primary before any local migration.
+                        # A fresh or discarded replica must never publish an
+                        # empty local view over existing cloud state.
+                        self._sync_remote_with_retry_sync()
+                    self._migrate_sync()
+                except Exception as exc:
+                    if not self.uses_remote or not _is_replica_corruption_error(exc):
+                        raise
+                    self._rebuild_remote_replica_sync(exc)
+                    self._ready = False
+                    self._migrate_sync()
                 self._remote_reconnect_required = False
+                self._replica_rebuild_required = False
 
             await asyncio.to_thread(_connect_and_migrate)
             self._ready = True
@@ -368,7 +566,13 @@ class Database:
                         raise sqlite3.DatabaseError(f"backup integrity_check returned {result!r}")
                 return int(target.stat().st_size)
 
-            return await asyncio.to_thread(_backup)
+            try:
+                return await asyncio.to_thread(_backup)
+            except Exception as exc:
+                if not self.uses_remote or not _is_replica_corruption_error(exc):
+                    raise
+                await asyncio.to_thread(self._rebuild_remote_replica_sync, exc)
+                return await asyncio.to_thread(_backup)
 
     async def restore_from(self, source_path: str | Path) -> int:
         """Replace the live SQLite file with a validated backup and migrate it.
@@ -485,6 +689,9 @@ class Database:
                 rank INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 contacted_ts INTEGER NOT NULL,
+                offer_channel_id INTEGER,
+                offer_message_id INTEGER,
+                offer_expires_ts INTEGER,
                 PRIMARY KEY (guild_id, week_start, user_id)
             );""",
             """CREATE TABLE IF NOT EXISTS weekly_sessions(
@@ -510,6 +717,11 @@ class Database:
                 week_start TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
                 reminded_ts INTEGER NOT NULL,
+                delivery_status TEXT NOT NULL DEFAULT 'sent',
+                channel_id INTEGER,
+                message_id INTEGER,
+                attempted_ts INTEGER,
+                error_text TEXT,
                 PRIMARY KEY (guild_id, week_start, user_id)
             );""",
             """CREATE TABLE IF NOT EXISTS weekly_runs(
@@ -582,6 +794,10 @@ class Database:
                 satisfaction_user_id INTEGER,
                 satisfaction_ts INTEGER,
                 satisfaction_message_id INTEGER,
+                satisfaction_delivery_status TEXT NOT NULL DEFAULT 'pending',
+                satisfaction_delivery_error TEXT,
+                satisfaction_attempted_ts INTEGER,
+                satisfaction_resolution_version INTEGER NOT NULL DEFAULT 0,
                 closing_prompt_message_id INTEGER,
                 opening_message_id INTEGER
             );""",
@@ -812,6 +1028,8 @@ class Database:
                 created_by INTEGER,
                 created_ts INTEGER NOT NULL,
                 approval_message_id INTEGER,
+                approval_delivery_status TEXT NOT NULL DEFAULT 'pending',
+                approval_attempted_ts INTEGER,
                 decided_by INTEGER,
                 decided_ts INTEGER,
                 error_text TEXT
@@ -886,8 +1104,41 @@ class Database:
         self._ensure_column_sync("tickets", "satisfaction_user_id", "INTEGER")
         self._ensure_column_sync("tickets", "satisfaction_ts", "INTEGER")
         self._ensure_column_sync("tickets", "satisfaction_message_id", "INTEGER")
+        self._ensure_column_sync(
+            "tickets",
+            "satisfaction_delivery_status",
+            "TEXT NOT NULL DEFAULT 'pending'",
+        )
+        self._ensure_column_sync("tickets", "satisfaction_delivery_error", "TEXT")
+        self._ensure_column_sync("tickets", "satisfaction_attempted_ts", "INTEGER")
+        self._ensure_column_sync(
+            "tickets",
+            "satisfaction_resolution_version",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        self._conn.execute(
+            "UPDATE tickets SET satisfaction_delivery_status='sent' "
+            "WHERE satisfaction_message_id IS NOT NULL AND satisfaction_score IS NULL "
+            "AND satisfaction_delivery_status='pending'"
+        )
+        self._conn.execute(
+            "UPDATE tickets SET satisfaction_delivery_status='completed' "
+            "WHERE satisfaction_score IS NOT NULL"
+        )
         self._ensure_column_sync("tickets", "closing_prompt_message_id", "INTEGER")
         self._ensure_column_sync("tickets", "opening_message_id", "INTEGER")
+        self._ensure_column_sync("weekly_claims", "offer_channel_id", "INTEGER")
+        self._ensure_column_sync("weekly_claims", "offer_message_id", "INTEGER")
+        self._ensure_column_sync("weekly_claims", "offer_expires_ts", "INTEGER")
+        self._ensure_column_sync(
+            "weekly_reminders",
+            "delivery_status",
+            "TEXT NOT NULL DEFAULT 'sent'",
+        )
+        self._ensure_column_sync("weekly_reminders", "channel_id", "INTEGER")
+        self._ensure_column_sync("weekly_reminders", "message_id", "INTEGER")
+        self._ensure_column_sync("weekly_reminders", "attempted_ts", "INTEGER")
+        self._ensure_column_sync("weekly_reminders", "error_text", "TEXT")
         self._ensure_column_sync("weekly_sessions", "decline_prompt_message_id", "INTEGER")
         self._ensure_column_sync("transcript_requests", "ticket_id", "INTEGER")
         self._ensure_column_sync("transcript_requests", "updated_ts", "INTEGER")
@@ -923,6 +1174,21 @@ class Database:
         self._ensure_column_sync("level_request_scheduled_openings", "opened_wave_id", "INTEGER")
         self._ensure_column_sync("level_request_scheduled_openings", "request_type", "TEXT")
         self._ensure_column_sync("level_request_scheduled_openings", "open_message", "TEXT")
+        self._ensure_column_sync(
+            "bot_releases",
+            "approval_delivery_status",
+            "TEXT NOT NULL DEFAULT 'pending'",
+        )
+        self._ensure_column_sync("bot_releases", "approval_attempted_ts", "INTEGER")
+        self._conn.execute(
+            "UPDATE bot_releases SET approval_delivery_status='sent' "
+            "WHERE approval_message_id IS NOT NULL "
+            "AND approval_delivery_status='pending'"
+        )
+        self._conn.execute(
+            "UPDATE bot_releases SET approval_delivery_status='completed' "
+            "WHERE status IN ('approved','rejected')"
+        )
         self._normalize_weekly_dm_log_sync()
         self._init_ticket_sequences_sync()
         for stmt in index_stmts:
@@ -975,23 +1241,26 @@ class Database:
         assert self._conn is not None
         for gid_row in _fetchall(self._conn.execute("SELECT DISTINCT guild_id FROM tickets")):
             gid = int(_row_get(gid_row, "guild_id", index=0, default=0) or 0)
-            max_row = self._conn.execute(
+            max_row = self._execute_sync(
                 "SELECT MAX(ticket_id) AS m FROM tickets WHERE guild_id=?",
                 (gid,),
             ).fetchone()
             max_value = _row_get(max_row, "m", index=0)
             max_id = int(max_value) if max_value is not None else 0
-            cur2 = self._conn.execute("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (gid,))
+            cur2 = self._execute_sync(
+                "SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?",
+                (gid,),
+            )
             sequence_row = cur2.fetchone()
             if sequence_row is None:
-                self._conn.execute(
+                self._execute_sync(
                     "INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)",
                     (gid, max_id + 1 if max_id > 0 else 1),
                 )
             else:
                 current_next = int(_row_get(sequence_row, "next_ticket_id", index=0, default=1) or 1)
                 if current_next <= max_id:
-                    self._conn.execute(
+                    self._execute_sync(
                         "UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?",
                         (max_id + 1, gid),
                     )
@@ -999,15 +1268,24 @@ class Database:
     async def next_ticket_id(self, guild_id: int) -> int:
         def _run():
             assert self._conn is not None
-            cur = self._conn.execute("SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?", (guild_id,))
+            cur = self._execute_sync(
+                "SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?",
+                (guild_id,),
+            )
             row = cur.fetchone()
             if row is None:
                 next_id = 1
-                self._conn.execute("INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)", (guild_id, 2))
+                self._execute_sync(
+                    "INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)",
+                    (guild_id, 2),
+                )
                 self._commit_and_sync_sync()
                 return next_id
             next_id = int(_row_get(row, "next_ticket_id", index=0, default=1) or 1)
-            self._conn.execute("UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?", (next_id + 1, guild_id))
+            self._execute_write_compat_sync(
+                "UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?",
+                (next_id + 1, guild_id),
+            )
             self._commit_and_sync_sync()
             return next_id
 
@@ -1016,7 +1294,7 @@ class Database:
     async def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
         def _run():
             assert self._conn is not None
-            self._conn.execute(sql, params)
+            self._execute_write_compat_sync(sql, params)
             self._commit_and_sync_sync()
 
         await self._run_locked_with_retry(_run, retry_operation=False)
@@ -1026,7 +1304,7 @@ class Database:
 
         def _run() -> int:
             assert self._conn is not None
-            cursor = self._conn.execute(sql, params)
+            cursor = self._execute_sync(sql, params)
             row_id = getattr(cursor, "lastrowid", None)
             if row_id is None:
                 row = self._conn.execute("SELECT last_insert_rowid()").fetchone()
@@ -1052,7 +1330,7 @@ class Database:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 for sql, params in items:
-                    self._conn.execute(sql, params)
+                    self._execute_write_compat_sync(sql, params)
                 self._commit_and_sync_sync()
             except Exception:
                 try:
@@ -1083,8 +1361,157 @@ class Database:
         except Exception:
             return default
 
+    async def repair_legacy_snowflake_precision(
+        self,
+        *,
+        guild_ids: Sequence[int] = (),
+        user_ids: Sequence[int] = (),
+        channel_ids: Sequence[int] = (),
+    ) -> dict[str, int]:
+        """Repair IDs rounded by libsql-python's historical f64 fallback.
+
+        Only IDs supplied by Discord itself are trusted. Ambiguous 256-value
+        buckets are skipped, and conflicting rows are retained for manual
+        inspection instead of being deleted.
+        """
+        if not self.uses_remote:
+            return {
+                "updated": 0,
+                "conflicts": 0,
+                "ambiguous": 0,
+                "feedback_requeued": 0,
+            }
+
+        def _mapping(values: Sequence[int]) -> tuple[dict[int, int], int]:
+            candidates: dict[int, set[int]] = {}
+            for raw_value in values:
+                try:
+                    exact = int(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if not _requires_libsql_integer_workaround(exact):
+                    continue
+                legacy = int(float(exact))
+                candidates.setdefault(legacy, set()).add(exact)
+            mapping = {
+                legacy: next(iter(exact_values))
+                for legacy, exact_values in candidates.items()
+                if len(exact_values) == 1 and next(iter(exact_values)) != legacy
+            }
+            ambiguous = sum(1 for exact_values in candidates.values() if len(exact_values) > 1)
+            return mapping, ambiguous
+
+        guild_map, guild_ambiguous = _mapping(guild_ids)
+        user_map, user_ambiguous = _mapping(user_ids)
+        channel_map, channel_ambiguous = _mapping(channel_ids)
+
+        def _run() -> dict[str, int]:
+            assert self._conn is not None
+            result = {
+                "updated": 0,
+                "conflicts": 0,
+                "ambiguous": guild_ambiguous + user_ambiguous + channel_ambiguous,
+                "feedback_requeued": 0,
+            }
+            table_rows = _fetchall(
+                self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            )
+            tables = [str(_row_get(row, "name", index=0, default="")) for row in table_rows]
+
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                for table in tables:
+                    if table not in _SNOWFLAKE_REPAIR_TABLES:
+                        continue
+                    info = _fetchall(self._conn.execute(f"PRAGMA table_info({table})"))
+                    columns = {
+                        str(_row_get(row, "name", index=1, default=""))
+                        for row in info
+                    }
+                    for column in columns:
+                        mapping: dict[int, int]
+                        if column == "guild_id":
+                            mapping = guild_map
+                        elif column in _USER_SNOWFLAKE_COLUMNS:
+                            mapping = user_map
+                        elif column in _CHANNEL_SNOWFLAKE_COLUMNS:
+                            mapping = channel_map
+                        else:
+                            continue
+                        if not mapping:
+                            continue
+
+                        # Both identifiers are selected from fixed registries
+                        # above; neither can contain user or configuration data.
+                        values = _fetchall(
+                            self._conn.execute(
+                                f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"  # nosec
+                            )
+                        )
+                        for value_row in values:
+                            stored_raw = _row_get(value_row, column, index=0)
+                            try:
+                                stored = int(stored_raw)
+                            except (TypeError, ValueError):
+                                continue
+                            exact = mapping.get(stored)
+                            if exact is None or exact == stored:
+                                continue
+                            cursor = self._conn.execute(
+                                f"UPDATE OR IGNORE {table} SET {column}=? WHERE {column}=?",  # nosec
+                                (str(exact), str(stored)),
+                            )
+                            changed = max(0, int(getattr(cursor, "rowcount", 0) or 0))
+                            result["updated"] += changed
+                            if table == "tickets" and column == "creator_id" and changed:
+                                retry_cursor = self._conn.execute(
+                                    "UPDATE tickets SET satisfaction_delivery_status='pending', "
+                                    "satisfaction_delivery_error=NULL "
+                                    "WHERE creator_id=? AND satisfaction_score IS NULL "
+                                    "AND satisfaction_message_id IS NULL "
+                                    "AND satisfaction_delivery_status='recipient_unavailable'",
+                                    (str(exact),),
+                                )
+                                result["feedback_requeued"] += max(
+                                    0,
+                                    int(getattr(retry_cursor, "rowcount", 0) or 0),
+                                )
+                            remaining = self._conn.execute(
+                                f"SELECT COUNT(*) FROM {table} WHERE {column}=?",  # nosec
+                                (str(stored),),
+                            ).fetchone()
+                            result["conflicts"] += int(
+                                _row_get(remaining, "COUNT(*)", index=0, default=0) or 0
+                            )
+                self._commit_and_sync_sync()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                raise
+            return result
+
+        return await self._run_locked_with_retry(_run, retry_operation=True)
+
+    def health_snapshot(self) -> dict[str, Any]:
+        return {
+            "uses_remote": self.uses_remote,
+            "remote_dirty": self._remote_dirty,
+            "replica_refresh_pending": self._remote_dirty,
+            "remote_reconnect_required": self._remote_reconnect_required,
+            "replica_rebuild_required": self._replica_rebuild_required,
+            "last_remote_sync_error": self._last_remote_sync_error,
+            "last_remote_sync_error_ts": self._last_remote_sync_error_ts,
+            "replica_rebuild_count": self._replica_rebuild_count,
+            "last_replica_rebuild_ts": self._last_replica_rebuild_ts,
+            "last_replica_rebuild_reason": self._last_replica_rebuild_reason,
+        }
+
     async def sync_remote(self) -> bool:
-        """Force any pending embedded-replica changes toward the remote primary."""
+        """Pull the latest remote primary state into the embedded replica."""
         if not self.uses_remote:
             return True
 
@@ -1092,6 +1519,7 @@ class Database:
             self._sync_remote_with_retry_sync()
             self._remote_dirty = False
             self._remote_reconnect_required = False
+            self._replica_rebuild_required = False
             self._remote_sync_retry_after = 0.0
             self._last_remote_sync_error = ""
             self._last_remote_sync_error_ts = 0
@@ -1104,7 +1532,8 @@ class Database:
 
         def _run():
             assert self._conn is not None
-            self._conn.executemany(sql, items)
+            for params in items:
+                self._execute_write_compat_sync(sql, params)
             self._commit_and_sync_sync()
 
         await self._run_locked_with_retry(_run, retry_operation=False)
@@ -1112,8 +1541,14 @@ class Database:
     async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[Any]:
         def _run():
             assert self._conn is not None
-            cur = self._conn.execute(sql, params)
-            return _normalize_row(cur, cur.fetchone())
+            cur = self._execute_sync(sql, params)
+            row = cur.fetchone()
+            if row is None and self.uses_remote:
+                legacy_params = _legacy_where_params(sql, params)
+                if legacy_params is not None and legacy_params != tuple(params):
+                    cur = self._conn.execute(sql, self._adapt_params(legacy_params))
+                    row = cur.fetchone()
+            return _normalize_row(cur, row)
 
         return await self._run_locked_with_retry(_run)
 
@@ -1127,15 +1562,27 @@ class Database:
 
         def _run():
             assert self._conn is not None
-            cur = self._conn.execute(sql, params)
-            return _normalize_row(cur, cur.fetchone())
+            cur = self._execute_sync(sql, params)
+            row = cur.fetchone()
+            if row is None and self.uses_remote:
+                legacy_params = _legacy_where_params(sql, params)
+                if legacy_params is not None and legacy_params != tuple(params):
+                    cur = self._conn.execute(sql, self._adapt_params(legacy_params))
+                    row = cur.fetchone()
+            return _normalize_row(cur, row)
 
         return await self._run_locked_with_retry(_run, attempt_pending_sync=False)
 
     async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[Any]:
         def _run():
             assert self._conn is not None
-            cur = self._conn.execute(sql, params)
-            return _normalize_rows(cur, cur.fetchall())
+            cur = self._execute_sync(sql, params)
+            rows = cur.fetchall()
+            if not rows and self.uses_remote:
+                legacy_params = _legacy_where_params(sql, params)
+                if legacy_params is not None and legacy_params != tuple(params):
+                    cur = self._conn.execute(sql, self._adapt_params(legacy_params))
+                    rows = cur.fetchall()
+            return _normalize_rows(cur, rows)
 
         return await self._run_locked_with_retry(_run)

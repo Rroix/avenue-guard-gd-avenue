@@ -154,8 +154,14 @@ def get_public_bot_payload() -> dict:
 
     state = str(status.get("state") or "unknown")
     online_since_ts = int(status.get("online_since_ts") or 0)
+    service_uptime_seconds = max(0, now - _process_started_ts)
+    discord_connection_uptime_seconds = (
+        max(0, now - online_since_ts)
+        if state == "online" and online_since_ts
+        else 0
+    )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "service": "Avenue Guard",
         "bot_name": str(metrics.get("bot_name") or "Avenue Guard"),
         "avatar_url": str(metrics.get("avatar_url") or ""),
@@ -167,14 +173,17 @@ def get_public_bot_payload() -> dict:
             if current_release
             else "Version unavailable"
         ),
+        # Canonical names distinguish the Render process lifetime from a
+        # Discord gateway session, which can reconnect without a bot restart.
+        "service_started_ts": _process_started_ts,
+        "service_uptime_seconds": service_uptime_seconds,
+        "discord_connected_since_ts": online_since_ts,
+        "discord_connection_uptime_seconds": discord_connection_uptime_seconds,
+        # Keep schema-v2 names so older status-page deployments remain valid.
         "process_started_ts": _process_started_ts,
-        "process_uptime_seconds": max(0, now - _process_started_ts),
+        "process_uptime_seconds": service_uptime_seconds,
         "online_since_ts": online_since_ts,
-        "online_uptime_seconds": (
-            max(0, now - online_since_ts)
-            if state == "online" and online_since_ts
-            else 0
-        ),
+        "online_uptime_seconds": discord_connection_uptime_seconds,
         "latency_ms": metrics.get("latency_ms"),
         "guild_count": int(metrics.get("guild_count") or 0),
         "member_count": int(metrics.get("member_count") or 0),

@@ -1,9 +1,11 @@
 import asyncio
 from contextlib import closing
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
+import utils.db as db_module
 from utils.db import Database
 
 
@@ -30,7 +32,15 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     } <= tables
 
     ticket_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(tickets)")}
-    assert {"opening_message_id", "closing_prompt_message_id", "satisfaction_message_id"} <= ticket_columns
+    assert {
+        "opening_message_id",
+        "closing_prompt_message_id",
+        "satisfaction_message_id",
+        "satisfaction_delivery_status",
+        "satisfaction_delivery_error",
+        "satisfaction_attempted_ts",
+        "satisfaction_resolution_version",
+    } <= ticket_columns
 
     transcript_request_columns = {
         str(row["name"])
@@ -42,6 +52,28 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         str(row["name"]) for row in await db.fetchall("PRAGMA table_info(level_request_submissions)")
     }
     assert "edit_deadline_ts" in request_columns
+
+    weekly_claim_columns = {
+        str(row["name"]) for row in await db.fetchall("PRAGMA table_info(weekly_claims)")
+    }
+    assert {"offer_channel_id", "offer_message_id", "offer_expires_ts"} <= weekly_claim_columns
+
+    weekly_reminder_columns = {
+        str(row["name"])
+        for row in await db.fetchall("PRAGMA table_info(weekly_reminders)")
+    }
+    assert {
+        "delivery_status",
+        "channel_id",
+        "message_id",
+        "attempted_ts",
+        "error_text",
+    } <= weekly_reminder_columns
+
+    release_columns = {
+        str(row["name"]) for row in await db.fetchall("PRAGMA table_info(bot_releases)")
+    }
+    assert {"approval_delivery_status", "approval_attempted_ts"} <= release_columns
     await db.close()
 
 
@@ -191,23 +223,24 @@ async def test_local_interaction_read_skips_pending_remote_sync(tmp_path):
     await db.close()
 
 
-def test_recoverable_remote_sync_marks_connection_for_reopen(tmp_path):
+def test_remote_commit_does_not_force_a_replica_pull(tmp_path):
     class Connection:
+        sync_calls = 0
+
         def commit(self):
             return None
+
+        def sync(self):
+            self.sync_calls += 1
+            raise AssertionError("a normal commit must not perform a replica pull")
 
     db = Database(str(tmp_path / "replica.db"))
     db.uses_remote = True
     db._conn = Connection()
-
-    def fail_sync():
-        raise ValueError("connection has reached an invalid state, started with Txn")
-
-    db._sync_remote_with_retry_sync = fail_sync
     db._commit_and_sync_sync()
 
-    assert db._remote_dirty is True
-    assert db._remote_reconnect_required is True
+    assert db._conn.sync_calls == 0
+    assert db._remote_dirty is False
 
 
 def test_pending_sync_reopens_invalid_connection_before_backoff(tmp_path):
@@ -227,3 +260,184 @@ def test_pending_sync_reopens_invalid_connection_before_backoff(tmp_path):
 
     assert reopened == [True]
     assert db._remote_dirty is True
+
+
+@pytest.mark.asyncio
+async def test_remote_parameter_adapter_preserves_64_bit_discord_ids(tmp_path):
+    path = tmp_path / "snowflakes.db"
+    db = Database(str(path))
+    db.uses_remote = True
+    db._conn = db_module.libsql.connect(str(path))
+    db._ready = True
+    await db.execute(
+        "CREATE TABLE sticky_state("
+        "guild_id INTEGER NOT NULL,channel_id INTEGER NOT NULL,"
+        "last_sticky_message_id INTEGER,PRIMARY KEY(guild_id,channel_id))"
+    )
+
+    guild_id = 717003826288394271
+    channel_id = 1480304268346130552
+    message_id = 1548671314074673201
+    await db.execute(
+        "INSERT INTO sticky_state(guild_id,channel_id,last_sticky_message_id) VALUES(?,?,?)",
+        (guild_id, channel_id, message_id),
+    )
+
+    row = await db.fetchone(
+        "SELECT guild_id,channel_id,last_sticky_message_id FROM sticky_state "
+        "WHERE guild_id=? AND channel_id=?",
+        (guild_id, channel_id),
+    )
+    assert int(row["guild_id"]) == guild_id
+    assert int(row["channel_id"]) == channel_id
+    assert int(row["last_sticky_message_id"]) == message_id
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_compatibility_lookup_repairs_legacy_rounded_ids(tmp_path):
+    db = Database(str(tmp_path / "legacy-snowflakes.db"))
+    await db.connect()
+
+    guild_id = 717003826288394271
+    channel_id = 1480304268346130553
+    message_id = 1548671314074673201
+    rounded_guild = int(float(guild_id))
+    rounded_channel = int(float(channel_id))
+    rounded_message = int(float(message_id))
+    assert (rounded_guild, rounded_channel, rounded_message) != (
+        guild_id,
+        channel_id,
+        message_id,
+    )
+    await db.execute(
+        "INSERT INTO sticky_state(guild_id,channel_id,last_sticky_message_id) VALUES(?,?,?)",
+        (rounded_guild, rounded_channel, rounded_message),
+    )
+    db.uses_remote = True
+
+    legacy_row = await db.fetchone(
+        "SELECT guild_id,channel_id,last_sticky_message_id FROM sticky_state "
+        "WHERE guild_id=? AND channel_id=?",
+        (guild_id, channel_id),
+    )
+    assert int(legacy_row["guild_id"]) == rounded_guild
+
+    await db.execute(
+        "UPDATE sticky_state SET guild_id=?,channel_id=?,last_sticky_message_id=? "
+        "WHERE guild_id=? AND channel_id=?",
+        (guild_id, channel_id, message_id, guild_id, channel_id),
+    )
+    repaired = await db.fetchone(
+        "SELECT guild_id,channel_id,last_sticky_message_id FROM sticky_state "
+        "WHERE guild_id=? AND channel_id=?",
+        (guild_id, channel_id),
+    )
+    assert int(repaired["guild_id"]) == guild_id
+    assert int(repaired["channel_id"]) == channel_id
+    assert int(repaired["last_sticky_message_id"]) == message_id
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_repair_recovers_known_users_channels_and_feedback(tmp_path):
+    db = Database(str(tmp_path / "startup-repair.db"))
+    await db.connect()
+    guild_id = 717003826288394271
+    channel_id = 1480304268346130553
+    user_id = 1115678273079349288
+    await db.execute(
+        "INSERT INTO tickets("
+        "guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,"
+        "ticket_id,closed_ts,satisfaction_delivery_status,satisfaction_delivery_error"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (
+            int(float(guild_id)),
+            int(float(channel_id)),
+            int(float(user_id)),
+            1,
+            1,
+            "closed",
+            6,
+            2,
+            "recipient_unavailable",
+            "legacy rounded identity",
+        ),
+    )
+    db.uses_remote = True
+
+    result = await db.repair_legacy_snowflake_precision(
+        guild_ids=(guild_id,),
+        user_ids=(user_id,),
+        channel_ids=(channel_id,),
+    )
+    row = await db.fetchone(
+        "SELECT guild_id,channel_id,creator_id,satisfaction_delivery_status,"
+        "satisfaction_delivery_error FROM tickets WHERE guild_id=? AND ticket_id=6",
+        (guild_id,),
+    )
+
+    assert result["updated"] >= 3
+    assert result["feedback_requeued"] == 1
+    assert int(row["guild_id"]) == guild_id
+    assert int(row["channel_id"]) == channel_id
+    assert int(row["creator_id"]) == user_id
+    assert row["satisfaction_delivery_status"] == "pending"
+    assert row["satisfaction_delivery_error"] is None
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_repair_skips_float_bucket_with_two_real_discord_ids(tmp_path):
+    db = Database(str(tmp_path / "ambiguous-snowflakes.db"))
+    await db.connect()
+    guild_id = 717003826288394271
+    rounded_user_id = 1129311352628989952
+    neighboring_user_id = rounded_user_id + 31
+    assert int(float(neighboring_user_id)) == rounded_user_id
+    await db.execute(
+        "INSERT INTO tickets("
+        "guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,ticket_id"
+        ") VALUES(?,?,?,?,?,?,?)",
+        (guild_id, 999, rounded_user_id, 1, 1, "closed", 6),
+    )
+    db.uses_remote = True
+
+    result = await db.repair_legacy_snowflake_precision(
+        guild_ids=(guild_id,),
+        user_ids=(rounded_user_id, neighboring_user_id),
+    )
+    row = await db.fetchone(
+        "SELECT creator_id FROM tickets WHERE guild_id=? AND ticket_id=6",
+        (guild_id,),
+    )
+
+    assert result["ambiguous"] >= 1
+    assert int(row["creator_id"]) == rounded_user_id
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_remote_replica_is_quarantined_and_rebuilt(tmp_path, monkeypatch):
+    path = tmp_path / "replica.db"
+    path.write_bytes(b"this is not a SQLite database")
+
+    def connect(database, **_kwargs):
+        conn = sqlite3.connect(database, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(db_module, "libsql", SimpleNamespace(connect=connect))
+    db = Database(
+        str(path),
+        remote_url="libsql://example.invalid",
+        auth_token="database-token",
+    )
+    await db.connect()
+
+    assert db.health_snapshot()["replica_rebuild_count"] == 1
+    assert list(tmp_path.glob(".replica.db.corrupt-*"))
+    assert await db.fetchone(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tickets'"
+    ) is not None
+    await db.close()

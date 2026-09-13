@@ -272,7 +272,7 @@ Public bot updates live under `release_updates` in `config.json`.
 - `public_api_url`: the Render service base URL checked by `/bot config_check`.
 - Pending, approved, and rejected proposals are stored in `bot_releases`, including the approval message and decision audit fields.
 - `bot_uptime_tracker` stores the availability measurement start, latest heartbeat, observed time, and online time in Turso.
-- `/api/bot` exposes operational state, current connected uptime, process uptime, measured availability, latency, the configured GD Avenue guild's member count, avatar, and latest published version.
+- `/api/bot` exposes operational state, service-process uptime, the separate Discord gateway-session uptime, measured availability, latency, the configured GD Avenue guild's member count, avatar, and latest published version.
 - `/api/releases` exposes approved release titles, summaries, changes, versions, and publication timestamps. Pending and rejected proposals, owner IDs, errors, and database details are never returned.
 - Both endpoints allow read-only cross-origin requests so the static Netlify page can refresh without holding a secret.
 
@@ -390,7 +390,11 @@ Useful bot permissions:
 
 ## Persistence Notes
 
-For free Render deployments, use Turso/libSQL by setting `database.turso_url` or `TURSO_DATABASE_URL`, plus the secret `TURSO_AUTH_TOKEN`. The bot keeps a local embedded replica for speed, but the durable source of truth is the Turso database, so Render cache clears do not wipe bot history. If Turso is not configured, SQLite must live outside Render's clearable cache/project filesystem for true persistence. Automatic zipped backups also post to Discord as a second safety net.
+For free Render deployments, use Turso/libSQL by setting `database.turso_url` or `TURSO_DATABASE_URL`, plus the secret `TURSO_AUTH_TOKEN`. The bot keeps a local embedded replica for fast reads while Turso remains the durable source of truth, so Render cache clears do not wipe bot history. Writes are forwarded by the embedded-replica client; the bot pulls remote state during startup, explicit resync, and controlled recovery rather than after every write.
+
+Discord IDs are unsigned 64-bit snowflakes. Avenue Guard binds large IDs as exact decimal values because older `libsql-python` releases could route them through floating point and silently round nearby users, channels, or messages. Startup repair compares historical rounded rows with exact IDs from Discord, while workflow-specific recovery validates saved pointers against message authors, embeds, transcript files, and channel context. Ambiguous IDs are never guessed.
+
+If the local replica is corrupt and Turso reports `file is not a database`, the bot quarantines the replica and its sidecar files, opens a clean replica, and pulls from the remote database before running migrations. Externally visible workflows also save delivery states before sending: an uncertain post-send write therefore remains recoverable without repeatedly sending sticky posts, reminders, weekly offers, satisfaction prompts, or release approvals. If Turso is not configured, SQLite must live outside Render's clearable cache/project filesystem for true persistence. Automatic zipped backups also post to Discord as a second safety net.
 
 ## Local Testing
 
@@ -405,4 +409,4 @@ The suite checks migrations from an empty database, transaction rollback, concur
 
 Use `TEST_CHECKLIST.md` for the full Discord-side test flow. It covers startup, moderation, live request waves, tracking, help sessions, ticket closure, transcript requests, sticky messages, forum reminders, required-word deletion, and fun commands.
 
-The workflow-by-workflow support diagnosis, state model, corrected failure modes, and residual external risks are recorded in `docs/SUPPORT_WORKFLOW_AUDIT_2026-07-29.md`.
+The workflow-by-workflow support diagnosis, state model, corrected failure modes, and residual external risks are recorded in `docs/SUPPORT_WORKFLOW_AUDIT_2026-07-29.md`. The latest complete function inventory and Turso migration diagnosis are recorded in `docs/BOT_FUNCTION_DIAGNOSIS_2026-09-13.md`.

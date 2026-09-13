@@ -1,16 +1,16 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.20.1",
-  "title": "Support and service visibility",
-  "summary": "Clearer support workflows and dependable public operational reporting for Avenue Guard.",
+  "version": "3.20.2",
+  "title": "Persistence and uptime reliability",
+  "summary": "A broad reliability pass for Turso-backed workflows, Discord references, tracking, and public service reporting.",
   "changes": [
-    "Rebuilt DM support around clear menus, partnership tickets, and former-member appeals",
-    "Fixed appeal, report, transcript, and staff-response continuation workflows",
-    "Added live public service status, Discord uptime, latency, and recent update history",
-    "Limited the public member total to the configured GD Avenue server",
-    "Added a persistent measured uptime percentage that survives bot restarts",
-    "Added the live Avenue Guard profile picture and consistent semantic version checks",
-    "Changed the release changes field to use | between update bullets",
-    "Fixed valid newer approval DMs being mistaken for replaced panels"
+    "Preserved exact Discord IDs in Turso and repaired legacy IDs that had been rounded",
+    "Recovered stale request, sticky, ticket, and release message references from live Discord data",
+    "Made tracking totals, weekly rewards, daily summaries, and member resolution restart-safe",
+    "Prevented duplicate weekly notices, support DMs, and release approvals after uncertain deliveries",
+    "Hardened Turso replica recovery and removed redundant remote pulls from normal writes",
+    "Improved request scheduling, auto-close recovery, ticket satisfaction, and support response delivery",
+    "Corrected the public current-uptime counter so Discord reconnects no longer reset it",
+    "Expanded automated coverage for migrations, 64-bit IDs, recovery, and notification delivery"
   ]
 }

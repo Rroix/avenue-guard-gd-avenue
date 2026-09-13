@@ -103,6 +103,65 @@ def _run_preflight_database_check(
     loop.run_until_complete(bot.db.connect())
 
 
+async def _repair_legacy_turso_snowflakes(bot: discord.Bot, guild: discord.Guild) -> None:
+    """Repair historical rounded IDs once before persistent workflows start."""
+    if bool(getattr(bot, "_legacy_snowflake_repair_complete", False)):
+        return
+
+    # A complete member cache gives the precision repair exact IDs supplied by
+    # Discord. This remains best effort when member intent is unavailable.
+    if not bool(getattr(guild, "chunked", True)):
+        try:
+            await asyncio.wait_for(guild.chunk(cache=True), timeout=45)
+        except Exception as chunk_error:
+            startup_log(
+                "Member cache chunk before Turso snowflake repair was unavailable: "
+                f"{type(chunk_error).__name__}: {chunk_error}"
+            )
+
+    known_users = {
+        int(member.id)
+        for member in getattr(guild, "members", ())
+        if getattr(member, "id", None)
+    }
+    known_users.update(
+        int(user.id)
+        for user in getattr(bot, "users", ())
+        if getattr(user, "id", None)
+    )
+    known_users.update(bot.config.get_int_list("impact", "allowed_user_ids"))
+    known_users.update(bot.config.get_int_list("release_updates", "owner_user_ids"))
+    if bot.user is not None:
+        known_users.add(int(bot.user.id))
+
+    known_channels = {
+        int(channel.id)
+        for channel in (
+            *tuple(getattr(guild, "channels", ()) or ()),
+            *tuple(getattr(guild, "threads", ()) or ()),
+        )
+        if getattr(channel, "id", None)
+    }
+    repair = await bot.db.repair_legacy_snowflake_precision(
+        guild_ids=(int(guild.id),),
+        user_ids=tuple(known_users),
+        channel_ids=tuple(known_channels),
+    )
+    bot._last_snowflake_repair = {**repair, "ts": int(time.time())}
+    bot._legacy_snowflake_repair_complete = True
+    if any(
+        repair.get(key)
+        for key in ("updated", "conflicts", "ambiguous", "feedback_requeued")
+    ):
+        startup_log(
+            "Legacy Turso snowflake repair: "
+            f"updated={repair.get('updated', 0)} "
+            f"conflicts={repair.get('conflicts', 0)} "
+            f"ambiguous={repair.get('ambiguous', 0)} "
+            f"feedback_requeued={repair.get('feedback_requeued', 0)}"
+        )
+
+
 async def _close_runtime_storage(bot: discord.Bot) -> None:
     """Best-effort flush on Discord's event loop before it is torn down."""
     requests = bot.get_cog("RequestLevelsCog")
@@ -145,7 +204,7 @@ async def _close_runtime_storage(bot: discord.Bot) -> None:
     try:
         await bot.db.sync_remote()
     except Exception as e:
-        startup_log(f"Final database sync failed: {type(e).__name__}: {e}")
+        startup_log(f"Final database replica refresh failed: {type(e).__name__}: {e}")
     finally:
         await bot.db.close()
 
@@ -325,6 +384,15 @@ def create_bot() -> discord.Bot:
                     await log_error(bot, message)
                     await bot.close()
                     return
+
+            try:
+                await _repair_legacy_turso_snowflakes(bot, g)
+            except Exception as e:
+                await log_error(
+                    bot,
+                    "Legacy Turso snowflake repair failed; compatibility lookups remain active: "
+                    f"{e!r}",
+                )
 
         # Start keepalive server
         try:

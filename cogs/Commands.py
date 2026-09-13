@@ -21,6 +21,7 @@ import discord
 from discord.ext import commands
 
 from utils.checks import is_admin_or_owner, is_mod
+from utils.discord_refs import fetch_persisted_message
 from utils.mentions import no_mentions
 from utils.server_icons import (
     ensure_server_icon_config,
@@ -206,7 +207,7 @@ class CommandsCog(commands.Cog):
         bot.add_application_command(self.requests_group)
         bot.add_application_command(self.server_icon_group)
 
-        @bot.slash_command(name="resync", description="Reload config, views, and responses without restart", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
+        @bot.slash_command(name="resync", description="Refresh Turso, config, views, and responses without restart", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         async def resync(ctx: discord.ApplicationContext):
             await self._resync(ctx)
 
@@ -2201,8 +2202,27 @@ class CommandsCog(commands.Cog):
             issues.append("database storage: path may not be persistent")
             repairs.append("Configure Turso/libSQL with `TURSO_AUTH_TOKEN`, or set `AVENUE_GUARD_DB_PATH`/`database.path` to durable storage")
         if bool(getattr(self.bot.db, "uses_remote", False)) and bool(getattr(self.bot.db, "_remote_dirty", False)):
-            issues.append("database replication: local commits are waiting to sync to Turso")
-            repairs.append("Check Turso status and credentials, then run `/resync`")
+            issues.append("database replica: the latest explicit refresh was deferred")
+            repairs.append("Check Turso status and credentials, then run `/resync` to refresh the local replica")
+        db_health = (
+            self.bot.db.health_snapshot()
+            if hasattr(self.bot.db, "health_snapshot")
+            else {}
+        )
+        if bool(db_health.get("replica_rebuild_required")):
+            issues.append("database replica: local cache is waiting to be rebuilt")
+            repairs.append("Run `/resync`; restart only if the replica cannot rebuild automatically")
+        snowflake_repair = getattr(self.bot, "_last_snowflake_repair", {})
+        if isinstance(snowflake_repair, dict) and int(
+            snowflake_repair.get("conflicts", 0) or 0
+        ):
+            conflict_count = int(snowflake_repair.get("conflicts", 0) or 0)
+            issues.append(
+                f"database IDs: {conflict_count} historical precision conflict(s) need review"
+            )
+            repairs.append(
+                "Preserve a backup and inspect startup's `Legacy Turso snowflake repair` result before removing conflicting historical rows"
+            )
 
         command_error = getattr(self.bot, "_last_command_error", None)
         if isinstance(command_error, dict):
@@ -2265,7 +2285,15 @@ class CommandsCog(commands.Cog):
         if db_ok and bool(getattr(self.bot.db, "uses_remote", False)):
             db_note = "Connected to Turso"
             if bool(getattr(self.bot.db, "_remote_dirty", False)):
-                db_note = "Connected; replication pending"
+                db_note = "Connected; replica refresh deferred"
+        db_health = (
+            self.bot.db.health_snapshot()
+            if hasattr(self.bot.db, "health_snapshot")
+            else {}
+        )
+        snowflake_repair = getattr(self.bot, "_last_snowflake_repair", {})
+        if not isinstance(snowflake_repair, dict):
+            snowflake_repair = {}
         storage_note, storage_ok = self._database_storage_note()
 
         try:
@@ -2346,7 +2374,17 @@ class CommandsCog(commands.Cog):
             color=discord.Color.green() if db_ok and not issues else discord.Color.orange(),
             timestamp=now_madrid(),
         )
-        embed.add_field(name="Core", value=f"Database: **{db_note}**\nLatency: **{round(self.bot.latency * 1000)} ms**\nLoaded cogs: **{len(self.bot.cogs)}**", inline=True)
+        embed.add_field(
+            name="Core",
+            value=(
+                f"Database: **{db_note}**\n"
+                f"Replica rebuilds: **{int(db_health.get('replica_rebuild_count', 0) or 0)}**\n"
+                f"Historical IDs repaired: **{int(snowflake_repair.get('updated', 0) or 0)}**\n"
+                f"Latency: **{round(self.bot.latency * 1000)} ms**\n"
+                f"Loaded cogs: **{len(self.bot.cogs)}**"
+            ),
+            inline=True,
+        )
         embed.add_field(name="Requests", value=f"{request_state}\nPending reviews: **{pending_live}** live / **{pending_weekly}** weekly", inline=True)
         embed.add_field(
             name="Tracking",
@@ -2413,7 +2451,7 @@ class CommandsCog(commands.Cog):
         if db_ok and bool(getattr(self.bot.db, "uses_remote", False)):
             db_note = "Connected to Turso"
             if bool(getattr(self.bot.db, "_remote_dirty", False)):
-                db_note = "Connected; replication pending"
+                db_note = "Connected; replica refresh deferred"
 
         storage_note, storage_ok = self._database_storage_note()
         open_tickets = await _count("SELECT COUNT(*) AS c FROM tickets WHERE guild_id=? AND status IN ('open','closing_prompted')", (guild.id,))
@@ -2535,7 +2573,7 @@ class CommandsCog(commands.Cog):
             issues.append(f"database storage: {storage_note}")
         if bool(getattr(self.bot.db, "uses_remote", False)) and bool(getattr(self.bot.db, "_remote_dirty", False)):
             last_sync_error = str(getattr(self.bot.db, "_last_remote_sync_error", "") or "")
-            issues.append(f"Turso replication pending: {last_sync_error[:180] or 'sync retry queued'}")
+            issues.append(f"Turso replica refresh deferred: {last_sync_error[:180] or 'refresh retry queued'}")
 
         category_id = cfg.get_int("tickets", "ticket_category_id")
         category = guild.get_channel(category_id) if category_id else None
@@ -3750,14 +3788,19 @@ class CommandsCog(commands.Cog):
         prompt_message_id = int(row["closing_prompt_message_id"] or 0)
         if prompt_message_id:
             try:
-                prompt = await ctx.channel.fetch_message(prompt_message_id)
-                await prompt.edit(
-                    content="Ticket status was updated by staff.",
-                    view=None,
-                    allowed_mentions=no_mentions(),
+                prompt, _recovered = await fetch_persisted_message(
+                    ctx.channel,
+                    prompt_message_id,
+                    author_id=int(
+                        getattr(getattr(self.bot, "user", None), "id", 0) or 0
+                    ),
                 )
-            except discord.NotFound:
-                pass
+                if prompt is not None:
+                    await prompt.edit(
+                        content="Ticket status was updated by staff.",
+                        view=None,
+                        allowed_mentions=no_mentions(),
+                    )
             except Exception as e:
                 await log_error(
                     self.bot,
@@ -4061,6 +4104,13 @@ class CommandsCog(commands.Cog):
         if member is None or not is_admin_or_owner(member, admin_roles):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
 
+        database_refreshed = True
+        try:
+            await self.bot.db.sync_remote()
+        except Exception as e:
+            database_refreshed = False
+            await log_error(self.bot, f"Turso replica refresh during resync failed: {repr(e)}")
+
         async with self._config_write_lock():
             self.bot.config.reload()
             try:
@@ -4083,8 +4133,16 @@ class CommandsCog(commands.Cog):
         except Exception as e:
             await log_error(self.bot, f"Persistent view registration failed during resync: {repr(e)}")
 
-        await self._log_admin_action(ctx.guild, ctx.user.id, "bot_resync", "config/views/responses reloaded")
-        await ctx.respond("Resynced config, views, and responses.", ephemeral=True)
+        detail = f"config/views/responses reloaded database_refreshed={database_refreshed}"
+        await self._log_admin_action(ctx.guild, ctx.user.id, "bot_resync", detail)
+        if database_refreshed:
+            message = "Resynced the Turso replica, config, views, and responses."
+        else:
+            message = (
+                "Config, views, and responses were reloaded, but the Turso replica refresh failed. "
+                "Check the error log before relying on restored state."
+            )
+        await ctx.respond(message, ephemeral=True)
 
     # --- /restart ---
     async def _restart(self, ctx: discord.ApplicationContext):
@@ -4100,7 +4158,7 @@ class CommandsCog(commands.Cog):
         await ctx.respond("Restarting...", ephemeral=True)
         await self._log_admin_action(ctx.guild, ctx.user.id, "bot_restart", "manual restart command")
         # bot.close is wrapped in main.py and flushes tracking, daily metrics,
-        # remote replication, and the database exactly once.
+        # the Turso replica, and the database exactly once.
         await self.bot.close()
         os._exit(0)
 
