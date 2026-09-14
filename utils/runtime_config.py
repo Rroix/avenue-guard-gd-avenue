@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from utils.config_schema import validate_config
+
 
 SERVER_ICON_SETTING = "background.server_icon_rotation"
 FORUM_RULES_SETTING = "forum.required_rules"
@@ -69,6 +71,7 @@ async def load_runtime_config_overrides(bot) -> None:
 
     forum_rules = await bot.db.get_runtime_setting(FORUM_RULES_SETTING)
     apply_forum_required_rules(bot.config, forum_rules)
+    bot.config.validation_issues = validate_config(bot.config.data)
 
 
 async def persist_server_icon_config(bot, value: dict[str, Any]) -> None:

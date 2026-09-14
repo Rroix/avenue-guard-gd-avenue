@@ -11,10 +11,11 @@ from datetime import date
 from pathlib import Path
 
 
-RUNTIME_PATHS = ("main.py", "cogs", "utils")
+RUNTIME_PATHS = ("main.py", "cogs", "services", "utils")
 DB_METHODS = {
     "backup_to",
     "execute",
+    "execute_affected",
     "execute_insert",
     "execute_transaction",
     "executemany",
@@ -316,21 +317,16 @@ def _markdown(root: Path, records: list[FunctionRecord], test_count: int) -> str
         "",
         "## Current Review Fixes",
         "",
-        "- Pinned the Render runtime to Python 3.13 and refreshed production dependency bounds.",
-        "- Replaced implicit event-loop lookup during startup with explicit loop ownership and cleanup.",
-        "- Restored the Discord presence intent required for accurate daily online-member summaries.",
-        "- Preserved every Discord snowflake exactly when using the legacy libSQL Python binding; large integers are never routed through floating point.",
-        "- Added compatible reads and in-place repair for historical IDs that Turso/libSQL rounded before this release.",
-        "- Reconciled message and channel pointers against live Discord evidence instead of trusting a rounded database value.",
-        "- Recovered closed-ticket recipients from exact guild membership, transcript embeds, and transcript attachments before declaring them unavailable.",
-        "- Made ticket satisfaction outcomes durable so deleted or inaccessible users are logged once instead of retried on every restart.",
-        "- Reserved weekly offers, reminders, and release approvals before sending Discord messages to prevent duplicates after uncertain writes.",
-        "- Removed a redundant remote pull after every embedded-replica write; startup and explicit resync remain authoritative pull points.",
-        "- Quarantined and rebuilt corrupt local replica files when Turso reports `file is not a database`.",
-        "- Kept scheduled openings and auto-closes transactional, restart-safe, and isolated from transient Turso failures.",
-        "- Suppressed expected Discord 404s for genuinely deleted saved messages while retaining actionable diagnostics.",
-        "- Made presence rotation tolerate a transport that is closing during reconnect or shutdown.",
-        "- Expanded migration, 64-bit ID, recovery, restart-idempotency, and notification-delivery regression coverage.",
+        "- Added a durable Discord action outbox with idempotency keys, atomic work claims, backoff, stale-worker recovery, and dead-letter visibility.",
+        "- Added an operations supervisor that distinguishes disabled jobs from failures and restarts stopped tracking, help, request, release, summary, status, icon, and backup work.",
+        "- Added persistent health samples, database query timing, external-provider latency, grouped incidents, permission drift history, and workflow correlation IDs.",
+        "- Added typed config and embed-template validation with explicit config, runtime, embed, and database schema versions.",
+        "- Added post-deployment smoke checks, non-destructive restore drills, retention controls, and automated monthly impact reports.",
+        "- Added request result-notification preferences, queue SLA indicators, reviewer validation rechecks, wave comparison, and structured rejection analytics.",
+        "- Added weekday-aware forecasts with confidence levels, rolling trends, and anomaly detection.",
+        "- Extracted request validation, scheduling, review analytics, diagnostics, backups, and forecasting into focused service modules.",
+        "- Retained the hardened GD/Boomlings provider circuits, bounded payload parsing, shared HTTP sessions, CA trust, and external-failure fallback behavior.",
+        "- Expanded migration, outbox, workflow, config-schema, restore-drill, forecast, request analytics, and operational recovery regression coverage.",
         "",
         "## Attention Summary",
         "",
@@ -419,7 +415,11 @@ def main() -> None:
     output = root / output_name
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(_markdown(root, records, max(0, int(args.test_count))), encoding="utf-8")
-    print(f"Wrote {len(records)} function records to {output.relative_to(root)}")
+    try:
+        display_path = output.relative_to(root)
+    except ValueError:
+        display_path = output
+    print(f"Wrote {len(records)} function records to {display_path}")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import ipaddress
 import json
 import random
 import socket
+import ssl
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time as dtime
@@ -13,6 +14,7 @@ from typing import Dict, Optional, List, Tuple
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+import certifi
 import discord
 from discord.ext import commands, tasks
 
@@ -111,6 +113,8 @@ class BackgroundCog(commands.Cog):
         self._persist_tasks: set[asyncio.Task] = set()
         self._server_icon_lock = asyncio.Lock()
         self._daily_summary_lock = asyncio.Lock()
+        self._icon_http_session: Optional[aiohttp.ClientSession] = None
+        self._icon_download_cache: dict[str, tuple[float, bytes]] = {}
 
     def cog_unload(self) -> None:
         for loop in (
@@ -129,8 +133,36 @@ class BackgroundCog(commands.Cog):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        task = loop.create_task(self._persist_current_day())
+        task = loop.create_task(self._cleanup_resources())
         self._track_background_persist(task)
+
+    async def _cleanup_resources(self) -> None:
+        await self._persist_current_day()
+        await self.close_resources()
+
+    async def close_resources(self) -> None:
+        session = self._icon_http_session
+        self._icon_http_session = None
+        self._icon_download_cache.clear()
+        if session is not None and not session.closed:
+            await session.close()
+
+    async def _get_icon_http_session(self) -> aiohttp.ClientSession:
+        if self._icon_http_session is None or self._icon_http_session.closed:
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(
+                ssl=ssl_context,
+                limit=6,
+                limit_per_host=3,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True,
+            )
+            self._icon_http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20),
+                connector=connector,
+                trust_env=False,
+            )
+        return self._icon_http_session
 
     async def start_background(self):
         try:
@@ -371,32 +403,37 @@ class BackgroundCog(commands.Cog):
         warning = server_icon_url_warning(url)
         if warning:
             raise RuntimeError(warning)
-        timeout = aiohttp.ClientTimeout(total=20)
+        now = time.monotonic()
+        cached = self._icon_download_cache.get(url)
+        if cached is not None and now - cached[0] <= 600:
+            return cached[1]
+
         max_bytes = 8 * 1024 * 1024
         headers = {"User-Agent": "AvenueGuard/1.0"}
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            current_url = url
-            for _redirect_count in range(4):
-                await self._assert_public_server_icon_url(current_url)
-                async with session.get(current_url, headers=headers, allow_redirects=False) as resp:
-                    if 300 <= resp.status < 400 and resp.headers.get("Location"):
-                        current_url = urljoin(current_url, str(resp.headers["Location"]))
-                        continue
-                    if resp.status >= 400:
-                        raise RuntimeError(f"image URL returned HTTP {resp.status}")
-                    content_type = str(resp.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().casefold()
-                    if content_type and not (content_type.startswith("image/") or content_type == "application/octet-stream"):
-                        raise RuntimeError(f"image URL returned `{content_type}` instead of an image")
-                    try:
-                        content_length = int(resp.headers.get("Content-Length", 0) or 0)
-                    except (TypeError, ValueError):
-                        content_length = 0
-                    if content_length > max_bytes:
-                        raise RuntimeError("image is larger than 8 MB")
-                    data = await resp.content.read(max_bytes + 1)
-                    break
-            else:
-                raise RuntimeError("image URL redirected too many times")
+        session = await self._get_icon_http_session()
+        current_url = url
+        data = b""
+        for _redirect_count in range(4):
+            await self._assert_public_server_icon_url(current_url)
+            async with session.get(current_url, headers=headers, allow_redirects=False) as resp:
+                if 300 <= resp.status < 400 and resp.headers.get("Location"):
+                    current_url = urljoin(current_url, str(resp.headers["Location"]))
+                    continue
+                if resp.status >= 400:
+                    raise RuntimeError(f"image URL returned HTTP {resp.status}")
+                content_type = str(resp.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().casefold()
+                if content_type and not (content_type.startswith("image/") or content_type == "application/octet-stream"):
+                    raise RuntimeError(f"image URL returned `{content_type}` instead of an image")
+                try:
+                    content_length = int(resp.headers.get("Content-Length", 0) or 0)
+                except (TypeError, ValueError):
+                    content_length = 0
+                if content_length > max_bytes:
+                    raise RuntimeError("image is larger than 8 MB")
+                data = await resp.content.read(max_bytes + 1)
+                break
+        else:
+            raise RuntimeError("image URL redirected too many times")
         if not data:
             raise RuntimeError("image URL returned an empty file")
         if len(data) > max_bytes:
@@ -406,6 +443,13 @@ class BackgroundCog(commands.Cog):
             raise RuntimeError("image URL returned an HTML/Cloudflare page instead of an image")
         if not self._looks_like_server_icon_image(data):
             raise RuntimeError("image URL did not return a supported image file")
+        self._icon_download_cache[url] = (now, data)
+        if len(self._icon_download_cache) > 32:
+            oldest_url = min(
+                self._icon_download_cache,
+                key=lambda item: self._icon_download_cache[item][0],
+            )
+            self._icon_download_cache.pop(oldest_url, None)
         return data
 
     async def _detect_current_server_icon_index(self, guild: discord.Guild, urls: list[str]) -> int:

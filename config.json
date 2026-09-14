@@ -1,4 +1,6 @@
 {
+  "schema_version": 2,
+  "embed_schema_version": 2,
   "_comment_0": "IDs are strings here. The loader converts them to ints. Keys starting with '_' are ignored.",
   "guild": {
     "_comment": "The only guild this bot will operate in.",
@@ -282,16 +284,21 @@
     "has_requested_role_id": "1510348407384965252",
     "request_banned_role_id": "1463987510236545127",
     "request_post_close_edit_minutes": 5,
+    "aging_threshold_hours": [12, 24, 48],
+    "default_result_notification": "channel",
     "level_validation": {
-      "_comment": "Checks submitted level IDs through GDBrowser and the direct GD/Boomlings endpoint. Cache keeps repeated submissions fast and refreshes after cache_seconds.",
+      "_comment": "Checks submitted level IDs through GDBrowser and the direct GD/Boomlings endpoint. Failures degrade safely, access-denied providers cool down automatically, and cached results keep submissions fast.",
       "enabled": true,
       "cache_seconds": 1800,
+      "failure_cache_seconds": 90,
       "request_timeout_seconds": 8,
       "per_user_cooldown_seconds": 20,
       "per_user_window_seconds": 60,
       "per_user_max_checks": 6,
       "provider_failure_threshold": 5,
       "provider_circuit_breaker_seconds": 300,
+      "provider_access_denied_backoff_seconds": 21600,
+      "provider_retry_attempts": 2,
       "provider_min_interval_seconds": {
         "gdbrowser": 0.1,
         "boomlings": 0.55
@@ -354,7 +361,8 @@
         { "name": "Sent", "value": "{sent_count} ({sent_percent_reviewed} of reviewed)", "inline": true },
         { "name": "Not sent", "value": "{not_sent_count} ({not_sent_percent_reviewed} of reviewed)", "inline": true },
         { "name": "Not sent breakdown", "value": "Rejected: **{rejected_count}**\nLevel doesn't exist: **{level_doesnt_exist_count}**\nStolen level: **{stolen_level_count}**\nAlready rated: **{already_rated_count}**", "inline": false },
-        { "name": "Reviewer stats", "value": "{reviewer_stats}", "inline": false }
+        { "name": "Reviewer stats", "value": "{reviewer_stats}", "inline": false },
+        { "name": "Compared with previous wave", "value": "{wave_comparison}", "inline": false }
       ],
       "footer": "This updates whenever a request in the wave is reviewed."
     },
@@ -367,6 +375,7 @@
         { "name": "Level ID", "value": "{level_id}", "inline": true },
         { "name": "Level Info", "value": "[Level](https://gdbrowser.com/{level_id})", "inline": true },
         { "name": "Submitted", "value": "{submitted_ago}", "inline": true },
+        { "name": "Queue age", "value": "{sla_indicator} **{sla_status}** ({sla_hours}h)", "inline": true },
         { "name": "Wave Type", "value": "{request_type_label}", "inline": true },
         { "name": "GD Info", "value": "{gd_info}", "inline": false },
         { "name": "Showcase", "value": "{level_showcase}", "inline": false },
@@ -545,5 +554,24 @@
     "allowed_user_ids": [
       "1102884420207255653"
     ]
+  },
+  "operations": {
+    "_comment": "Durable worker supervision, health history, permission checks, monthly reporting, and retention",
+    "supervisor_interval_seconds": 60,
+    "health_sample_interval_seconds": 300,
+    "outbox_poll_seconds": 5,
+    "permission_scan_interval_seconds": 1800,
+    "smoke_test_delay_seconds": 30,
+    "monthly_report_channel_id": "1445502925081284729",
+    "monthly_report_day": 1,
+    "monthly_report_hour": 9,
+    "retention_days": {
+      "health_metrics": 365,
+      "workflow_events": 730,
+      "error_incidents": 730,
+      "discord_outbox": 90,
+      "gd_level_validation_cache": 7,
+      "impact_snapshots": 1095
+    }
   }
 }

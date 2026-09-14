@@ -27,6 +27,7 @@ from utils.views import (
 )
 from utils.transcript import build_text_transcript
 from utils.timeutils import now_madrid, week_start_sunday
+from utils.workflows import new_correlation_id
 
 
 def _format_duration(seconds: int) -> str:
@@ -1994,9 +1995,11 @@ class HelpCog(commands.Cog):
 
     async def _insert_help_submission(self, guild_id: int, user_id: int, kind: str, data: Dict[str, Any]) -> int:
         now = int(time.time())
+        correlation_id = str(data.get("correlation_id") or new_correlation_id(kind))
+        data["correlation_id"] = correlation_id
         return await self.bot.db.execute_insert(
-            "INSERT INTO help_submissions(guild_id,kind,user_id,status,created_ts,updated_ts,data_json) VALUES(?,?,?,?,?,?,?)",
-            (guild_id, kind, user_id, "pending", now, now, json.dumps(data, separators=(",", ":"))),
+            "INSERT INTO help_submissions(guild_id,kind,user_id,status,created_ts,updated_ts,data_json,correlation_id) VALUES(?,?,?,?,?,?,?,?)",
+            (guild_id, kind, user_id, "pending", now, now, json.dumps(data, separators=(",", ":")), correlation_id),
         )
 
     async def _submit_help_submission(self, guild: discord.Guild, user_id: int, kind: str, data: Dict[str, Any]) -> tuple[bool, str, str]:
@@ -4148,6 +4151,7 @@ class HelpCog(commands.Cog):
             str(member.name or "member").casefold(),
         ).strip("-") or "member"
         name = f"ticket-{ticket_id}-{topic_slug}-{member_slug}"[:90]
+        correlation_id = new_correlation_id("ticket")
 
         try:
             channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites, reason=f"Ticket created: {topic_label}")
@@ -4163,9 +4167,9 @@ class HelpCog(commands.Cog):
                         (guild.id, member.id, now),
                     ),
                     (
-                        "INSERT INTO tickets(guild_id, channel_id, creator_id, created_ts, last_user_activity_ts, status, ticket_id, status_tag) "
-                        "VALUES(?,?,?,?,?, 'open', ?, 'waiting_staff')",
-                        (guild.id, channel.id, member.id, now, now, ticket_id),
+                        "INSERT INTO tickets(guild_id, channel_id, creator_id, created_ts, last_user_activity_ts, status, ticket_id, status_tag, correlation_id) "
+                        "VALUES(?,?,?,?,?, 'open', ?, 'waiting_staff', ?)",
+                        (guild.id, channel.id, member.id, now, now, ticket_id, correlation_id),
                     ),
                 ),
                 retry_safe=True,

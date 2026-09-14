@@ -82,7 +82,10 @@ def source_code(title: str, rel_path: str, start: int, end: int, language: str =
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
         selected = lines[max(0, start - 1): max(start - 1, end)]
-        numbered = [f"{idx:>4}: {line}" for idx, line in enumerate(selected, start=start)]
+        numbered = [
+            f"{idx:>4}: {line.rstrip()}".rstrip()
+            for idx, line in enumerate(selected, start=start)
+        ]
         text = "\n".join(numbered)
     except Exception as exc:
         text = f"# Could not load {rel_path}:{start}-{end}: {type(exc).__name__}"
@@ -105,8 +108,8 @@ CHAPTERS = [
             ),
             callout(
                 "Core idea",
-                "The bot is built around a single configured Discord server, a JSON configuration file, persistent SQLite "
-                "state, and a set of cogs that each own a clear part of the community workflow.",
+                "The bot is built around a single configured Discord server, versioned JSON configuration, Turso/libSQL-compatible "
+                "persistent state, feature cogs, focused service modules, and a supervised delivery layer.",
             ),
             h2("Document Map"),
             bullets(
@@ -144,7 +147,8 @@ CHAPTERS = [
                 [
                     "Discord event or command",
                     "Persistent view or cog",
-                    "Config plus database state",
+                    "Config plus service rules",
+                    "Database state plus outbox",
                     "Discord response",
                     "Logs, summaries, and metrics",
                 ],
@@ -155,7 +159,7 @@ CHAPTERS = [
                 [
                     ["Request waves", "Opens, limits, schedules, validates, reviews, summarizes, and repairs level request waves.", "Turns a messy manual process into a controlled staff queue."],
                     ["Weekly rewards", "Tracks eligible activity, contacts winners, records claims, and routes weekly submissions into the review workflow.", "Rewards activity while keeping staff review consistent."],
-                    ["Help and tickets", "Runs a DM help dashboard, FAQ search, appeals, reports, bot issues, transcript requests, tickets, and satisfaction prompts.", "Gives members private support without losing staff accountability."],
+                    ["Help and tickets", "Runs a DM help dashboard, paginated FAQ, appeals, reports, bot issues, transcript requests, tickets, and satisfaction prompts.", "Gives members private support without losing staff accountability."],
                     ["Guardrails", "Deletes restricted proof-channel misuse, applies restriction roles, sends role DMs, manages sticky/forum reminders, and enforces forum words.", "Reduces repeated moderation work and keeps public channels organized."],
                     ["Telemetry", "Tracks daily summaries, command usage, voice time, activity, anti-farm events, and now persistent impact exports.", "Makes the bot measurable and useful for operations, not just automation."],
                 ],
@@ -197,7 +201,7 @@ CHAPTERS = [
             ),
             p(
                 "The help system grew in parallel. Instead of only sending generic DMs, Avenue Guard now runs an in-DMs dashboard, "
-                "FAQ search, pre-ticket FAQ suggestions, appeal/report/bug previews, staff reply relay, private ticket creation, "
+                "a paginated FAQ, pre-ticket FAQ suggestions, appeal/report/bug previews, staff reply relay, private ticket creation, "
                 "ticket statuses, transcript saving, transcript search, transcript requests, and satisfaction prompts."
             ),
             p(
@@ -205,6 +209,11 @@ CHAPTERS = [
                 "anti-farm detection, server icon rotation, admin dashboards, doctor/repair suggestions, and now impact reporting. "
                 "The bot's direction has been consistent: when a process starts to need staff memory, the bot stores it, exposes it, "
                 "and makes it reviewable."
+            ),
+            p(
+                "Version 3.22 added a shared operations platform: durable Discord delivery, task supervision, typed configuration, "
+                "schema contracts, correlation IDs, incident grouping, health history, permission drift, restore drills, retention, "
+                "monthly impact reporting, and more informative request-review analytics."
             ),
             callout(
                 "History in one sentence",
@@ -223,8 +232,8 @@ CHAPTERS = [
                 "global error handlers, and loads each cog extension."
             ),
             p(
-                "Startup is deliberately defensive. On ready, the bot connects the database, checks that it can see the allowed "
-                "guild, starts the keepalive server, starts background tasks in the tracking, help, request, and background cogs, "
+                "Startup is deliberately defensive. A database preflight connects and migrates storage before Discord login. On ready, "
+                "the bot checks that it can see the allowed guild, starts the keepalive server, starts feature loops plus OperationsCog, "
                 "and registers persistent views. Persistent views are crucial because Discord button interactions can arrive "
                 "after a restart. The custom IDs live in utils.views and route back to the correct cog."
             ),
@@ -233,16 +242,16 @@ CHAPTERS = [
                 [
                     ["Load config", "utils.config.Config", "Reads config.json and exposes typed getters for IDs, lists, and strings."],
                     ["Connect DB", "utils.db.Database", "Creates or migrates SQLite tables before workflows depend on them."],
-                    ["Load cogs", "main.py", "Attaches feature modules for moderation, tracking, help, responses, sticky messages, requests, commands, and background jobs."],
-                    ["Start tasks", "on_ready", "Starts loops for weekly handling, ticket scans, request auto-close, scheduled openings, summaries, status, and icon rotation."],
+                    ["Load cogs", "main.py", "Attaches feature modules plus OperationsCog, which supervises shared background reliability."],
+                    ["Start tasks", "on_ready and OperationsCog", "Starts feature loops, outbox delivery, health sampling, maintenance, supervision, and smoke checks."],
                     ["Register views", "utils.views", "Keeps buttons and selects alive across restarts through stable custom IDs."],
                 ],
             ),
             h2("Hosted Environment"),
             p(
                 "The bot is designed to run on a hosted service such as Render. A small keepalive HTTP server exists for hosted "
-                "environments, but the important persistence requirement is the SQLite database. If the host uses ephemeral "
-                "storage, the database path must live on a persistent disk or equivalent mounted storage."
+                "environments, but the important persistence requirement is the database. Production uses a local embedded replica "
+                "that forwards writes to Turso, so the host's temporary filesystem is a cache rather than the durable source of truth."
             ),
             p(
                 "The bot also assumes that startup may happen after Discord components already exist. That is why persistent "
@@ -257,8 +266,8 @@ CHAPTERS = [
         [
             p(
                 "Avenue Guard uses config.json as the main control plane. The Config loader treats keys beginning with an "
-                "underscore as comments by convention, but it does not need a separate schema file. IDs can be stored as strings; "
-                "the getter methods convert them to integers or lists when code needs them."
+                "underscore as comments by convention, while utils.config_schema validates the version, IDs, option types, bounds, "
+                "notification modes, and request embed placeholders. IDs can be stored as strings and converted by typed getters."
             ),
             p(
                 "This design makes server-specific changes practical. Admins can change channel IDs, role IDs, request wording, "
@@ -634,7 +643,7 @@ CHAPTERS = [
                 "Help And Ticket Flow",
                 [
                     "DM dashboard",
-                    "FAQ suggestions",
+                    "FAQ or clear topic choice",
                     "Submission or ticket",
                     "Staff log or private channel",
                     "Reply, transcript, or satisfaction",
@@ -642,9 +651,9 @@ CHAPTERS = [
                 "The user experience stays private while staff still get auditable records.",
             ),
             p(
-                "FAQ search and auto-suggestions are meant to reduce unnecessary tickets. Before opening a staff ticket, the bot can show "
-                "relevant FAQ entries so common questions are solved privately. If the user still needs help, they can open a routed private "
-                "ticket channel by topic."
+                "The FAQ is a short paginated list rather than an intelligent free-text search. Before an ordinary staff ticket opens, the bot "
+                "can still suggest configured FAQ entries so common questions are solved privately. If the user still needs help, they can open "
+                "a routed private ticket channel by topic."
             ),
             h2("Submission Workflows"),
             p(
@@ -925,15 +934,26 @@ def _source_file_inventory_rows() -> list[list[str]]:
         "cogs/Help.py",
         "cogs/MessageResponses.py",
         "cogs/Mod.py",
+        "cogs/Operations.py",
+        "cogs/Release.py",
         "cogs/RequestLevels.py",
         "cogs/Sticky.py",
         "cogs/Tracking.py",
+        "services/backups.py",
+        "services/diagnostics.py",
+        "services/impact.py",
+        "services/request_reviews.py",
+        "services/request_scheduling.py",
+        "services/request_validation.py",
         "utils/config.py",
+        "utils/config_schema.py",
         "utils/db.py",
         "utils/errors.py",
         "utils/gd_validation.py",
+        "utils/outbox.py",
         "utils/server_icons.py",
         "utils/views.py",
+        "utils/workflows.py",
     ]
     rows: list[list[str]] = []
     for rel in files:
@@ -1004,6 +1024,15 @@ def _database_table_rows() -> list[list[str]]:
         "daily_stats": "Daily telemetry payloads.",
         "impact_snapshots": "Owner impact report payload history.",
         "database_backups": "Posted backup metadata.",
+        "schema_metadata": "Explicit database, config, runtime, and embed schema versions.",
+        "discord_outbox": "Durable retryable Discord actions and delivery IDs.",
+        "workflow_events": "Correlation-based workflow and task timeline.",
+        "error_incidents": "Grouped error fingerprints, counts, and resolution state.",
+        "health_metrics": "Historical runtime, query, gateway, and provider samples.",
+        "permission_drift_events": "Open and resolved channel or role permission drift.",
+        "user_notification_preferences": "Per-user request result delivery choice.",
+        "restore_drills": "Non-destructive backup integrity test history.",
+        "monthly_impact_reports": "Monthly report generation and outbox delivery state.",
     }
     return [[name, purpose.get(name, "Persistent workflow state.")] for name in names]
 
@@ -1019,19 +1048,20 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "state, how that state survives a restart, and how the bot repairs visible Discord messages when they drift."
                 ),
                 p(
-                    "A useful way to study the project is to read it in layers: main.py starts the system, utils provide shared "
-                    "rules, cogs own workflows, config.json controls server-specific behavior, and SQLite remembers anything that "
+                    "A useful way to study the project is to read it in layers: main.py starts the system, cogs own Discord workflows, "
+                    "services hold reusable business rules, utils provide infrastructure, config.json controls server-specific behavior, and Turso remembers anything that "
                     "matters after a restart. When you get lost, ask: who owns this event, where is the state stored, and what "
                     "Discord object does the user see?"
                 ),
                 diagram(
                     "Code Reading Map",
                     [
-                        "main.py boots",
-                        "utils define shared rules",
-                        "cogs own workflows",
+                    "main.py boots",
+                        "cogs own Discord workflows",
+                        "services apply business rules",
+                        "utils provide infrastructure",
                         "config shapes behavior",
-                        "SQLite preserves state",
+                        "Turso preserves state",
                         "Discord shows results",
                     ],
                     "This is the mental route for almost every feature in the bot.",
@@ -1109,22 +1139,23 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
             "Startup Code Walkthrough",
             [
                 p(
-                    "main.py is the bot's entry point. The most important design choice here is that startup resolves a usable database path "
-                    "before creating the Database wrapper. That protects production from accidentally using ephemeral source storage when a "
-                    "persistent disk exists."
+                    "main.py is the bot's entry point. The most important startup choice is that production resolves a writable embedded replica "
+                    "and valid Turso credentials before Discord login. That prevents a briefly online but unusable bot and refuses an accidental "
+                    "fallback to disposable host storage."
                 ),
-                source_code("Database path resolution", "main.py", 46, 74),
+                source_code("Database path resolution", "main.py", 258, 325),
                 p(
-                    "The path resolver checks sources in priority order: environment variable, config.json, Render persistent disk candidate, "
-                    "then local fallback. The key technical trick is the write probe: the bot does not assume a path works just because it looks "
-                    "right. It tries to create the parent directory, writes a tiny test file, deletes it, and only then accepts the path."
+                    "When Turso is configured, the resolver requires both a database URL and database-scoped token, verifies the replica path, "
+                    "and refuses silent local fallback in production. Local-only mode still checks environment, config, mounted disk, and development "
+                    "paths with a real write probe before accepting one."
                 ),
-                source_code("Bot creation and startup hooks", "main.py", 76, 138),
+                source_code("Bot creation, outbox, and cog loading", "main.py", 327, 377),
                 p(
-                    "create_bot wires the bot object, configuration, database, cogs, and on_ready behavior together. on_ready is where the "
-                    "runtime becomes alive: database connection, guild validation, background loops, and persistent views are all started from there."
+                    "create_bot wires configuration, database, the durable outbox, command correlation, cogs, and on_ready behavior together. "
+                    "A preflight migration happens before login; on_ready then validates the guild, repairs legacy IDs, starts cog loops, starts the "
+                    "operations supervisor, and registers persistent views."
                 ),
-                source_code("Persistent view registration", "main.py", 167, 177),
+                source_code("Persistent view registration", "main.py", 534, 545),
                 p(
                     "Persistent view registration is easy to underestimate. Discord button messages can outlive the Python process. Without "
                     "registering the views again after restart, users could click old buttons and Discord would not know which callback should run."
@@ -1446,6 +1477,163 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
             ],
         ),
         (
+            "Durable Operations Platform 3 22",
+            [
+                p(
+                    "Version 3.22 turns reliability from a collection of local fixes into a shared platform. The request, ticket, "
+                    "tracking, release, summary, and support systems still own their business rules, but background supervision, "
+                    "Discord delivery, workflow tracing, schema validation, health history, retention, and recovery drills now have "
+                    "central owners. This reduces duplicated recovery code and makes failures visible as one connected incident."
+                ),
+                diagram(
+                    "The New Runtime Shape",
+                    [
+                        "Discord command or event",
+                        "feature cog",
+                        "focused service",
+                        "database transaction",
+                        "durable outbox",
+                        "Discord delivery",
+                    ],
+                    "The database commit defines the durable workflow result. Discord is then updated from a retryable queue instead of being the only record that something happened.",
+                ),
+                h2("Why The Outbox Exists"),
+                p(
+                    "A direct channel.send followed by a database update has an unavoidable failure window. If Discord accepts the "
+                    "message and Turso fails before the second write, the bot may send the same result again after restart. If the "
+                    "database changes first and Discord fails, the workflow looks complete while the user never receives the result. "
+                    "The transactional outbox closes most of this gap by writing the business result and the delivery intent in one transaction."
+                ),
+                source_code("Durable action creation and idempotency", "utils/outbox.py", 35, 76),
+                source_code("Atomic claim, retry, and delivered state", "utils/outbox.py", 102, 172),
+                table(
+                    ["Outbox State", "Meaning", "Recovery Rule"],
+                    [
+                        ["pending", "Ready to be claimed by a worker.", "A worker atomically changes exactly one matching row to processing."],
+                        ["processing", "A worker owns this attempt.", "Startup recovers rows abandoned by an interrupted process."],
+                        ["delivered", "Discord accepted the operation.", "The Discord message ID is stored when one exists."],
+                        ["dead", "The error is permanent or attempts are exhausted.", "The dashboard exposes it for explicit retry or repair."],
+                    ],
+                ),
+                code(
+                    "Simplified transaction boundary with commentary",
+                    "python",
+                    """# 1. Store the irreversible business decision.
+statements = [
+    (\"UPDATE level_request_submissions SET status='reviewed' WHERE message_id=?\", (message_id,)),
+
+    # 2. Store what Discord must receive in the SAME transaction.
+    #    The unique idempotency key prevents a second queue row for this result.
+    (\"INSERT OR IGNORE INTO discord_outbox(...) VALUES(...)\", outbox_values),
+]
+await db.execute_transaction(statements, retry_safe=True)
+
+# 3. A separate worker performs Discord I/O. A network failure no longer
+#    erases the review decision and can be retried after a restart.""",
+                ),
+                h2("Supervising Background Work"),
+                p(
+                    "A task that exists is not necessarily a healthy task. asyncio tasks can finish after an uncaught exception, while "
+                    "the process and slash commands stay online. OperationsCog inventories the expected loops in every cog, recognizes "
+                    "when optional work is deliberately disabled, records state changes, and asks each affected cog to start its work again."
+                ),
+                source_code("Task inventory and restart decision", "cogs/Operations.py", 108, 199),
+                source_code("Supervisor loop and state-change timeline", "cogs/Operations.py", 218, 268),
+                callout(
+                    "Important distinction",
+                    "Disabled is a valid configured state. Stopped or failed is an operational problem. Treating both as the same would make the supervisor repeatedly start features that the owner intentionally turned off.",
+                ),
+                h2("Correlation IDs And State Machines"),
+                p(
+                    "Every slash-command execution can receive a correlation ID stored in a ContextVar. ContextVar is an asyncio-aware "
+                    "context slot: concurrent commands can each see their own ID without passing it through every helper parameter. Long "
+                    "workflows also persist that ID in their request, ticket, help, scheduled-opening, outbox, event, and incident rows."
+                ),
+                source_code("Workflow context and transition guards", "utils/workflows.py", 12, 85),
+                source_code("Persistent workflow timeline event", "utils/workflows.py", 88, 116),
+                p(
+                    "The state machine is deliberately small. It does not execute workflows; it rejects illegal transitions such as delivered "
+                    "back to processing or a reviewed request back to pending. This makes the lifecycle explicit while leaving database and "
+                    "Discord work in the modules that own it."
+                ),
+                h2("Typed Configuration And Schema Contracts"),
+                p(
+                    "The original Config object remains the convenient runtime reader, but config_schema.py now validates the structure before "
+                    "staff discovers a typo through a broken button. It verifies IDs, lists, operation bounds, notification modes, request-template "
+                    "field shapes, colors, and which placeholders each embed is allowed to use. Runtime overrides trigger validation again."
+                ),
+                source_code("Versioned config contracts", "utils/config_schema.py", 7, 74),
+                source_code("Request template variable contract", "utils/config_schema.py", 95, 177),
+                table(
+                    ["Contract", "Current Version", "What It Protects"],
+                    [
+                        ["Config", "2", "The checked-in JSON structure and supported option types."],
+                        ["Runtime", "2", "Persisted settings written by slash commands and maintenance controls."],
+                        ["Embed templates", "2", "Allowed request placeholders and Discord field shapes."],
+                        ["Database", "4", "Tables and columns expected by the deployed code."],
+                    ],
+                ),
+                h2("Historical Health Rather Than A Snapshot"),
+                p(
+                    "The dashboard still answers what is happening now, but OperationsCog also stores what happened over time. A sample contains "
+                    "gateway latency, a measured database probe, internal database health, per-operation query timing, command errors, task state, "
+                    "and provider latency. Provider samples make it possible to distinguish a slow external level API from a slow database or Discord connection."
+                ),
+                source_code("Persistent runtime and provider samples", "cogs/Operations.py", 270, 325),
+                p(
+                    "Error logging follows the same principle. The message text is normalized and hashed into a fingerprint. Repeated failures update "
+                    "one incident with an occurrence count and latest correlation ID instead of behaving like unrelated errors. Permission drift is "
+                    "stored similarly, including when a previously missing permission is resolved."
+                ),
+                h2("Retention, Restore Drills, And Monthly Impact"),
+                source_code("Allowlisted retention and restore drill entry", "cogs/Operations.py", 361, 391),
+                source_code("Non-destructive SQLite restore drill", "services/backups.py", 22, 82),
+                p(
+                    "Retention is allowlisted, not arbitrary SQL supplied by a command. Only operational history tables can be trimmed, each with a "
+                    "bounded number of days. Business records such as tickets, requests, reviews, and tracking history are outside that map. A restore "
+                    "drill creates a temporary backup, opens it read-only, runs PRAGMA integrity_check, verifies core tables, stores the result, and then "
+                    "deletes the temporary directory without replacing production data."
+                ),
+                source_code("Idempotent monthly impact delivery", "cogs/Operations.py", 393, 442),
+                diagram(
+                    "Monthly Impact Report Lifecycle",
+                    [
+                        "collect persistent metrics",
+                        "build forecast and embed",
+                        "enqueue month key",
+                        "deliver through outbox",
+                        "save message ID and final status",
+                    ],
+                    "The guild and month form the idempotency key, so a restart during the scheduled window cannot create a second report for the same month.",
+                ),
+                h2("Request Review Improvements Built On The Platform"),
+                p(
+                    "Request cards now calculate queue age from the original submitted timestamp and configurable thresholds. The displayed label can "
+                    "move from Fresh to Aging, Due soon, and Overdue without mutating the source timestamp. Reviewer rechecks bypass stale provider cache, "
+                    "save the refreshed evidence, and edit the same review card. Final-result notification preference is stored per user as channel, DM, "
+                    "both, or none. The result decision and its channel-delivery row are committed together, while any requested DM is queued with its own idempotency key."
+                ),
+                source_code("Queue age and SLA calculation", "services/request_reviews.py", 18, 55),
+                source_code("Wave comparison calculation", "services/request_reviews.py", 70, 100),
+                p(
+                    "The wave summary combines total demand, reviewed and pending work, sent rate, structured non-sent reasons, per-reviewer throughput, "
+                    "average review time, and the delta from the previous wave. This makes the summary useful for staffing and policy decisions instead of "
+                    "being only a completion counter."
+                ),
+                h2("Post Deployment Smoke Test"),
+                p(
+                    "After a short configurable delay, the operations layer probes the database, confirms the configured guild, validates typed config, "
+                    "checks its outbox worker and request cog, compares schema versions, and inventories slash commands. This is an in-process release check, "
+                    "not a full staging environment. It catches incomplete deployments and startup wiring mistakes while the dashboard can still explain them."
+                ),
+                source_code("Post-deployment smoke checks", "cogs/Operations.py", 502, 545),
+                callout(
+                    "Mental model",
+                    "Cogs own Discord workflows. Services own reusable business rules. Utils own infrastructure. Turso owns durable truth. OperationsCog watches the watchers, and the outbox turns important Discord effects into recoverable work.",
+                ),
+            ],
+        ),
+        (
             "Engineering Thinking Behind The Bot",
             [
                 p(
@@ -1461,8 +1649,8 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                         ["Two reviewers can click the same request", "Use review lock, pending status check, and disabled buttons."],
                         ["A provider can fail or disagree", "Cache normalized validation, warn on uncertainty, and circuit-break repeated failures."],
                         ["A ticket close can fail midway", "Save transcript before deletion and restore status on failure."],
-                        ["Render can wipe source storage", "Resolve DB path to persistent disk and post zipped backups."],
-                        ["Config can drift from Discord", "Expose dashboard, config check, doctor, repair, and storage commands."],
+                        ["Render can wipe source storage", "Use a Turso-backed embedded replica, zipped backups, and read-only restore drills."],
+                        ["Config can drift from Discord", "Validate typed schema, scan permissions, and expose dashboard repair controls."],
                     ],
                 ),
                 p(
@@ -1565,6 +1753,11 @@ def set_table_widths(tbl, widths: list[float]) -> None:
                 row.cells[idx].width = Inches(width)
 
 
+def keep_row_together(row) -> None:
+    row_properties = row._tr.get_or_add_trPr()
+    row_properties.append(OxmlElement("w:cantSplit"))
+
+
 def add_para(doc: Document, text: str, style: str = "Normal", bold: bool = False, italic: bool = False) -> None:
     para = doc.add_paragraph(style=style)
     para.paragraph_format.space_after = Pt(6)
@@ -1641,28 +1834,41 @@ def add_manual_diagram(doc: Document, title: str, steps: list[str], note: str = 
 
 
 def add_code_block(doc: Document, title: str, language: str, text: str) -> None:
-    add_para(doc, title, bold=True)
-    tbl = doc.add_table(rows=1, cols=1)
-    tbl.autofit = False
-    set_table_widths(tbl, [6.5])
-    cell = tbl.cell(0, 0)
-    set_cell_shading(cell, CODE_FILL)
-    cell.text = ""
-    para = cell.paragraphs[0]
-    para.paragraph_format.space_after = Pt(0)
-    para.paragraph_format.line_spacing = 1.0
-    run = para.add_run(str(text or ""))
-    run.font.name = "Courier New"
-    run.font.size = Pt(7.3)
-    run.font.color.rgb = INK
-    if language:
-        para2 = cell.add_paragraph()
-        para2.paragraph_format.space_after = Pt(0)
-        r2 = para2.add_run(f"language: {language}")
-        r2.font.name = "Calibri"
-        r2.font.size = Pt(7.5)
-        r2.font.color.rgb = MUTED
-    doc.add_paragraph()
+    raw_lines = str(text or "").splitlines() or [""]
+    chunk_size = 34
+    chunks = [
+        raw_lines[index : index + chunk_size]
+        for index in range(0, len(raw_lines), chunk_size)
+    ]
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        chunk_title = (
+            title
+            if len(chunks) == 1
+            else f"{title} - part {chunk_index} of {len(chunks)}"
+        )
+        add_para(doc, chunk_title, bold=True)
+        tbl = doc.add_table(rows=1, cols=1)
+        tbl.autofit = False
+        set_table_widths(tbl, [6.5])
+        keep_row_together(tbl.rows[0])
+        cell = tbl.cell(0, 0)
+        set_cell_shading(cell, CODE_FILL)
+        cell.text = ""
+        para = cell.paragraphs[0]
+        para.paragraph_format.space_after = Pt(0)
+        para.paragraph_format.line_spacing = 1.0
+        run = para.add_run("\n".join(chunk))
+        run.font.name = "Courier New"
+        run.font.size = Pt(7.0)
+        run.font.color.rgb = INK
+        if language:
+            para2 = cell.add_paragraph()
+            para2.paragraph_format.space_after = Pt(0)
+            r2 = para2.add_run(f"language: {language}")
+            r2.font.name = "Calibri"
+            r2.font.size = Pt(7.5)
+            r2.font.color.rgb = MUTED
+        doc.add_paragraph()
 
 
 def set_styles(doc: Document) -> None:

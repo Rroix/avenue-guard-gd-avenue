@@ -2,22 +2,33 @@ import asyncio
 import calendar
 import json
 import re
+import ssl
 import time as time_module
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 import aiohttp
+import certifi
 import discord
 from discord.ext import commands
 
+from services.request_reviews import compare_waves, normalize_notification_mode, request_age
+from services.request_scheduling import local_time_round_trip
+from services.request_validation import validate_level_id_shape, validate_showcase_url
 from utils.checks import basic_color, is_admin_or_owner, is_mod, member_has_any_role
 from utils.discord_refs import fetch_persisted_channel, fetch_persisted_message
 from utils.errors import log_error
 from utils.gd_validation import combine_level_validation, fetch_boomlings_level, fetch_gdbrowser_level, validation_notice
-from utils.mentions import no_mentions, user_and_role_mentions, user_mentions
+from utils.mentions import no_mentions, user_and_role_mentions
 from utils.timeutils import TZ, now_madrid
 from utils.views import LevelRequestButtonView, LevelRequestReviewView
+from utils.workflows import (
+    REQUEST_REVIEW_STATES,
+    current_correlation_id,
+    new_correlation_id,
+    record_workflow_event,
+)
 
 
 STATE_OPEN = "open"
@@ -412,9 +423,13 @@ class RequestLevelsCog(commands.Cog):
         self._validation_session_timeout: int = 0
         self._validation_attempts: dict[tuple[int, int], list[int]] = {}
         self._validation_provider_failures: dict[str, list[int]] = {}
+        self._validation_provider_open_until: dict[str, int] = {}
+        self._validation_provider_open_reason: dict[str, str] = {}
+        self._validation_provider_last_result: dict[str, dict[str, Any]] = {}
         self._validation_inflight: dict[str, asyncio.Task] = {}
         self._validation_provider_locks: dict[str, asyncio.Lock] = {}
         self._validation_provider_last_call: dict[str, float] = {}
+        self._validation_provider_stats: dict[str, dict[str, float | int]] = {}
         self._background_tasks: set[asyncio.Task] = set()
 
         guild_ids = [self.allowed_guild_id] if self.allowed_guild_id else None
@@ -592,6 +607,13 @@ class RequestLevelsCog(commands.Cog):
         if self._started and close_running and scheduled_running:
             return
         await self.bot.db.connect()
+        try:
+            await self.bot.db.execute(
+                "DELETE FROM gd_level_validation_cache WHERE expires_ts<?",
+                (int(time_module.time()),),
+            )
+        except Exception as e:
+            await log_error(self.bot, f"GD validation cache startup cleanup failed: {repr(e)}")
         if not close_running:
             self._close_task = asyncio.create_task(self._auto_close_loop())
         if not scheduled_running:
@@ -599,7 +621,14 @@ class RequestLevelsCog(commands.Cog):
         self._started = True
 
     def on_config_reload(self) -> None:
-        pass
+        enabled = self._level_validation_providers()
+        for provider in ("gdbrowser", "boomlings"):
+            if enabled.get(provider):
+                continue
+            self._validation_provider_failures.pop(provider, None)
+            self._validation_provider_open_until.pop(provider, None)
+            self._validation_provider_open_reason.pop(provider, None)
+            self._validation_provider_last_result.pop(provider, None)
 
     def _start_background_task(self, coroutine, *, label: str) -> asyncio.Task:
         async def runner():
@@ -905,13 +934,13 @@ class RequestLevelsCog(commands.Cog):
 
     def _validate_request_data(self, data: Dict[str, str]) -> list[str]:
         errors = []
-        level_id = self._clean_level_id(data.get("level_id"))
-        if not re.fullmatch(r"\d{7,9}", level_id):
-            errors.append("Level ID must be 7 to 9 numbers, like `111111111`.")
-
+        level_error = validate_level_id_shape(data.get("level_id"))
+        if level_error:
+            errors.append(f"{level_error}, like `111111111`.")
         showcase = str(data.get("level_showcase") or "").strip()
-        if showcase and not self._valid_url(showcase):
-            errors.append("Level showcase must be a valid URL, usually YouTube or Streamable.")
+        showcase_error = validate_showcase_url(showcase)
+        if showcase_error:
+            errors.append(f"{showcase_error}.")
         return errors
 
     def _level_validation_cfg(self) -> Dict[str, Any]:
@@ -1006,22 +1035,157 @@ class RequestLevelsCog(commands.Cog):
             seconds = 300
         return threshold, seconds
 
+    def _provider_access_denied_backoff_seconds(self) -> int:
+        try:
+            return max(
+                300,
+                min(
+                    86400,
+                    int(
+                        self._level_validation_cfg().get(
+                            "provider_access_denied_backoff_seconds",
+                            21600,
+                        )
+                    ),
+                ),
+            )
+        except Exception:
+            return 21600
+
+    def _provider_retry_attempts(self) -> int:
+        try:
+            return max(
+                1,
+                min(
+                    3,
+                    int(self._level_validation_cfg().get("provider_retry_attempts", 2)),
+                ),
+            )
+        except Exception:
+            return 2
+
+    def _level_validation_failure_cache_seconds(self) -> int:
+        try:
+            return max(
+                15,
+                min(
+                    600,
+                    int(self._level_validation_cfg().get("failure_cache_seconds", 90)),
+                ),
+            )
+        except Exception:
+            return 90
+
+    def _provider_circuit_result(self, provider: str) -> dict[str, Any]:
+        now_ts = int(time_module.time())
+        open_until = int(self._validation_provider_open_until.get(provider, 0) or 0)
+        remaining = max(0, open_until - now_ts)
+        reason = self._validation_provider_open_reason.get(provider, "repeated failures")
+        return {
+            "provider": provider,
+            "ok": False,
+            "exists": None,
+            "error": "Provider temporarily paused",
+            "failure_kind": "circuit_open",
+            "retryable": True,
+            "retry_after_seconds": remaining,
+            "circuit_reason": reason,
+        }
+
     def _provider_circuit_open(self, provider: str) -> bool:
         threshold, seconds = self._provider_failure_cfg()
         now_ts = int(time_module.time())
+        open_until = int(self._validation_provider_open_until.get(provider, 0) or 0)
+        if open_until > now_ts:
+            return True
+        if open_until:
+            self._validation_provider_open_until.pop(provider, None)
+            self._validation_provider_open_reason.pop(provider, None)
         failures = [ts for ts in self._validation_provider_failures.get(provider, []) if now_ts - int(ts) < seconds]
         self._validation_provider_failures[provider] = failures
-        return len(failures) >= threshold
+        if len(failures) < threshold:
+            return False
+        self._validation_provider_open_until[provider] = now_ts + seconds
+        self._validation_provider_open_reason[provider] = "repeated failures"
+        self._validation_provider_failures[provider] = []
+        return True
 
     def _record_provider_validation_result(self, provider: str, result: Dict[str, Any]) -> None:
         now_ts = int(time_module.time())
+        self._validation_provider_last_result[provider] = dict(result)
         if result.get("ok"):
+            self._validation_provider_failures[provider] = []
+            self._validation_provider_open_until.pop(provider, None)
+            self._validation_provider_open_reason.pop(provider, None)
+            return
+        failure_kind = str(result.get("failure_kind") or "")
+        if failure_kind == "access_denied":
+            self._validation_provider_open_until[provider] = (
+                now_ts + self._provider_access_denied_backoff_seconds()
+            )
+            self._validation_provider_open_reason[provider] = "upstream access denied"
+            self._validation_provider_failures[provider] = []
+            return
+        if failure_kind == "rate_limited":
+            _, default_seconds = self._provider_failure_cfg()
+            retry_after = int(result.get("retry_after_seconds", 0) or 0)
+            self._validation_provider_open_until[provider] = now_ts + max(
+                30,
+                retry_after or default_seconds,
+            )
+            self._validation_provider_open_reason[provider] = "upstream rate limit"
             self._validation_provider_failures[provider] = []
             return
         failures = self._validation_provider_failures.get(provider, [])
         failures.append(now_ts)
-        _, seconds = self._provider_failure_cfg()
+        threshold, seconds = self._provider_failure_cfg()
         self._validation_provider_failures[provider] = [ts for ts in failures if now_ts - int(ts) < seconds]
+        if len(self._validation_provider_failures[provider]) >= threshold:
+            self._validation_provider_open_until[provider] = now_ts + seconds
+            self._validation_provider_open_reason[provider] = "repeated failures"
+            self._validation_provider_failures[provider] = []
+
+    def validation_provider_snapshot(self) -> dict[str, dict[str, Any]]:
+        now_ts = int(time_module.time())
+        enabled = self._level_validation_providers()
+        snapshot: dict[str, dict[str, Any]] = {}
+        for provider in ("gdbrowser", "boomlings"):
+            open_until = int(self._validation_provider_open_until.get(provider, 0) or 0)
+            is_open = bool(enabled.get(provider)) and open_until > now_ts
+            last = self._validation_provider_last_result.get(provider, {})
+            snapshot[provider] = {
+                "enabled": bool(enabled.get(provider)),
+                "available": bool(enabled.get(provider)) and not is_open,
+                "circuit_open": is_open,
+                "retry_after_seconds": max(0, open_until - now_ts),
+                "reason": self._validation_provider_open_reason.get(provider, ""),
+                "last_failure_kind": "" if last.get("ok") else str(last.get("failure_kind") or ""),
+                "last_status_code": last.get("status_code"),
+                **self._provider_telemetry(provider),
+            }
+        return snapshot
+
+    def _provider_telemetry(self, provider: str) -> dict[str, Any]:
+        stats_by_provider = getattr(self, "_validation_provider_stats", None)
+        if not isinstance(stats_by_provider, dict):
+            stats_by_provider = {}
+            self._validation_provider_stats = stats_by_provider
+        stats = stats_by_provider.get(provider, {})
+        calls = int(stats.get("calls", 0) or 0)
+        return {
+            "calls": calls,
+            "successes": int(stats.get("successes", 0) or 0),
+            "failures": int(stats.get("failures", 0) or 0),
+            "average_latency_ms": round(float(stats.get("total_ms", 0.0) or 0.0) / calls, 2) if calls else 0.0,
+            "last_latency_ms": round(float(stats.get("last_ms", 0.0) or 0.0), 2),
+        }
+
+    def reset_validation_providers(self) -> None:
+        self._validation_provider_failures.clear()
+        self._validation_provider_open_until.clear()
+        self._validation_provider_open_reason.clear()
+        self._validation_provider_last_result.clear()
+        self._validation_provider_stats.clear()
 
     def _provider_min_interval(self, provider: str) -> float:
         configured = self._level_validation_cfg().get("provider_min_interval_seconds", {})
@@ -1043,18 +1207,50 @@ class RequestLevelsCog(commands.Cog):
     ) -> Dict[str, Any]:
         lock = self._validation_provider_locks.setdefault(provider, asyncio.Lock())
         async with lock:
-            interval = self._provider_min_interval(provider)
-            elapsed = time_module.monotonic() - self._validation_provider_last_call.get(provider, 0.0)
-            if elapsed < interval:
-                await asyncio.sleep(interval - elapsed)
-            try:
+            if self._provider_circuit_open(provider):
+                return self._provider_circuit_result(provider)
+            result: Dict[str, Any] = {
+                "provider": provider,
+                "ok": False,
+                "exists": None,
+                "error": "Provider did not run",
+            }
+            for attempt in range(1, self._provider_retry_attempts() + 1):
+                interval = self._provider_min_interval(provider)
+                elapsed = time_module.monotonic() - self._validation_provider_last_call.get(provider, 0.0)
+                if elapsed < interval:
+                    await asyncio.sleep(interval - elapsed)
+                request_started = time_module.perf_counter()
                 if provider == "gdbrowser":
-                    return await fetch_gdbrowser_level(session, level_id)
-                if provider == "boomlings":
-                    return await fetch_boomlings_level(session, level_id)
-                return {"provider": provider, "ok": False, "exists": None, "error": "Unknown provider"}
-            finally:
+                    result = await fetch_gdbrowser_level(session, level_id)
+                elif provider == "boomlings":
+                    result = await fetch_boomlings_level(session, level_id)
+                else:
+                    return {"provider": provider, "ok": False, "exists": None, "error": "Unknown provider"}
+                elapsed_ms = (time_module.perf_counter() - request_started) * 1000
+                stats_by_provider = getattr(self, "_validation_provider_stats", None)
+                if not isinstance(stats_by_provider, dict):
+                    stats_by_provider = {}
+                    self._validation_provider_stats = stats_by_provider
+                stats = stats_by_provider.setdefault(
+                    provider,
+                    {"calls": 0, "successes": 0, "failures": 0, "total_ms": 0.0, "last_ms": 0.0},
+                )
+                stats["calls"] = int(stats["calls"]) + 1
+                stats["successes"] = int(stats["successes"]) + int(bool(result.get("ok")))
+                stats["failures"] = int(stats["failures"]) + int(not bool(result.get("ok")))
+                stats["total_ms"] = float(stats["total_ms"]) + elapsed_ms
+                stats["last_ms"] = elapsed_ms
                 self._validation_provider_last_call[provider] = time_module.monotonic()
+                result["attempts"] = attempt
+                if result.get("ok") or not result.get("retryable"):
+                    break
+                if str(result.get("failure_kind") or "") == "rate_limited":
+                    break
+                if attempt < self._provider_retry_attempts():
+                    await asyncio.sleep(min(1.0, 0.25 * (2 ** (attempt - 1))))
+            self._record_provider_validation_result(provider, result)
+            return result
 
     async def _get_level_validation_session(self) -> aiohttp.ClientSession:
         timeout_seconds = self._level_validation_timeout_seconds()
@@ -1070,7 +1266,19 @@ class RequestLevelsCog(commands.Cog):
                 except Exception:
                     pass
             timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-            self._validation_session = aiohttp.ClientSession(timeout=timeout)
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(
+                ssl=ssl_context,
+                limit=12,
+                limit_per_host=4,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True,
+            )
+            self._validation_session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                trust_env=False,
+            )
             self._validation_session_timeout = timeout_seconds
         return self._validation_session
 
@@ -1123,33 +1331,44 @@ class RequestLevelsCog(commands.Cog):
 
         providers = self._level_validation_providers()
         results: dict[str, dict[str, Any]] = {}
-        session = await self._get_level_validation_session()
-        tasks = []
-        if providers.get("gdbrowser"):
-            if self._provider_circuit_open("gdbrowser"):
-                results["gdbrowser"] = {"provider": "gdbrowser", "ok": False, "exists": None, "error": "Circuit breaker open"}
+        ready_providers: list[str] = []
+        for provider in ("gdbrowser", "boomlings"):
+            if not providers.get(provider):
+                continue
+            if self._provider_circuit_open(provider):
+                results[provider] = self._provider_circuit_result(provider)
             else:
-                tasks.append(("gdbrowser", self._fetch_validation_provider("gdbrowser", session, level_id)))
-        if providers.get("boomlings"):
-            if self._provider_circuit_open("boomlings"):
-                results["boomlings"] = {"provider": "boomlings", "ok": False, "exists": None, "error": "Circuit breaker open"}
-            else:
-                tasks.append(("boomlings", self._fetch_validation_provider("boomlings", session, level_id)))
+                ready_providers.append(provider)
 
-        if not tasks and not results:
+        if not ready_providers and not results:
             return {}
+
+        tasks = []
+        if ready_providers:
+            session = await self._get_level_validation_session()
+            tasks = [
+                (provider, self._fetch_validation_provider(provider, session, level_id))
+                for provider in ready_providers
+            ]
 
         fetched = await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
         for (provider, _), result in zip(tasks, fetched, strict=True):
             if isinstance(result, Exception):
                 results[provider] = {"provider": provider, "ok": False, "exists": None, "error": type(result).__name__}
+                self._record_provider_validation_result(provider, results[provider])
             elif isinstance(result, dict):
                 results[provider] = result
             else:
                 results[provider] = {"provider": provider, "ok": False, "exists": None, "error": "Unexpected result"}
-            self._record_provider_validation_result(provider, results[provider])
+                self._record_provider_validation_result(provider, results[provider])
 
-        expires_ts = now_ts + self._level_validation_cache_seconds()
+        successful_provider = any(result.get("ok") for result in results.values())
+        cache_seconds = (
+            self._level_validation_cache_seconds()
+            if successful_provider
+            else self._level_validation_failure_cache_seconds()
+        )
+        expires_ts = now_ts + cache_seconds
         combined = combine_level_validation(level_id, results, checked_ts=now_ts, expires_ts=expires_ts)
         try:
             await self.bot.db.execute(
@@ -1416,7 +1635,7 @@ class RequestLevelsCog(commands.Cog):
 
     async def _wave_summary_vars(self, guild_id: int, wave_id: int) -> Dict[str, Any]:
         rows = await self.bot.db.fetchall(
-            "SELECT status, result, reviewed_by, data_json FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
+            "SELECT status, result, reviewed_by, reviewed_ts, created_ts, data_json FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
             (guild_id, wave_id),
         )
         total = len(rows)
@@ -1437,7 +1656,7 @@ class RequestLevelsCog(commands.Cog):
                 request_type = str(data.get("request_type") or "")
                 if request_type:
                     break
-        return {
+        variables = {
             "wave_id": wave_id,
             "request_type": request_type,
             "request_type_label": self._request_type_label(request_type),
@@ -1461,6 +1680,26 @@ class RequestLevelsCog(commands.Cog):
             "reviewer_stats": reviewer_stats,
             "summary_color": self._color_name("sent" if pending == 0 else "pending", "blurple"),
         }
+        previous_wave = await self.bot.db.fetchone(
+            "SELECT MAX(wave_id) AS wave_id FROM level_request_submissions WHERE guild_id=? AND wave_id<?",
+            (guild_id, wave_id),
+        )
+        previous: Optional[Dict[str, Any]] = None
+        previous_wave_id = int(previous_wave["wave_id"] or 0) if previous_wave else 0
+        if previous_wave_id:
+            previous_rows = await self.bot.db.fetchall(
+                "SELECT status,result FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
+                (guild_id, previous_wave_id),
+            )
+            previous_reviewed = sum(1 for item in previous_rows if str(item["status"]) == "reviewed")
+            previous = {
+                "wave_id": previous_wave_id,
+                "total_requests": len(previous_rows),
+                "reviewed_count": previous_reviewed,
+                "sent_count": sum(1 for item in previous_rows if str(item["result"]) == "sent"),
+            }
+        variables.update(compare_waves(variables, previous))
+        return variables
 
     async def _reviewer_stats_lines(self, rows) -> str:
         stats: dict[int, dict[str, int]] = {}
@@ -1468,19 +1707,27 @@ class RequestLevelsCog(commands.Cog):
             if str(row["status"]) != "reviewed" or row["reviewed_by"] is None:
                 continue
             reviewer_id = int(row["reviewed_by"])
-            bucket = stats.setdefault(reviewer_id, {"total": 0, "sent": 0, "not_sent": 0})
+            bucket = stats.setdefault(reviewer_id, {"total": 0, "sent": 0, "not_sent": 0, "seconds": 0, "timed": 0})
             bucket["total"] += 1
             if str(row["result"]) == "sent":
                 bucket["sent"] += 1
             else:
                 bucket["not_sent"] += 1
+            try:
+                elapsed = max(0, int(row["reviewed_ts"] or 0) - int(row["created_ts"] or 0))
+            except Exception:
+                elapsed = 0
+            if elapsed:
+                bucket["seconds"] += elapsed
+                bucket["timed"] += 1
         if not stats:
             return "No reviews yet."
         lines = []
         for reviewer_id, bucket in sorted(stats.items(), key=lambda item: item[1]["total"], reverse=True)[:8]:
+            average_hours = bucket["seconds"] / bucket["timed"] / 3600 if bucket["timed"] else 0.0
             lines.append(
                 f"<@{reviewer_id}> - **{bucket['total']}** reviewed "
-                f"({bucket['sent']} sent / {bucket['not_sent']} not sent)"
+                f"({bucket['sent']} sent / {bucket['not_sent']} not sent) | avg **{average_hours:.1f}h**"
             )
         return "\n".join(lines)
 
@@ -1504,6 +1751,11 @@ class RequestLevelsCog(commands.Cog):
         embed.add_field(name="Sent", value=f"{variables['sent_count']} ({variables['sent_percent_reviewed']} of reviewed)", inline=True)
         embed.add_field(name="Not sent", value=f"{variables['not_sent_count']} ({variables['not_sent_percent_reviewed']} of reviewed)", inline=True)
         embed.add_field(name="Reviewer stats", value=str(variables.get("reviewer_stats") or "No reviews yet.")[:1024], inline=False)
+        embed.add_field(
+            name="Compared with previous wave",
+            value=str(variables.get("wave_comparison") or "No earlier wave is available yet.")[:1024],
+            inline=False,
+        )
         embed.add_field(
             name="Not sent breakdown",
             value=(
@@ -1671,20 +1923,7 @@ class RequestLevelsCog(commands.Cog):
         return year, month
 
     def _scheduled_local_time_exists(self, candidate: datetime) -> bool:
-        round_trip = datetime.fromtimestamp(candidate.timestamp(), TZ)
-        return (
-            round_trip.year,
-            round_trip.month,
-            round_trip.day,
-            round_trip.hour,
-            round_trip.minute,
-        ) == (
-            candidate.year,
-            candidate.month,
-            candidate.day,
-            candidate.hour,
-            candidate.minute,
-        )
+        return local_time_round_trip(candidate, TZ)
 
     def _parse_scheduled_open_ts(self, when: str, day: int = 0) -> tuple[Optional[int], str]:
         when_text = str(when or "").strip()
@@ -1934,6 +2173,10 @@ class RequestLevelsCog(commands.Cog):
             wave_id = str(wave_raw or "")
         created_ts = self._row_value(row, "created_ts", "")
         edit_deadline_ts = data.get("edit_deadline_ts") or self._row_value(row, "edit_deadline_ts", "")
+        raw_thresholds = self._cfg("aging_threshold_hours", default=[12, 24, 48])
+        thresholds = raw_thresholds if isinstance(raw_thresholds, list) else [12, 24, 48]
+        age = request_age(created_ts, thresholds=thresholds)
+        correlation_id = str(data.get("correlation_id") or self._row_value(row, "correlation_id", "") or "")
         variables = {
             **data,
             "level_id": data.get("level_id", ""),
@@ -1949,6 +2192,10 @@ class RequestLevelsCog(commands.Cog):
             "wave_id": wave_id,
             "submitted_ts": created_ts,
             "submitted_ago": self._submitted_ago(created_ts),
+            "sla_indicator": age.indicator,
+            "sla_status": age.status,
+            "sla_hours": f"{age.hours:.1f}",
+            "correlation_id": correlation_id,
             "edit_deadline_ts": edit_deadline_ts,
             "edit_deadline": f"<t:{edit_deadline_ts}:R>" if edit_deadline_ts else "",
             "edit_count": data.get("edit_count", 0),
@@ -2046,6 +2293,8 @@ class RequestLevelsCog(commands.Cog):
         )
 
     async def _set_state_closed(self, guild: discord.Guild, reason: str = "manual") -> None:
+        changed = False
+        closed_ts = int(time_module.time())
         async with self._state_lock:
             async with self._submit_lock:
                 row = await self._get_state(guild.id)
@@ -2071,6 +2320,18 @@ class RequestLevelsCog(commands.Cog):
                         ),
                         retry_safe=True,
                     )
+                    changed = True
+
+        if changed:
+            await record_workflow_event(
+                self.bot.db,
+                workflow_type="request_wave",
+                entity_id=str(wave_id),
+                event="closed",
+                correlation_id=current_correlation_id(),
+                guild_id=guild.id,
+                payload={"reason": reason, "closed_ts": closed_ts},
+            )
 
         try:
             await self.refresh_or_create_request_button(guild)
@@ -2099,12 +2360,17 @@ class RequestLevelsCog(commands.Cog):
             raise RuntimeError("The configured level review channel is missing or invalid.")
 
         previous_wave_id = 0
+        correlation_id = current_correlation_id() or new_correlation_id("request-wave")
         async with self._state_lock:
             async with self._submit_lock:
                 if scheduled_opening_id:
                     scheduled = await self.get_scheduled_opening(guild.id, int(scheduled_opening_id))
                     if scheduled is None:
                         raise RuntimeError("That scheduled opening is no longer pending.")
+                    correlation_id = str(
+                        self._row_value(scheduled, "correlation_id", "")
+                        or correlation_id
+                    )
 
                 current = await self._get_state(guild.id)
                 if current and str(current["state"]) == STATE_OPEN:
@@ -2148,6 +2414,23 @@ class RequestLevelsCog(commands.Cog):
                         )
                     )
                 await self.bot.db.execute_transaction(statements, retry_safe=True)
+
+        await record_workflow_event(
+            self.bot.db,
+            workflow_type="request_wave",
+            entity_id=str(wave_id),
+            event="opened",
+            correlation_id=correlation_id,
+            guild_id=guild.id,
+            payload={
+                "request_limit": request_limit,
+                "close_minutes": close_minutes,
+                "close_ts": close_ts,
+                "request_type": normalized_type,
+                "scheduled_opening_id": int(scheduled_opening_id or 0),
+                "replaced_wave_id": previous_wave_id,
+            },
+        )
 
         if previous_wave_id:
             try:
@@ -2413,9 +2696,20 @@ class RequestLevelsCog(commands.Cog):
             if open_ts is None:
                 return await ctx.respond(error or "I couldn't parse that opening time.", ephemeral=True)
             await self.bot.db.execute(
-                "INSERT INTO level_request_scheduled_openings(guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,status,request_type,open_message) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
-                (ctx.guild.id, request_limit, close_minutes, open_ts, ctx.user.id, int(time_module.time()), "pending", normalized_type or None, cleaned_open_message),
+                "INSERT INTO level_request_scheduled_openings(guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,status,request_type,open_message,correlation_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ctx.guild.id,
+                    request_limit,
+                    close_minutes,
+                    open_ts,
+                    ctx.user.id,
+                    int(time_module.time()),
+                    "pending",
+                    normalized_type or None,
+                    cleaned_open_message,
+                    new_correlation_id("scheduled"),
+                ),
             )
             details = [f"Request opening scheduled for <t:{open_ts}:F> (<t:{open_ts}:R>)."]
             if normalized_type:
@@ -2829,6 +3123,8 @@ class RequestLevelsCog(commands.Cog):
                 data["request_type_label"] = self._request_type_label(request_type)
                 data["edit_deadline_ts"] = self._edit_deadline_ts_for_state(row)
                 data["edit_count"] = 0
+                correlation_id = new_correlation_id("request")
+                data["correlation_id"] = correlation_id
                 data["duplicate_history_warning"] = await self._duplicate_history_warning(
                     interaction.guild.id,
                     normalized_level_id,
@@ -2841,8 +3137,8 @@ class RequestLevelsCog(commands.Cog):
 
                 try:
                     await self.bot.db.execute(
-                        "INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,status,created_ts,data_json) VALUES(?,?,?,?,?,?,?)",
-                        (interaction.guild.id, wave_id, user_id, normalized_level_id, "pending", created_ts, data_json),
+                        "INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,status,created_ts,data_json,correlation_id) VALUES(?,?,?,?,?,?,?,?)",
+                        (interaction.guild.id, wave_id, user_id, normalized_level_id, "pending", created_ts, data_json, correlation_id),
                     )
                 except Exception as e:
                     await log_error(self.bot, f"Could not save level request submission before sending embed: {repr(e)}")
@@ -2907,6 +3203,16 @@ class RequestLevelsCog(commands.Cog):
                             )
                         )
                     await self.bot.db.execute_transaction(statements, retry_safe=True)
+                    await record_workflow_event(
+                        self.bot.db,
+                        workflow_type="level_request",
+                        entity_id=f"{interaction.guild.id}:{wave_id}:{user_id}",
+                        event="submitted",
+                        correlation_id=correlation_id,
+                        guild_id=interaction.guild.id,
+                        actor_id=user_id,
+                        payload={"level_id": normalized_level_id, "message_id": int(msg.id)},
+                    )
                 except Exception as e:
                     try:
                         await msg.delete()
@@ -3296,6 +3602,9 @@ class RequestLevelsCog(commands.Cog):
         member = self._cached_interaction_member(interaction)
         if member is None or not self._has_reviewer_role(member):
             return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
+        if action == "recheck":
+            await interaction.response.defer(ephemeral=True)
+            return await self._recheck_review_validation(interaction, interaction.message.id)
         _, row = await self._review_target_by_message_local(interaction.guild.id, interaction.message.id)
         if not row:
             return await interaction.response.send_message("Request not found.", ephemeral=True)
@@ -3306,6 +3615,56 @@ class RequestLevelsCog(commands.Cog):
             return await interaction.response.send_message("Choose a result:", view=OtherReasonView(self, interaction.message.id), ephemeral=True)
 
         await interaction.response.send_modal(ReviewModal(self, interaction.message.id, action))
+
+    async def _recheck_review_validation(self, interaction: discord.Interaction, message_id: int) -> None:
+        async with self._review_lock:
+            target_kind, row = await self._review_target_by_message(interaction.guild.id, message_id)
+            if row is None:
+                return await self._reply_ephemeral(interaction, "Request not found.")
+            if str(row["status"]) != "pending":
+                return await self._reply_ephemeral(interaction, "This request has already been reviewed.")
+            data = self._safe_json_loads(row["data_json"], {})
+            if not isinstance(data, dict):
+                data = {}
+            level_id = str(data.get("level_id") or self._row_value(row, "level_id", "")).strip()
+            validation = await self._lookup_level_validation(level_id, force=True)
+            data = self._apply_level_validation_vars(data, validation)
+            data_json = json.dumps(data, separators=(",", ":"))
+            table = "weekly_request_reviews" if target_kind == "weekly" else "level_request_submissions"
+            await self.bot.db.execute(
+                f"UPDATE {table} SET data_json=? WHERE guild_id=? AND request_message_id=? AND status='pending'",  # nosec B608
+                (data_json, interaction.guild.id, message_id),
+            )
+            variables = (
+                self._weekly_data_vars(row, data)
+                if target_kind == "weekly"
+                else self._data_vars(row, data)
+            )
+            template_key = "weekly_request_submitted_embed" if target_kind == "weekly" else "level_requested_embed"
+            embed = self._embed_from_template(
+                self._cfg(template_key, default={}) or {},
+                variables,
+                default_color=self._color_name("pending", "blurple"),
+            )
+            await interaction.message.edit(embed=embed, view=LevelRequestReviewView())
+            correlation = str(self._row_value(row, "correlation_id", "") or data.get("correlation_id") or "")
+            await record_workflow_event(
+                self.bot.db,
+                workflow_type="level_request",
+                entity_id=str(message_id),
+                event="validation_rechecked",
+                correlation_id=correlation,
+                guild_id=interaction.guild.id,
+                actor_id=interaction.user.id,
+                payload={
+                    "level_id": level_id,
+                    "exists": validation.get("exists"),
+                    "rated": validation.get("rated"),
+                    "sources": validation.get("source_summary"),
+                },
+            )
+        notice = validation_notice(validation) or "Validation refreshed successfully."
+        await self._reply_ephemeral(interaction, notice[:1900])
 
     async def handle_review_submission(self, interaction: discord.Interaction, message_id: int, result_key: str, review: str):
         await self._finalize_review(interaction, message_id, result_key, review)
@@ -3344,72 +3703,135 @@ class RequestLevelsCog(commands.Cog):
             request_channel = await self._review_target_channel(interaction.guild, target_kind, row)
             if request_channel is None:
                 return await self._reply_ephemeral(interaction, "I couldn't find the original request channel, so I did not mark it reviewed.")
-            try:
-                msg = await request_channel.fetch_message(message_id)
-            except Exception as e:
-                await log_error(self.bot, f"Could not fetch reviewed level request {message_id}: {repr(e)}")
-                return await self._reply_ephemeral(interaction, "I couldn't find the original request message, so I did not mark it reviewed.")
+            msg = interaction.message
+            if msg is None or int(msg.id) != int(message_id):
+                try:
+                    msg = await request_channel.fetch_message(message_id)
+                except Exception as e:
+                    await log_error(self.bot, f"Could not fetch reviewed level request {message_id}: {repr(e)}")
+                    return await self._reply_ephemeral(interaction, "I couldn't find the original request message, so I did not mark it reviewed.")
 
             result_channel_id = self._status_channel_id(result_key)
-            result_channel = await self._channel_by_id(interaction.guild, result_channel_id)
-            if not isinstance(result_channel, discord.TextChannel):
+            if not result_channel_id:
                 return await self._reply_ephemeral(interaction, "I couldn't find the result channel, so I did not mark it reviewed.")
 
             reviewed_ts = int(time_module.time())
+            requester_id = int(self._row_value(row, "user_id", 0) or 0)
+            preference_row = await self.bot.db.fetchone(
+                "SELECT request_result_mode FROM user_notification_preferences WHERE guild_id=? AND user_id=?",
+                (interaction.guild.id, requester_id),
+            )
+            default_mode = self._cfg("default_result_notification", default="channel")
+            notification_mode = normalize_notification_mode(
+                preference_row["request_result_mode"] if preference_row else default_mode
+            )
+            correlation_id = str(
+                self._row_value(row, "correlation_id", "")
+                or data.get("correlation_id")
+                or new_correlation_id("review")
+            )
             try:
                 result_embed = self._embed_from_template(
                     self._cfg(self._result_template_key(result_key), default={}) or {},
                     variables,
                     default_color=self._color_name(result_key, "red"),
                 )
-                notification = await result_channel.send(
-                    content=f"<@{int(self._row_value(row, 'user_id', 0) or 0)}>",
-                    embed=result_embed,
-                    allowed_mentions=user_mentions(),
+                REQUEST_REVIEW_STATES.require("pending", "reviewed")
+                update_sql = (
+                    "UPDATE weekly_request_reviews SET request_message_id=?, status='reviewed', result=?, "
+                    "review_text=?, reviewed_by=?, reviewed_ts=?, correlation_id=? "
+                    "WHERE guild_id=? AND request_message_id=? AND status='pending'"
+                    if target_kind == "weekly"
+                    else
+                    "UPDATE level_request_submissions SET request_message_id=?, status='reviewed', result=?, "
+                    "review_text=?, reviewed_by=?, reviewed_ts=?, correlation_id=? "
+                    "WHERE guild_id=? AND request_message_id=? AND status='pending'"
                 )
-            except Exception as e:
-                await log_error(self.bot, f"Could not send level request result {message_id}: {repr(e)}")
-                return await self._reply_ephemeral(
-                    interaction,
-                    "I couldn't send the requester notification, so I did not mark the request reviewed.",
-                )
-
-            try:
-                if target_kind == "weekly":
-                    await self.bot.db.execute(
-                        "UPDATE weekly_request_reviews SET request_message_id=?, status='reviewed', result=?, "
-                        "review_text=?, reviewed_by=?, reviewed_ts=? "
-                        "WHERE guild_id=? AND request_message_id=? AND status='pending'",
+                statements = [
+                    (
+                        update_sql,
                         (
                             message_id,
                             result_key,
                             review,
                             reviewer_id,
                             reviewed_ts,
+                            correlation_id,
                             interaction.guild.id,
                             message_id,
                         ),
-                    )
-                else:
-                    await self.bot.db.execute(
-                        "UPDATE level_request_submissions SET request_message_id=?, status='reviewed', result=?, "
-                        "review_text=?, reviewed_by=?, reviewed_ts=? "
-                        "WHERE guild_id=? AND request_message_id=? AND status='pending'",
+                    ),
+                    (
+                        "INSERT OR IGNORE INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
-                            message_id,
-                            result_key,
-                            review,
-                            reviewer_id,
-                            reviewed_ts,
+                            correlation_id,
+                            f"request-result-channel:{interaction.guild.id}:{message_id}",
+                            "send_channel",
                             interaction.guild.id,
+                            result_channel_id,
+                            requester_id,
                             message_id,
+                            json.dumps(
+                                {
+                                    "content": f"<@{requester_id}>" if notification_mode in {"channel", "both"} else "",
+                                    "embed": result_embed.to_dict(),
+                                    "allow_user_mention": notification_mode in {"channel", "both"},
+                                },
+                                separators=(",", ":"),
+                            ),
+                            "pending",
+                            0,
+                            reviewed_ts,
+                            reviewed_ts,
+                            reviewed_ts,
                         ),
+                    ),
+                    (
+                        "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            correlation_id,
+                            "level_request",
+                            str(message_id),
+                            "reviewed",
+                            interaction.guild.id,
+                            reviewer_id,
+                            json.dumps({"result": result_key, "kind": target_kind}, separators=(",", ":")),
+                            reviewed_ts,
+                        ),
+                    ),
+                ]
+                if notification_mode in {"dm", "both"}:
+                    request_link = f"https://discord.com/channels/{interaction.guild.id}/{request_channel.id}/{message_id}"
+                    statements.append(
+                        (
+                            "INSERT OR IGNORE INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                correlation_id,
+                                f"request-result-dm:{interaction.guild.id}:{message_id}",
+                                "send_dm",
+                                interaction.guild.id,
+                                0,
+                                requester_id,
+                                message_id,
+                                json.dumps(
+                                    {
+                                        "content": f"Your level request was marked **{result_label}**. [Open the review]({request_link})",
+                                        "embed": result_embed.to_dict(),
+                                    },
+                                    separators=(",", ":"),
+                                ),
+                                "pending",
+                                0,
+                                reviewed_ts,
+                                reviewed_ts,
+                                reviewed_ts,
+                            ),
+                        )
                     )
+                await self.bot.db.execute_transaction(statements, retry_safe=True)
             except Exception as e:
-                try:
-                    await notification.delete()
-                except Exception:
-                    pass
                 await log_error(self.bot, f"Could not save reviewed level request {message_id}: {repr(e)}")
                 return await self._reply_ephemeral(interaction, "I couldn't save the review, so I did not update the request.")
 

@@ -1,16 +1,18 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.20.2",
-  "title": "Persistence and uptime reliability",
-  "summary": "A broad reliability pass for Turso-backed workflows, Discord references, tracking, and public service reporting.",
+  "version": "3.22.0",
+  "title": "Durable operations and request insights",
+  "summary": "A platform reliability release that makes Discord deliveries recoverable, supervises background work, expands request review tools, and turns operational history into useful staff and impact reporting.",
   "changes": [
-    "Preserved exact Discord IDs in Turso and repaired legacy IDs that had been rounded",
-    "Recovered stale request, sticky, ticket, and release message references from live Discord data",
-    "Made tracking totals, weekly rewards, daily summaries, and member resolution restart-safe",
-    "Prevented duplicate weekly notices, support DMs, and release approvals after uncertain deliveries",
-    "Hardened Turso replica recovery and removed redundant remote pulls from normal writes",
-    "Improved request scheduling, auto-close recovery, ticket satisfaction, and support response delivery",
-    "Corrected the public current-uptime counter so Discord reconnects no longer reset it",
-    "Expanded automated coverage for migrations, 64-bit IDs, recovery, and notification delivery"
+    "Added a persistent Discord action outbox with idempotent delivery, retries, dead-letter recovery, and saved message IDs",
+    "Added a background-task supervisor, historical health samples, provider latency telemetry, and post-deployment smoke checks",
+    "Added request notification preferences, live queue aging indicators, validation rechecks, wave comparisons, and structured review analytics",
+    "Expanded wave summaries with reviewer throughput and average review time",
+    "Added actionable dashboard controls for task restarts, request repair, delivery retries, permission scans, backups, and restore drills",
+    "Grouped repeated errors into persistent incidents and added workflow correlation IDs across commands, requests, tickets, and support submissions",
+    "Added permission drift scanning across configured channels, ticket categories, logs, summaries, backups, and assignable roles",
+    "Added forecast confidence, anomaly detection, automated monthly impact reports, retention controls, and scheduled restore drills",
+    "Added typed config and embed-template validation plus explicit database, runtime, config, and template schema versions",
+    "Split validation, scheduling, review analytics, diagnostics, backups, and impact forecasting into reusable service modules"
   ]
 }

@@ -12,6 +12,13 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence
 
+from utils.config_schema import (
+    CONFIG_SCHEMA_VERSION,
+    DATABASE_SCHEMA_VERSION,
+    EMBED_SCHEMA_VERSION,
+    RUNTIME_SCHEMA_VERSION,
+)
+
 try:
     import libsql
 except Exception:
@@ -218,6 +225,8 @@ _SNOWFLAKE_REPAIR_TABLES = {
     "daily_summary_reports",
     "database_backups",
     "database_restore_log",
+    "discord_outbox",
+    "health_metrics",
     "help_cooldowns",
     "help_sessions",
     "help_submissions",
@@ -234,6 +243,7 @@ _SNOWFLAKE_REPAIR_TABLES = {
     "ticket_transcripts",
     "tickets",
     "transcript_requests",
+    "user_notification_preferences",
     "weekly_claims",
     "weekly_dm_log",
     "weekly_recaps",
@@ -243,6 +253,7 @@ _SNOWFLAKE_REPAIR_TABLES = {
     "weekly_runs",
     "weekly_sessions",
     "weekly_streaks",
+    "workflow_events",
 }
 
 
@@ -272,6 +283,33 @@ class Database:
         self._replica_rebuild_count = 0
         self._last_replica_rebuild_ts = 0
         self._last_replica_rebuild_reason = ""
+        self._query_metrics: dict[str, dict[str, float | int]] = {}
+
+    def _record_query_timing(self, operation: str, elapsed_ms: float, *, failed: bool) -> None:
+        key = str(operation or "database")[:40]
+        metric = self._query_metrics.setdefault(
+            key,
+            {"count": 0, "errors": 0, "total_ms": 0.0, "max_ms": 0.0},
+        )
+        metric["count"] = int(metric["count"]) + 1
+        metric["errors"] = int(metric["errors"]) + int(failed)
+        metric["total_ms"] = float(metric["total_ms"]) + max(0.0, float(elapsed_ms))
+        metric["max_ms"] = max(float(metric["max_ms"]), max(0.0, float(elapsed_ms)))
+
+    def query_timing_snapshot(self, *, reset: bool = False) -> dict[str, dict[str, float | int]]:
+        snapshot: dict[str, dict[str, float | int]] = {}
+        for key, raw in self._query_metrics.items():
+            count = int(raw.get("count", 0) or 0)
+            total_ms = float(raw.get("total_ms", 0.0) or 0.0)
+            snapshot[key] = {
+                "count": count,
+                "errors": int(raw.get("errors", 0) or 0),
+                "average_ms": round(total_ms / count, 2) if count else 0.0,
+                "max_ms": round(float(raw.get("max_ms", 0.0) or 0.0), 2),
+            }
+        if reset:
+            self._query_metrics.clear()
+        return snapshot
 
     def _close_connection_sync(self) -> None:
         if self._conn is None:
@@ -456,20 +494,33 @@ class Database:
         *,
         retry_operation: bool = True,
         attempt_pending_sync: bool = True,
+        operation_name: str = "database",
     ) -> Any:
         await self.connect()
         attempts = 3 if self.uses_remote and retry_operation else 1
         last_error: Optional[Exception] = None
 
         for attempt in range(attempts):
+            started = time.perf_counter()
             async with self._lock:
                 assert self._conn is not None
 
                 try:
                     if attempt_pending_sync:
                         await asyncio.to_thread(self._try_pending_remote_sync_sync)
-                    return await asyncio.to_thread(operation)
+                    result = await asyncio.to_thread(operation)
+                    self._record_query_timing(
+                        operation_name,
+                        (time.perf_counter() - started) * 1000,
+                        failed=False,
+                    )
+                    return result
                 except Exception as exc:
+                    self._record_query_timing(
+                        operation_name,
+                        (time.perf_counter() - started) * 1000,
+                        failed=True,
+                    )
                     last_error = exc
                     should_recover = self.uses_remote and _is_recoverable_remote_error(exc)
                     if should_recover:
@@ -1041,6 +1092,100 @@ class Database:
                 observed_seconds INTEGER NOT NULL DEFAULT 0,
                 online_seconds INTEGER NOT NULL DEFAULT 0
             );""",
+            """CREATE TABLE IF NOT EXISTS schema_metadata(
+                component TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL
+            );""",
+            """CREATE TABLE IF NOT EXISTS discord_outbox(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                correlation_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                action_type TEXT NOT NULL,
+                guild_id INTEGER,
+                channel_id INTEGER,
+                user_id INTEGER,
+                message_id INTEGER,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_ts INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL,
+                delivered_ts INTEGER,
+                delivered_message_id INTEGER,
+                last_error TEXT
+            );""",
+            """CREATE TABLE IF NOT EXISTS workflow_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                correlation_id TEXT NOT NULL,
+                workflow_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL DEFAULT '',
+                event TEXT NOT NULL,
+                guild_id INTEGER,
+                actor_id INTEGER,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_ts INTEGER NOT NULL
+            );""",
+            """CREATE TABLE IF NOT EXISTS error_incidents(
+                fingerprint TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                first_seen_ts INTEGER NOT NULL,
+                last_seen_ts INTEGER NOT NULL,
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                last_message TEXT NOT NULL,
+                last_correlation_id TEXT,
+                log_message_id INTEGER,
+                resolved_ts INTEGER
+            );""",
+            """CREATE TABLE IF NOT EXISTS health_metrics(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                sample_ts INTEGER NOT NULL,
+                metric_type TEXT NOT NULL,
+                value REAL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );""",
+            """CREATE TABLE IF NOT EXISTS permission_drift_events(
+                guild_id INTEGER NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                detail_json TEXT NOT NULL DEFAULT '{}',
+                first_seen_ts INTEGER NOT NULL,
+                last_seen_ts INTEGER NOT NULL,
+                PRIMARY KEY(guild_id, resource_type, resource_id)
+            );""",
+            """CREATE TABLE IF NOT EXISTS user_notification_preferences(
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                request_result_mode TEXT NOT NULL DEFAULT 'channel',
+                updated_ts INTEGER NOT NULL,
+                PRIMARY KEY(guild_id, user_id)
+            );""",
+            """CREATE TABLE IF NOT EXISTS restore_drills(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                drill_ts INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                table_count INTEGER NOT NULL DEFAULT 0,
+                missing_tables_json TEXT NOT NULL DEFAULT '[]',
+                error_text TEXT,
+                trigger TEXT NOT NULL DEFAULT 'scheduled'
+            );""",
+            """CREATE TABLE IF NOT EXISTS monthly_impact_reports(
+                guild_id INTEGER NOT NULL,
+                month_key TEXT NOT NULL,
+                generated_ts INTEGER NOT NULL,
+                channel_id INTEGER,
+                message_id INTEGER,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'generated',
+                PRIMARY KEY(guild_id, month_key)
+            );""",
             """CREATE INDEX IF NOT EXISTS idx_activity_counts_week_count
                 ON activity_counts(guild_id, week_start, count DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_weekly_sessions_active_expiry
@@ -1086,6 +1231,16 @@ class Database:
                 ON bot_releases(version, id DESC);""",
             """CREATE INDEX IF NOT EXISTS idx_database_restore_log_guild
                 ON database_restore_log(guild_id, restore_ts DESC);""",
+            """CREATE INDEX IF NOT EXISTS idx_discord_outbox_ready
+                ON discord_outbox(status, next_attempt_ts, created_ts);""",
+            """CREATE INDEX IF NOT EXISTS idx_workflow_events_correlation
+                ON workflow_events(correlation_id, created_ts);""",
+            """CREATE INDEX IF NOT EXISTS idx_workflow_events_entity
+                ON workflow_events(workflow_type, entity_id, created_ts);""",
+            """CREATE INDEX IF NOT EXISTS idx_health_metrics_time
+                ON health_metrics(guild_id, sample_ts DESC, metric_type);""",
+            """CREATE INDEX IF NOT EXISTS idx_restore_drills_time
+                ON restore_drills(guild_id, drill_ts DESC);""",
         ]
         index_stmts = [
             stmt
@@ -1157,6 +1312,7 @@ class Database:
         self._ensure_column_sync("level_request_submissions", "reviewed_by", "INTEGER")
         self._ensure_column_sync("level_request_submissions", "reviewed_ts", "INTEGER")
         self._ensure_column_sync("level_request_submissions", "edit_deadline_ts", "INTEGER")
+        self._ensure_column_sync("level_request_submissions", "correlation_id", "TEXT")
         self._ensure_column_sync("weekly_request_reviews", "channel_id", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "rank", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "result", "TEXT")
@@ -1164,6 +1320,11 @@ class Database:
         self._ensure_column_sync("weekly_request_reviews", "reviewed_by", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "reviewed_ts", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "data_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column_sync("weekly_request_reviews", "correlation_id", "TEXT")
+        self._ensure_column_sync("tickets", "correlation_id", "TEXT")
+        self._ensure_column_sync("help_submissions", "correlation_id", "TEXT")
+        self._ensure_column_sync("level_request_scheduled_openings", "correlation_id", "TEXT")
+        self._ensure_column_sync("discord_outbox", "delivered_message_id", "INTEGER")
         self._ensure_column_sync("help_submissions", "response_text", "TEXT")
         self._ensure_column_sync("help_submissions", "responded_by", "INTEGER")
         self._ensure_column_sync("help_submissions", "responded_ts", "INTEGER")
@@ -1191,6 +1352,18 @@ class Database:
         )
         self._normalize_weekly_dm_log_sync()
         self._init_ticket_sequences_sync()
+        now_ts = int(time.time())
+        for component, version in (
+            ("database", DATABASE_SCHEMA_VERSION),
+            ("config", CONFIG_SCHEMA_VERSION),
+            ("runtime_settings", RUNTIME_SCHEMA_VERSION),
+            ("embed_templates", EMBED_SCHEMA_VERSION),
+        ):
+            self._conn.execute(
+                "INSERT INTO schema_metadata(component,schema_version,updated_ts) VALUES(?,?,?) "
+                "ON CONFLICT(component) DO UPDATE SET schema_version=excluded.schema_version,updated_ts=excluded.updated_ts",
+                (component, version, now_ts),
+            )
         for stmt in index_stmts:
             self._conn.execute(stmt)
         self._commit_and_sync_sync()
@@ -1289,7 +1462,7 @@ class Database:
             self._commit_and_sync_sync()
             return next_id
 
-        return await self._run_locked_with_retry(_run, retry_operation=False)
+        return await self._run_locked_with_retry(_run, retry_operation=False, operation_name="next_ticket_id")
 
     async def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
         def _run():
@@ -1297,7 +1470,24 @@ class Database:
             self._execute_write_compat_sync(sql, params)
             self._commit_and_sync_sync()
 
-        await self._run_locked_with_retry(_run, retry_operation=False)
+        await self._run_locked_with_retry(_run, retry_operation=False, operation_name="execute")
+
+    async def execute_affected(self, sql: str, params: Sequence[Any] = ()) -> int:
+        """Execute one write and return its affected-row count under the same lock."""
+
+        def _run() -> int:
+            assert self._conn is not None
+            self._execute_write_compat_sync(sql, params)
+            row = self._conn.execute("SELECT changes()").fetchone()
+            changed = int(_row_get(row, "changes()", index=0, default=0) or 0)
+            self._commit_and_sync_sync()
+            return changed
+
+        return await self._run_locked_with_retry(
+            _run,
+            retry_operation=False,
+            operation_name="execute_affected",
+        )
 
     async def execute_insert(self, sql: str, params: Sequence[Any] = ()) -> int:
         """Execute one INSERT and return its generated integer row ID."""
@@ -1312,7 +1502,7 @@ class Database:
             self._commit_and_sync_sync()
             return int(row_id or 0)
 
-        return await self._run_locked_with_retry(_run, retry_operation=False)
+        return await self._run_locked_with_retry(_run, retry_operation=False, operation_name="insert")
 
     async def execute_transaction(
         self,
@@ -1339,7 +1529,7 @@ class Database:
                     pass
                 raise
 
-        await self._run_locked_with_retry(_run, retry_operation=retry_safe)
+        await self._run_locked_with_retry(_run, retry_operation=retry_safe, operation_name="transaction")
 
     async def set_runtime_setting(self, key: str, value: Any) -> None:
         payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
@@ -1494,7 +1684,7 @@ class Database:
                 raise
             return result
 
-        return await self._run_locked_with_retry(_run, retry_operation=True)
+        return await self._run_locked_with_retry(_run, retry_operation=True, operation_name="snowflake_repair")
 
     def health_snapshot(self) -> dict[str, Any]:
         return {
@@ -1508,6 +1698,7 @@ class Database:
             "replica_rebuild_count": self._replica_rebuild_count,
             "last_replica_rebuild_ts": self._last_replica_rebuild_ts,
             "last_replica_rebuild_reason": self._last_replica_rebuild_reason,
+            "query_timing": self.query_timing_snapshot(),
         }
 
     async def sync_remote(self) -> bool:
@@ -1525,7 +1716,7 @@ class Database:
             self._last_remote_sync_error_ts = 0
             return True
 
-        return bool(await self._run_locked_with_retry(_run))
+        return bool(await self._run_locked_with_retry(_run, operation_name="remote_sync"))
 
     async def executemany(self, sql: str, seq: Iterable[Sequence[Any]]) -> None:
         items = list(seq)
@@ -1536,7 +1727,7 @@ class Database:
                 self._execute_write_compat_sync(sql, params)
             self._commit_and_sync_sync()
 
-        await self._run_locked_with_retry(_run, retry_operation=False)
+        await self._run_locked_with_retry(_run, retry_operation=False, operation_name="executemany")
 
     async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[Any]:
         def _run():
@@ -1550,7 +1741,7 @@ class Database:
                     row = cur.fetchone()
             return _normalize_row(cur, row)
 
-        return await self._run_locked_with_retry(_run)
+        return await self._run_locked_with_retry(_run, operation_name="fetchone")
 
     async def fetchone_local(self, sql: str, params: Sequence[Any] = ()) -> Optional[Any]:
         """Read current replica state without waiting for a pending remote sync.
@@ -1571,7 +1762,7 @@ class Database:
                     row = cur.fetchone()
             return _normalize_row(cur, row)
 
-        return await self._run_locked_with_retry(_run, attempt_pending_sync=False)
+        return await self._run_locked_with_retry(_run, attempt_pending_sync=False, operation_name="fetchone_local")
 
     async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[Any]:
         def _run():
@@ -1585,4 +1776,4 @@ class Database:
                     rows = cur.fetchall()
             return _normalize_rows(cur, rows)
 
-        return await self._run_locked_with_retry(_run)
+        return await self._run_locked_with_retry(_run, operation_name="fetchall")

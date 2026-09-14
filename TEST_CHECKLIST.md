@@ -389,6 +389,18 @@
 39. Choose each `Other` reason on separate requests.
     - Expected: staff embed color/result updates, buttons disable, and a pinged result appears in `rejected_channel`.
     - Expected: the wave summary updates the not-sent breakdown.
+40. Run `/requests notifications mode:dm`, submit a request, and have it reviewed.
+    - Expected: the result channel still receives the configured result embed without a requester ping, and the requester receives a DM containing the result and review-message link.
+41. Repeat with `mode:both`, `mode:channel`, and `mode:none`.
+    - Expected: `both` pings in-channel and sends a DM; `channel` only pings in-channel; `none` records the review without an additional requester notification.
+42. Leave requests pending across each configured aging threshold.
+    - Expected: request cards and `/requests pending` move through Fresh, Aging, Due soon, and Overdue without changing the stored submission time.
+43. Press `Recheck` on a pending request as a configured reviewer.
+    - Expected: the bot fetches fresh provider evidence, updates the validation and GD information on the same card, and leaves the request pending.
+44. Run `/requests analytics` as a reviewer.
+    - Expected: the ephemeral report shows pending age/SLA, review throughput, and counts for rejected, missing, stolen, and already-rated outcomes.
+45. Close a second wave after reviewing some requests.
+    - Expected: the summary compares request volume and sent-rate percentage points with the preceding wave and includes per-reviewer throughput plus average review time.
 
 ---
 
@@ -487,6 +499,26 @@
    - Expected: the manual force DM still sends if the user has no active/past non-resettable claim, and the override is logged.
 16. Temporarily misconfigure an appeal/report/bot-issue log channel, then complete that DM flow.
    - Expected: the user is told the submission could not be sent instead of receiving a false success message.
+17. Open `/bot dashboard`, then select `Incidents`.
+   - Expected: repeated errors are grouped by fingerprint with occurrence count, first/last seen time, and workflow correlation context.
+18. Use `Restart tasks` on the dashboard.
+   - Expected: failed or stopped required loops restart; intentionally disabled icon/status/summary jobs remain disabled.
+19. Use `Repair requests`, `Retry deliveries`, and `Scan permissions`.
+   - Expected: each action acknowledges immediately, runs one bounded repair, and refreshes the dashboard with the new outcome.
+20. Temporarily remove `Send Messages` from one configured log channel, then run the permission scan.
+   - Expected: the dashboard reports the exact channel and missing permission; restoring it marks the persistent drift record resolved on the next scan.
+21. Use `Backup + drill`.
+   - Expected: a backup is produced and a separate read-only copy passes SQLite integrity and required-table checks without replacing the live database.
+22. Run `/bot retention action:show`, then set one allowlisted retention period and run cleanup.
+   - Expected: the override survives restart, only eligible old rows in allowlisted operational tables are deleted, and workflow/business records are untouched.
+23. Create a temporary retryable outbox failure by making a result channel unavailable, then restore it before the retry limit.
+   - Expected: the workflow result stays committed, the outbox retries with backoff, and exactly one queue row eventually becomes delivered with its Discord message ID.
+24. Run `/bot impact` with at least 21 days of daily data.
+   - Expected: the report shows 7-day and 28-day averages, trend percentage, forecast confidence, and recent anomaly signals when applicable.
+25. Temporarily set the monthly report schedule to the next safe test time.
+   - Expected: one idempotent monthly report is queued and delivered; restarts do not duplicate that month’s report.
+26. Restart after deployment and inspect `/bot dashboard` after the configured smoke-test delay.
+   - Expected: smoke status verifies database access, guild visibility, typed config, outbox, request cog, schema versions, and slash-command registration.
 
 ---
 

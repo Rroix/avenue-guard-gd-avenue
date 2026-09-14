@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import re
 import time
 import traceback
 import discord
 
 from utils.mentions import no_mentions
+from utils.workflows import clear_workflow_context, current_correlation_id
 
 _ERROR_DEDUPE_SECONDS = 300
 _recent_error_logs: dict[str, float] = {}
@@ -74,6 +76,29 @@ def _dedupe_key(message: str) -> str:
     return text[:600]
 
 
+async def _persist_incident(bot: discord.Client, message: str) -> tuple[str, int]:
+    normalized = _dedupe_key(message)
+    fingerprint = hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()[:24]
+    now = int(time.time())
+    category = str(message or "Bot error").splitlines()[0][:120]
+    correlation = current_correlation_id()
+    try:
+        await bot.db.execute(
+            "INSERT INTO error_incidents(fingerprint,category,status,first_seen_ts,last_seen_ts,occurrence_count,last_message,last_correlation_id) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET status='open',last_seen_ts=excluded.last_seen_ts,"
+            "occurrence_count=error_incidents.occurrence_count+1,last_message=excluded.last_message,"
+            "last_correlation_id=excluded.last_correlation_id,resolved_ts=NULL",
+            (fingerprint, category, "open", now, now, 1, message[:3600], correlation or None),
+        )
+        row = await bot.db.fetchone(
+            "SELECT occurrence_count FROM error_incidents WHERE fingerprint=?",
+            (fingerprint,),
+        )
+        return fingerprint, int(row["occurrence_count"] or 1) if row else 1
+    except Exception:
+        return fingerprint, 1
+
+
 def _unwrap_command_error(error: Exception) -> Exception:
     current = error
     seen: set[int] = set()
@@ -105,6 +130,7 @@ def _command_error_record(ctx: discord.ApplicationContext, error: Exception) -> 
 
 async def log_error(bot: discord.Client, message: str) -> None:
     message = _compact_error_message(_redact_secrets(message))
+    fingerprint, occurrence_count = await _persist_incident(bot, message)
     try:
         print(f"[Avenue Guard error] {message}", flush=True)
     except Exception:
@@ -142,9 +168,21 @@ async def log_error(bot: discord.Client, message: str) -> None:
             color=discord.Color.red(),
             timestamp=datetime.now(timezone.utc),
         )
+        embed.add_field(name="Incident", value=f"`{fingerprint}`", inline=True)
+        embed.add_field(name="Occurrences", value=str(occurrence_count), inline=True)
+        correlation = current_correlation_id()
+        if correlation:
+            embed.add_field(name="Workflow", value=f"`{correlation}`", inline=False)
         embed.set_footer(text="Avenue Guard error log")
         try:
-            await channel.send(embed=embed, allowed_mentions=no_mentions())
+            sent = await channel.send(embed=embed, allowed_mentions=no_mentions())
+            try:
+                await bot.db.execute(
+                    "UPDATE error_incidents SET log_message_id=? WHERE fingerprint=?",
+                    (int(sent.id), fingerprint),
+                )
+            except Exception:
+                pass
         except Exception as send_error:
             if len(message) > 1800:
                 message = message[:1800] + "\n...truncated..."
@@ -183,11 +221,14 @@ def setup_global_error_handlers(bot: discord.Client) -> None:
             f"Command error in /{record['command']} [{record['category']}]: {repr(error)}\n{error_trace}",
         )
         if record["category"] == "interaction_timeout":
+            clear_workflow_context()
             return
         try:
             await ctx.respond("Something went wrong while running that command.", ephemeral=True)
         except Exception:
             pass
+        finally:
+            clear_workflow_context()
 
     @bot.event
     async def on_error(event_method: str, *args, **kwargs):

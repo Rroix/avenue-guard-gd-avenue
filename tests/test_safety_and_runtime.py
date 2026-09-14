@@ -1,9 +1,11 @@
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import discord
 import pytest
 
+from cogs.Background import BackgroundCog
 from cogs.Mod import _review_access_text, _within_one_edit
 from cogs.Sticky import StickyCog
 from utils.checks import basic_color
@@ -69,6 +71,44 @@ def test_icon_url_validation_blocks_local_targets_credentials_and_expiring_links
     ]
     assert normalize_server_icon_mode("LINEAR") == "linear"
     assert normalize_server_icon_mode("unknown") == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_server_icon_download_reuses_recent_validated_bytes():
+    class Content:
+        async def read(self, _limit):
+            return b"\x89PNG\r\n\x1a\nimage-bytes"
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "image/png", "Content-Length": "19"}
+        content = Content()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, *_args, **_kwargs):
+            self.calls += 1
+            return Response()
+
+    session = Session()
+    cog = object.__new__(BackgroundCog)
+    cog._icon_download_cache = {}
+    cog._assert_public_server_icon_url = AsyncMock()
+    cog._get_icon_http_session = AsyncMock(return_value=session)
+
+    first = await cog._download_server_icon("https://example.com/icon.png")
+    second = await cog._download_server_icon("https://example.com/icon.png")
+
+    assert first == second
+    assert session.calls == 1
 
 
 def test_forum_regex_guard_rejects_high_risk_patterns():

@@ -698,25 +698,28 @@ class ReleaseCog(commands.Cog):
                 await log_error(self.bot, f"Public bot status refresh failed: {exc!r}")
 
     async def start_background(self) -> None:
-        if self._background_started:
+        metrics_running = self._metrics_task is not None and not self._metrics_task.done()
+        if self._background_started and metrics_running:
             return
+        first_start = not self._background_started
         self._background_started = True
-        try:
-            await self._initialize_uptime_tracker()
-        except Exception as exc:
-            await log_error(self.bot, f"Initial uptime tracker setup failed: {exc!r}")
-        try:
-            await self.refresh_public_release_cache()
-        except Exception as exc:
-            await log_error(self.bot, f"Initial public release cache load failed: {exc!r}")
-        try:
-            await self.refresh_public_metrics()
-        except Exception as exc:
-            await log_error(self.bot, f"Initial public bot status refresh failed: {exc!r}")
-        try:
-            await self._ensure_manifest_proposal()
-        except Exception as exc:
-            await log_error(self.bot, f"Initial release manifest check failed: {exc!r}")
+        if first_start:
+            try:
+                await self._initialize_uptime_tracker()
+            except Exception as exc:
+                await log_error(self.bot, f"Initial uptime tracker setup failed: {exc!r}")
+            try:
+                await self.refresh_public_release_cache()
+            except Exception as exc:
+                await log_error(self.bot, f"Initial public release cache load failed: {exc!r}")
+            try:
+                await self.refresh_public_metrics()
+            except Exception as exc:
+                await log_error(self.bot, f"Initial public bot status refresh failed: {exc!r}")
+            try:
+                await self._ensure_manifest_proposal()
+            except Exception as exc:
+                await log_error(self.bot, f"Initial release manifest check failed: {exc!r}")
         self._metrics_task = asyncio.create_task(
             self._metrics_loop(),
             name="avenue-guard-public-status",

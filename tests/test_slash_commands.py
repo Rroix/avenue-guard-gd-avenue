@@ -22,6 +22,7 @@ DEFERRED_COMMAND_METHODS = (
     "bot_storage",
     "bot_release",
     "bot_releases",
+    "bot_retention",
     "tracking_top",
     "tracking_reset",
     "tracking_me",
@@ -35,6 +36,8 @@ DEFERRED_COMMAND_METHODS = (
     "requests_pending",
     "requests_history",
     "requests_repair",
+    "requests_notifications",
+    "requests_analytics",
     "server_icon_status",
     "server_icon_mode",
     "server_icon_add",
@@ -85,7 +88,7 @@ def test_all_registered_slash_commands_serialize_with_descriptions(tmp_path, mon
 
         names = {name for name, _ in leaves}
         assert len(bot.pending_application_commands) == 17
-        assert len(names) == 41
+        assert len(names) == 44
         assert {
             "bot release",
             "bot releases",
@@ -93,6 +96,9 @@ def test_all_registered_slash_commands_serialize_with_descriptions(tmp_path, mon
             "tracking enable_reward",
             "open-requests",
             "edit-request",
+            "requests notifications",
+            "requests analytics",
+            "bot retention",
         } <= names
 
         for name, data in leaves:

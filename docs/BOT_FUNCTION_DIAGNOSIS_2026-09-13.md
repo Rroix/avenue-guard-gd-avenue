@@ -1,7 +1,7 @@
 # Avenue Guard Function-by-Function Diagnosis
 
 **Audit date:** 2026-09-13  
-**Runtime scope:** 26 Python modules, 908 definitions, 22,864 physical lines
+**Runtime scope:** 26 Python modules, 919 definitions, 23,284 physical lines
 **Method:** AST inventory, per-function control-flow scoring, interaction-order review, persistence/Discord I/O mapping, compile, tests, Ruff, Bandit, and dependency audit
 
 ## Reading This Report
@@ -15,7 +15,7 @@ Every runtime function, method, nested callback, and modal handler has one row b
 ## Executive Diagnosis
 
 - All runtime modules parse and compile.
-- The complete automated suite passes: 122 tests.
+- The complete automated suite passes: 132 tests.
 - Ruff's correctness and bug checks pass.
 - Bandit reports no medium or high security findings.
 - The production dependency set has no known published vulnerabilities.
@@ -24,27 +24,22 @@ Every runtime function, method, nested callback, and modal handler has one row b
 
 ## Current Review Fixes
 
-- Pinned the Render runtime to Python 3.13 and refreshed production dependency bounds.
-- Replaced implicit event-loop lookup during startup with explicit loop ownership and cleanup.
-- Restored the Discord presence intent required for accurate daily online-member summaries.
-- Preserved every Discord snowflake exactly when using the legacy libSQL Python binding; large integers are never routed through floating point.
-- Added compatible reads and in-place repair for historical IDs that Turso/libSQL rounded before this release.
-- Reconciled message and channel pointers against live Discord evidence instead of trusting a rounded database value.
-- Recovered closed-ticket recipients from exact guild membership, transcript embeds, and transcript attachments before declaring them unavailable.
-- Made ticket satisfaction outcomes durable so deleted or inaccessible users are logged once instead of retried on every restart.
-- Reserved weekly offers, reminders, and release approvals before sending Discord messages to prevent duplicates after uncertain writes.
-- Removed a redundant remote pull after every embedded-replica write; startup and explicit resync remain authoritative pull points.
-- Quarantined and rebuilt corrupt local replica files when Turso reports `file is not a database`.
-- Kept scheduled openings and auto-closes transactional, restart-safe, and isolated from transient Turso failures.
-- Suppressed expected Discord 404s for genuinely deleted saved messages while retaining actionable diagnostics.
-- Made presence rotation tolerate a transport that is closing during reconnect or shutdown.
-- Expanded migration, 64-bit ID, recovery, restart-idempotency, and notification-delivery regression coverage.
+- Updated direct GD/Boomlings requests to the current GD 2.2 form, cookie, and header contract.
+- Classified access denials, rate limits, transient outages, malformed payloads, and oversized responses separately.
+- Added one bounded retry for transient provider failures and immediate long backoff for upstream `401`/`403` responses.
+- Rechecked provider circuits inside serialized calls so concurrent submissions cannot continue hitting a newly blocked endpoint.
+- Shortened all-provider-failure caching while retaining the normal cache for successful evidence and pruning expired rows at startup.
+- Added explicit CA trust, DNS caching, connection limits, and deterministic shutdown to outbound HTTP sessions.
+- Reused and briefly cached validated server-icon downloads instead of creating a new TLS session for every image candidate.
+- Exposed GD provider readiness and cooldown state in the admin dashboard with actionable fallback guidance.
+- Hardened validation against incomplete GDBrowser JSON, HTML challenge pages, and error bodies that resemble missing-level responses.
+- Expanded external-access, provider-state, icon-cache, configuration, and shutdown regression coverage.
 
 ## Attention Summary
 
 | Classification | Definitions |
 |---|---:|
-| Routine | 725 |
+| Routine | 736 |
 | Focused review | 151 |
 | High attention | 32 |
 
@@ -52,96 +47,99 @@ Every runtime function, method, nested callback, and modal handler has one row b
 
 ### `cogs/Background.py`
 
-86 definitions: 71 routine, 13 focused, 2 high attention.
+89 definitions: 74 routine, 13 focused, 2 high attention.
 
 | Line | Definition | Kind | LOC | CC | Await | DB | Discord | Recovery | Assessment |
 |---:|---|---|---:|---:|---:|---:|---:|---|---|
-| 32 | `_day_key` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 36 | `_parse_hhmm` | internal helper | 10 | 3 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 47 | `_fmt_minutes` | internal helper | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 55 | `_fmt_num` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 58 | `_fmt_delta` | internal helper | 8 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 67 | `_fmt_percent` | internal helper | 4 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 101 | `BackgroundCog.__init__` | internal helper | 13 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 115 | `BackgroundCog.cog_unload` | helper | 19 | 5 | 0 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
-| 135 | `BackgroundCog.start_background` | helper | 60 | 22 | 10 | 0 | 0 | 7 broad / 0 silent | **Focused review**: 7 broad catches |
-| 196 | `BackgroundCog.on_config_reload` | helper | 45 | 21 | 0 | 0 | 0 | 8 broad / 4 silent | **High attention**: 8 broad catches; 4 silent recovery paths |
-| 245 | `BackgroundCog._excluded_channels` | internal helper | 7 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 253 | `BackgroundCog._status_rotation_enabled` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 256 | `BackgroundCog._status_rotation_interval` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 259 | `BackgroundCog._status_list` | internal helper | 14 | 8 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 274 | `BackgroundCog._presence_transport_is_closing` | internal helper | 13 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 288 | `BackgroundCog._server_icon_rotation_enabled` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 292 | `BackgroundCog._server_icon_interval` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 296 | `BackgroundCog._server_icon_urls` | internal helper | 4 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 301 | `BackgroundCog._database_backup_enabled` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 304 | `BackgroundCog._database_backup_interval_seconds` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 308 | `BackgroundCog._server_icon_current_index` | internal helper | 8 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 317 | `BackgroundCog._server_icon_candidate_indices` | internal helper | 14 | 8 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 332 | `BackgroundCog._looks_like_server_icon_image` | internal helper | 10 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 343 | `BackgroundCog._assert_public_server_icon_url` | internal helper | 26 | 12 | 1 | 0 | 0 | 0 broad / 1 silent | **Focused review**: 1 silent recovery path |
-| 370 | `BackgroundCog._download_server_icon` | internal helper | 40 | 18 | 2 | 0 | 0 | none | **Focused review**: small, direct control flow |
-| 411 | `BackgroundCog._detect_current_server_icon_index` | internal helper | 18 | 8 | 2 | 0 | 0 | 2 broad / 1 silent | **Focused review**: 2 broad catches; 1 silent recovery path |
-| 430 | `BackgroundCog._persist_server_icon_state` | internal helper | 6 | 2 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 437 | `BackgroundCog._remember_server_icon_error` | internal helper | 7 | 3 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 445 | `BackgroundCog._config_write_lock` | internal helper | 7 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 453 | `BackgroundCog.rotate_server_icon_once` | helper | 15 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 469 | `BackgroundCog._rotate_server_icon_once_locked` | internal helper | 70 | 19 | 6 | 0 | 1 | 2 broad / 0 silent | **Focused review**: 1 Discord operation; 2 broad catches |
-| 540 | `BackgroundCog._render_status_text` | internal helper | 55 | 14 | 5 | 3 | 0 | 3 broad / 0 silent | **Routine**: 3 persistence calls; 3 broad catches |
-| 543 | `BackgroundCog._render_status_text._SafeDict.__missing__` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 596 | `BackgroundCog._daily_summary_enabled` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 599 | `BackgroundCog._daily_summary_channel_id` | internal helper | 5 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 605 | `BackgroundCog._daily_reset_after_report` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 608 | `BackgroundCog._daily_summary_due` | internal helper | 6 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 615 | `BackgroundCog._daily_summary_already_sent` | internal helper | 6 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 622 | `BackgroundCog._record_daily_summary_sent` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 628 | `BackgroundCog._voice_sessions_from_guild` | internal helper | 9 | 6 | 0 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
-| 638 | `BackgroundCog._stats_payload` | internal helper | 23 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 662 | `BackgroundCog._stats_from_payload` | internal helper | 16 | 12 | 0 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
-| 679 | `BackgroundCog._load_daily_stats` | internal helper | 11 | 4 | 1 | 1 | 0 | 1 broad / 0 silent | **Routine**: 1 persistence call; 1 broad catch |
-| 691 | `BackgroundCog._persist_daily_stats` | internal helper | 6 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 698 | `BackgroundCog._persist_current_day` | internal helper | 9 | 3 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 708 | `BackgroundCog._rollover_boundary_ts` | internal helper | 6 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 715 | `BackgroundCog._add_voice_until` | internal helper | 8 | 4 | 0 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
-| 724 | `BackgroundCog._track_background_persist` | internal helper | 18 | 5 | 0 | 0 | 0 | 2 broad / 1 silent | **Focused review**: 2 broad catches; 1 silent recovery path |
-| 727 | `BackgroundCog._track_background_persist._done` | internal helper | 13 | 5 | 0 | 0 | 0 | 2 broad / 1 silent | **Focused review**: 2 broad catches; 1 silent recovery path |
-| 743 | `BackgroundCog._rollover_if_needed` | internal helper | 28 | 7 | 0 | 0 | 0 | 2 broad / 1 silent | **Focused review**: 2 broad catches; 1 silent recovery path |
-| 776 | `BackgroundCog.on_message` | event listener | 14 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 792 | `BackgroundCog.on_message_edit` | event listener | 11 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 805 | `BackgroundCog.on_message_delete` | event listener | 11 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 818 | `BackgroundCog.on_reaction_add` | event listener | 11 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 831 | `BackgroundCog.on_member_join` | event listener | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 840 | `BackgroundCog.on_member_remove` | event listener | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 849 | `BackgroundCog.on_member_ban` | event listener | 7 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 858 | `BackgroundCog.on_member_unban` | event listener | 7 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 867 | `BackgroundCog.on_member_update` | event listener | 10 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 879 | `BackgroundCog.on_voice_state_update` | event listener | 23 | 14 | 1 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 904 | `BackgroundCog.on_application_command_completion` | event listener | 14 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 920 | `BackgroundCog.on_application_command_error` | event listener | 15 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 940 | `BackgroundCog.update_snapshot` | background loop | 22 | 11 | 5 | 0 | 0 | 3 broad / 0 silent | **Routine**: 3 broad catches |
-| 963 | `BackgroundCog._log_snapshot_failure` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 967 | `BackgroundCog._before_snapshot` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 971 | `BackgroundCog._snapshot_error` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 975 | `BackgroundCog.database_backup` | background loop | 33 | 13 | 5 | 1 | 0 | 2 broad / 0 silent | **Routine**: 1 persistence call; 2 broad catches |
-| 1010 | `BackgroundCog._before_database_backup` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1014 | `BackgroundCog._database_backup_error` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1018 | `BackgroundCog.rotate_status` | background loop | 40 | 11 | 3 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 1060 | `BackgroundCog._before_rotate` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1064 | `BackgroundCog._rotate_error` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1068 | `BackgroundCog.rotate_server_icon` | background loop | 23 | 11 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1093 | `BackgroundCog._before_server_icon_rotate` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1097 | `BackgroundCog._server_icon_rotate_error` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1100 | `BackgroundCog._start_daily_report_loop` | internal helper | 14 | 5 | 0 | 0 | 0 | 2 broad / 2 silent | **Focused review**: 2 broad catches; 2 silent recovery paths |
-| 1115 | `BackgroundCog._top_channel_lines` | internal helper | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1123 | `BackgroundCog._top_member_lines` | internal helper | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1131 | `BackgroundCog._top_command_lines` | internal helper | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1139 | `BackgroundCog._summary_color` | internal helper | 8 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1148 | `BackgroundCog._send_daily_summary_for_day` | internal helper | 7 | 2 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1156 | `BackgroundCog._send_daily_summary_for_day_locked` | internal helper | 173 | 33 | 11 | 0 | 3 | 7 broad / 3 silent | **High attention**: 3 Discord operations; split candidate; 7 broad catches; 3 silent recovery paths |
-| 1331 | `BackgroundCog.daily_report` | background loop | 12 | 4 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 1345 | `BackgroundCog._before_daily` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1349 | `BackgroundCog._daily_error` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1352 | `setup` | helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 34 | `_day_key` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 38 | `_parse_hhmm` | internal helper | 10 | 3 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 49 | `_fmt_minutes` | internal helper | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 57 | `_fmt_num` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 60 | `_fmt_delta` | internal helper | 8 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 69 | `_fmt_percent` | internal helper | 4 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 103 | `BackgroundCog.__init__` | internal helper | 15 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 119 | `BackgroundCog.cog_unload` | helper | 19 | 5 | 0 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
+| 139 | `BackgroundCog._cleanup_resources` | internal helper | 3 | 1 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 143 | `BackgroundCog.close_resources` | helper | 6 | 3 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 150 | `BackgroundCog._get_icon_http_session` | internal helper | 16 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 167 | `BackgroundCog.start_background` | helper | 60 | 22 | 10 | 0 | 0 | 7 broad / 0 silent | **Focused review**: 7 broad catches |
+| 228 | `BackgroundCog.on_config_reload` | helper | 45 | 21 | 0 | 0 | 0 | 8 broad / 4 silent | **High attention**: 8 broad catches; 4 silent recovery paths |
+| 277 | `BackgroundCog._excluded_channels` | internal helper | 7 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 285 | `BackgroundCog._status_rotation_enabled` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 288 | `BackgroundCog._status_rotation_interval` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 291 | `BackgroundCog._status_list` | internal helper | 14 | 8 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 306 | `BackgroundCog._presence_transport_is_closing` | internal helper | 13 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 320 | `BackgroundCog._server_icon_rotation_enabled` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 324 | `BackgroundCog._server_icon_interval` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 328 | `BackgroundCog._server_icon_urls` | internal helper | 4 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 333 | `BackgroundCog._database_backup_enabled` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 336 | `BackgroundCog._database_backup_interval_seconds` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 340 | `BackgroundCog._server_icon_current_index` | internal helper | 8 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 349 | `BackgroundCog._server_icon_candidate_indices` | internal helper | 14 | 8 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 364 | `BackgroundCog._looks_like_server_icon_image` | internal helper | 10 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 375 | `BackgroundCog._assert_public_server_icon_url` | internal helper | 26 | 12 | 1 | 0 | 0 | 0 broad / 1 silent | **Focused review**: 1 silent recovery path |
+| 402 | `BackgroundCog._download_server_icon` | internal helper | 52 | 21 | 3 | 0 | 0 | none | **Focused review**: small, direct control flow |
+| 455 | `BackgroundCog._detect_current_server_icon_index` | internal helper | 18 | 8 | 2 | 0 | 0 | 2 broad / 1 silent | **Focused review**: 2 broad catches; 1 silent recovery path |
+| 474 | `BackgroundCog._persist_server_icon_state` | internal helper | 6 | 2 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 481 | `BackgroundCog._remember_server_icon_error` | internal helper | 7 | 3 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 489 | `BackgroundCog._config_write_lock` | internal helper | 7 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 497 | `BackgroundCog.rotate_server_icon_once` | helper | 15 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 513 | `BackgroundCog._rotate_server_icon_once_locked` | internal helper | 70 | 19 | 6 | 0 | 1 | 2 broad / 0 silent | **Focused review**: 1 Discord operation; 2 broad catches |
+| 584 | `BackgroundCog._render_status_text` | internal helper | 55 | 14 | 5 | 3 | 0 | 3 broad / 0 silent | **Routine**: 3 persistence calls; 3 broad catches |
+| 587 | `BackgroundCog._render_status_text._SafeDict.__missing__` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 640 | `BackgroundCog._daily_summary_enabled` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 643 | `BackgroundCog._daily_summary_channel_id` | internal helper | 5 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 649 | `BackgroundCog._daily_reset_after_report` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 652 | `BackgroundCog._daily_summary_due` | internal helper | 6 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 659 | `BackgroundCog._daily_summary_already_sent` | internal helper | 6 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 666 | `BackgroundCog._record_daily_summary_sent` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 672 | `BackgroundCog._voice_sessions_from_guild` | internal helper | 9 | 6 | 0 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
+| 682 | `BackgroundCog._stats_payload` | internal helper | 23 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 706 | `BackgroundCog._stats_from_payload` | internal helper | 16 | 12 | 0 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
+| 723 | `BackgroundCog._load_daily_stats` | internal helper | 11 | 4 | 1 | 1 | 0 | 1 broad / 0 silent | **Routine**: 1 persistence call; 1 broad catch |
+| 735 | `BackgroundCog._persist_daily_stats` | internal helper | 6 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 742 | `BackgroundCog._persist_current_day` | internal helper | 9 | 3 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 752 | `BackgroundCog._rollover_boundary_ts` | internal helper | 6 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 759 | `BackgroundCog._add_voice_until` | internal helper | 8 | 4 | 0 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
+| 768 | `BackgroundCog._track_background_persist` | internal helper | 18 | 5 | 0 | 0 | 0 | 2 broad / 1 silent | **Focused review**: 2 broad catches; 1 silent recovery path |
+| 771 | `BackgroundCog._track_background_persist._done` | internal helper | 13 | 5 | 0 | 0 | 0 | 2 broad / 1 silent | **Focused review**: 2 broad catches; 1 silent recovery path |
+| 787 | `BackgroundCog._rollover_if_needed` | internal helper | 28 | 7 | 0 | 0 | 0 | 2 broad / 1 silent | **Focused review**: 2 broad catches; 1 silent recovery path |
+| 820 | `BackgroundCog.on_message` | event listener | 14 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 836 | `BackgroundCog.on_message_edit` | event listener | 11 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 849 | `BackgroundCog.on_message_delete` | event listener | 11 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 862 | `BackgroundCog.on_reaction_add` | event listener | 11 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 875 | `BackgroundCog.on_member_join` | event listener | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 884 | `BackgroundCog.on_member_remove` | event listener | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 893 | `BackgroundCog.on_member_ban` | event listener | 7 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 902 | `BackgroundCog.on_member_unban` | event listener | 7 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 911 | `BackgroundCog.on_member_update` | event listener | 10 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 923 | `BackgroundCog.on_voice_state_update` | event listener | 23 | 14 | 1 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 948 | `BackgroundCog.on_application_command_completion` | event listener | 14 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 964 | `BackgroundCog.on_application_command_error` | event listener | 15 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 984 | `BackgroundCog.update_snapshot` | background loop | 22 | 11 | 5 | 0 | 0 | 3 broad / 0 silent | **Routine**: 3 broad catches |
+| 1007 | `BackgroundCog._log_snapshot_failure` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1011 | `BackgroundCog._before_snapshot` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1015 | `BackgroundCog._snapshot_error` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1019 | `BackgroundCog.database_backup` | background loop | 33 | 13 | 5 | 1 | 0 | 2 broad / 0 silent | **Routine**: 1 persistence call; 2 broad catches |
+| 1054 | `BackgroundCog._before_database_backup` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1058 | `BackgroundCog._database_backup_error` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1062 | `BackgroundCog.rotate_status` | background loop | 40 | 11 | 3 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 1104 | `BackgroundCog._before_rotate` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1108 | `BackgroundCog._rotate_error` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1112 | `BackgroundCog.rotate_server_icon` | background loop | 23 | 11 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1137 | `BackgroundCog._before_server_icon_rotate` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1141 | `BackgroundCog._server_icon_rotate_error` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1144 | `BackgroundCog._start_daily_report_loop` | internal helper | 14 | 5 | 0 | 0 | 0 | 2 broad / 2 silent | **Focused review**: 2 broad catches; 2 silent recovery paths |
+| 1159 | `BackgroundCog._top_channel_lines` | internal helper | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1167 | `BackgroundCog._top_member_lines` | internal helper | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1175 | `BackgroundCog._top_command_lines` | internal helper | 7 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1183 | `BackgroundCog._summary_color` | internal helper | 8 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1192 | `BackgroundCog._send_daily_summary_for_day` | internal helper | 7 | 2 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1200 | `BackgroundCog._send_daily_summary_for_day_locked` | internal helper | 173 | 33 | 11 | 0 | 3 | 7 broad / 3 silent | **High attention**: 3 Discord operations; split candidate; 7 broad catches; 3 silent recovery paths |
+| 1375 | `BackgroundCog.daily_report` | background loop | 12 | 4 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 1389 | `BackgroundCog._before_daily` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1393 | `BackgroundCog._daily_error` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1396 | `setup` | helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
 
 ### `cogs/Commands.py`
 
@@ -230,57 +228,57 @@ Every runtime function, method, nested callback, and modal handler has one row b
 | 2132 | `CommandsCog._resolve_member` | internal helper | 15 | 5 | 1 | 0 | 1 | 2 broad / 0 silent | **Routine**: 1 Discord operation; 2 broad catches |
 | 2148 | `CommandsCog._task_state` | internal helper | 13 | 8 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
 | 2162 | `CommandsCog._count_db` | internal helper | 6 | 4 | 1 | 1 | 0 | 1 broad / 0 silent | **Routine**: 1 persistence call; 1 broad catch |
-| 2169 | `CommandsCog._dashboard_issues` | internal helper | 105 | 38 | 1 | 0 | 0 | 1 broad / 0 silent | **High attention**: split candidate; 1 broad catch |
-| 2275 | `CommandsCog._admin_dashboard_embed` | internal helper | 141 | 36 | 9 | 2 | 0 | 2 broad / 0 silent | **High attention**: 2 persistence calls; split candidate; 2 broad catches |
-| 2417 | `CommandsCog.bot_dashboard` | helper | 8 | 3 | 6 | 0 | 2 | none | **Routine**: 2 Discord operations |
-| 2428 | `CommandsCog.bot_health` | helper | 89 | 22 | 12 | 3 | 2 | 4 broad / 0 silent | **Focused review**: 3 persistence calls; 2 Discord operations; 4 broad catches |
-| 2437 | `CommandsCog.bot_health._count` | internal helper | 6 | 4 | 1 | 1 | 0 | 1 broad / 0 silent | **Routine**: 1 persistence call; 1 broad catch |
-| 2470 | `CommandsCog.bot_health._task_state` | internal helper | 13 | 8 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 2518 | `CommandsCog.bot_doctor` | helper | 139 | 49 | 6 | 0 | 2 | none | **High attention**: 2 Discord operations; split candidate |
-| 2533 | `CommandsCog.bot_doctor.channel_perm_report` | helper | 16 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2658 | `CommandsCog._template_variables` | internal helper | 12 | 6 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 2671 | `CommandsCog._request_template_allowed_vars` | internal helper | 80 | 1 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
-| 2752 | `CommandsCog._looks_like_color_value` | internal helper | 23 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2776 | `CommandsCog._validate_request_templates` | internal helper | 69 | 28 | 0 | 0 | 0 | none | **Focused review**: split candidate |
-| 2797 | `CommandsCog._validate_request_templates.check_text` | helper | 8 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2806 | `CommandsCog._validate_request_templates.walk` | helper | 26 | 18 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
-| 2846 | `CommandsCog.bot_config_check` | helper | 399 | 104 | 5 | 0 | 2 | 2 broad / 0 silent | **High attention**: 2 Discord operations; split candidate; 2 broad catches |
-| 2857 | `CommandsCog.bot_config_check.check_channel` | helper | 13 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2871 | `CommandsCog.bot_config_check.check_role` | helper | 9 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2934 | `CommandsCog.bot_config_check.check_hhmm` | helper | 7 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2953 | `CommandsCog.bot_config_check.check_number` | helper | 22 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 3246 | `CommandsCog._parse_snowflake_arg` | internal helper | 8 | 4 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 3255 | `CommandsCog._request_change_lines` | internal helper | 22 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 3264 | `CommandsCog._request_change_lines.short` | helper | 5 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 3278 | `CommandsCog.requests_history` | helper | 74 | 13 | 9 | 3 | 2 | 2 broad / 0 silent | **Focused review**: 3 persistence calls; 2 Discord operations; 2 broad catches |
-| 3353 | `CommandsCog.requests_repair` | helper | 36 | 13 | 8 | 0 | 3 | none | **Routine**: 3 Discord operations |
-| 3390 | `CommandsCog.requests_pending` | helper | 129 | 29 | 8 | 3 | 2 | 1 broad / 0 silent | **Focused review**: 3 persistence calls; 2 Discord operations; split candidate; 1 broad catch |
-| 3474 | `CommandsCog.requests_pending.request_name` | helper | 8 | 5 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 3522 | `CommandsCog.tracking_top` | helper | 60 | 20 | 8 | 1 | 2 | 1 broad / 1 silent | **Focused review**: 1 persistence call; 2 Discord operations; 1 broad catch; 1 silent recovery path |
-| 3584 | `CommandsCog.tracking_me` | helper | 44 | 12 | 8 | 1 | 2 | 1 broad / 1 silent | **Focused review**: 1 persistence call; 2 Discord operations; 1 broad catch; 1 silent recovery path |
-| 3629 | `CommandsCog.tracking_force_dm` | helper | 22 | 5 | 8 | 0 | 3 | none | **Routine**: 3 Discord operations |
-| 3652 | `CommandsCog.tracking_reset` | helper | 17 | 5 | 8 | 0 | 3 | none | **Routine**: 3 Discord operations |
-| 3670 | `CommandsCog.tracking_disable_reward` | helper | 21 | 5 | 8 | 0 | 3 | none | **Routine**: 3 Discord operations |
-| 3692 | `CommandsCog.tracking_enable_reward` | helper | 26 | 6 | 8 | 0 | 3 | none | **Routine**: 3 Discord operations |
-| 3720 | `CommandsCog.ticket_close` | helper | 27 | 9 | 10 | 1 | 6 | 1 broad / 1 silent | **Focused review**: 1 persistence call; 6 Discord operations; 1 broad catch; 1 silent recovery path |
-| 3748 | `CommandsCog.ticket_status` | helper | 78 | 17 | 14 | 2 | 6 | 1 broad / 0 silent | **Focused review**: 2 persistence calls; 6 Discord operations; 1 broad catch |
-| 3827 | `CommandsCog.ticket_transcripts` | helper | 65 | 19 | 7 | 1 | 4 | none | **Focused review**: 1 persistence call; 4 Discord operations |
-| 3894 | `CommandsCog._parse_channel_id` | internal helper | 10 | 4 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 3905 | `CommandsCog._configured_forum_entries` | internal helper | 29 | 8 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 3935 | `CommandsCog._resolve_forum_entry` | internal helper | 41 | 15 | 0 | 0 | 0 | 4 broad / 3 silent | **Focused review**: 4 broad catches; 3 silent recovery paths |
-| 3977 | `CommandsCog.forum_required_word` | helper | 118 | 31 | 16 | 0 | 9 | 3 broad / 0 silent | **High attention**: 9 Discord operations; split candidate; 3 broad catches |
-| 4097 | `CommandsCog._resync` | internal helper | 49 | 11 | 13 | 1 | 3 | 4 broad / 0 silent | **Focused review**: 1 persistence call; 3 Discord operations; 4 broad catches |
-| 4148 | `CommandsCog._restart` | internal helper | 16 | 4 | 7 | 0 | 3 | none | **Routine**: 3 Discord operations |
-| 4166 | `CommandsCog._dance` | internal helper | 7 | 3 | 3 | 0 | 3 | none | **Routine**: 3 Discord operations |
-| 4175 | `CommandsCog._rps` | internal helper | 97 | 23 | 15 | 0 | 8 | 3 broad / 1 silent | **Focused review**: 8 Discord operations; 3 broad catches; 1 silent recovery path |
-| 4188 | `CommandsCog._rps.outcome` | helper | 5 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 4195 | `CommandsCog._rps.RPSView.__init__` | internal helper | 12 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 4208 | `CommandsCog._rps.RPSView._make_callback` | internal helper | 62 | 18 | 12 | 0 | 5 | 3 broad / 1 silent | **Focused review**: 5 Discord operations; 3 broad catches; 1 silent recovery path |
-| 4209 | `CommandsCog._rps.RPSView._make_callback._cb` | internal helper | 60 | 18 | 12 | 0 | 5 | 3 broad / 1 silent | **Focused review**: 5 Discord operations; 3 broad catches; 1 silent recovery path |
-| 4273 | `CommandsCog._rps_get_streak` | internal helper | 8 | 2 | 2 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 4282 | `CommandsCog._rps_update_streak` | internal helper | 28 | 4 | 4 | 3 | 0 | none | **Routine**: 3 persistence calls |
-| 4312 | `CommandsCog._gambling` | internal helper | 58 | 21 | 9 | 0 | 6 | 3 broad / 2 silent | **Focused review**: 6 Discord operations; 3 broad catches; 2 silent recovery paths |
-| 4371 | `setup` | helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2169 | `CommandsCog._dashboard_issues` | internal helper | 135 | 51 | 1 | 0 | 0 | 1 broad / 0 silent | **High attention**: split candidate; 1 broad catch |
+| 2305 | `CommandsCog._admin_dashboard_embed` | internal helper | 161 | 44 | 9 | 2 | 0 | 2 broad / 0 silent | **High attention**: 2 persistence calls; split candidate; 2 broad catches |
+| 2467 | `CommandsCog.bot_dashboard` | helper | 8 | 3 | 6 | 0 | 2 | none | **Routine**: 2 Discord operations |
+| 2478 | `CommandsCog.bot_health` | helper | 89 | 22 | 12 | 3 | 2 | 4 broad / 0 silent | **Focused review**: 3 persistence calls; 2 Discord operations; 4 broad catches |
+| 2487 | `CommandsCog.bot_health._count` | internal helper | 6 | 4 | 1 | 1 | 0 | 1 broad / 0 silent | **Routine**: 1 persistence call; 1 broad catch |
+| 2520 | `CommandsCog.bot_health._task_state` | internal helper | 13 | 8 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 2568 | `CommandsCog.bot_doctor` | helper | 139 | 49 | 6 | 0 | 2 | none | **High attention**: 2 Discord operations; split candidate |
+| 2583 | `CommandsCog.bot_doctor.channel_perm_report` | helper | 16 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2708 | `CommandsCog._template_variables` | internal helper | 12 | 6 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 2721 | `CommandsCog._request_template_allowed_vars` | internal helper | 80 | 1 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
+| 2802 | `CommandsCog._looks_like_color_value` | internal helper | 23 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2826 | `CommandsCog._validate_request_templates` | internal helper | 69 | 28 | 0 | 0 | 0 | none | **Focused review**: split candidate |
+| 2847 | `CommandsCog._validate_request_templates.check_text` | helper | 8 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2856 | `CommandsCog._validate_request_templates.walk` | helper | 26 | 18 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
+| 2896 | `CommandsCog.bot_config_check` | helper | 402 | 104 | 5 | 0 | 2 | 2 broad / 0 silent | **High attention**: 2 Discord operations; split candidate; 2 broad catches |
+| 2907 | `CommandsCog.bot_config_check.check_channel` | helper | 13 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2921 | `CommandsCog.bot_config_check.check_role` | helper | 9 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2984 | `CommandsCog.bot_config_check.check_hhmm` | helper | 7 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 3003 | `CommandsCog.bot_config_check.check_number` | helper | 22 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 3299 | `CommandsCog._parse_snowflake_arg` | internal helper | 8 | 4 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 3308 | `CommandsCog._request_change_lines` | internal helper | 22 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 3317 | `CommandsCog._request_change_lines.short` | helper | 5 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 3331 | `CommandsCog.requests_history` | helper | 74 | 13 | 9 | 3 | 2 | 2 broad / 0 silent | **Focused review**: 3 persistence calls; 2 Discord operations; 2 broad catches |
+| 3406 | `CommandsCog.requests_repair` | helper | 36 | 13 | 8 | 0 | 3 | none | **Routine**: 3 Discord operations |
+| 3443 | `CommandsCog.requests_pending` | helper | 129 | 29 | 8 | 3 | 2 | 1 broad / 0 silent | **Focused review**: 3 persistence calls; 2 Discord operations; split candidate; 1 broad catch |
+| 3527 | `CommandsCog.requests_pending.request_name` | helper | 8 | 5 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 3575 | `CommandsCog.tracking_top` | helper | 60 | 20 | 8 | 1 | 2 | 1 broad / 1 silent | **Focused review**: 1 persistence call; 2 Discord operations; 1 broad catch; 1 silent recovery path |
+| 3637 | `CommandsCog.tracking_me` | helper | 44 | 12 | 8 | 1 | 2 | 1 broad / 1 silent | **Focused review**: 1 persistence call; 2 Discord operations; 1 broad catch; 1 silent recovery path |
+| 3682 | `CommandsCog.tracking_force_dm` | helper | 22 | 5 | 8 | 0 | 3 | none | **Routine**: 3 Discord operations |
+| 3705 | `CommandsCog.tracking_reset` | helper | 17 | 5 | 8 | 0 | 3 | none | **Routine**: 3 Discord operations |
+| 3723 | `CommandsCog.tracking_disable_reward` | helper | 21 | 5 | 8 | 0 | 3 | none | **Routine**: 3 Discord operations |
+| 3745 | `CommandsCog.tracking_enable_reward` | helper | 26 | 6 | 8 | 0 | 3 | none | **Routine**: 3 Discord operations |
+| 3773 | `CommandsCog.ticket_close` | helper | 27 | 9 | 10 | 1 | 6 | 1 broad / 1 silent | **Focused review**: 1 persistence call; 6 Discord operations; 1 broad catch; 1 silent recovery path |
+| 3801 | `CommandsCog.ticket_status` | helper | 78 | 17 | 14 | 2 | 6 | 1 broad / 0 silent | **Focused review**: 2 persistence calls; 6 Discord operations; 1 broad catch |
+| 3880 | `CommandsCog.ticket_transcripts` | helper | 65 | 19 | 7 | 1 | 4 | none | **Focused review**: 1 persistence call; 4 Discord operations |
+| 3947 | `CommandsCog._parse_channel_id` | internal helper | 10 | 4 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 3958 | `CommandsCog._configured_forum_entries` | internal helper | 29 | 8 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 3988 | `CommandsCog._resolve_forum_entry` | internal helper | 41 | 15 | 0 | 0 | 0 | 4 broad / 3 silent | **Focused review**: 4 broad catches; 3 silent recovery paths |
+| 4030 | `CommandsCog.forum_required_word` | helper | 118 | 31 | 16 | 0 | 9 | 3 broad / 0 silent | **High attention**: 9 Discord operations; split candidate; 3 broad catches |
+| 4150 | `CommandsCog._resync` | internal helper | 49 | 11 | 13 | 1 | 3 | 4 broad / 0 silent | **Focused review**: 1 persistence call; 3 Discord operations; 4 broad catches |
+| 4201 | `CommandsCog._restart` | internal helper | 16 | 4 | 7 | 0 | 3 | none | **Routine**: 3 Discord operations |
+| 4219 | `CommandsCog._dance` | internal helper | 7 | 3 | 3 | 0 | 3 | none | **Routine**: 3 Discord operations |
+| 4228 | `CommandsCog._rps` | internal helper | 97 | 23 | 15 | 0 | 8 | 3 broad / 1 silent | **Focused review**: 8 Discord operations; 3 broad catches; 1 silent recovery path |
+| 4241 | `CommandsCog._rps.outcome` | helper | 5 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 4248 | `CommandsCog._rps.RPSView.__init__` | internal helper | 12 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 4261 | `CommandsCog._rps.RPSView._make_callback` | internal helper | 62 | 18 | 12 | 0 | 5 | 3 broad / 1 silent | **Focused review**: 5 Discord operations; 3 broad catches; 1 silent recovery path |
+| 4262 | `CommandsCog._rps.RPSView._make_callback._cb` | internal helper | 60 | 18 | 12 | 0 | 5 | 3 broad / 1 silent | **Focused review**: 5 Discord operations; 3 broad catches; 1 silent recovery path |
+| 4326 | `CommandsCog._rps_get_streak` | internal helper | 8 | 2 | 2 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 4335 | `CommandsCog._rps_update_streak` | internal helper | 28 | 4 | 4 | 3 | 0 | none | **Routine**: 3 persistence calls |
+| 4365 | `CommandsCog._gambling` | internal helper | 58 | 21 | 9 | 0 | 6 | 3 broad / 2 silent | **Focused review**: 6 Discord operations; 3 broad catches; 2 silent recovery paths |
+| 4424 | `setup` | helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
 
 ### `cogs/Help.py`
 
@@ -543,169 +541,174 @@ Every runtime function, method, nested callback, and modal handler has one row b
 
 ### `cogs/RequestLevels.py`
 
-159 definitions: 135 routine, 16 focused, 8 high attention.
+164 definitions: 140 routine, 16 focused, 8 high attention.
 
 | Line | Definition | Kind | LOC | CC | Await | DB | Discord | Recovery | Assessment |
 |---:|---|---|---:|---:|---:|---:|---:|---|---|
-| 90 | `_SafeDict.__missing__` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 95 | `LevelRequestModal.__init__` | internal helper | 39 | 9 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 135 | `LevelRequestModal.callback` | helper | 15 | 8 | 3 | 0 | 1 | none | **Routine**: 1 Discord operation |
-| 153 | `ReviewModal.__init__` | internal helper | 13 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 167 | `ReviewModal.callback` | helper | 7 | 2 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 177 | `FirstRequestChoiceView.__init__` | internal helper | 8 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 186 | `FirstRequestChoiceView._will` | internal helper | 4 | 2 | 2 | 0 | 1 | none | **Routine**: 1 Discord operation |
-| 193 | `OtherReasonView.__init__` | internal helper | 9 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 203 | `OtherReasonView._make_callback` | internal helper | 4 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 204 | `OtherReasonView._make_callback._callback` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 210 | `ScheduledOpeningEditModal.__init__` | internal helper | 47 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 258 | `ScheduledOpeningEditModal.callback` | helper | 12 | 7 | 2 | 0 | 1 | none | **Routine**: 1 Discord operation |
-| 273 | `ScheduledOpeningsView.__init__` | internal helper | 33 | 10 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 307 | `ScheduledOpeningsView._allowed` | internal helper | 12 | 5 | 3 | 0 | 3 | none | **Routine**: 3 Discord operations |
-| 320 | `ScheduledOpeningsView._select` | internal helper | 8 | 3 | 2 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
-| 329 | `ScheduledOpeningsView._refresh` | internal helper | 5 | 2 | 3 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 335 | `ScheduledOpeningsView._edit` | internal helper | 15 | 6 | 4 | 0 | 2 | none | **Routine**: 2 Discord operations |
-| 351 | `ScheduledOpeningsView._delete` | internal helper | 5 | 2 | 3 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 357 | `ScheduledOpeningsView._open_now` | internal helper | 5 | 2 | 3 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 365 | `ScheduledOpenNowConfirmView.__init__` | internal helper | 5 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 371 | `ScheduledOpenNowConfirmView._allowed` | internal helper | 12 | 5 | 3 | 0 | 3 | none | **Routine**: 3 Discord operations |
-| 385 | `ScheduledOpenNowConfirmView.confirm` | UI callback | 5 | 2 | 3 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 392 | `ScheduledOpenNowConfirmView.cancel` | UI callback | 4 | 2 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 399 | `RequestLevelsCog.__init__` | internal helper | 158 | 3 | 6 | 0 | 0 | none | **High attention**: split candidate |
-| 423 | `RequestLevelsCog.__init__.refresh_request_button` | slash command | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 427 | `RequestLevelsCog.__init__.open_requests` | slash command | 49 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 478 | `RequestLevelsCog.__init__.close_requests` | slash command | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 482 | `RequestLevelsCog.__init__.requests_are` | slash command | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 486 | `RequestLevelsCog.__init__.edit_request` | slash command | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 490 | `RequestLevelsCog.__init__.pending_openings` | slash command | 67 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 558 | `RequestLevelsCog.cog_unload` | helper | 14 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 573 | `RequestLevelsCog.close_resources` | helper | 15 | 7 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 589 | `RequestLevelsCog.start_background` | helper | 11 | 8 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 601 | `RequestLevelsCog.on_config_reload` | helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 604 | `RequestLevelsCog._start_background_task` | internal helper | 13 | 3 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 605 | `RequestLevelsCog._start_background_task.runner` | helper | 7 | 3 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 618 | `RequestLevelsCog._cfg` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 621 | `RequestLevelsCog._cfg_int` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 624 | `RequestLevelsCog._cfg_int_list` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 627 | `RequestLevelsCog._reviewer_role_ids` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 631 | `RequestLevelsCog._post_close_edit_seconds` | internal helper | 3 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 635 | `RequestLevelsCog._edit_deadline_ts_for_state` | internal helper | 19 | 7 | 0 | 0 | 0 | 2 broad / 0 silent | **Routine**: 2 broad catches |
-| 655 | `RequestLevelsCog._edit_window_text` | internal helper | 6 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 662 | `RequestLevelsCog._can_edit_submission` | internal helper | 32 | 14 | 0 | 0 | 0 | 3 broad / 1 silent | **Focused review**: 3 broad catches; 1 silent recovery path |
-| 695 | `RequestLevelsCog._current_user_submission` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 701 | `RequestLevelsCog._current_user_submission_local` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 707 | `RequestLevelsCog._latest_editable_user_submission` | internal helper | 6 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 714 | `RequestLevelsCog._editable_user_submission_for_modal` | internal helper | 20 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 735 | `RequestLevelsCog._state_after_timed_close_check` | internal helper | 12 | 6 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 748 | `RequestLevelsCog._request_initial_values` | internal helper | 5 | 3 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 754 | `RequestLevelsCog._message` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 757 | `RequestLevelsCog._message_formatted` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 760 | `RequestLevelsCog._request_button_label` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 763 | `RequestLevelsCog._request_type_normalize_text` | internal helper | 5 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 769 | `RequestLevelsCog._normalize_request_type` | internal helper | 9 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 779 | `RequestLevelsCog._request_type_label` | internal helper | 5 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 785 | `RequestLevelsCog._request_type_help` | internal helper | 2 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 788 | `RequestLevelsCog._request_type_from_row` | internal helper | 6 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 795 | `RequestLevelsCog._clean_open_message` | internal helper | 7 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 803 | `RequestLevelsCog._request_open_condition_text` | internal helper | 11 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 815 | `RequestLevelsCog._send_open_announcement` | internal helper | 55 | 23 | 4 | 0 | 1 | 3 broad / 0 silent | **Focused review**: 1 Discord operation; 3 broad catches |
-| 871 | `RequestLevelsCog._color_name` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 874 | `RequestLevelsCog._format` | internal helper | 5 | 5 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 880 | `RequestLevelsCog._submitted_ago` | internal helper | 6 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 887 | `RequestLevelsCog._clean_level_id` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 890 | `RequestLevelsCog._normalize_level_id` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 893 | `RequestLevelsCog._valid_url` | internal helper | 12 | 7 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 906 | `RequestLevelsCog._validate_request_data` | internal helper | 10 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 917 | `RequestLevelsCog._level_validation_cfg` | internal helper | 3 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 921 | `RequestLevelsCog._level_validation_enabled` | internal helper | 3 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 925 | `RequestLevelsCog._level_validation_cache_seconds` | internal helper | 5 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 931 | `RequestLevelsCog._level_validation_timeout_seconds` | internal helper | 5 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 937 | `RequestLevelsCog._level_validation_message` | internal helper | 5 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 943 | `RequestLevelsCog._level_validation_providers` | internal helper | 8 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 952 | `RequestLevelsCog._level_validation_rate_limit_message` | internal helper | 44 | 19 | 0 | 0 | 0 | 3 broad / 0 silent | **Focused review**: 3 broad catches |
-| 997 | `RequestLevelsCog._provider_failure_cfg` | internal helper | 11 | 3 | 0 | 0 | 0 | 2 broad / 0 silent | **Routine**: 2 broad catches |
-| 1009 | `RequestLevelsCog._provider_circuit_open` | internal helper | 6 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1016 | `RequestLevelsCog._record_provider_validation_result` | internal helper | 9 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1026 | `RequestLevelsCog._provider_min_interval` | internal helper | 11 | 3 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 1038 | `RequestLevelsCog._fetch_validation_provider` | internal helper | 20 | 5 | 3 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1059 | `RequestLevelsCog._get_level_validation_session` | internal helper | 17 | 7 | 1 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
-| 1077 | `RequestLevelsCog._safe_json_loads` | internal helper | 5 | 4 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 1083 | `RequestLevelsCog._cached_level_validation` | internal helper | 17 | 5 | 1 | 1 | 0 | 1 broad / 0 silent | **Routine**: 1 persistence call; 1 broad catch |
-| 1101 | `RequestLevelsCog._lookup_level_validation` | internal helper | 62 | 20 | 7 | 1 | 0 | 1 broad / 0 silent | **Focused review**: 1 persistence call; 1 broad catch |
-| 1164 | `RequestLevelsCog._apply_level_validation_vars` | internal helper | 81 | 30 | 0 | 0 | 0 | 1 broad / 0 silent | **High attention**: split candidate; 1 broad catch |
-| 1246 | `RequestLevelsCog._validate_level_external` | internal helper | 28 | 14 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1275 | `RequestLevelsCog._request_type_validation_error` | internal helper | 32 | 23 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
-| 1308 | `RequestLevelsCog._has_reviewer_role` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1312 | `RequestLevelsCog._embed_from_template` | internal helper | 50 | 21 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
-| 1363 | `RequestLevelsCog._reply_ephemeral` | internal helper | 5 | 2 | 2 | 0 | 2 | none | **Routine**: 2 Discord operations |
-| 1369 | `RequestLevelsCog._log_request_admin_action` | internal helper | 23 | 7 | 2 | 0 | 1 | 1 broad / 0 silent | **Routine**: 1 Discord operation; 1 broad catch |
-| 1393 | `RequestLevelsCog._state_label` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1396 | `RequestLevelsCog._request_button_embed` | internal helper | 15 | 8 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1412 | `RequestLevelsCog._pct` | internal helper | 4 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1417 | `RequestLevelsCog._wave_summary_vars` | internal helper | 47 | 20 | 2 | 1 | 0 | none | **Focused review**: 1 persistence call |
-| 1465 | `RequestLevelsCog._reviewer_stats_lines` | internal helper | 21 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1487 | `RequestLevelsCog._wave_summary_embed` | internal helper | 32 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1520 | `RequestLevelsCog.update_wave_summary` | helper | 3 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1524 | `RequestLevelsCog._update_wave_summary_unlocked` | internal helper | 79 | 17 | 15 | 4 | 6 | 6 broad / 3 silent | **Focused review**: 4 persistence calls; 6 Discord operations; 6 broad catches; 3 silent recovery paths |
-| 1604 | `RequestLevelsCog._base_state_vars` | internal helper | 25 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1630 | `RequestLevelsCog._row_value` | internal helper | 7 | 3 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 1638 | `RequestLevelsCog._duplicate_history_warning` | internal helper | 25 | 6 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 1664 | `RequestLevelsCog._days_in_month` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1667 | `RequestLevelsCog._add_month` | internal helper | 5 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1673 | `RequestLevelsCog._scheduled_local_time_exists` | internal helper | 15 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1689 | `RequestLevelsCog._parse_scheduled_open_ts` | internal helper | 41 | 16 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
-| 1731 | `RequestLevelsCog._scheduled_opening_rows` | internal helper | 6 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 1738 | `RequestLevelsCog.get_scheduled_opening` | helper | 6 | 2 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1745 | `RequestLevelsCog._scheduled_openings_embed` | internal helper | 37 | 14 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1783 | `RequestLevelsCog.refresh_pending_openings_panel` | helper | 5 | 2 | 2 | 0 | 1 | none | **Routine**: 1 Discord operation |
-| 1789 | `RequestLevelsCog.delete_scheduled_opening` | helper | 16 | 2 | 6 | 1 | 2 | none | **Routine**: 1 persistence call; 2 Discord operations |
-| 1806 | `RequestLevelsCog.open_scheduled_opening_now` | helper | 3 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 1810 | `RequestLevelsCog._open_scheduled_opening_now_locked` | internal helper | 44 | 11 | 9 | 0 | 4 | none | **Routine**: 4 Discord operations |
-| 1855 | `RequestLevelsCog.handle_scheduled_opening_edit_modal` | workflow handler | 68 | 20 | 13 | 1 | 9 | 2 broad / 0 silent | **Focused review**: 1 persistence call; 9 Discord operations; 2 broad catches |
-| 1879 | `RequestLevelsCog.handle_scheduled_opening_edit_modal.optional_positive` | helper | 11 | 6 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 1924 | `RequestLevelsCog._data_vars` | internal helper | 60 | 35 | 0 | 0 | 0 | 1 broad / 0 silent | **High attention**: split candidate; 1 broad catch |
-| 1985 | `RequestLevelsCog._weekly_data_vars` | internal helper | 27 | 4 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 2013 | `RequestLevelsCog._result_label` | internal helper | 6 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2020 | `RequestLevelsCog._status_channel_id` | internal helper | 4 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2025 | `RequestLevelsCog._result_template_key` | internal helper | 6 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2032 | `RequestLevelsCog._get_state` | internal helper | 9 | 2 | 3 | 3 | 0 | none | **Routine**: 3 persistence calls |
-| 2042 | `RequestLevelsCog._get_state_local` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 2048 | `RequestLevelsCog._set_state_closed` | internal helper | 36 | 9 | 6 | 1 | 0 | 2 broad / 0 silent | **Routine**: 1 persistence call; 2 broad catches |
-| 2085 | `RequestLevelsCog._open_requests_now` | internal helper | 88 | 20 | 11 | 1 | 0 | 2 broad / 0 silent | **Focused review**: 1 persistence call; 2 broad catches |
-| 2174 | `RequestLevelsCog._auto_close_loop` | internal helper | 17 | 9 | 5 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 2192 | `RequestLevelsCog._scheduled_open_loop` | internal helper | 44 | 14 | 8 | 1 | 0 | 2 broad / 0 silent | **Routine**: 1 persistence call; 2 broad catches |
-| 2237 | `RequestLevelsCog._in_allowed_guild` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2240 | `RequestLevelsCog._defer_command` | internal helper | 5 | 3 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2246 | `RequestLevelsCog._cached_interaction_member` | internal helper | 6 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2253 | `RequestLevelsCog._resolve_member` | internal helper | 18 | 5 | 1 | 0 | 1 | 2 broad / 0 silent | **Routine**: 1 Discord operation; 2 broad catches |
-| 2272 | `RequestLevelsCog._is_admin` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2275 | `RequestLevelsCog._is_mod` | internal helper | 7 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2283 | `RequestLevelsCog._configured_channel` | internal helper | 9 | 6 | 1 | 0 | 1 | 1 broad / 0 silent | **Routine**: 1 Discord operation; 1 broad catch |
-| 2293 | `RequestLevelsCog.refresh_or_create_request_button` | helper | 3 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2297 | `RequestLevelsCog._refresh_or_create_request_button_unlocked` | internal helper | 70 | 19 | 14 | 3 | 6 | 6 broad / 3 silent | **Focused review**: 3 persistence calls; 6 Discord operations; 6 broad catches; 3 silent recovery paths |
-| 2368 | `RequestLevelsCog.refresh_request_button` | helper | 13 | 5 | 8 | 0 | 4 | none | **Routine**: 4 Discord operations |
-| 2382 | `RequestLevelsCog.open_requests` | helper | 83 | 37 | 15 | 1 | 9 | none | **High attention**: 1 persistence call; 9 Discord operations; split candidate |
-| 2466 | `RequestLevelsCog.pending_openings` | helper | 96 | 34 | 25 | 3 | 15 | none | **High attention**: 3 persistence calls; 15 Discord operations; split candidate |
-| 2563 | `RequestLevelsCog.close_requests` | helper | 16 | 5 | 10 | 0 | 4 | none | **Routine**: 4 Discord operations |
-| 2580 | `RequestLevelsCog.requests_are` | helper | 15 | 7 | 4 | 0 | 2 | none | **Routine**: 2 Discord operations |
-| 2596 | `RequestLevelsCog._requirements_ok` | internal helper | 8 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 2605 | `RequestLevelsCog.handle_request_button` | workflow handler | 86 | 19 | 15 | 0 | 12 | none | **Focused review**: 12 Discord operations |
-| 2692 | `RequestLevelsCog.edit_request` | helper | 18 | 3 | 4 | 0 | 3 | none | **Routine**: 3 Discord operations |
-| 2711 | `RequestLevelsCog.handle_first_choice` | workflow handler | 20 | 7 | 5 | 0 | 4 | 1 broad / 0 silent | **Routine**: 4 Discord operations; 1 broad catch |
-| 2732 | `RequestLevelsCog.handle_request_form` | workflow handler | 212 | 33 | 40 | 7 | 3 | 8 broad / 1 silent | **High attention**: 7 persistence calls; 3 Discord operations; split candidate; 8 broad catches; 1 silent recovery path |
-| 2945 | `RequestLevelsCog.handle_request_edit_form` | workflow handler | 267 | 44 | 41 | 5 | 5 | 8 broad / 3 silent | **High attention**: 5 persistence calls; 5 Discord operations; split candidate; 8 broad catches; 3 silent recovery paths |
-| 3213 | `RequestLevelsCog._refresh_closed_wave` | internal helper | 7 | 3 | 3 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 3221 | `RequestLevelsCog._submission_by_message` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 3227 | `RequestLevelsCog._weekly_submission_by_message` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 3233 | `RequestLevelsCog._review_target_by_message` | internal helper | 8 | 3 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 3242 | `RequestLevelsCog._review_target_by_message_local` | internal helper | 24 | 4 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 3267 | `RequestLevelsCog._channel_by_id` | internal helper | 8 | 4 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 3276 | `RequestLevelsCog._review_target_channel` | internal helper | 16 | 6 | 3 | 1 | 0 | none | **Routine**: 1 persistence call |
-| 3293 | `RequestLevelsCog.handle_review_button` | workflow handler | 16 | 8 | 7 | 0 | 6 | none | **Routine**: 6 Discord operations |
-| 3310 | `RequestLevelsCog.handle_review_submission` | workflow handler | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 3313 | `RequestLevelsCog.handle_other_reason` | workflow handler | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 3316 | `RequestLevelsCog._finalize_review` | internal helper | 122 | 23 | 27 | 2 | 4 | 6 broad / 1 silent | **Focused review**: 2 persistence calls; 4 Discord operations; split candidate; 6 broad catches; 1 silent recovery path |
-| 3439 | `RequestLevelsCog.repair_request_system` | helper | 332 | 83 | 44 | 15 | 7 | 15 broad / 4 silent | **High attention**: 15 persistence calls; 7 Discord operations; split candidate; 15 broad catches; 4 silent recovery paths |
-| 3773 | `setup` | helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 92 | `_SafeDict.__missing__` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 97 | `LevelRequestModal.__init__` | internal helper | 39 | 9 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 137 | `LevelRequestModal.callback` | helper | 15 | 8 | 3 | 0 | 1 | none | **Routine**: 1 Discord operation |
+| 155 | `ReviewModal.__init__` | internal helper | 13 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 169 | `ReviewModal.callback` | helper | 7 | 2 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 179 | `FirstRequestChoiceView.__init__` | internal helper | 8 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 188 | `FirstRequestChoiceView._will` | internal helper | 4 | 2 | 2 | 0 | 1 | none | **Routine**: 1 Discord operation |
+| 195 | `OtherReasonView.__init__` | internal helper | 9 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 205 | `OtherReasonView._make_callback` | internal helper | 4 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 206 | `OtherReasonView._make_callback._callback` | internal helper | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 212 | `ScheduledOpeningEditModal.__init__` | internal helper | 47 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 260 | `ScheduledOpeningEditModal.callback` | helper | 12 | 7 | 2 | 0 | 1 | none | **Routine**: 1 Discord operation |
+| 275 | `ScheduledOpeningsView.__init__` | internal helper | 33 | 10 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 309 | `ScheduledOpeningsView._allowed` | internal helper | 12 | 5 | 3 | 0 | 3 | none | **Routine**: 3 Discord operations |
+| 322 | `ScheduledOpeningsView._select` | internal helper | 8 | 3 | 2 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
+| 331 | `ScheduledOpeningsView._refresh` | internal helper | 5 | 2 | 3 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 337 | `ScheduledOpeningsView._edit` | internal helper | 15 | 6 | 4 | 0 | 2 | none | **Routine**: 2 Discord operations |
+| 353 | `ScheduledOpeningsView._delete` | internal helper | 5 | 2 | 3 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 359 | `ScheduledOpeningsView._open_now` | internal helper | 5 | 2 | 3 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 367 | `ScheduledOpenNowConfirmView.__init__` | internal helper | 5 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 373 | `ScheduledOpenNowConfirmView._allowed` | internal helper | 12 | 5 | 3 | 0 | 3 | none | **Routine**: 3 Discord operations |
+| 387 | `ScheduledOpenNowConfirmView.confirm` | UI callback | 5 | 2 | 3 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 394 | `ScheduledOpenNowConfirmView.cancel` | UI callback | 4 | 2 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 401 | `RequestLevelsCog.__init__` | internal helper | 161 | 3 | 6 | 0 | 0 | none | **High attention**: split candidate |
+| 428 | `RequestLevelsCog.__init__.refresh_request_button` | slash command | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 432 | `RequestLevelsCog.__init__.open_requests` | slash command | 49 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 483 | `RequestLevelsCog.__init__.close_requests` | slash command | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 487 | `RequestLevelsCog.__init__.requests_are` | slash command | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 491 | `RequestLevelsCog.__init__.edit_request` | slash command | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 495 | `RequestLevelsCog.__init__.pending_openings` | slash command | 67 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 563 | `RequestLevelsCog.cog_unload` | helper | 14 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 578 | `RequestLevelsCog.close_resources` | helper | 15 | 7 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 594 | `RequestLevelsCog.start_background` | helper | 18 | 9 | 3 | 1 | 0 | 1 broad / 0 silent | **Routine**: 1 persistence call; 1 broad catch |
+| 613 | `RequestLevelsCog.on_config_reload` | helper | 9 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 623 | `RequestLevelsCog._start_background_task` | internal helper | 13 | 3 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 624 | `RequestLevelsCog._start_background_task.runner` | helper | 7 | 3 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 637 | `RequestLevelsCog._cfg` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 640 | `RequestLevelsCog._cfg_int` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 643 | `RequestLevelsCog._cfg_int_list` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 646 | `RequestLevelsCog._reviewer_role_ids` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 650 | `RequestLevelsCog._post_close_edit_seconds` | internal helper | 3 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 654 | `RequestLevelsCog._edit_deadline_ts_for_state` | internal helper | 19 | 7 | 0 | 0 | 0 | 2 broad / 0 silent | **Routine**: 2 broad catches |
+| 674 | `RequestLevelsCog._edit_window_text` | internal helper | 6 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 681 | `RequestLevelsCog._can_edit_submission` | internal helper | 32 | 14 | 0 | 0 | 0 | 3 broad / 1 silent | **Focused review**: 3 broad catches; 1 silent recovery path |
+| 714 | `RequestLevelsCog._current_user_submission` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 720 | `RequestLevelsCog._current_user_submission_local` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 726 | `RequestLevelsCog._latest_editable_user_submission` | internal helper | 6 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 733 | `RequestLevelsCog._editable_user_submission_for_modal` | internal helper | 20 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 754 | `RequestLevelsCog._state_after_timed_close_check` | internal helper | 12 | 6 | 2 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 767 | `RequestLevelsCog._request_initial_values` | internal helper | 5 | 3 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 773 | `RequestLevelsCog._message` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 776 | `RequestLevelsCog._message_formatted` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 779 | `RequestLevelsCog._request_button_label` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 782 | `RequestLevelsCog._request_type_normalize_text` | internal helper | 5 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 788 | `RequestLevelsCog._normalize_request_type` | internal helper | 9 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 798 | `RequestLevelsCog._request_type_label` | internal helper | 5 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 804 | `RequestLevelsCog._request_type_help` | internal helper | 2 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 807 | `RequestLevelsCog._request_type_from_row` | internal helper | 6 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 814 | `RequestLevelsCog._clean_open_message` | internal helper | 7 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 822 | `RequestLevelsCog._request_open_condition_text` | internal helper | 11 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 834 | `RequestLevelsCog._send_open_announcement` | internal helper | 55 | 23 | 4 | 0 | 1 | 3 broad / 0 silent | **Focused review**: 1 Discord operation; 3 broad catches |
+| 890 | `RequestLevelsCog._color_name` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 893 | `RequestLevelsCog._format` | internal helper | 5 | 5 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 899 | `RequestLevelsCog._submitted_ago` | internal helper | 6 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 906 | `RequestLevelsCog._clean_level_id` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 909 | `RequestLevelsCog._normalize_level_id` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 912 | `RequestLevelsCog._valid_url` | internal helper | 12 | 7 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 925 | `RequestLevelsCog._validate_request_data` | internal helper | 10 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 936 | `RequestLevelsCog._level_validation_cfg` | internal helper | 3 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 940 | `RequestLevelsCog._level_validation_enabled` | internal helper | 3 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 944 | `RequestLevelsCog._level_validation_cache_seconds` | internal helper | 5 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 950 | `RequestLevelsCog._level_validation_timeout_seconds` | internal helper | 5 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 956 | `RequestLevelsCog._level_validation_message` | internal helper | 5 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 962 | `RequestLevelsCog._level_validation_providers` | internal helper | 8 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 971 | `RequestLevelsCog._level_validation_rate_limit_message` | internal helper | 44 | 19 | 0 | 0 | 0 | 3 broad / 0 silent | **Focused review**: 3 broad catches |
+| 1016 | `RequestLevelsCog._provider_failure_cfg` | internal helper | 11 | 3 | 0 | 0 | 0 | 2 broad / 0 silent | **Routine**: 2 broad catches |
+| 1028 | `RequestLevelsCog._provider_access_denied_backoff_seconds` | internal helper | 16 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 1045 | `RequestLevelsCog._provider_retry_attempts` | internal helper | 11 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 1057 | `RequestLevelsCog._level_validation_failure_cache_seconds` | internal helper | 11 | 2 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 1069 | `RequestLevelsCog._provider_circuit_result` | internal helper | 15 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1085 | `RequestLevelsCog._provider_circuit_open` | internal helper | 17 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1103 | `RequestLevelsCog._record_provider_validation_result` | internal helper | 34 | 10 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1138 | `RequestLevelsCog.validation_provider_snapshot` | helper | 18 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1157 | `RequestLevelsCog._provider_min_interval` | internal helper | 11 | 3 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 1169 | `RequestLevelsCog._fetch_validation_provider` | internal helper | 37 | 11 | 4 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1207 | `RequestLevelsCog._get_level_validation_session` | internal helper | 29 | 7 | 1 | 0 | 0 | 1 broad / 1 silent | **Focused review**: 1 broad catch; 1 silent recovery path |
+| 1237 | `RequestLevelsCog._safe_json_loads` | internal helper | 5 | 4 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 1243 | `RequestLevelsCog._cached_level_validation` | internal helper | 17 | 5 | 1 | 1 | 0 | 1 broad / 0 silent | **Routine**: 1 persistence call; 1 broad catch |
+| 1261 | `RequestLevelsCog._lookup_level_validation` | internal helper | 73 | 23 | 7 | 1 | 0 | 1 broad / 0 silent | **Focused review**: 1 persistence call; 1 broad catch |
+| 1335 | `RequestLevelsCog._apply_level_validation_vars` | internal helper | 81 | 30 | 0 | 0 | 0 | 1 broad / 0 silent | **High attention**: split candidate; 1 broad catch |
+| 1417 | `RequestLevelsCog._validate_level_external` | internal helper | 28 | 14 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1446 | `RequestLevelsCog._request_type_validation_error` | internal helper | 32 | 23 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
+| 1479 | `RequestLevelsCog._has_reviewer_role` | internal helper | 3 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1483 | `RequestLevelsCog._embed_from_template` | internal helper | 50 | 21 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
+| 1534 | `RequestLevelsCog._reply_ephemeral` | internal helper | 5 | 2 | 2 | 0 | 2 | none | **Routine**: 2 Discord operations |
+| 1540 | `RequestLevelsCog._log_request_admin_action` | internal helper | 23 | 7 | 2 | 0 | 1 | 1 broad / 0 silent | **Routine**: 1 Discord operation; 1 broad catch |
+| 1564 | `RequestLevelsCog._state_label` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1567 | `RequestLevelsCog._request_button_embed` | internal helper | 15 | 8 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1583 | `RequestLevelsCog._pct` | internal helper | 4 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1588 | `RequestLevelsCog._wave_summary_vars` | internal helper | 47 | 20 | 2 | 1 | 0 | none | **Focused review**: 1 persistence call |
+| 1636 | `RequestLevelsCog._reviewer_stats_lines` | internal helper | 21 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1658 | `RequestLevelsCog._wave_summary_embed` | internal helper | 32 | 7 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1691 | `RequestLevelsCog.update_wave_summary` | helper | 3 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1695 | `RequestLevelsCog._update_wave_summary_unlocked` | internal helper | 79 | 17 | 15 | 4 | 6 | 6 broad / 3 silent | **Focused review**: 4 persistence calls; 6 Discord operations; 6 broad catches; 3 silent recovery paths |
+| 1775 | `RequestLevelsCog._base_state_vars` | internal helper | 25 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1801 | `RequestLevelsCog._row_value` | internal helper | 7 | 3 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 1809 | `RequestLevelsCog._duplicate_history_warning` | internal helper | 25 | 6 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 1835 | `RequestLevelsCog._days_in_month` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1838 | `RequestLevelsCog._add_month` | internal helper | 5 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1844 | `RequestLevelsCog._scheduled_local_time_exists` | internal helper | 15 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1860 | `RequestLevelsCog._parse_scheduled_open_ts` | internal helper | 41 | 16 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
+| 1902 | `RequestLevelsCog._scheduled_opening_rows` | internal helper | 6 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 1909 | `RequestLevelsCog.get_scheduled_opening` | helper | 6 | 2 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1916 | `RequestLevelsCog._scheduled_openings_embed` | internal helper | 37 | 14 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1954 | `RequestLevelsCog.refresh_pending_openings_panel` | helper | 5 | 2 | 2 | 0 | 1 | none | **Routine**: 1 Discord operation |
+| 1960 | `RequestLevelsCog.delete_scheduled_opening` | helper | 16 | 2 | 6 | 1 | 2 | none | **Routine**: 1 persistence call; 2 Discord operations |
+| 1977 | `RequestLevelsCog.open_scheduled_opening_now` | helper | 3 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 1981 | `RequestLevelsCog._open_scheduled_opening_now_locked` | internal helper | 44 | 11 | 9 | 0 | 4 | none | **Routine**: 4 Discord operations |
+| 2026 | `RequestLevelsCog.handle_scheduled_opening_edit_modal` | workflow handler | 68 | 20 | 13 | 1 | 9 | 2 broad / 0 silent | **Focused review**: 1 persistence call; 9 Discord operations; 2 broad catches |
+| 2050 | `RequestLevelsCog.handle_scheduled_opening_edit_modal.optional_positive` | helper | 11 | 6 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 2095 | `RequestLevelsCog._data_vars` | internal helper | 60 | 35 | 0 | 0 | 0 | 1 broad / 0 silent | **High attention**: split candidate; 1 broad catch |
+| 2156 | `RequestLevelsCog._weekly_data_vars` | internal helper | 27 | 4 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 2184 | `RequestLevelsCog._result_label` | internal helper | 6 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2191 | `RequestLevelsCog._status_channel_id` | internal helper | 4 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2196 | `RequestLevelsCog._result_template_key` | internal helper | 6 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2203 | `RequestLevelsCog._get_state` | internal helper | 9 | 2 | 3 | 3 | 0 | none | **Routine**: 3 persistence calls |
+| 2213 | `RequestLevelsCog._get_state_local` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 2219 | `RequestLevelsCog._set_state_closed` | internal helper | 36 | 9 | 6 | 1 | 0 | 2 broad / 0 silent | **Routine**: 1 persistence call; 2 broad catches |
+| 2256 | `RequestLevelsCog._open_requests_now` | internal helper | 88 | 20 | 11 | 1 | 0 | 2 broad / 0 silent | **Focused review**: 1 persistence call; 2 broad catches |
+| 2345 | `RequestLevelsCog._auto_close_loop` | internal helper | 17 | 9 | 5 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 2363 | `RequestLevelsCog._scheduled_open_loop` | internal helper | 44 | 14 | 8 | 1 | 0 | 2 broad / 0 silent | **Routine**: 1 persistence call; 2 broad catches |
+| 2408 | `RequestLevelsCog._in_allowed_guild` | internal helper | 2 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2411 | `RequestLevelsCog._defer_command` | internal helper | 5 | 3 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2417 | `RequestLevelsCog._cached_interaction_member` | internal helper | 6 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2424 | `RequestLevelsCog._resolve_member` | internal helper | 18 | 5 | 1 | 0 | 1 | 2 broad / 0 silent | **Routine**: 1 Discord operation; 2 broad catches |
+| 2443 | `RequestLevelsCog._is_admin` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2446 | `RequestLevelsCog._is_mod` | internal helper | 7 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2454 | `RequestLevelsCog._configured_channel` | internal helper | 9 | 6 | 1 | 0 | 1 | 1 broad / 0 silent | **Routine**: 1 Discord operation; 1 broad catch |
+| 2464 | `RequestLevelsCog.refresh_or_create_request_button` | helper | 3 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2468 | `RequestLevelsCog._refresh_or_create_request_button_unlocked` | internal helper | 70 | 19 | 14 | 3 | 6 | 6 broad / 3 silent | **Focused review**: 3 persistence calls; 6 Discord operations; 6 broad catches; 3 silent recovery paths |
+| 2539 | `RequestLevelsCog.refresh_request_button` | helper | 13 | 5 | 8 | 0 | 4 | none | **Routine**: 4 Discord operations |
+| 2553 | `RequestLevelsCog.open_requests` | helper | 83 | 37 | 15 | 1 | 9 | none | **High attention**: 1 persistence call; 9 Discord operations; split candidate |
+| 2637 | `RequestLevelsCog.pending_openings` | helper | 96 | 34 | 25 | 3 | 15 | none | **High attention**: 3 persistence calls; 15 Discord operations; split candidate |
+| 2734 | `RequestLevelsCog.close_requests` | helper | 16 | 5 | 10 | 0 | 4 | none | **Routine**: 4 Discord operations |
+| 2751 | `RequestLevelsCog.requests_are` | helper | 15 | 7 | 4 | 0 | 2 | none | **Routine**: 2 Discord operations |
+| 2767 | `RequestLevelsCog._requirements_ok` | internal helper | 8 | 5 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 2776 | `RequestLevelsCog.handle_request_button` | workflow handler | 86 | 19 | 15 | 0 | 12 | none | **Focused review**: 12 Discord operations |
+| 2863 | `RequestLevelsCog.edit_request` | helper | 18 | 3 | 4 | 0 | 3 | none | **Routine**: 3 Discord operations |
+| 2882 | `RequestLevelsCog.handle_first_choice` | workflow handler | 20 | 7 | 5 | 0 | 4 | 1 broad / 0 silent | **Routine**: 4 Discord operations; 1 broad catch |
+| 2903 | `RequestLevelsCog.handle_request_form` | workflow handler | 212 | 33 | 40 | 7 | 3 | 8 broad / 1 silent | **High attention**: 7 persistence calls; 3 Discord operations; split candidate; 8 broad catches; 1 silent recovery path |
+| 3116 | `RequestLevelsCog.handle_request_edit_form` | workflow handler | 267 | 44 | 41 | 5 | 5 | 8 broad / 3 silent | **High attention**: 5 persistence calls; 5 Discord operations; split candidate; 8 broad catches; 3 silent recovery paths |
+| 3384 | `RequestLevelsCog._refresh_closed_wave` | internal helper | 7 | 3 | 3 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 3392 | `RequestLevelsCog._submission_by_message` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 3398 | `RequestLevelsCog._weekly_submission_by_message` | internal helper | 5 | 1 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 3404 | `RequestLevelsCog._review_target_by_message` | internal helper | 8 | 3 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 3413 | `RequestLevelsCog._review_target_by_message_local` | internal helper | 24 | 4 | 1 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 3438 | `RequestLevelsCog._channel_by_id` | internal helper | 8 | 4 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 3447 | `RequestLevelsCog._review_target_channel` | internal helper | 16 | 6 | 3 | 1 | 0 | none | **Routine**: 1 persistence call |
+| 3464 | `RequestLevelsCog.handle_review_button` | workflow handler | 16 | 8 | 7 | 0 | 6 | none | **Routine**: 6 Discord operations |
+| 3481 | `RequestLevelsCog.handle_review_submission` | workflow handler | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 3484 | `RequestLevelsCog.handle_other_reason` | workflow handler | 2 | 1 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 3487 | `RequestLevelsCog._finalize_review` | internal helper | 122 | 23 | 27 | 2 | 4 | 6 broad / 1 silent | **Focused review**: 2 persistence calls; 4 Discord operations; split candidate; 6 broad catches; 1 silent recovery path |
+| 3610 | `RequestLevelsCog.repair_request_system` | helper | 332 | 83 | 44 | 15 | 7 | 15 broad / 4 silent | **High attention**: 15 persistence calls; 7 Discord operations; split candidate; 15 broad catches; 4 silent recovery paths |
+| 3944 | `setup` | helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
 
 ### `cogs/Sticky.py`
 
@@ -831,18 +834,18 @@ Every runtime function, method, nested callback, and modal handler has one row b
 | 90 | `_is_discord_startup_rate_limit` | internal helper | 6 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
 | 98 | `_run_preflight_database_check` | internal helper | 6 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
 | 106 | `_repair_legacy_turso_snowflakes` | internal helper | 57 | 15 | 2 | 0 | 0 | 1 broad / 0 silent | **Focused review**: 1 broad catch |
-| 165 | `_close_runtime_storage` | internal helper | 45 | 11 | 6 | 1 | 0 | 5 broad / 0 silent | **Focused review**: 1 persistence call; 5 broad catches |
-| 212 | `_install_storage_close_hook` | internal helper | 13 | 3 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 216 | `_install_storage_close_hook.close_with_storage_flush` | helper | 7 | 3 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 227 | `_database_path_usable` | internal helper | 13 | 3 | 0 | 0 | 0 | 2 broad / 1 silent | **Focused review**: 2 broad catches; 1 silent recovery path |
-| 242 | `resolve_db_path` | helper | 68 | 24 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
-| 311 | `create_bot` | helper | 214 | 37 | 25 | 0 | 0 | 13 broad / 1 silent | **High attention**: split candidate; 13 broad catches; 1 silent recovery path |
-| 339 | `create_bot._load_cogs` | internal helper | 10 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 351 | `create_bot.on_ready` | helper | 98 | 21 | 17 | 0 | 0 | 8 broad / 1 silent | **Focused review**: 8 broad catches; 1 silent recovery path |
-| 451 | `create_bot.on_disconnect` | helper | 31 | 8 | 4 | 0 | 0 | 2 broad / 0 silent | **Routine**: 2 broad catches |
-| 484 | `create_bot.on_resumed` | helper | 19 | 7 | 4 | 0 | 0 | 2 broad / 0 silent | **Routine**: 2 broad catches |
-| 504 | `create_bot.register_persistent_views` | helper | 10 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 526 | `run_bot_with_startup_backoff` | helper | 92 | 15 | 0 | 0 | 0 | 3 broad / 1 silent | **Focused review**: 3 broad catches; 1 silent recovery path |
+| 165 | `_close_runtime_storage` | internal helper | 51 | 13 | 7 | 1 | 0 | 6 broad / 0 silent | **Focused review**: 1 persistence call; 6 broad catches |
+| 218 | `_install_storage_close_hook` | internal helper | 13 | 3 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 222 | `_install_storage_close_hook.close_with_storage_flush` | helper | 7 | 3 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 233 | `_database_path_usable` | internal helper | 13 | 3 | 0 | 0 | 0 | 2 broad / 1 silent | **Focused review**: 2 broad catches; 1 silent recovery path |
+| 248 | `resolve_db_path` | helper | 68 | 24 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
+| 317 | `create_bot` | helper | 214 | 37 | 25 | 0 | 0 | 13 broad / 1 silent | **High attention**: split candidate; 13 broad catches; 1 silent recovery path |
+| 345 | `create_bot._load_cogs` | internal helper | 10 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 357 | `create_bot.on_ready` | helper | 98 | 21 | 17 | 0 | 0 | 8 broad / 1 silent | **Focused review**: 8 broad catches; 1 silent recovery path |
+| 457 | `create_bot.on_disconnect` | helper | 31 | 8 | 4 | 0 | 0 | 2 broad / 0 silent | **Routine**: 2 broad catches |
+| 490 | `create_bot.on_resumed` | helper | 19 | 7 | 4 | 0 | 0 | 2 broad / 0 silent | **Routine**: 2 broad catches |
+| 510 | `create_bot.register_persistent_views` | helper | 10 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 532 | `run_bot_with_startup_backoff` | helper | 92 | 15 | 0 | 0 | 0 | 3 broad / 1 silent | **Focused review**: 3 broad catches; 1 silent recovery path |
 
 ### `utils/checks.py`
 
@@ -976,24 +979,27 @@ Every runtime function, method, nested callback, and modal handler has one row b
 
 ### `utils/gd_validation.py`
 
-14 definitions: 11 routine, 2 focused, 1 high attention.
+17 definitions: 14 routine, 2 focused, 1 high attention.
 
 | Line | Definition | Kind | LOC | CC | Await | DB | Discord | Recovery | Assessment |
 |---:|---|---|---:|---:|---:|---:|---:|---|---|
-| 16 | `_as_int` | internal helper | 7 | 4 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 25 | `_as_bool` | internal helper | 7 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 34 | `_kv_pairs` | internal helper | 3 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 39 | `_boomlings_creator_map` | internal helper | 7 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 48 | `_demon_difficulty` | internal helper | 8 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 58 | `_classic_difficulty` | internal helper | 9 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 69 | `_length_name` | internal helper | 9 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 80 | `_provider_error` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 84 | `parse_gdbrowser_level` | helper | 35 | 20 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
-| 121 | `parse_boomlings_level` | helper | 51 | 22 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
-| 174 | `fetch_gdbrowser_level` | helper | 15 | 6 | 1 | 0 | 0 | 2 broad / 0 silent | **Routine**: 2 broad catches |
-| 191 | `fetch_boomlings_level` | helper | 15 | 3 | 1 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
-| 208 | `combine_level_validation` | helper | 74 | 42 | 0 | 0 | 0 | none | **High attention**: split candidate |
-| 284 | `validation_notice` | helper | 20 | 10 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 17 | `_as_int` | internal helper | 7 | 4 | 0 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 26 | `_as_bool` | internal helper | 7 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 35 | `_kv_pairs` | internal helper | 3 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 40 | `_boomlings_creator_map` | internal helper | 7 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 49 | `_demon_difficulty` | internal helper | 8 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 59 | `_classic_difficulty` | internal helper | 9 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 70 | `_length_name` | internal helper | 9 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 81 | `_provider_error` | internal helper | 22 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 105 | `_retry_after_seconds` | internal helper | 5 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 112 | `_read_provider_text` | internal helper | 27 | 7 | 1 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 141 | `_http_error` | internal helper | 22 | 4 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 165 | `parse_gdbrowser_level` | helper | 41 | 20 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
+| 208 | `parse_boomlings_level` | helper | 61 | 23 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
+| 271 | `fetch_gdbrowser_level` | helper | 27 | 8 | 1 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 300 | `fetch_boomlings_level` | helper | 37 | 5 | 1 | 0 | 0 | 1 broad / 0 silent | **Routine**: 1 broad catch |
+| 339 | `combine_level_validation` | helper | 80 | 45 | 0 | 0 | 0 | none | **High attention**: split candidate |
+| 421 | `validation_notice` | helper | 20 | 10 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
 
 ### `utils/keepalive.py`
 
@@ -1006,18 +1012,18 @@ Every runtime function, method, nested callback, and modal handler has one row b
 | 74 | `set_public_bot_metrics` | helper | 35 | 9 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
 | 111 | `set_public_release_data` | helper | 19 | 9 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
 | 132 | `_public_state_label` | internal helper | 14 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 148 | `get_public_bot_payload` | helper | 43 | 15 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
-| 193 | `get_public_releases_payload` | helper | 8 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 203 | `_response_for_path` | internal helper | 27 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 233 | `_HealthHandler._health_response` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 236 | `_HealthHandler._send_health_headers` | internal helper | 15 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 252 | `_HealthHandler.do_GET` | helper | 8 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 261 | `_HealthHandler.do_HEAD` | helper | 3 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 265 | `_HealthHandler.log_message` | helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 269 | `start_keepalive_thread` | helper | 19 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 277 | `start_keepalive_thread._run` | internal helper | 8 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 290 | `_handle` | internal helper | 14 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
-| 305 | `start_keepalive` | helper | 18 | 3 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 148 | `get_public_bot_payload` | helper | 52 | 15 | 0 | 0 | 0 | none | **Focused review**: small, direct control flow |
+| 202 | `get_public_releases_payload` | helper | 8 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 212 | `_response_for_path` | internal helper | 27 | 6 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 242 | `_HealthHandler._health_response` | internal helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 245 | `_HealthHandler._send_health_headers` | internal helper | 15 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 261 | `_HealthHandler.do_GET` | helper | 8 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 270 | `_HealthHandler.do_HEAD` | helper | 3 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 274 | `_HealthHandler.log_message` | helper | 2 | 1 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 278 | `start_keepalive_thread` | helper | 19 | 3 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 286 | `start_keepalive_thread._run` | internal helper | 8 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 299 | `_handle` | internal helper | 14 | 2 | 0 | 0 | 0 | none | **Routine**: small, direct control flow |
+| 314 | `start_keepalive` | helper | 18 | 3 | 2 | 0 | 0 | none | **Routine**: small, direct control flow |
 
 ### `utils/mentions.py`
 
@@ -1137,7 +1143,7 @@ The largest functions are concentrated in configuration diagnostics, impact aggr
 ```text
 Python compileall                     PASS
 Ruff correctness and bug checks      PASS
-Pytest                                PASS (122 tests)
+Pytest                                PASS (132 tests)
 Bandit medium/high security scan     PASS
 Production dependency audit          PASS
 Discord modal serialization          PASS

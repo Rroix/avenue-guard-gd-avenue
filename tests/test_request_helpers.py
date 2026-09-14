@@ -84,6 +84,70 @@ def test_level_validation_rate_limit_cache_has_a_hard_ceiling(monkeypatch):
     assert (717, 9999) in cog._validation_attempts
 
 
+def test_access_denied_provider_enters_long_cooldown_immediately(monkeypatch):
+    cog = make_cog()
+    cog._validation_provider_failures = {}
+    cog._validation_provider_open_until = {}
+    cog._validation_provider_open_reason = {}
+    cog._validation_provider_last_result = {}
+    cog.bot.config.data["level_requests"]["level_validation"] = {
+        "provider_access_denied_backoff_seconds": 21600,
+        "providers": {"gdbrowser": True, "boomlings": True},
+    }
+    monkeypatch.setattr(request_module.time_module, "time", lambda: 1_000)
+
+    cog._record_provider_validation_result(
+        "boomlings",
+        {
+            "provider": "boomlings",
+            "ok": False,
+            "exists": None,
+            "failure_kind": "access_denied",
+            "status_code": 403,
+        },
+    )
+
+    assert cog._provider_circuit_open("boomlings") is True
+    snapshot = cog.validation_provider_snapshot()["boomlings"]
+    assert snapshot["circuit_open"] is True
+    assert snapshot["retry_after_seconds"] == 21600
+    assert snapshot["reason"] == "upstream access denied"
+
+
+@pytest.mark.asyncio
+async def test_transient_provider_failure_is_retried_once(monkeypatch):
+    cog = make_cog()
+    cog._validation_provider_failures = {}
+    cog._validation_provider_open_until = {}
+    cog._validation_provider_open_reason = {}
+    cog._validation_provider_last_result = {}
+    cog._validation_provider_locks = {}
+    cog._validation_provider_last_call = {}
+    cog.bot.config.data["level_requests"]["level_validation"] = {
+        "provider_retry_attempts": 2,
+        "provider_min_interval_seconds": {"gdbrowser": 0},
+    }
+    fetch = AsyncMock(
+        side_effect=[
+            {
+                "provider": "gdbrowser",
+                "ok": False,
+                "exists": None,
+                "failure_kind": "network_error",
+                "retryable": True,
+            },
+            {"provider": "gdbrowser", "ok": True, "exists": True},
+        ]
+    )
+    monkeypatch.setattr(request_module, "fetch_gdbrowser_level", fetch)
+
+    result = await cog._fetch_validation_provider("gdbrowser", object(), "111111111")
+
+    assert result["ok"] is True
+    assert result["attempts"] == 2
+    assert fetch.await_count == 2
+
+
 def test_edit_window_uses_persisted_deadline_for_a_closed_or_old_wave(monkeypatch):
     cog = make_cog()
     monkeypatch.setattr(request_module.time_module, "time", lambda: 1_000)

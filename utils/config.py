@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils.config_schema import validate_config
+
 class Config:
     """Simple JSON config loader with pseudo-comments support.
 
@@ -15,13 +17,16 @@ class Config:
     def __init__(self, path: str):
         self.path = Path(path)
         self.data: Dict[str, Any] = {}
+        self.validation_issues = []
         self.reload()
 
     def reload(self) -> None:
         raw = self.path.read_text(encoding="utf-8")
         self.data = json.loads(raw)
+        self.validation_issues = validate_config(self.data)
 
     def save(self) -> None:
+        self.validation_issues = validate_config(self.data)
         payload = json.dumps(self.data, indent=2, ensure_ascii=False) + "\n"
         tmp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
         tmp_path.write_text(payload, encoding="utf-8")

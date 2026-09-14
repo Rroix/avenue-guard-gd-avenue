@@ -24,6 +24,8 @@ from utils.views import (
     LevelRequestReviewView,
 )
 from utils.runtime_config import load_runtime_config_overrides
+from utils.outbox import DiscordOutbox
+from utils.workflows import begin_workflow_context, clear_workflow_context
 
 DEFAULT_DB_PATH = "data/bot.db"
 TURSO_REPLICA_PATH = "data/turso-replica.db"
@@ -164,6 +166,14 @@ async def _repair_legacy_turso_snowflakes(bot: discord.Bot, guild: discord.Guild
 
 async def _close_runtime_storage(bot: discord.Bot) -> None:
     """Best-effort flush on Discord's event loop before it is torn down."""
+    operations = bot.get_cog("OperationsCog")
+    close_operations = getattr(operations, "close_resources", None)
+    if callable(close_operations):
+        try:
+            await close_operations()
+        except Exception as e:
+            startup_log(f"Operations shutdown failed: {type(e).__name__}: {e}")
+
     requests = bot.get_cog("RequestLevelsCog")
     close_request_resources = getattr(requests, "close_resources", None)
     if callable(close_request_resources):
@@ -200,6 +210,12 @@ async def _close_runtime_storage(bot: discord.Bot) -> None:
             await persist_daily()
         except Exception as e:
             startup_log(f"Daily stats flush during shutdown failed: {type(e).__name__}: {e}")
+    close_background_resources = getattr(background, "close_resources", None)
+    if callable(close_background_resources):
+        try:
+            await close_background_resources()
+        except Exception as e:
+            startup_log(f"Background HTTP session shutdown failed: {type(e).__name__}: {e}")
 
     try:
         await bot.db.sync_remote()
@@ -332,7 +348,25 @@ def create_bot() -> discord.Bot:
     bot.db_path, bot.db_path_source, bot.db_path_warning, bot.db_remote_url, bot.db_remote_token = resolve_db_path(bot.config)
     startup_log(f"Using database path: {bot.db_path} ({bot.db_path_source})")
     bot.db = Database(bot.db_path, remote_url=bot.db_remote_url, auth_token=bot.db_remote_token)
+    bot.outbox = DiscordOutbox(bot)
     _install_storage_close_hook(bot)
+
+    @bot.check_once
+    async def attach_command_correlation(ctx: discord.ApplicationContext) -> bool:
+        command = getattr(ctx, "command", None)
+        command_name = str(
+            getattr(command, "qualified_name", None)
+            or getattr(command, "name", None)
+            or "command"
+        )
+        ctx.correlation_id = begin_workflow_context(prefix=command_name)
+        return True
+
+    @bot.event
+    async def on_application_command_completion(
+        ctx: discord.ApplicationContext,
+    ) -> None:
+        clear_workflow_context()
 
     setup_global_error_handlers(bot)
 
@@ -346,6 +380,7 @@ def create_bot() -> discord.Bot:
         bot.load_extension("cogs.Release")
         bot.load_extension("cogs.Commands")
         bot.load_extension("cogs.Background")
+        bot.load_extension("cogs.Operations")
 
     @bot.event
     async def on_ready():
@@ -410,6 +445,7 @@ def create_bot() -> discord.Bot:
             "RequestLevelsCog",
             "ReleaseCog",
             "BackgroundCog",
+            "OperationsCog",
         ):
             cog = bot.get_cog(cog_name)
             start = getattr(cog, "start_background", None)

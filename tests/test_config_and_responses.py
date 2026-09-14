@@ -22,6 +22,13 @@ def test_checked_in_config_contains_recovery_and_rate_limit_defaults():
         "gdbrowser": 0.1,
         "boomlings": 0.55,
     }
+    assert config.get_int("level_requests", "level_validation", "failure_cache_seconds") == 90
+    assert config.get_int("level_requests", "level_validation", "provider_retry_attempts") == 2
+    assert config.get_int(
+        "level_requests",
+        "level_validation",
+        "provider_access_denied_backoff_seconds",
+    ) == 21600
     assert config.get_int("channels", "dm_fail_log_channel_id") == 1445502925081284729
     assert config.get_int("channels", "transcript_requests_channel_id") == 1455042313855307939
 

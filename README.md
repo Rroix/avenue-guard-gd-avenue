@@ -47,9 +47,10 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Counts a request only after the modal form is successfully submitted.
 - Blocks duplicate users and duplicate level IDs inside the same wave.
 - Warns staff when a submitted level ID has appeared in previous waves.
-- Validates level IDs as 7 to 9 digits, validates showcase links as URLs, and checks level existence through GDBrowser plus the direct GD/Boomlings endpoint.
+- Validates level IDs as 7 to 9 digits, validates showcase links as URLs, and checks level existence through GDBrowser plus the current GD 2.2/Boomlings request protocol.
 - Enforces the active wave type after GD validation and before the request counts toward the wave.
-- Reuses one validation HTTP session, rate-limits validation attempts per user, and temporarily backs off providers that fail repeatedly.
+- Reuses one validation HTTP session with a trusted CA bundle, rate-limits checks per user, retries transient failures once, and pauses blocked or rate-limited providers automatically.
+- Bounds external response sizes and treats malformed HTML or incomplete payloads as unavailable evidence instead of incorrectly marking a level missing.
 - Auto-rejects confidently missing level IDs while surfacing uncertain validation warnings to reviewers.
 - Warns reviewers when a level appears rated, when validation sources disagree, or when validation will refresh after the configured cache time.
 - Automatically requires a showcase URL when validation detects a demon or platformer.
@@ -62,11 +63,15 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Sends staff review embeds to `level_requests.level_requested`.
 - Configured reviewer roles, admins, and owners can choose `Send`, `Reject`, or `Other`.
 - Staff can filter pending live-wave and weekly requests with `/requests pending`.
+- Requesters can choose whether final results arrive in the result channel, by DM, in both places, or without an additional notification through `/requests notifications`.
+- Pending queues and request cards show configurable fresh, aging, due-soon, and overdue SLA indicators.
+- Reviewers can force a fresh Geometry Dash validation check from the request card without reopening the submission.
+- `/requests analytics` shows queue age, review throughput, and a structured rejection-reason breakdown.
 - Admins can run `/requests repair` to refresh the request button, rebuild wave summaries, recreate missing pending request messages, refresh stale validation warnings, and relock reviewed messages.
 - Review actions verify the original request message and result channel before marking the request reviewed.
 - Sends final result embeds to `level_requests.sent_channel` or `level_requests.rejected_channel`.
 - Disables review buttons after a request is processed.
-- Posts one live summary embed per closed wave in `level_requests.level_requested`, including requested, reviewed, sent, not sent, percentages, remaining reviews, and reviewer stats.
+- Posts one live summary embed per closed wave in `level_requests.level_requested`, including requested, reviewed, sent, not sent, percentages, remaining reviews, reviewer stats, average review time, and comparison with the previous wave.
 - Stores request state, request button message ID, wave count, submitted users, and submitted level IDs in SQLite so restarts do not wipe the wave.
 
 ### Help Menu And Staff Tickets
@@ -116,8 +121,8 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Blocks mass mentions from configured auto-responses and caps configured response length.
 
 ### Background Utilities
-- `/bot dashboard` opens a button-driven admin dashboard with system health, request state, tracking state, icon rotation, config issues, and repair tips.
-- `/bot impact` generates an owner-only community impact and forecast report, stores a database snapshot, and posts Markdown, CSV, trend CSV, breakdown CSV, and JSON exports to the configured impact/log channel.
+- `/bot dashboard` opens a button-driven admin dashboard with system health, request state, tracking state, icon rotation, persistent incidents, permission drift, schema versions, and direct repair controls.
+- `/bot impact` generates an owner-only community impact and forecast report with confidence, trend, anomaly signals, database history, and Markdown, CSV, trend CSV, breakdown CSV, and JSON exports.
 - `/bot backup` creates a zipped database backup and posts it to the configured backup/log channel.
 - `/bot storage` shows the active database path, whether it looks persistent, automatic backup status, and the latest backup record.
 - `/bot release` creates a private version proposal and DMs the configured owner an approval panel.
@@ -125,7 +130,12 @@ The bot is intentionally built around one configured server. Most behavior is co
 - `/bot health` shows database, background task, request, ticket, and weekly workflow status.
 - `/bot config_check` validates configured channels, roles, request embed template variables, and `responses.json` rule shape/channel references.
 - `/bot doctor` runs deeper permission diagnostics for channels, ticket category access, managed role hierarchy, and request-button state.
+- `/bot retention` shows or changes the allowlisted retention periods for operational telemetry and can run cleanup immediately.
 - `/requests pending` shows and filters pending live-wave and weekly request reviews.
+- Supervises critical background tasks and restarts unexpected failures while respecting features that are intentionally disabled.
+- Uses a durable Discord action outbox so important sends, edits, DMs, deletions, and role changes can retry after temporary Discord or network failures.
+- Samples historical health, database query timing, external-provider latency, permission drift, and grouped error incidents into persistent tables.
+- Runs non-destructive restore drills, automated monthly impact reports, and post-deployment smoke checks.
 - Optional rotating bot status with placeholders like `{members}`, `{online}`, `{week_msgs}`, `{week_top}`, `{open_tickets}`, and `{today_msgs}`.
 - Optional server icon rotation from configured image URLs, with `disabled`, `linear`, and `random` modes.
 - Optional daily server summary embeds with highlights, day-over-day movement, active members/channels, moderation signals, command health, voice/presence, and top channels/members/commands.
@@ -154,6 +164,7 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/bot impact` generates an owner-only community impact and forecast report with Markdown, CSV, trend CSV, breakdown CSV, and JSON exports.
 - `/bot backup` creates a zipped database backup in the configured backup channel.
 - `/bot storage` shows database storage and backup status.
+- `/bot retention action:<show|set|run>` manages owner-only retention controls for operational history.
 - `/bot release version:<x.y.z> title:<title> changes:<item | item> summary:<optional>` prepares a release and sends the owner an approval DM.
 - `/bot releases` shows the approved website version and any pending proposals. Running `/bot release` again with a pending version resends its DM.
 - `/server_icon status` shows the server icon rotation mode, interval, current image, and configured URLs.
@@ -162,6 +173,8 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/server_icon set number:<n>` changes to a specific configured server icon immediately.
 - `/server_icon next` changes to the next configured server icon immediately.
 - `/requests pending scope:<optional> status:<optional> wave:<optional>` shows filtered live and weekly request reviews.
+- `/requests notifications mode:<channel|dm|both|none>` saves how the requester wants final level results delivered.
+- `/requests analytics` shows live queue SLA, review throughput, and rejection-reason analytics to configured reviewers.
 - `/requests history message_id:<optional> user_id:<optional> wave:<optional>` shows the edit audit trail for a live-wave request.
 - `/requests repair` runs request-system recovery and message refresh tasks.
 - `/refresh-request-button` refreshes or recreates the live request button.
@@ -319,9 +332,14 @@ Set these before opening requests:
 - `open_announcement`: controls the message sent when waves open. Blank `message` uses the default `<@&role>, requests have been opened for {condition_text}`.
 - `level_validation.enabled`: enables GDBrowser plus GD/Boomlings existence/rating/showcase checks.
 - `level_validation.cache_seconds`: how long validation warnings stay fresh before repair or the next submission refreshes them.
+- `level_validation.failure_cache_seconds`: short cache lifetime used when every provider is unavailable.
 - `level_validation.per_user_cooldown_seconds`, `per_user_window_seconds`, and `per_user_max_checks`: protect validation from spam.
 - `level_validation.provider_failure_threshold` and `provider_circuit_breaker_seconds`: pause failing validation providers briefly.
+- `level_validation.provider_access_denied_backoff_seconds`: longer cooldown after an upstream `401` or `403`, which avoids repeatedly hitting a provider that rejects the hosting network.
+- `level_validation.provider_retry_attempts`: bounded attempts for transient network and upstream failures; rate limits and access denials are never immediately retried.
 - `level_validation.auto_reject_missing`: blocks the modal when enabled sources confidently agree that the ID is missing.
+
+`/bot dashboard` reports each validation provider as ready, disabled, or paused. A Boomlings `403` is normally an upstream Cloudflare/hosting-network restriction rather than a Discord or Turso failure; the bot keeps requests usable through its remaining provider and retries Boomlings only after the configured cooldown.
 
 The same section controls the request button text, all user-facing messages, request/review/result embed templates, wave summary embed, weekly request embeds, duplicate-history warnings, validation warnings, aging fields, edit-audit counters, and final-result colors.
 
@@ -330,6 +348,21 @@ Validated live requests also expose compact GD details for embeds:
 - `{gd_difficulty}`, `{gd_length}`, `{gd_stars}`, `{gd_rated}`.
 - `{gd_demon}`, `{gd_platformer}`, `{gd_featured}`, `{gd_epic}`, `{gd_flags}`.
 - `{gd_level_name}` and `{gd_creator}` when the validation provider returns them.
+
+### Operations And Reliability Config
+
+The `operations` section controls the bot's recovery and observability layer.
+
+- `supervisor_interval_seconds`: how often Avenue Guard checks critical cog loops and restarts unexpected failures.
+- `outbox_poll_seconds`: how quickly queued Discord actions are retried.
+- `health_sample_seconds`: how often gateway, database, query-timing, command, error, and provider health is stored.
+- `permission_scan_seconds`: how often configured channels, categories, permissions, and assignable roles are checked for drift.
+- `monthly_report_channel_id`, `monthly_report_day`, and `monthly_report_hour`: where and when the automated impact report is queued.
+- `retention_days`: an allowlisted per-table policy for health samples, workflow events, resolved incidents, delivered/dead outbox rows, validation cache, and impact snapshots.
+
+The database records explicit config, runtime, embed-template, and database schema versions. Startup smoke checks compare those contracts, verify the guild and database, confirm the outbox and request cog are available, and inventory slash commands. Each command or long-running workflow receives a correlation ID so a request, ticket, support submission, outbox delivery, and error incident can be followed as one timeline.
+
+Important Discord side effects use a transactional outbox pattern: the workflow result and the intended Discord action are committed together, then a separate worker claims and delivers the action. Idempotency keys prevent duplicate queue entries, interrupted `processing` rows are recovered, transient failures back off exponentially, and permanent failures move to a visible dead-letter state for staff retry or repair.
 
 ## Running The Bot
 
@@ -405,7 +438,7 @@ pip install -r requirements-dev.txt
 ./scripts/quality_check.sh
 ```
 
-The suite checks migrations from an empty database, transaction rollback, concurrent ticket IDs, backup integrity, GD validation, request schedules and edit windows, cold-cache tracking ranks, runtime configuration persistence, URL and regex safety, daily-summary durability, lint, dependency vulnerabilities, and common security mistakes.
+The current suite contains 140 passing tests. It checks migrations from an empty database, transaction rollback, concurrent ticket IDs, outbox idempotency and recovery, state-machine transitions, typed config validation, restore drills, forecasting, request SLA and wave comparison helpers, GD validation, request schedules and edit windows, cold-cache tracking ranks, runtime configuration persistence, URL and regex safety, daily-summary durability, lint, dependency vulnerabilities, and common security mistakes.
 
 Use `TEST_CHECKLIST.md` for the full Discord-side test flow. It covers startup, moderation, live request waves, tracking, help sessions, ticket closure, transcript requests, sticky messages, forum reminders, required-word deletion, and fun commands.
 

@@ -23,6 +23,7 @@ CID_LEVEL_REQUEST_BUTTON = "level_request_button"
 CID_LEVEL_REQUEST_SEND = "level_request_send"
 CID_LEVEL_REQUEST_REJECT = "level_request_reject"
 CID_LEVEL_REQUEST_OTHER = "level_request_other"
+CID_LEVEL_REQUEST_RECHECK = "level_request_recheck"
 
 
 class TranscriptRequestView(discord.ui.View):
@@ -334,6 +335,7 @@ class LevelRequestReviewView(discord.ui.View):
             ("Send", discord.ButtonStyle.success, CID_LEVEL_REQUEST_SEND, "sent"),
             ("Reject", discord.ButtonStyle.danger, CID_LEVEL_REQUEST_REJECT, "rejected"),
             ("Other", discord.ButtonStyle.secondary, CID_LEVEL_REQUEST_OTHER, "other"),
+            ("Recheck", discord.ButtonStyle.secondary, CID_LEVEL_REQUEST_RECHECK, "recheck"),
         ):
             button = discord.ui.Button(label=label, style=style, custom_id=custom_id, disabled=disabled)
             button.callback = self._make_callback(action)

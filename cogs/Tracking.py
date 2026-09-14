@@ -16,6 +16,7 @@ from utils.errors import log_error
 from utils.mentions import no_mentions
 from utils.timeutils import now_madrid, week_start_sunday, TZ
 from utils.views import LevelRequestReviewView, TrackingDeclineConfirmView
+from utils.workflows import new_correlation_id
 
 REQUEST_DM_TEXT = (
     "Congratulations! You have been the most active member this week, so you have earned a **level request**. "
@@ -473,7 +474,8 @@ class TrackingCog(commands.Cog):
         weekly_running = self._weekly_task is not None and not self._weekly_task.done()
         timeout_running = self._timeout_task is not None and not self._timeout_task.done()
         flush_running = self._activity_flush_task is not None and not self._activity_flush_task.done()
-        if self._started and weekly_running and timeout_running and flush_running:
+        recap_running = self._recap_task is not None and not self._recap_task.done()
+        if self._started and weekly_running and timeout_running and flush_running and recap_running:
             return
         self._started = True
 
@@ -491,7 +493,7 @@ class TrackingCog(commands.Cog):
             self._timeout_task = asyncio.create_task(self._timeout_loop())
         if not flush_running:
             self._activity_flush_task = asyncio.create_task(self._activity_flush_loop())
-        if self._recap_task is None or self._recap_task.done():
+        if not recap_running:
             self._recap_task = asyncio.create_task(self._weekly_recap_loop())
 
     def cog_unload(self) -> None:
@@ -1228,6 +1230,8 @@ class TrackingCog(commands.Cog):
         if not ok:
             return
         created_ts = int(time.time())
+        correlation_id = new_correlation_id("weekly-request")
+        review_data["correlation_id"] = correlation_id
         variables = {
             **review_data,
             "user_id": user_id,
@@ -1275,8 +1279,8 @@ class TrackingCog(commands.Cog):
                 (
                     (
                         "INSERT INTO weekly_request_reviews("
-                        "guild_id,request_message_id,channel_id,user_id,week_start,rank,status,created_ts,data_json"
-                        ") VALUES(?,?,?,?,?,?,?,?,?)",
+                        "guild_id,request_message_id,channel_id,user_id,week_start,rank,status,created_ts,data_json,correlation_id"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (
                             guild.id,
                             msg.id,
@@ -1287,6 +1291,7 @@ class TrackingCog(commands.Cog):
                             "pending",
                             created_ts,
                             json.dumps(review_data, separators=(",", ":")),
+                            correlation_id,
                         ),
                     ),
                     (

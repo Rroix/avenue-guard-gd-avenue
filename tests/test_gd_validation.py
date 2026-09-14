@@ -1,15 +1,64 @@
+from types import SimpleNamespace
+
+import pytest
+
 from utils.gd_validation import (
     combine_level_validation,
+    fetch_boomlings_level,
+    fetch_gdbrowser_level,
     parse_boomlings_level,
     parse_gdbrowser_level,
     validation_notice,
 )
 
 
+class _FakeContent:
+    def __init__(self, body: bytes):
+        self.body = body
+
+    async def read(self, limit: int):
+        return self.body[:limit]
+
+
+class _FakeResponse:
+    def __init__(self, status: int, body: str, headers=None):
+        self.status = status
+        self.headers = headers or {}
+        self.charset = "utf-8"
+        self.content = _FakeContent(body.encode("utf-8"))
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, response: _FakeResponse):
+        self.response = response
+        self.request = None
+
+    def get(self, url, **kwargs):
+        self.request = SimpleNamespace(method="GET", url=url, **kwargs)
+        return self.response
+
+    def post(self, url, **kwargs):
+        self.request = SimpleNamespace(method="POST", url=url, **kwargs)
+        return self.response
+
+
 def test_gdbrowser_rejects_a_mismatched_returned_id():
     result = parse_gdbrowser_level({"id": "222222222", "name": "Wrong"}, "111111111")
     assert result["ok"] is False
     assert result["exists"] is None
+
+
+def test_gdbrowser_rejects_a_success_payload_without_an_id():
+    result = parse_gdbrowser_level({"name": "Not enough evidence"}, "111111111")
+
+    assert result["ok"] is False
+    assert result["failure_kind"] == "invalid_response"
 
 
 def test_boomlings_selects_only_the_exact_level_and_maps_metadata():
@@ -33,6 +82,13 @@ def test_boomlings_does_not_accept_a_related_but_different_level():
     response = "1:222222222:2:Related:6:43:9:10:15:1:18:0#43:Creator:0"
     result = parse_boomlings_level(response, "111111111")
     assert result == {"provider": "boomlings", "ok": True, "exists": False}
+
+
+def test_boomlings_does_not_treat_an_html_success_page_as_a_missing_level():
+    result = parse_boomlings_level("<html>Cloudflare challenge</html>", "111111111")
+
+    assert result["ok"] is False
+    assert result["failure_kind"] == "invalid_response"
 
 
 def test_all_requested_sources_must_agree_before_missing_is_confident():
@@ -76,3 +132,51 @@ def test_disagreement_keeps_request_reviewable_and_surfaces_warning():
     notice = validation_notice(result)
     assert "disagreed" in notice
     assert "Refreshes <t:200:R>" in notice
+
+
+@pytest.mark.asyncio
+async def test_boomlings_uses_current_form_headers_and_classifies_access_denial():
+    session = _FakeSession(_FakeResponse(403, "Cloudflare denied this request"))
+
+    result = await fetch_boomlings_level(session, "111111111")
+
+    assert result["failure_kind"] == "access_denied"
+    assert result["status_code"] == 403
+    assert result["retryable"] is False
+    assert session.request.data["gameVersion"] == "22"
+    assert session.request.data["binaryVersion"] == "45"
+    assert session.request.headers["User-Agent"] == ""
+    assert session.request.headers["Cookie"] == "gd=1;"
+    assert session.request.headers["Content-Type"] == "application/x-www-form-urlencoded"
+
+
+@pytest.mark.asyncio
+async def test_provider_response_body_is_bounded():
+    session = _FakeSession(_FakeResponse(200, "x" * 1_000_001))
+
+    result = await fetch_gdbrowser_level(session, "111111111")
+
+    assert result["ok"] is False
+    assert result["failure_kind"] == "invalid_response"
+    assert result["error"] == "Response was too large"
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_preserves_bounded_retry_after():
+    session = _FakeSession(_FakeResponse(429, "slow down", {"Retry-After": "99999"}))
+
+    result = await fetch_gdbrowser_level(session, "111111111")
+
+    assert result["failure_kind"] == "rate_limited"
+    assert result["retryable"] is True
+    assert result["retry_after_seconds"] == 3600
+
+
+@pytest.mark.asyncio
+async def test_server_error_body_cannot_be_mistaken_for_a_missing_level():
+    session = _FakeSession(_FakeResponse(503, "-1"))
+
+    result = await fetch_gdbrowser_level(session, "111111111")
+
+    assert result["ok"] is False
+    assert result["failure_kind"] == "upstream_unavailable"

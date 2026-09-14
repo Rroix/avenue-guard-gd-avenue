@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict
+from typing import Any
 
 import aiohttp
 
@@ -11,6 +11,7 @@ GDBROWSER_LEVEL_URL = "https://gdbrowser.com/api/level/{level_id}"
 BOOMLINGS_LEVEL_URL = "https://www.boomlings.com/database/getGJLevels21.php"
 # Public Geometry Dash protocol value, not an application credential.
 COMMON_SECRET = "Wmfd2893gb7"  # nosec B105
+MAX_PROVIDER_RESPONSE_BYTES = 1_000_000
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -77,8 +78,88 @@ def _length_name(code: Any) -> str:
     }.get(_as_int(code, -1), "Unknown")
 
 
-def _provider_error(provider: str, message: str) -> dict[str, Any]:
-    return {"provider": provider, "ok": False, "exists": None, "error": message}
+def _provider_error(
+    provider: str,
+    message: str,
+    *,
+    failure_kind: str = "upstream_error",
+    status_code: int | None = None,
+    retryable: bool = False,
+    retry_after_seconds: int = 0,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "provider": provider,
+        "ok": False,
+        "exists": None,
+        "error": message,
+        "failure_kind": failure_kind,
+        "retryable": bool(retryable),
+    }
+    if status_code is not None:
+        result["status_code"] = int(status_code)
+    if retry_after_seconds > 0:
+        result["retry_after_seconds"] = int(retry_after_seconds)
+    return result
+
+
+def _retry_after_seconds(response: aiohttp.ClientResponse) -> int:
+    try:
+        return max(0, min(3600, int(response.headers.get("Retry-After", "0"))))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _read_provider_text(
+    response: aiohttp.ClientResponse,
+    provider: str,
+) -> tuple[str, dict[str, Any] | None]:
+    try:
+        declared_length = int(response.headers.get("Content-Length", "0") or 0)
+    except (TypeError, ValueError):
+        declared_length = 0
+    if declared_length > MAX_PROVIDER_RESPONSE_BYTES:
+        return "", _provider_error(
+            provider,
+            "Response was too large",
+            failure_kind="invalid_response",
+        )
+
+    payload = await response.content.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+    if len(payload) > MAX_PROVIDER_RESPONSE_BYTES:
+        return "", _provider_error(
+            provider,
+            "Response was too large",
+            failure_kind="invalid_response",
+        )
+    encoding = response.charset or "utf-8"
+    try:
+        return payload.decode(encoding, errors="replace"), None
+    except LookupError:
+        return payload.decode("utf-8", errors="replace"), None
+
+
+def _http_error(provider: str, response: aiohttp.ClientResponse) -> dict[str, Any]:
+    status = int(response.status)
+    if status in {401, 403}:
+        kind = "access_denied"
+        retryable = False
+    elif status == 429:
+        kind = "rate_limited"
+        retryable = True
+    elif status >= 500:
+        kind = "upstream_unavailable"
+        retryable = True
+    else:
+        kind = "http_error"
+        retryable = False
+    return _provider_error(
+        provider,
+        f"HTTP {status}",
+        failure_kind=kind,
+        status_code=status,
+        retryable=retryable,
+        retry_after_seconds=_retry_after_seconds(response),
+    )
 
 
 def parse_gdbrowser_level(payload: Any, level_id: str) -> dict[str, Any]:
@@ -88,7 +169,13 @@ def parse_gdbrowser_level(payload: Any, level_id: str) -> dict[str, Any]:
         return _provider_error("gdbrowser", "Unexpected response")
 
     returned_id = str(payload.get("id") or "").strip()
-    if returned_id and returned_id != str(level_id).strip():
+    if not returned_id:
+        return _provider_error(
+            "gdbrowser",
+            "Response did not include a level ID",
+            failure_kind="invalid_response",
+        )
+    if returned_id != str(level_id).strip():
         return _provider_error("gdbrowser", "Response level ID did not match the requested ID")
 
     difficulty = str(payload.get("difficulty") or "")
@@ -120,15 +207,25 @@ def parse_gdbrowser_level(payload: Any, level_id: str) -> dict[str, Any]:
 
 def parse_boomlings_level(text: str, level_id: str) -> dict[str, Any]:
     raw = str(text or "").strip()
-    if not raw or raw == "-1":
+    if raw == "-1":
         return {"provider": "boomlings", "ok": True, "exists": False}
+    if not raw or raw.startswith("<"):
+        return _provider_error(
+            "boomlings",
+            "Unexpected response",
+            failure_kind="invalid_response",
+        )
 
     sections = raw.split("#")
     levels_text = sections[0] if sections else ""
     creators = _boomlings_creator_map(sections[1] if len(sections) > 1 else "")
     level_parts = [part for part in levels_text.split("|") if part]
     if not level_parts:
-        return {"provider": "boomlings", "ok": True, "exists": False}
+        return _provider_error(
+            "boomlings",
+            "Response did not include level data",
+            failure_kind="invalid_response",
+        )
 
     selected = None
     for item in level_parts:
@@ -173,41 +270,75 @@ def parse_boomlings_level(text: str, level_id: str) -> dict[str, Any]:
 
 async def fetch_gdbrowser_level(session: aiohttp.ClientSession, level_id: str) -> dict[str, Any]:
     try:
-        async with session.get(GDBROWSER_LEVEL_URL.format(level_id=level_id)) as resp:
-            text = await resp.text()
-            if resp.status == 404 or text.strip() == "-1":
+        headers = {"Accept": "application/json", "User-Agent": "Avenue-Guard/1"}
+        async with session.get(GDBROWSER_LEVEL_URL.format(level_id=level_id), headers=headers) as resp:
+            text, read_error = await _read_provider_text(resp, "gdbrowser")
+            if read_error:
+                return read_error
+            if resp.status == 404:
                 return {"provider": "gdbrowser", "ok": True, "exists": False}
             if resp.status >= 400:
-                return _provider_error("gdbrowser", f"HTTP {resp.status}")
+                return _http_error("gdbrowser", resp)
+            if text.strip() == "-1":
+                return {"provider": "gdbrowser", "ok": True, "exists": False}
             try:
                 payload = json.loads(text)
-            except Exception:
+            except (TypeError, ValueError):
                 payload = text
             return parse_gdbrowser_level(payload, level_id)
+    except (aiohttp.ClientError, TimeoutError) as e:
+        return _provider_error(
+            "gdbrowser",
+            type(e).__name__,
+            failure_kind="network_error",
+            retryable=True,
+        )
     except Exception as e:
         return _provider_error("gdbrowser", type(e).__name__)
 
 
 async def fetch_boomlings_level(session: aiohttp.ClientSession, level_id: str) -> dict[str, Any]:
     payload = {
+        "gameVersion": "22",
+        "binaryVersion": "45",
+        "gdw": "0",
         "str": str(level_id),
         "type": "10",
+        "page": "0",
+        "total": "0",
         "secret": COMMON_SECRET,
     }
-    headers = {"User-Agent": ""}
+    # These headers mirror current GD 2.2 clients. In particular, Boomlings'
+    # Cloudflare rules reject ordinary server-side HTTP clients surprisingly often.
+    headers = {
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Cookie": "gd=1;",
+        "Host": "www.boomlings.com",
+        "User-Agent": "",
+    }
     try:
         async with session.post(BOOMLINGS_LEVEL_URL, data=payload, headers=headers) as resp:
-            text = await resp.text()
+            text, read_error = await _read_provider_text(resp, "boomlings")
+            if read_error:
+                return read_error
             if resp.status >= 400:
-                return _provider_error("boomlings", f"HTTP {resp.status}")
+                return _http_error("boomlings", resp)
             return parse_boomlings_level(text, level_id)
+    except (aiohttp.ClientError, TimeoutError) as e:
+        return _provider_error(
+            "boomlings",
+            type(e).__name__,
+            failure_kind="network_error",
+            retryable=True,
+        )
     except Exception as e:
         return _provider_error("boomlings", type(e).__name__)
 
 
 def combine_level_validation(
     level_id: str,
-    provider_results: Dict[str, dict[str, Any]],
+    provider_results: dict[str, dict[str, Any]],
     checked_ts: int | None = None,
     expires_ts: int | None = None,
 ) -> dict[str, Any]:
@@ -254,7 +385,13 @@ def combine_level_validation(
         elif result.get("ok") and result.get("exists") is False:
             status = "missing"
         else:
-            status = f"failed ({result.get('error') or 'unknown'})"
+            kind = str(
+                result.get("circuit_reason")
+                or result.get("failure_kind")
+                or ""
+            ).replace("_", " ")
+            detail = kind or str(result.get("error") or "unknown")
+            status = f"unavailable ({detail})"
         sources.append(f"{provider}: {status}")
 
     return {

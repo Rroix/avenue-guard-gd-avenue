@@ -20,6 +20,8 @@ from urllib.parse import urlparse
 import discord
 from discord.ext import commands
 
+from services.impact import forecast_engagement
+from services.request_reviews import normalize_notification_mode, rejection_breakdown, request_age
 from utils.checks import is_admin_or_owner, is_mod
 from utils.discord_refs import fetch_persisted_message
 from utils.mentions import no_mentions
@@ -142,9 +144,74 @@ class AdminDashboardView(discord.ui.View):
     async def repairs(self, button: discord.ui.Button, interaction: discord.Interaction):
         await self._show(interaction, "repairs")
 
+    @discord.ui.button(label="Incidents", style=discord.ButtonStyle.secondary)
+    async def incidents(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._show(interaction, "incidents")
+
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.success)
     async def refresh(self, button: discord.ui.Button, interaction: discord.Interaction):
         await self._show(interaction, self.page)
+
+    async def _run_action(self, interaction: discord.Interaction, action: str):
+        if interaction.user.id != self.user_id or interaction.guild is None:
+            return await interaction.response.send_message("This dashboard belongs to another admin.", ephemeral=True)
+        await interaction.response.defer()
+        member = await self.cog._resolve_member(interaction.guild, interaction.user)
+        admin_roles = self.cog.bot.config.get_int_list("roles", "admin_owner_role_ids")
+        if member is None or not is_admin_or_owner(member, admin_roles):
+            return await interaction.followup.send("You don't have permission to use this.", ephemeral=True)
+        detail = ""
+        try:
+            operations = self.cog.bot.get_cog("OperationsCog")
+            if action == "restart_tasks" and operations:
+                states = await operations.restart_stopped_tasks(force=True)
+                detail = f"Restart check completed for {len(states)} supervised tasks."
+            elif action == "repair_requests":
+                request_cog = self.cog.bot.get_cog("RequestLevelsCog")
+                result = await request_cog.repair_request_system(interaction.guild)
+                detail = f"Request repair completed with {len(result.get('errors') or [])} note(s)."
+            elif action == "retry_deliveries":
+                now = int(time.time())
+                changed = await self.cog.bot.db.execute_affected(
+                    "UPDATE discord_outbox SET status='pending',next_attempt_ts=?,updated_ts=?,last_error=NULL WHERE status='dead'",
+                    (now, now),
+                )
+                detail = f"Requeued {changed} delivery action(s)."
+            elif action == "scan_permissions" and operations:
+                findings = await operations.scan_permissions()
+                detail = f"Permission scan completed with {len(findings)} drift finding(s)."
+            elif action == "backup_drill" and operations:
+                sent = await self.cog._post_database_backup(interaction.guild, reason="dashboard", requested_by=interaction.user.id)
+                drill = await operations.run_restore_drill(trigger="dashboard")
+                detail = f"Backup {'posted' if sent else 'created locally'}; restore drill {drill['status']}."
+            else:
+                detail = "That recovery action is unavailable right now."
+        except Exception as exc:
+            await log_error(self.cog.bot, f"Dashboard action {action} failed: {exc!r}")
+            detail = f"Action failed: {type(exc).__name__}. Check the incident page."
+        embed = await self.cog._admin_dashboard_embed(interaction.guild, self.page)
+        await interaction.message.edit(embed=embed, view=self)
+        await interaction.followup.send(detail, ephemeral=True)
+
+    @discord.ui.button(label="Restart tasks", style=discord.ButtonStyle.secondary, row=1)
+    async def restart_tasks(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._run_action(interaction, "restart_tasks")
+
+    @discord.ui.button(label="Repair requests", style=discord.ButtonStyle.secondary, row=1)
+    async def repair_requests(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._run_action(interaction, "repair_requests")
+
+    @discord.ui.button(label="Retry deliveries", style=discord.ButtonStyle.secondary, row=1)
+    async def retry_deliveries(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._run_action(interaction, "retry_deliveries")
+
+    @discord.ui.button(label="Scan permissions", style=discord.ButtonStyle.secondary, row=1)
+    async def scan_permissions(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._run_action(interaction, "scan_permissions")
+
+    @discord.ui.button(label="Backup + drill", style=discord.ButtonStyle.primary, row=1)
+    async def backup_drill(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._run_action(interaction, "backup_drill")
 
 
 class CommandsCog(commands.Cog):
@@ -177,6 +244,7 @@ class CommandsCog(commands.Cog):
         self.bot_group.command(name="storage", description="Show database storage and backup status")(self.bot_storage)
         self.bot_group.command(name="release", description="Prepare a version update for private approval")(self.bot_release)
         self.bot_group.command(name="releases", description="Show approved and pending bot releases")(self.bot_releases)
+        self.bot_group.command(name="retention", description="View, update, or run data retention")(self.bot_retention)
 
         self.tracking_group.command(name="top", description="Show the current week's top 20 active members")(self.tracking_top)
         self.tracking_group.command(name="reset", description="Reset current week's tracking stats")(self.tracking_reset)
@@ -192,6 +260,8 @@ class CommandsCog(commands.Cog):
         self.requests_group.command(name="pending", description="Show and filter pending request reviews")(self.requests_pending)
         self.requests_group.command(name="history", description="Show request edit history")(self.requests_history)
         self.requests_group.command(name="repair", description="Repair request system messages")(self.requests_repair)
+        self.requests_group.command(name="notifications", description="Choose how request results notify you")(self.requests_notifications)
+        self.requests_group.command(name="analytics", description="Show request outcomes and review performance")(self.requests_analytics)
         self.server_icon_group.command(name="status", description="Show server icon rotation status")(self.server_icon_status)
         self.server_icon_group.command(name="mode", description="Set server icon rotation mode")(self.server_icon_mode)
         self.server_icon_group.command(name="add", description="Add a server icon URL")(self.server_icon_add)
@@ -814,6 +884,10 @@ class CommandsCog(commands.Cog):
         if not recommendations:
             recommendations.append("No urgent trend warning from the tracked data.")
 
+        advanced = forecast_engagement(
+            (str(row.get("day") or ""), int(row.get("messages", 0) or 0))
+            for row in series
+        )
         return {
             "days_recorded": days_recorded,
             "data_coverage_7d": _fmt_percent(coverage_7, 7),
@@ -821,7 +895,7 @@ class CommandsCog(commands.Cog):
             "last_7_messages": int(last_7_messages),
             "previous_7_messages": int(previous_7_messages),
             "message_growth_percent": message_change,
-            "projected_next_7_messages": int(projected_messages),
+            "projected_next_7_messages": int(advanced.next_7_days or projected_messages),
             "last_7_commands": int(last_7_commands),
             "previous_7_commands": int(previous_7_commands),
             "command_growth_percent": command_change,
@@ -831,6 +905,11 @@ class CommandsCog(commands.Cog):
             "command_error_rate_30d": command_error_rate,
             "review_backlog": int(review_backlog),
             "engagement_signal": signal,
+            "forecast_confidence": advanced.confidence,
+            "daily_message_average_7d": round(advanced.daily_average_7d, 2),
+            "daily_message_average_28d": round(advanced.daily_average_28d, 2),
+            "seasonal_trend_percent": round(advanced.trend_percent, 1),
+            "anomalies": list(advanced.anomalies),
             "recommendations": recommendations,
         }
 
@@ -1411,11 +1490,20 @@ class CommandsCog(commands.Cog):
             name="Forecast",
             value=(
                 f"Signal: **{forecast.get('engagement_signal', 'Unknown')}**\n"
+                f"Confidence: **{str(forecast.get('forecast_confidence', 'low')).title()}**\n"
                 f"Next 7d messages: **{_fmt_num(forecast.get('projected_next_7_messages', 0))}**\n"
+                f"28d trend: **{float(forecast.get('seasonal_trend_percent', 0) or 0):+.1f}%**\n"
                 f"Review backlog: **{_fmt_num(forecast.get('review_backlog', 0))}**"
             ),
             inline=True,
         )
+        anomalies = list(forecast.get("anomalies") or [])
+        if anomalies:
+            embed.add_field(
+                name="Recent Anomalies",
+                value="\n".join(str(item) for item in anomalies[:5])[:1024],
+                inline=False,
+            )
         return embed
 
     def _impact_files(self, metrics: dict) -> list[discord.File]:
@@ -1652,6 +1740,73 @@ class CommandsCog(commands.Cog):
         link = f"https://discord.com/channels/{ctx.guild.id}/{sent.channel.id}/{sent.id}"
         await self._log_admin_action(ctx.guild, ctx.user.id, "database_backup_created", f"message_id={sent.id}")
         await self._send(ctx, f"Database backup posted: {link}", ephemeral=True)
+
+    async def bot_retention(
+        self,
+        ctx: discord.ApplicationContext,
+        action: discord.Option(
+            str,
+            "Show settings, update one table, or run cleanup now",
+            required=False,
+            default="show",
+            choices=[
+                discord.OptionChoice("Show settings", "show"),
+                discord.OptionChoice("Update a table", "set"),
+                discord.OptionChoice("Run cleanup now", "run"),
+            ],
+        ),
+        table: discord.Option(
+            str,
+            "Data category to update when action is set",
+            required=False,
+            default="health_metrics",
+            choices=[
+                discord.OptionChoice("Health history", "health_metrics"),
+                discord.OptionChoice("Workflow timeline", "workflow_events"),
+                discord.OptionChoice("Error incidents", "error_incidents"),
+                discord.OptionChoice("Delivered outbox actions", "discord_outbox"),
+                discord.OptionChoice("Validation cache", "gd_level_validation_cache"),
+                discord.OptionChoice("Impact snapshots", "impact_snapshots"),
+            ],
+        ),
+        days: discord.Option(
+            int,
+            "Days to retain when action is set",
+            required=False,
+            default=365,
+            min_value=1,
+            max_value=3650,
+        ),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        if not await self._is_impact_owner_ctx(ctx):
+            return await self._send(ctx, "You don't have permission to use this.", ephemeral=True)
+        operations = self.bot.get_cog("OperationsCog")
+        if operations is None:
+            return await self._send(ctx, "Operations service is unavailable.", ephemeral=True)
+        action_key = str(action or "show").casefold()
+        settings = self.bot.config.data.setdefault("operations", {}).setdefault("retention_days", {})
+        if action_key == "set":
+            settings[str(table)] = max(1, min(3650, int(days)))
+            await self.bot.db.set_runtime_setting("operations.retention_days", settings)
+        removed = await operations.run_retention() if action_key == "run" else {}
+        lines = [f"`{name}`: **{int(value)} days**" for name, value in sorted(settings.items())]
+        embed = discord.Embed(
+            title="Data Retention",
+            description="Persistent retention controls for operational history. Core tickets, requests, and activity totals are not removed.",
+            color=discord.Color.blurple(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(name="Policy", value="\n".join(lines)[:1024] or "No explicit retention policy", inline=False)
+        if removed:
+            embed.add_field(
+                name="Cleanup Result",
+                value="\n".join(f"{name}: **{count}** removed" for name, count in sorted(removed.items()))[:1024],
+                inline=False,
+            )
+        await self._send(ctx, embed=embed, ephemeral=True)
 
     async def bot_restore(
         self,
@@ -2172,6 +2327,26 @@ class CommandsCog(commands.Cog):
         repairs: list[str] = []
         me = guild.me or guild.get_member(self.bot.user.id)
 
+        for config_issue in getattr(cfg, "validation_issues", ()):
+            if config_issue.severity == "error":
+                issues.append(f"config schema: {config_issue.render()}")
+                repairs.append("Correct the typed config issue, then run `/resync`")
+
+        open_drift = await self._count_db(
+            "SELECT COUNT(*) AS c FROM permission_drift_events WHERE guild_id=? AND status='open'",
+            (guild.id,),
+        )
+        if open_drift:
+            issues.append(f"permission drift: {open_drift} configured channel(s) need attention")
+            repairs.append("Use the dashboard permission scan after correcting channel overrides")
+        dead_deliveries = await self._count_db(
+            "SELECT COUNT(*) AS c FROM discord_outbox WHERE guild_id=? AND status='dead'",
+            (guild.id,),
+        )
+        if dead_deliveries:
+            issues.append(f"durable delivery: {dead_deliveries} action(s) need retry or configuration repair")
+            repairs.append("Use Retry deliveries after fixing the destination or permission")
+
         channel_checks = {
             "general logs": cfg.get_int("channels", "general_logging_channel_id"),
             "weekly requests": cfg.get_int("channels", "weekly_request_channel_ID"),
@@ -2263,6 +2438,36 @@ class CommandsCog(commands.Cog):
             except Exception as e:
                 issues.append(f"request state: {type(e).__name__}")
                 repairs.append("Run `/requests repair`, then check the error log")
+            provider_snapshot = (
+                request_cog.validation_provider_snapshot()
+                if hasattr(request_cog, "validation_provider_snapshot")
+                else {}
+            )
+            enabled_providers = [
+                name
+                for name, details in provider_snapshot.items()
+                if bool(details.get("enabled"))
+            ]
+            available_providers = [
+                name
+                for name, details in provider_snapshot.items()
+                if bool(details.get("available"))
+            ]
+            if enabled_providers and not available_providers:
+                issues.append("GD validation: every configured provider is temporarily unavailable")
+                repairs.append("Wait for provider backoff to expire; requests remain reviewable while validation is unavailable")
+            for provider, details in provider_snapshot.items():
+                if not details.get("circuit_open"):
+                    continue
+                reason = str(details.get("reason") or "provider failures")
+                retry_after = int(details.get("retry_after_seconds", 0) or 0)
+                issues.append(
+                    f"GD validation {provider}: paused until <t:{int(time.time()) + retry_after}:R> ({reason})"
+                )
+                if provider == "boomlings" and reason == "upstream access denied":
+                    repairs.append(
+                        "Boomlings rejected this hosting network; GDBrowser remains the automatic fallback until the cooldown ends"
+                    )
 
         template_issues: list[str] = []
         self._validate_request_templates(template_issues)
@@ -2319,6 +2524,57 @@ class CommandsCog(commands.Cog):
         icon_current = parse_server_icon_index(icon_cfg.get("current_index", -1), len(icon_cfg.get("urls", []) or []))
         icon_text = f"Mode: **{icon_mode}**\nInterval: **{icon_interval}s**\nCurrent: **{icon_current + 1 if icon_current >= 0 else 'unknown'}** / **{len(icon_cfg.get('urls', []) or [])}**"
 
+        request_cog = self.bot.get_cog("RequestLevelsCog")
+        provider_snapshot = (
+            request_cog.validation_provider_snapshot()
+            if request_cog is not None and hasattr(request_cog, "validation_provider_snapshot")
+            else {}
+        )
+        provider_lines: list[str] = []
+        for provider, details in provider_snapshot.items():
+            label = "GDBrowser" if provider == "gdbrowser" else "GD/Boomlings"
+            if not details.get("enabled"):
+                state = "disabled"
+            elif details.get("circuit_open"):
+                retry_after = int(details.get("retry_after_seconds", 0) or 0)
+                state = f"paused until <t:{int(time.time()) + retry_after}:R>"
+            else:
+                state = "ready"
+            line = f"{label}: **{state}**"
+            calls = int(details.get("calls", 0) or 0)
+            if calls:
+                line += f" | {float(details.get('average_latency_ms', 0) or 0):.0f} ms avg | {calls} calls"
+            provider_lines.append(line)
+        provider_text = "\n".join(provider_lines) or "Validation cog unavailable"
+
+        if page == "incidents":
+            incidents = await self.bot.db.fetchall(
+                "SELECT fingerprint,category,first_seen_ts,last_seen_ts,occurrence_count,last_correlation_id "
+                "FROM error_incidents WHERE status='open' ORDER BY last_seen_ts DESC LIMIT 8"
+            )
+            embed = discord.Embed(
+                title="Admin Dashboard - Incident Timeline",
+                description="Repeated errors are grouped by fingerprint, with their workflow correlation when available.",
+                color=discord.Color.orange() if incidents else discord.Color.green(),
+                timestamp=now_madrid(),
+            )
+            if not incidents:
+                embed.add_field(name="Open Incidents", value="No unresolved incident groups.", inline=False)
+            for incident in incidents:
+                correlation = str(incident["last_correlation_id"] or "")
+                value = (
+                    f"Seen **{int(incident['occurrence_count'] or 0)}** time(s) | "
+                    f"first <t:{int(incident['first_seen_ts'])}:R> | last <t:{int(incident['last_seen_ts'])}:R>"
+                )
+                if correlation:
+                    value += f"\nWorkflow: `{correlation}`"
+                embed.add_field(
+                    name=f"{str(incident['category'] or 'Error')[:70]} [{str(incident['fingerprint'])[:8]}]",
+                    value=value[:1024],
+                    inline=False,
+                )
+            return embed
+
         if page == "config":
             embed = discord.Embed(
                 title="Admin Dashboard - Config",
@@ -2367,6 +2623,47 @@ class CommandsCog(commands.Cog):
                 (guild.id, current_week),
             )
         )
+        health_rows = await self.bot.db.fetchall(
+            "SELECT sample_ts,value,payload_json FROM health_metrics "
+            "WHERE guild_id=? AND metric_type='runtime' AND sample_ts>=? "
+            "ORDER BY sample_ts DESC LIMIT 288",
+            (guild.id, int(time.time()) - 86400),
+        )
+        health_text = "No historical sample yet"
+        if health_rows:
+            parsed_health: list[dict] = []
+            for health_row in health_rows:
+                try:
+                    payload = json.loads(health_row["payload_json"] or "{}")
+                except Exception:
+                    payload = {}
+                parsed_health.append(
+                    {
+                        "sample_ts": int(health_row["sample_ts"] or 0),
+                        "db_probe_ms": float(health_row["value"] or 0),
+                        "gateway_latency_ms": float(payload.get("gateway_latency_ms", 0) or 0),
+                        "db_ok": bool(payload.get("db_ok", False)),
+                    }
+                )
+            latest_health = parsed_health[0]
+            sample_count = len(parsed_health)
+            average_db = sum(item["db_probe_ms"] for item in parsed_health) / sample_count
+            maximum_db = max(item["db_probe_ms"] for item in parsed_health)
+            average_gateway = sum(item["gateway_latency_ms"] for item in parsed_health) / sample_count
+            healthy_percent = sum(int(item["db_ok"]) for item in parsed_health) / sample_count * 100
+            health_text = (
+                f"24h samples: **{sample_count}** | DB healthy: **{healthy_percent:.1f}%**\n"
+                f"DB probe: **{average_db:.1f} ms avg** / **{maximum_db:.1f} ms max**\n"
+                f"Gateway: **{average_gateway:.1f} ms avg** | latest <t:{latest_health['sample_ts']}:R>"
+            )
+
+        schema_rows = await self.bot.db.fetchall(
+            "SELECT component,schema_version FROM schema_metadata ORDER BY component"
+        )
+        schema_text = " | ".join(
+            f"{str(row['component']).replace('_', ' ').title()} **v{int(row['schema_version'])}**"
+            for row in schema_rows
+        ) or "Schema metadata unavailable"
 
         embed = discord.Embed(
             title="Avenue Guard Admin Dashboard",
@@ -2397,6 +2694,16 @@ class CommandsCog(commands.Cog):
         )
         embed.add_field(name="Tickets", value=f"Open tickets: **{open_tickets}**", inline=True)
         embed.add_field(name="Icon Rotation", value=icon_text, inline=True)
+        embed.add_field(name="GD Validation", value=provider_text, inline=True)
+        embed.add_field(name="Historical Health", value=health_text, inline=True)
+        embed.add_field(name="Schema Contracts", value=schema_text[:1024], inline=False)
+        operations_cog = self.bot.get_cog("OperationsCog")
+        if operations_cog is not None:
+            smoke = getattr(operations_cog, "_last_smoke_result", {}) or {}
+            smoke_text = str(smoke.get("status") or "pending").title()
+            if smoke.get("correlation_id"):
+                smoke_text += f"\n`{smoke['correlation_id']}`"
+            embed.add_field(name="Deployment Smoke Test", value=smoke_text, inline=True)
         embed.add_field(
             name="Background Tasks",
             value=(
@@ -3119,6 +3426,9 @@ class CommandsCog(commands.Cog):
                 "per_user_max_checks": (1, 100),
                 "provider_failure_threshold": (1, 100),
                 "provider_circuit_breaker_seconds": (30, 86400),
+                "provider_access_denied_backoff_seconds": (300, 86400),
+                "provider_retry_attempts": (1, 3),
+                "failure_cache_seconds": (15, 600),
             }
             for key, (minimum, maximum) in numeric_limits.items():
                 try:
@@ -3274,6 +3584,113 @@ class CommandsCog(commands.Cog):
             if old_value != new_value:
                 lines.append(f"**{label}:** `{old_value}` -> `{new_value}`")
         return "\n".join(lines)[:1024] or "No visible form-field changes."
+
+    async def requests_notifications(
+        self,
+        ctx: discord.ApplicationContext,
+        mode: discord.Option(
+            str,
+            "Where the bot should notify you after a request review",
+            required=False,
+            default="show",
+            choices=[
+                discord.OptionChoice("Show current setting", "show"),
+                discord.OptionChoice("Review channel ping", "channel"),
+                discord.OptionChoice("Direct message", "dm"),
+                discord.OptionChoice("Channel ping and DM", "both"),
+                discord.OptionChoice("No personal notification", "none"),
+            ],
+        ),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        selected = str(mode or "show").casefold()
+        if selected != "show":
+            selected = normalize_notification_mode(selected)
+            await self.bot.db.execute(
+                "INSERT INTO user_notification_preferences(guild_id,user_id,request_result_mode,updated_ts) VALUES(?,?,?,?) "
+                "ON CONFLICT(guild_id,user_id) DO UPDATE SET request_result_mode=excluded.request_result_mode,updated_ts=excluded.updated_ts",
+                (ctx.guild.id, ctx.user.id, selected, int(time.time())),
+            )
+        else:
+            row = await self.bot.db.fetchone(
+                "SELECT request_result_mode FROM user_notification_preferences WHERE guild_id=? AND user_id=?",
+                (ctx.guild.id, ctx.user.id),
+            )
+            default_mode = self.bot.config.get("level_requests", "default_result_notification", default="channel")
+            selected = normalize_notification_mode(row["request_result_mode"] if row else default_mode)
+        labels = {
+            "channel": "a ping in the result channel",
+            "dm": "a direct message",
+            "both": "a result-channel ping and a direct message",
+            "none": "no personal notification; the result still appears in the result channel",
+        }
+        await self._send(ctx, f"Request result notifications: **{labels[selected]}**.", ephemeral=True)
+
+    async def requests_analytics(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        if not await self._is_request_staff_ctx(ctx):
+            return await self._send(ctx, "Only request reviewers can use this.", ephemeral=True)
+        state = await self.bot.db.fetchone(
+            "SELECT wave_id,state FROM level_request_state WHERE guild_id=?",
+            (ctx.guild.id,),
+        )
+        wave_id = int(state["wave_id"] or 0) if state else 0
+        rows = await self.bot.db.fetchall(
+            "SELECT wave_id,status,result,created_ts,reviewed_ts,data_json FROM level_request_submissions WHERE guild_id=? ORDER BY created_ts DESC",
+            (ctx.guild.id,),
+        )
+        current = [row for row in rows if int(row["wave_id"] or 0) == wave_id]
+        reviewed = [row for row in current if str(row["status"]) == "reviewed"]
+        pending = [row for row in current if str(row["status"]) == "pending"]
+        breakdown = rejection_breakdown(reviewed)
+        sent = sum(1 for row in reviewed if str(row["result"]) == "sent")
+        review_seconds = [
+            max(0, int(row["reviewed_ts"] or 0) - int(row["created_ts"] or 0))
+            for row in reviewed
+            if row["reviewed_ts"] is not None
+        ]
+        average_hours = sum(review_seconds) / len(review_seconds) / 3600 if review_seconds else 0.0
+        oldest = max((request_age(row["created_ts"]).hours for row in pending), default=0.0)
+        all_rejections = rejection_breakdown(rows)
+        embed = discord.Embed(
+            title="Request Review Analytics",
+            description=f"Current wave **{wave_id}** is **{str(state['state']).title() if state else 'Unknown'}**.",
+            color=discord.Color.blurple(),
+            timestamp=now_madrid(),
+        )
+        embed.add_field(
+            name="Current Wave",
+            value=(
+                f"Submitted: **{len(current)}**\nReviewed: **{len(reviewed)}** ({_fmt_percent(len(reviewed), len(current))})\n"
+                f"Pending: **{len(pending)}**\nSent: **{sent}** ({_fmt_percent(sent, len(reviewed))} of reviewed)"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Review SLA",
+            value=f"Average completion: **{average_hours:.1f}h**\nOldest pending: **{oldest:.1f}h**",
+            inline=True,
+        )
+        embed.add_field(
+            name="Current Rejection Reasons",
+            value=(
+                f"Rejected: **{breakdown.get('rejected', 0)}**\n"
+                f"Missing: **{breakdown.get('level_doesnt_exist', 0)}**\n"
+                f"Stolen: **{breakdown.get('stolen_level', 0)}**\n"
+                f"Already rated: **{breakdown.get('already_rated', 0)}**"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="All-Time Structured Outcomes",
+            value=" | ".join(f"{key.replace('_', ' ').title()}: **{value}**" for key, value in sorted(all_rejections.items())) or "No rejected outcomes yet",
+            inline=False,
+        )
+        await self._send(ctx, embed=embed, ephemeral=True)
 
     async def requests_history(
         self,
@@ -3481,6 +3898,16 @@ class CommandsCog(commands.Cog):
             return f"**{level_name}** (`{level_id}`)"
 
         live_channel_id = self.bot.config.get_int("level_requests", "level_requested")
+        raw_aging_thresholds = self.bot.config.get(
+            "level_requests",
+            "aging_threshold_hours",
+            default=[12, 24, 48],
+        )
+        aging_thresholds = (
+            raw_aging_thresholds
+            if isinstance(raw_aging_thresholds, list)
+            else [12, 24, 48]
+        )
         live_lines = []
         for row in live_rows:
             msg_id = row["request_message_id"]
@@ -3490,9 +3917,11 @@ class CommandsCog(commands.Cog):
                 link = f"message `{msg_id}`"
             else:
                 link = "no message linked"
+            age = request_age(row["created_ts"], thresholds=aging_thresholds)
             live_lines.append(
                 f"Wave **{row['wave_id']}** - {request_name(row)} by <@{row['user_id']}> "
-                f"- `{row['status']}` - {link} - submitted <t:{int(row['created_ts'])}:R>"
+                f"- `{row['status']}` - {age.indicator} **{age.status}** - {link} "
+                f"- submitted <t:{int(row['created_ts'])}:R>"
             )
 
         weekly_lines = []
@@ -3503,9 +3932,11 @@ class CommandsCog(commands.Cog):
                 tail = f"[jump]({link})"
             else:
                 tail = "no message linked"
+            age = request_age(row["created_ts"], thresholds=aging_thresholds)
             weekly_lines.append(
                 f"Week **{row['week_start']}** - {request_name(row)} by <@{row['user_id']}> "
-                f"- `{row['status']}` - {tail} - submitted <t:{int(row['created_ts'])}:R>"
+                f"- `{row['status']}` - {age.indicator} **{age.status}** - {tail} "
+                f"- submitted <t:{int(row['created_ts'])}:R>"
             )
 
         embed = discord.Embed(

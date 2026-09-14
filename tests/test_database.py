@@ -29,6 +29,15 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         "runtime_settings",
         "bot_releases",
         "bot_uptime_tracker",
+        "schema_metadata",
+        "discord_outbox",
+        "workflow_events",
+        "error_incidents",
+        "health_metrics",
+        "permission_drift_events",
+        "user_notification_preferences",
+        "restore_drills",
+        "monthly_impact_reports",
     } <= tables
 
     ticket_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(tickets)")}
@@ -51,7 +60,20 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     request_columns = {
         str(row["name"]) for row in await db.fetchall("PRAGMA table_info(level_request_submissions)")
     }
-    assert "edit_deadline_ts" in request_columns
+    assert {"edit_deadline_ts", "correlation_id"} <= request_columns
+
+    for table in ("tickets", "help_submissions", "weekly_request_reviews", "level_request_scheduled_openings"):
+        columns = {str(row["name"]) for row in await db.fetchall(f"PRAGMA table_info({table})")}
+        assert "correlation_id" in columns
+
+    schema_rows = await db.fetchall("SELECT component,schema_version FROM schema_metadata")
+    schema_versions = {str(row["component"]): int(row["schema_version"]) for row in schema_rows}
+    assert schema_versions == {
+        "database": 4,
+        "config": 2,
+        "runtime_settings": 2,
+        "embed_templates": 2,
+    }
 
     weekly_claim_columns = {
         str(row["name"]) for row in await db.fetchall("PRAGMA table_info(weekly_claims)")
@@ -170,6 +192,23 @@ async def test_transaction_rolls_back_every_statement_on_failure(tmp_path):
         "SELECT 1 FROM runtime_settings WHERE setting_key=?",
         ("must_rollback",),
     ) is None
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_execute_affected_returns_the_atomic_row_count(tmp_path):
+    db = Database(str(tmp_path / "affected.db"))
+    await db.connect()
+    await db.set_runtime_setting("one", {"value": 1})
+    await db.set_runtime_setting("two", {"value": 2})
+
+    changed = await db.execute_affected(
+        "DELETE FROM runtime_settings WHERE setting_key IN (?,?)",
+        ("one", "two"),
+    )
+
+    assert changed == 2
+    assert await db.fetchone("SELECT 1 FROM runtime_settings LIMIT 1") is None
     await db.close()
 
 

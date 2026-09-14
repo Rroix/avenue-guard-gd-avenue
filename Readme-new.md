@@ -20,13 +20,13 @@ One of Avenue Guard's biggest jobs is managing level requests. Instead of relyin
 
 Request waves can be opened with different limits. Staff can open requests for a certain number of successful submissions, for a certain amount of time, indefinitely, or through a scheduled opening. The bot only counts a request after the form is successfully submitted, so simply clicking a button does not waste a slot.
 
-The request system also prevents common problems. A user can only submit once per wave, repeated level IDs are blocked during the same wave, and users can edit their request for a limited time if they notice a mistake. Reviewers see submitted levels in a staff queue, where they can mark each one as sent, rejected, or handled with other specific reasons.
+The request system also prevents common problems. A user can only submit once per wave, repeated level IDs are blocked during the same wave, and users can edit their request for a limited time if they notice a mistake. Reviewers see submitted levels in a staff queue with aging indicators, validation rechecks, and clear outcomes, while requesters can choose whether results arrive in-channel, by DM, in both places, or silently.
 
 Avenue Guard also checks Geometry Dash level information before a request reaches staff (Robtop's and Colon's APIs basically). It validates level IDs, checks whether a level appears to exist, detects whether a showcase may be required, and can warn reviewers when a level seems rated or suspicious. This does not replace human judgment (obviously), but it saves staff time and catches obvious issues early.
 
 We don't need some features other request bots like Request Helper provide, but we do need scheduled openings and pending checks. This comes to say that we use this bot to customize both your experience as a user and our experience as staff. We can also check what works and what doesn't in our community, which is a great advantage apart from customizability.
 
-We also have some telemitry, some wave statistics and tracking too.
+Wave summaries compare demand and acceptance with the previous wave, show reviewer throughput and average review time, and break down why requests were not sent.
 
 ## Weekly Activity Rewards
 
@@ -62,9 +62,9 @@ These checks are intentionally really specific, so there aren't any or as little
 
 ## Admin Tools And Reliability
 
-Behind the scenes, Avenue Guard has several tools for keeping itself healthy. It can show an admin dashboard, check configuration issues, diagnose missing permissions, create database backups, restore local database copies when using local storage, and generate impact reports.
+Behind the scenes, Avenue Guard has several tools for keeping itself healthy. It can show an admin dashboard, check configuration issues, diagnose missing permissions, create database backups, test those backups without touching production data, and generate impact reports.
 
-This is important because our bot depends on many moving parts like channels, roles, permissions, messages, buttons, background tasks, and persistent data. If any of those drift, we can at least know what is missing and how to fix it.
+This is important because our bot depends on many moving parts like channels, roles, permissions, messages, buttons, background tasks, and persistent data. A supervisor restarts failed jobs, a durable delivery queue retries important Discord actions, permission scans detect server drift, and repeated errors are grouped into incidents instead of becoming a wall of duplicate logs.
 
 Avenue Guard also powers its own public status and update page on the GD Avenue website. The page shows whether its Discord connection is operational, the current service-process uptime, persistent measured Discord availability, latency, the current GD Avenue member count, and a readable recent version history.
 
@@ -82,13 +82,16 @@ Some of the reliability methods behind Avenue Guard include:
 2. **Atomic counters and protected state updates**: ticket numbers, request counts, duplicate checks, and review transitions are handled carefully so two users or two reviewers cannot accidentally claim the same state at the same time.
 3. **Persistent Discord components**: buttons and menus are registered again after restarts, so old request buttons, review buttons, ticket controls, and help-menu controls can still route to the correct workflow.
 4. **Pre-action validation**: the bot checks roles, channels, permissions, level IDs, URLs, request state, and duplicate submissions before allowing important actions to continue.
-5. **External validation with caching and fallbacks**: Geometry Dash level checks use external sources, cached results, cooldowns, and provider backoff so one failing service does not break the whole request system.
+5. **External validation with caching and fallbacks**: Geometry Dash level checks use the current request protocol, bounded responses, cached results, one transient retry, and adaptive provider cooldowns so a blocked service does not slow or break the request system.
 6. **Recovery and repair commands**: staff can refresh request buttons, rebuild summaries, relock reviewed requests, check storage, run diagnostics, create backups, and restore local uploaded database copies when running on local SQLite.
 7. **Audit trails and logs**: request edits, reviewed levels, weekly reward events, ticket transcripts, forum deletions, admin actions, backups, restores, and impact reports all leave records.
 8. **Safe backup and replica recovery**: the bot can create zipped database backups, validate local uploaded database copies when appropriate, migrate restored data, quarantine a corrupt Turso replica, and log the recovery. Turso remains the main production source of truth, while backups act as an extra safety layer.
 9. **Rate limits and cooldowns**: activity tracking, help flows, validation checks, fun commands, and auto-responses use limits to reduce spam and accidental overload.
 10. **Config checks and permission diagnostics**: the bot can scan for missing roles, missing channels, bad template variables, broken permissions, and unhealthy background tasks before they become bigger problems.
 11. **Owner-approved release publishing**: pending version notes stay private in Turso until the configured owner accepts the bot's DM, while the website reads a separate sanitized API that cannot reveal drafts or internal errors.
+12. **Supervised background work**: critical loops are checked independently and restarted after unexpected failures, while intentionally disabled summaries or icon rotation remain off.
+13. **Durable Discord delivery**: important result messages, DMs, edits, deletions, and role changes can be queued with an idempotency key and retried without creating duplicate queue records.
+14. **Historical health and recovery drills**: database latency, provider latency, gateway health, permission drift, incidents, and backup restore checks are kept as trends instead of one-time snapshots.
 
 ## Impact Reports
 
@@ -117,8 +120,9 @@ Real server architecture:
 | Area | What it contains | Purpose |
 |---|---|---|
 | `main.py` | Bot startup, configuration loading, database connection, cog loading, keepalive startup, persistent view registration | Starts the bot and wires every major system together |
-| `cogs/` | Feature modules such as requests, tracking, help/tickets, moderation checks, sticky/forum automation, background jobs, commands, and message responses | Keeps each major bot workflow separated instead of putting everything in one giant file |
-| `utils/` | Shared helpers for config, database access, checks, safe mentions, time handling, transcripts, validation, persistent views, server icons, and error logging | Holds reusable logic used by multiple parts of the bot |
+| `cogs/` | Feature modules such as requests, tracking, help/tickets, moderation checks, sticky/forum automation, background jobs, commands, operations, and message responses | Keeps each major bot workflow separated instead of putting everything in one giant file |
+| `services/` | Focused request validation, scheduling, review analytics, diagnostics, backup drills, and impact forecasting | Keeps reusable business rules separate from Discord commands and buttons |
+| `utils/` | Shared helpers for config and schema validation, database access, durable Discord delivery, workflow IDs, safe mentions, time handling, transcripts, persistent views, server icons, and error logging | Holds infrastructure used by multiple feature areas |
 | `config.json` | Server-specific settings for roles, channels, request behavior, help text, embeds, backups, summaries, and permissions | Lets the bot be customized without changing source code every time |
 | `responses.json` | Configurable message-triggered auto-responses | Controls simple automatic replies outside the main Python logic |
 | `data/` | Local database fallback or Turso replica location | Keeps development simple and lets Turso sync through a local embedded replica |
@@ -137,13 +141,16 @@ Discord events / slash commands / buttons
 main.py loads the bot and routes work into cogs
         |
         v
-cogs handle feature-specific workflows
+cogs handle feature-specific workflows and staff controls
         |
         v
-utils provide shared helpers and database access
+services apply reusable rules and calculations
         |
         v
-persistent storage remembers long-running state
+utils provide persistence, outbox delivery, configuration, and workflow tracing
+        |
+        v
+Turso remembers state while supervised workers deliver Discord actions
         |
         v
 Discord receives embeds, logs, tickets, reviews, DMs, and summaries
