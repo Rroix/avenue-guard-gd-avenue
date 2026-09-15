@@ -13,6 +13,7 @@ from discord.ext import commands
 from utils.checks import ensure_allowed_guild_id, basic_color
 from utils.discord_refs import fetch_persisted_message, snowflake_matches_legacy
 from utils.errors import log_error
+from utils.db import DatabaseBusyError
 from utils.mentions import no_mentions
 from utils.timeutils import now_madrid, week_start_sunday, TZ
 from utils.views import LevelRequestReviewView, TrackingDeclineConfirmView
@@ -52,6 +53,8 @@ class TrackingCog(commands.Cog):
         self._activity_flush_task: Optional[asyncio.Task] = None
         self._recap_task: Optional[asyncio.Task] = None
         self._activity_lock = asyncio.Lock()
+        self._activity_flush_lock = asyncio.Lock()
+        self._activity_retry_batch = None
         self._weekly_offer_lock = asyncio.Lock()
         self._weekly_submit_lock = asyncio.Lock()
         self._pending_activity_counts: dict[tuple[int, int, str], int] = {}
@@ -1053,47 +1056,57 @@ class TrackingCog(commands.Cog):
             except Exception as e:
                 await self._log_background_error("activity_flush", f"Activity flush loop error: {repr(e)}")
 
-    async def flush_activity_counts(self) -> None:
-        async with self._activity_lock:
-            counts = self._pending_activity_counts
-            last_seen = self._pending_last_counted
-            self._pending_activity_counts = {}
-            self._pending_last_counted = {}
-
-        if not counts and not last_seen:
+    async def flush_activity_counts(self, *, drain: bool = False) -> None:
+        if self._activity_flush_lock.locked() and not drain:
             return
+        async with self._activity_flush_lock:
+            # Keep a failed batch immutable: its receipt may already exist
+            # remotely after an uncertain commit. New activity stays separate.
+            batches = 0
+            while drain or batches < 4:
+                batches += 1
+                if self._activity_retry_batch is None:
+                    async with self._activity_lock:
+                        count_keys = list(self._pending_activity_counts)[:50]
+                        counts = [(*key, self._pending_activity_counts.pop(key)) for key in count_keys]
+                        unflushed_users = {(key[0], key[1]) for key in self._pending_activity_counts}
+                        seen_keys = [key for key in self._pending_last_counted if key not in unflushed_users][:50]
+                        last_seen = [(*key, self._pending_last_counted.pop(key)) for key in seen_keys if key in self._pending_last_counted]
+                    if not counts and not last_seen:
+                        return
+                    self._activity_retry_batch = (new_correlation_id("activity"), counts, last_seen)
+                batch_id, counts, last_seen = self._activity_retry_batch
+                try:
+                    await self.bot.db.apply_activity_batch(batch_id, counts, last_seen)
+                except DatabaseBusyError:
+                    return
+                except Exception as e:
+                    await self._log_background_error("activity_flush_counts", f"Activity batch persistence deferred: {e!r}")
+                    return
+                self._activity_retry_batch = None
+                # Let interactive writers acquire the queue between chunks.
+                await asyncio.sleep(0)
 
-        if counts:
-            try:
-                await self.bot.db.executemany(
-                    "INSERT INTO activity_counts(guild_id,user_id,week_start,count) VALUES(?,?,?,?) "
-                    "ON CONFLICT(guild_id,user_id,week_start) DO UPDATE SET count=count+excluded.count",
-                    [(guild_id, user_id, week_start, amount) for (guild_id, user_id, week_start), amount in counts.items()],
-                )
-            except Exception as e:
-                async with self._activity_lock:
-                    for key, amount in counts.items():
-                        self._pending_activity_counts[key] = self._pending_activity_counts.get(key, 0) + amount
-                    for key, ts in last_seen.items():
-                        self._pending_last_counted[key] = max(self._pending_last_counted.get(key, 0), ts)
-                await self._log_background_error("activity_flush_counts", f"Activity count flush failed: {repr(e)}")
-                # Do not persist a cooldown timestamp for a message whose
-                # count did not persist. Otherwise a restart can lose the
-                # message permanently while still suppressing the next one.
-                return
-
-        if last_seen:
-            try:
-                await self.bot.db.executemany(
-                    "INSERT INTO activity_last_counted(guild_id,user_id,last_counted_ts) VALUES(?,?,?) "
-                    "ON CONFLICT(guild_id,user_id) DO UPDATE SET last_counted_ts=excluded.last_counted_ts",
-                    [(guild_id, user_id, ts) for (guild_id, user_id), ts in last_seen.items()],
-                )
-            except Exception as e:
-                async with self._activity_lock:
-                    for key, ts in last_seen.items():
-                        self._pending_last_counted[key] = max(self._pending_last_counted.get(key, 0), ts)
-                await self._log_background_error("activity_flush_last_seen", f"Activity cooldown flush failed: {repr(e)}")
+    async def _reset_activity(self, guild_id: int) -> None:
+        async with self._activity_flush_lock:
+            ws = week_start_sunday(now_madrid()).isoformat()
+            await self.bot.db.execute_transaction(
+                (
+                    ("DELETE FROM activity_counts WHERE guild_id=? AND week_start=?", (guild_id, ws)),
+                    ("DELETE FROM activity_last_counted WHERE guild_id=?", (guild_id,)),
+                ),
+                retry_safe=True,
+            )
+            batch = self._activity_retry_batch
+            if batch is not None:
+                batch_id, counts, last_seen = batch
+                remaining = [row for row in counts if not (row[0] == guild_id and row[2] == ws)]
+                seen = [row for row in last_seen if row[0] != guild_id]
+                self._activity_retry_batch = (batch_id, remaining, seen) if remaining or seen else None
+            async with self._activity_lock:
+                self._pending_activity_counts = {key: value for key, value in self._pending_activity_counts.items() if not (key[0] == guild_id and key[2] == ws)}
+                self._pending_last_counted = {key: value for key, value in self._pending_last_counted.items() if key[0] != guild_id}
+            self._last_counted_cache = {key: value for key, value in self._last_counted_cache.items() if key[0] != guild_id}
 
     # ----------------------------
     # Weekly DM workflow in DMs
@@ -1436,7 +1449,6 @@ class TrackingCog(commands.Cog):
                     continue
 
                 # Run job for previous week
-                await self.flush_activity_counts()
                 prev_week_start = week_start_sunday(this_sunday - timedelta(seconds=1)).isoformat()
                 await self.run_weekly_job(prev_week_start)
 
@@ -1786,7 +1798,13 @@ class TrackingCog(commands.Cog):
         guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
         if guild is None:
             return
-        await self.flush_activity_counts()
+        await self.flush_activity_counts(drain=True)
+        async with self._activity_lock:
+            pending = any(key[0] == guild.id and key[2] == week_start_iso for key in self._pending_activity_counts)
+            retry = self._activity_retry_batch
+            pending = pending or bool(retry and any(row[0] == guild.id and row[2] == week_start_iso for row in retry[1]))
+        if pending:
+            raise DatabaseBusyError("Weekly reward postponed until this week's activity batch is confirmed; no winners were selected")
 
         top_limit = max(1, min(500, self._cfg_int("tracking", "top_limit", 20)))
         winners_to_dm = max(0, min(top_limit, self._cfg_int("tracking", "winners_to_dm", 1)))
@@ -2217,7 +2235,7 @@ class TrackingCog(commands.Cog):
     # Public helpers used by Commands.py
     # ----------------------------
     async def get_top(self, guild_id: int, week_start_iso: str, limit: int = 20) -> List[Tuple[int, int]]:
-        await self.flush_activity_counts()
+        await self.flush_activity_counts(drain=True)
         limit = max(1, min(500, int(limit)))
         rows = await self.bot.db.fetchall(
             "SELECT user_id, count FROM activity_counts "
@@ -2241,7 +2259,7 @@ class TrackingCog(commands.Cog):
 
     async def get_member_stats(self, guild: discord.Guild, week_start_iso: str, user_id: int) -> tuple[int, Optional[int], int]:
         """Return (count, rank among eligible, eligible_total). Rank is 1-based, or None if not ranked/eligible."""
-        await self.flush_activity_counts()
+        await self.flush_activity_counts(drain=True)
         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
 
         member = await self._resolve_member(guild, user_id)
@@ -2355,24 +2373,7 @@ class TrackingCog(commands.Cog):
 
     async def reset_current_week(self, guild_id: int) -> None:
         await self.flush_activity_counts()
-        ws = week_start_sunday(now_madrid()).isoformat()
-        await self.bot.db.execute_transaction(
-            (
-                ("DELETE FROM activity_counts WHERE guild_id=? AND week_start=?", (guild_id, ws)),
-                ("DELETE FROM activity_last_counted WHERE guild_id=?", (guild_id,)),
-            ),
-            retry_safe=True,
-        )
-        async with self._activity_lock:
-            self._pending_activity_counts = {
-                key: value for key, value in self._pending_activity_counts.items()
-                if not (key[0] == guild_id and key[2] == ws)
-            }
-            self._pending_last_counted = {
-                key: value for key, value in self._pending_last_counted.items()
-                if key[0] != guild_id
-            }
-        self._last_counted_cache = {key: value for key, value in self._last_counted_cache.items() if key[0] != guild_id}
+        await self._reset_activity(guild_id)
 
 
 def setup(bot: discord.Bot):

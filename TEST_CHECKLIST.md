@@ -609,3 +609,42 @@
    - Expected: both replies are sent and the shared per-user cooldown is claimed only once.
 11. Stop a health-check client while the HTTP response is being written.
    - Expected: the monitor can reconnect normally and no misleading keepalive error is logged.
+
+---
+
+## 27) Turso contention and request-card recovery
+**Setup:** staging bot, a recent backup, and one pending wave request plus one pending weekly request. Do not inject failures into the production database.
+
+1. Deploy the update with existing valid Turso credentials.
+   - Expected: schema metadata reports database v6, existing records remain, and `activity_flush_batches` exists.
+2. Hold a slow primary write while querying initialized replica state.
+   - Expected: ticket/tracking/dashboard reads do not acquire the primary queue; Discord heartbeats continue.
+   - Expected: an interactive write that times out reports it was not started, identifies the holder, and can be retried later.
+3. Keep the outbox empty for several polling cycles.
+   - Expected: stale recovery reads locally and performs no no-op primary UPDATE.
+4. Lose a batch commit confirmation after activity reaches storage, then let persistence recover.
+   - Expected: the retry retains its batch ID and counts increase exactly once; new messages use another batch.
+   - Expected: cooldowns and counters persist atomically and the receipt survives a database backup.
+5. Leave prior-week activity unconfirmed at weekly processing time.
+   - Expected: winner selection is postponed and the weekly run is not marked completed prematurely.
+6. Cause one cold ticket cache load to fail while sending multiple guild messages.
+   - Expected: only one load starts at once, retry waits 30 seconds, and normal cached-ticket access resumes on recovery.
+   - Expected: partial channel-resolution failures keep the cache retryable; tickets opened during loading remain tracked, and ticket-category messages can check their row while loading is incomplete.
+7. Make the health sampler encounter a busy write queue.
+   - Expected: it yields after its short queue wait, retains its live sample and deferral count, and does not flood the error channel.
+   - Expected: missing historical samples remain gaps; an uninitialized replica is not labelled healthy.
+8. Delete one pending wave card and one pending weekly card, then trigger expired validation refresh or Recheck where available.
+   - Expected: confirmed missing cards are recreated, exact pointers persist, and review controls work on the replacements.
+   - Expected: a historical rounded pointer resolves the original card instead of creating a duplicate.
+9. Return HTTP 403 or a transport error when fetching a request card.
+   - Expected: no replacement is sent, the card backs off, and other pending cards still refresh.
+10. Interrupt storage confirmation after a replacement card is successfully sent.
+   - Expected: recovery reuses the receipt, including when the new pointer was actually committed; no duplicate card is sent or canonical card deleted.
+11. Fail a validation-card edit, then review or edit that request before its outbox retry.
+   - Expected: obsolete validation work is skipped; final review buttons stay disabled and newer user fields stay intact.
+12. Hold an active database operation beyond the normal queue threshold, then release it.
+   - Expected: the dashboard shows contention and `/ready` reports degraded while the stall is active, without resetting process uptime.
+   - Expected: readiness recovers when the operation finishes and other pillars are healthy.
+13. Validate backup/restore against schema 6 and a matching bot version.
+   - Expected: activity receipts remain present; retrying a restored receipt does not increment again.
+   - Expected: an incompatible newer schema is rejected instead of being downgraded.

@@ -517,6 +517,9 @@ async def test_validation_refresh_cannot_reopen_buttons_after_review(tmp_path):
     cog = object.__new__(RequestLevelsCog)
     cog.bot = SimpleNamespace(db=database)
     cog._review_lock = asyncio.Lock()
+    cog._validation_card_lock = asyncio.Lock()
+    cog._validation_refresh_receipts = {}
+    cog._review_target_channel = AsyncMock(return_value=SimpleNamespace(id=123))
     async def lookup(*_args, **_kwargs):
         await database.execute("UPDATE level_request_submissions SET status='reviewed'")
         return {"exists": True, "checked_ts": 10, "expires_ts": 20}

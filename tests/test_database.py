@@ -17,6 +17,7 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     tables = {str(row["name"]) for row in rows}
     assert {
         "activity_counts",
+        "activity_flush_batches",
         "tickets",
         "weekly_sessions",
         "level_request_state",
@@ -68,7 +69,7 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     schema_rows = await db.fetchall("SELECT component,schema_version FROM schema_metadata")
     schema_versions = {str(row["component"]): int(row["schema_version"]) for row in schema_rows}
     assert schema_versions == {
-        "database": 5,
+        "database": 6,
         "config": 2,
         "runtime_settings": 2,
         "embed_templates": 2,

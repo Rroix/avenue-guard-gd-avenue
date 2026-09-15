@@ -451,6 +451,8 @@ class HelpCog(commands.Cog):
         self._started = False
         self._active_ticket_channels: set[int] = set()
         self._ticket_cache_ready = False
+        self._ticket_cache_load_lock = asyncio.Lock()
+        self._ticket_cache_retry_after = 0.0
         self._last_error_log: Dict[str, float] = {}
         self._flow_start_attempts: Dict[int, list[int]] = {}
         self._ticket_create_lock = asyncio.Lock()
@@ -745,6 +747,19 @@ class HelpCog(commands.Cog):
         await log_error(self.bot, message)
 
     async def _load_active_ticket_channels(self) -> None:
+        if self._ticket_cache_load_lock.locked() or time.monotonic() < self._ticket_cache_retry_after:
+            return
+        async with self._ticket_cache_load_lock:
+            if self._ticket_cache_ready:
+                return
+            try:
+                await self._load_active_ticket_channels_once()
+            except Exception:
+                self._ticket_cache_retry_after = time.monotonic() + 30
+                raise
+            self._ticket_cache_retry_after = 0.0 if self._ticket_cache_ready else time.monotonic() + 30
+
+    async def _load_active_ticket_channels_once(self) -> None:
         cfg = self.bot.config
         allowed_guild_id = cfg.get_int("guild", "allowed_guild_id")
         if not allowed_guild_id:
@@ -755,6 +770,7 @@ class HelpCog(commands.Cog):
             (allowed_guild_id,),
         )
         active_channels: set[int] = set()
+        incomplete = False
         for row in rows:
             stored_channel_id = int(row["channel_id"])
             try:
@@ -763,6 +779,7 @@ class HelpCog(commands.Cog):
                     stored_channel_id,
                 )
             except Exception as e:
+                incomplete = True
                 await self._log_background_error(
                     "ticket_cache_channel",
                     f"Active ticket cache could not resolve channel_id={stored_channel_id}: {e!r}",
@@ -770,8 +787,10 @@ class HelpCog(commands.Cog):
                 continue
             if isinstance(channel, discord.TextChannel):
                 active_channels.add(int(channel.id))
-        self._active_ticket_channels = active_channels
-        self._ticket_cache_ready = True
+        # A ticket may open while channel resolution awaits Discord. Preserve
+        # those additions; normal ticket activity removes obsolete entries.
+        self._active_ticket_channels.update(active_channels)
+        self._ticket_cache_ready = not incomplete
 
     async def _ticket_channel_from_stored_id(
         self,
@@ -957,7 +976,13 @@ class HelpCog(commands.Cog):
                 return
             if not self._ticket_cache_ready:
                 await self._load_active_ticket_channels()
-            if message.channel.id not in self._active_ticket_channels:
+            cold_ticket_channel = (
+                not self._ticket_cache_ready
+                and int(getattr(message.channel, "category_id", 0) or 0)
+                == cfg.get_int("tickets", "ticket_category_id")
+                and bool(getattr(message.channel, "category_id", None))
+            )
+            if message.channel.id not in self._active_ticket_channels and not cold_ticket_channel:
                 return
             row = await self.bot.db.fetchone(
                 "SELECT status, creator_id, closing_prompt_message_id FROM tickets WHERE channel_id=?",

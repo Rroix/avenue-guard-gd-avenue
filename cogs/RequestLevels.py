@@ -1,5 +1,6 @@
 import asyncio
 import calendar
+import hashlib
 import json
 import re
 import ssl
@@ -431,6 +432,9 @@ class RequestLevelsCog(commands.Cog):
         self._validation_provider_last_call: dict[str, float] = {}
         self._validation_provider_stats: dict[str, dict[str, float | int]] = {}
         self._validation_refresh_task: Optional[asyncio.Task] = None
+        self._validation_refresh_retry_after: dict[tuple[str, int], float] = {}
+        self._validation_refresh_receipts: dict[tuple[str, int], Any] = {}
+        self._validation_card_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task] = set()
 
         guild_ids = [self.allowed_guild_id] if self.allowed_guild_id else None
@@ -646,15 +650,31 @@ class RequestLevelsCog(commands.Cog):
         refreshed = 0
         now = int(time_module.time())
         for kind, table in (("wave", "level_request_submissions"), ("weekly", "weekly_request_reviews")):
+            blocked_ids = [message_id for (key_kind, message_id), retry_ts in self._validation_refresh_retry_after.items()
+                           if key_kind == kind and retry_ts > time_module.monotonic()]
+            excluded = " AND request_message_id NOT IN (" + ",".join("?" for _ in blocked_ids) + ")" if blocked_ids else ""
             rows = await self.bot.db.fetchall(
                 f"SELECT * FROM {table} WHERE status='pending' AND request_message_id IS NOT NULL "  # nosec B608
                 "AND CASE WHEN json_valid(data_json) THEN COALESCE(CAST(json_extract(data_json,'$.level_validation_refresh_ts') AS INTEGER),0) ELSE 0 END<=? "
-                "ORDER BY created_ts ASC LIMIT ?", (now, max(1, min(5, limit))),
+                + excluded + " ORDER BY created_ts ASC LIMIT ?", (now, *blocked_ids, max(1, min(5, limit))),
             )
             for row in rows:
+                key = (kind, int(row["request_message_id"]))
+                retries = self._validation_refresh_retry_after
+                if retries.get(key, 0) > time_module.monotonic():
+                    continue
                 guild = self.bot.get_guild(int(row["guild_id"]))
-                if guild is not None and await self._refresh_review_validation(guild, kind, row):
-                    refreshed += 1
+                if guild is not None:
+                    try:
+                        if await self._refresh_review_validation(guild, kind, row):
+                            refreshed += 1
+                        retries.pop(key, None)
+                    except Exception as exc:
+                        retries[key] = time_module.monotonic() + 600
+                        await log_error(self.bot, f"Pending validation/card recovery deferred for {kind} message_id={key[1]}: {exc!r}")
+        for key, retry_ts in list(self._validation_refresh_retry_after.items()):
+            if retry_ts <= time_module.monotonic():
+                self._validation_refresh_retry_after.pop(key, None)
         return refreshed
 
     def on_config_reload(self) -> None:
@@ -3664,6 +3684,10 @@ class RequestLevelsCog(commands.Cog):
         await self._reply_ephemeral(interaction, (validation_notice(validation) or "Validation refreshed successfully.")[:1900])
 
     async def _refresh_review_validation(self, guild, target_kind, row, *, message=None):
+        async with self._validation_card_lock:
+            return await self._refresh_review_card(guild, target_kind, row, message=message)
+
+    async def _refresh_review_card(self, guild, target_kind, row, *, message=None):
         data = self._safe_json_loads(row["data_json"], {})
         if not isinstance(data, dict):
             data = {}
@@ -3674,31 +3698,65 @@ class RequestLevelsCog(commands.Cog):
         if not validation:
             return {}
         message_id = int(row["request_message_id"])
+        receipt_key = (target_kind, message_id)
+        channel = getattr(message, "channel", None)
+        if channel is None:
+            channel = await self._review_target_channel(guild, target_kind, row)
+        if channel is None:
+            raise RuntimeError("review channel is unavailable; card recovery was not attempted")
+        recreated = False
+        if message is None:
+            message = self._validation_refresh_receipts.get(receipt_key)
+            recreated = message is not None
+            if message is None:
+                message, _recovered = await asyncio.wait_for(fetch_persisted_message(
+                    channel, message_id, author_id=int(getattr(getattr(self.bot, "user", None), "id", 0) or 0)
+                ), timeout=15)
+                if message is None:
+                    # Save a delivery receipt before storage confirmation. A
+                    # failed confirmation must not create another live card.
+                    data = self._apply_level_validation_vars(data, validation)
+                    variables = self._weekly_data_vars(row, data) if target_kind == "weekly" else self._data_vars(row, data)
+                    template_key = "weekly_request_submitted_embed" if target_kind == "weekly" else "level_requested_embed"
+                    embed = self._embed_from_template(self._cfg(template_key, default={}) or {}, variables,
+                                                      default_color=self._color_name("pending", "blurple"))
+                    nonce = hashlib.sha256(f"review-card:{target_kind}:{guild.id}:{message_id}".encode()).hexdigest()[:24]
+                    message = await asyncio.wait_for(channel.send(embed=embed, view=LevelRequestReviewView(),
+                                                                  allowed_mentions=no_mentions(), nonce=nonce, enforce_nonce=True), timeout=15)
+                    self._validation_refresh_receipts[receipt_key] = message
+                    recreated = True
         async with self._review_lock:
+            expected_kind = target_kind
             target_kind, row = await self._review_target_by_message(guild.id, message_id)
-            if row is None:
+            canonical = False
+            if row is None and recreated:
+                target_kind, row = await self._review_target_by_message(guild.id, message.id)
+                canonical = row is not None and target_kind == expected_kind
+            if row is None or str(row["status"]) != "pending":
+                if recreated and not canonical:
+                    await message.delete()
+                self._validation_refresh_receipts.pop(receipt_key, None)
                 return {}
-            if str(row["status"]) != "pending":
-                return {}
+            message_id = int(row["request_message_id"])
             data = self._safe_json_loads(row["data_json"], {})
             if not isinstance(data, dict):
                 data = {}
             current_level_id = str(data.get("level_id") or self._row_value(row, "level_id", "")).strip()
             if current_level_id != level_id:
+                if recreated and not canonical:
+                    await message.delete()
+                self._validation_refresh_receipts.pop(receipt_key, None)
                 return {}
             data = self._apply_level_validation_vars(data, validation)
             data_json = json.dumps(data, separators=(",", ":"))
             table = "weekly_request_reviews" if target_kind == "weekly" else "level_request_submissions"
-            changed = await self.bot.db.execute_affected(
-                f"UPDATE {table} SET data_json=? WHERE guild_id=? AND request_message_id=? AND status='pending' AND data_json=?",  # nosec B608
-                (data_json, guild.id, message_id, row["data_json"]),
-            )
-            if changed != 1:
-                return {}
+            new_message_id = int(getattr(message, "id", message_id))
+            rendered_row = dict(row)
+            rendered_row["request_message_id"] = new_message_id
             variables = (
-                self._weekly_data_vars(row, data)
+                self._weekly_data_vars(rendered_row, data)
                 if target_kind == "weekly"
-                else self._data_vars(row, data)
+                else self._data_vars(rendered_row, data)
             )
             template_key = "weekly_request_submitted_embed" if target_kind == "weekly" else "level_requested_embed"
             embed = self._embed_from_template(
@@ -3706,15 +3764,35 @@ class RequestLevelsCog(commands.Cog):
                 variables,
                 default_color=self._color_name("pending", "blurple"),
             )
-            if message is None:
-                channel = await self._review_target_channel(guild, target_kind, row)
-                if channel is not None:
-                    try:
-                        message = await channel.fetch_message(message_id)
-                    except discord.NotFound:
-                        await log_error(self.bot, f"Pending request message is missing during validation refresh: {message_id}; use request repair")
+            correlation = str(self._row_value(row, "correlation_id", "") or new_correlation_id("validation"))
+            now = int(time_module.time())
+            payload = json.dumps({"embed": embed.to_dict(), "request_validation_guard": {"kind": target_kind, "data_json": data_json}}, separators=(",", ":"))
+            key = f"validation-card:{target_kind}:{guild.id}:{new_message_id}:{hashlib.sha256(data_json.encode()).hexdigest()[:24]}"
+            # Persist the snapshot and its Discord edit together. Delivery must
+            # recheck this exact pending snapshot under the review lock.
+            await self.bot.db.execute_transaction([
+                (f"UPDATE {table} SET data_json=?,request_message_id=? WHERE guild_id=? AND request_message_id=? AND status='pending' AND data_json=?",  # nosec B608
+                 (data_json, new_message_id, guild.id, message_id, row["data_json"])),
+                ("INSERT OR IGNORE INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) "
+                 f"SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM {table} WHERE guild_id=? AND request_message_id=? AND status='pending' AND data_json=?)",  # nosec B608
+                 (correlation, key, "edit_message", guild.id, int(channel.id),
+                  int(self._row_value(row, "user_id", 0) or 0), new_message_id, payload, "pending", 0, now, now, now, guild.id, new_message_id, data_json)),
+            ], retry_safe=True)
+            _kind, confirmed = await self._review_target_by_message(guild.id, new_message_id)
+            if confirmed is None or str(confirmed["status"]) != "pending" or confirmed["data_json"] != data_json:
+                if recreated and not canonical and confirmed is None:
+                    await message.delete()
+                self._validation_refresh_receipts.pop(receipt_key, None)
+                return {}
+            self._validation_refresh_receipts.pop(receipt_key, None)
+            for cached_key, cached_message in list(self._validation_refresh_receipts.items()):
+                if int(cached_message.id) == new_message_id:
+                    self._validation_refresh_receipts.pop(cached_key, None)
             if message is not None:
-                await message.edit(embed=embed, view=LevelRequestReviewView())
+                try:
+                    await asyncio.wait_for(message.edit(embed=embed, view=LevelRequestReviewView()), timeout=15)
+                except Exception as exc:
+                    await log_error(self.bot, f"Validation card edit queued for recovery message_id={new_message_id}: {exc!r}")
         return validation
 
     async def handle_review_submission(self, interaction: discord.Interaction, message_id: int, result_key: str, review: str):
@@ -3922,6 +4000,10 @@ class RequestLevelsCog(commands.Cog):
         await self._reply_ephemeral(interaction, f"Request marked as {result_label}.{result_warning}")
 
     async def repair_request_system(self, guild: discord.Guild) -> Dict[str, Any]:
+        async with self._validation_card_lock:
+            return await self._repair_request_system(guild)
+
+    async def _repair_request_system(self, guild: discord.Guild) -> Dict[str, Any]:
         result = {
             "request_button_refreshed": False,
             "wave_summary_refreshed": False,

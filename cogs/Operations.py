@@ -19,6 +19,7 @@ from utils.config_schema import (
     operations_settings,
 )
 from utils.errors import log_error
+from utils.db import DatabaseBusyError
 from utils.keepalive import set_runtime_heartbeat
 from utils.supervision import start_cog_background
 from utils.timeutils import now_madrid
@@ -49,6 +50,8 @@ class OperationsCog(commands.Cog):
         self._last_monthly_check = 0
         self._last_smoke_result: dict[str, Any] = {}
         self._bootstrap_ready = asyncio.Event()
+        self._last_health_sample: dict[str, Any] = {}
+        self._deferred_health_samples = 0
 
     def cog_unload(self) -> None:
         for task in self._tasks.values():
@@ -325,7 +328,7 @@ class OperationsCog(commands.Cog):
         started = time.perf_counter()
         db_ok = True
         try:
-            await self.bot.db.fetchone("SELECT 1 AS ready")
+            db_ok = await self.bot.db.fetchone_local("SELECT 1 AS ready") is not None
         except Exception:
             db_ok = False
         db_probe_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -355,27 +358,35 @@ class OperationsCog(commands.Cog):
         guild_id = int(
             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
         )
-        await self.bot.db.execute(
-            "INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) VALUES(?,?,?,?,?)",
-            (
+        samples = [(
                 guild_id,
                 payload["sample_ts"],
                 "runtime",
                 db_probe_ms,
                 json.dumps(payload, separators=(",", ":")),
-            ),
-        )
+            )]
         for provider, provider_payload in providers.items():
-            await self.bot.db.execute(
-                "INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) VALUES(?,?,?,?,?)",
-                (
+            samples.append((
                     guild_id,
                     payload["sample_ts"],
                     f"provider:{provider}",
                     float(provider_payload.get("average_latency_ms", 0) or 0),
                     json.dumps(provider_payload, separators=(",", ":")),
-                ),
-            )
+                ))
+        placeholders = ",".join("(?,?,?,?,?)" for _ in samples)
+        payload["persisted"] = False
+        self._last_health_sample = payload
+        try:
+            await self.bot.db.execute_transaction([(
+                f"INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) VALUES {placeholders}",  # nosec B608
+                tuple(value for sample in samples for value in sample),
+            )], queue_timeout=0.25)
+        except DatabaseBusyError:
+            self._deferred_health_samples += 1
+            payload["deferred_samples"] = self._deferred_health_samples
+            return payload
+        payload["persisted"] = True
+        payload["deferred_samples"] = self._deferred_health_samples
         return payload
 
     async def _health_loop(self) -> None:

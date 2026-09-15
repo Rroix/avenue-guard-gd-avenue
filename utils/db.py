@@ -267,7 +267,8 @@ class Database:
     """Small SQLite wrapper safe to use from an async bot.
 
     - Uses a single connection opened with check_same_thread=False
-    - Serializes all operations with an asyncio.Lock
+    - Serializes writes and connection recovery with an asyncio.Lock
+    - Remote reads use bounded, independent read-only replica snapshots
     - Executes each query fully inside one to_thread call to avoid cursor/thread mismatches
     """
 
@@ -297,16 +298,27 @@ class Database:
         self._queue_timeout_seconds = 10.0
         self._primary_write_degraded = False
         self._last_operation_error_ts = 0
+        self._read_slots = asyncio.Semaphore(4)
+        self._read_waiting = 0
+        self._last_queue_timeout_ts = 0
+        self._last_queue_timeout_operation = ""
+        self._background_queue_deferrals = 0
 
     @asynccontextmanager
-    async def _guard(self):
+    async def _guard(self, timeout: float | None = None, operation: str = "database"):
         self._waiting_operations += 1
         try:
             try:
-                await asyncio.wait_for(self._lock.acquire(), self._queue_timeout_seconds)
+                await asyncio.wait_for(self._lock.acquire(), self._queue_timeout_seconds if timeout is None else timeout)
             except asyncio.TimeoutError as exc:
                 self._queue_timeouts += 1
-                raise DatabaseBusyError("Database busy; this operation was not started, please retry") from exc
+                if timeout is None or timeout >= self._queue_timeout_seconds:
+                    self._last_queue_timeout_ts = int(time.time())
+                    self._last_queue_timeout_operation = operation
+                else:
+                    self._background_queue_deferrals += 1
+                holder = self._active_operation or "connection/maintenance"
+                raise DatabaseBusyError(f"Database busy; {operation} was not started, please retry (holder={holder}, waiting={self._waiting_operations})") from exc
         finally:
             self._waiting_operations -= 1
         try:
@@ -547,6 +559,7 @@ class Database:
         retry_operation: bool = True,
         attempt_pending_sync: bool = True,
         operation_name: str = "database",
+        queue_timeout: float | None = None,
     ) -> Any:
         await self.connect()
         attempts = 3 if self.uses_remote and retry_operation else 1
@@ -554,7 +567,7 @@ class Database:
 
         for attempt in range(attempts):
             started = time.perf_counter()
-            async with self._guard():
+            async with self._guard(queue_timeout, operation_name):
                 assert self._conn is not None
                 self._active_operation = operation_name
                 self._active_operation_since = time.monotonic()
@@ -795,21 +808,35 @@ class Database:
             return await self._thread_call(_restore)
 
     def _migrate_sync(self) -> None:
+        assert self._conn is not None
         try:
             versions = dict(self._conn.execute("SELECT component,schema_version FROM schema_metadata").fetchall())
-            expected = {
-                "database": DATABASE_SCHEMA_VERSION,
-                "config": CONFIG_SCHEMA_VERSION,
-                "runtime_settings": RUNTIME_SCHEMA_VERSION,
-                "embed_templates": EMBED_SCHEMA_VERSION,
-            }
-            if versions == expected:
-                tables = {row[0] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-                if {"tickets", "ticket_transcripts", "activity_counts", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
-                    return
-        except Exception:
-            pass
-        assert self._conn is not None
+        except Exception as exc:
+            if "no such table: schema_metadata" not in str(exc).casefold():
+                raise
+            versions = {}
+        expected = {
+            "database": DATABASE_SCHEMA_VERSION,
+            "config": CONFIG_SCHEMA_VERSION,
+            "runtime_settings": RUNTIME_SCHEMA_VERSION,
+            "embed_templates": EMBED_SCHEMA_VERSION,
+        }
+        if versions.get("database", 0) > DATABASE_SCHEMA_VERSION:
+            raise RuntimeError("Database schema is newer than this bot; deploy matching code instead of downgrading it")
+        if versions == {**expected, "database": 5}:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("CREATE TABLE IF NOT EXISTS activity_flush_batches(batch_id TEXT PRIMARY KEY,created_ts INTEGER NOT NULL)")
+                self._execute_sync("UPDATE schema_metadata SET schema_version=?,updated_ts=? WHERE component='database'", (DATABASE_SCHEMA_VERSION, int(time.time())))
+                self._commit_and_sync_sync()
+            except Exception:
+                self._conn.rollback()
+                raise
+            versions["database"] = DATABASE_SCHEMA_VERSION
+        if versions == expected:
+            tables = {row[0] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if {"tickets", "ticket_transcripts", "activity_counts", "activity_flush_batches", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
+                return
         stmts = [
             """CREATE TABLE IF NOT EXISTS activity_counts(
                 guild_id INTEGER NOT NULL,
@@ -823,6 +850,10 @@ class Database:
                 user_id INTEGER NOT NULL,
                 last_counted_ts INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, user_id)
+            );""",
+            """CREATE TABLE IF NOT EXISTS activity_flush_batches(
+                batch_id TEXT PRIMARY KEY,
+                created_ts INTEGER NOT NULL
             );""",
             """CREATE TABLE IF NOT EXISTS weekly_claims(
                 guild_id INTEGER NOT NULL,
@@ -1605,6 +1636,7 @@ class Database:
         statements: Iterable[tuple[str, Sequence[Any]]],
         *,
         retry_safe: bool = False,
+        queue_timeout: float | None = None,
     ) -> None:
         """Commit several statements atomically on the local/remote replica."""
         items = [(sql, tuple(params)) for sql, params in statements]
@@ -1625,7 +1657,33 @@ class Database:
                     pass
                 raise
 
-        await self._run_locked_with_retry(_run, retry_operation=retry_safe, operation_name="transaction")
+        await self._run_locked_with_retry(_run, retry_operation=retry_safe, operation_name="transaction", queue_timeout=queue_timeout)
+
+    async def apply_activity_batch(self, batch_id: str, counts: Sequence[tuple], last_seen: Sequence[tuple]) -> None:
+        """Commit counters, cooldowns and a retry receipt together in few RPCs."""
+        if not batch_id or len(counts) > 50 or len(last_seen) > 50:
+            raise ValueError("activity batches need an ID and at most 50 rows per table")
+        statements = []
+        if counts:
+            placeholders = ",".join("(?,?,?,?)" for _ in counts)
+            statements.append((
+                "INSERT INTO activity_counts(guild_id,user_id,week_start,count) "
+                f"SELECT column1,column2,column3,column4 FROM (VALUES {placeholders}) "  # nosec B608
+                "WHERE NOT EXISTS(SELECT 1 FROM activity_flush_batches WHERE batch_id=?) "
+                "ON CONFLICT(guild_id,user_id,week_start) DO UPDATE SET count=count+excluded.count",
+                tuple(value for row in counts for value in row) + (batch_id,),
+            ))
+        if last_seen:
+            placeholders = ",".join("(?,?,?)" for _ in last_seen)
+            statements.append((
+                "INSERT INTO activity_last_counted(guild_id,user_id,last_counted_ts) "
+                f"SELECT column1,column2,column3 FROM (VALUES {placeholders}) "  # nosec B608
+                "WHERE NOT EXISTS(SELECT 1 FROM activity_flush_batches WHERE batch_id=?) "
+                "ON CONFLICT(guild_id,user_id) DO UPDATE SET last_counted_ts=MAX(last_counted_ts,excluded.last_counted_ts)",
+                tuple(value for row in last_seen for value in row) + (batch_id,),
+            ))
+        statements.append(("INSERT OR IGNORE INTO activity_flush_batches(batch_id,created_ts) VALUES(?,?)", (batch_id, int(time.time()))))
+        await self.execute_transaction(statements, retry_safe=True, queue_timeout=0.5)
 
     async def set_runtime_setting(self, key: str, value: Any) -> None:
         payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
@@ -1804,6 +1862,11 @@ class Database:
             "queue_timeouts": self._queue_timeouts,
             "primary_write_degraded": self._primary_write_degraded,
             "last_operation_error_ts": self._last_operation_error_ts,
+            "read_waiting": self._read_waiting,
+            "last_queue_timeout_ts": self._last_queue_timeout_ts,
+            "last_queue_timeout_operation": self._last_queue_timeout_operation,
+            "background_queue_deferrals": self._background_queue_deferrals,
+            "write_queue_stalled": bool(self._active_operation_since and time.monotonic() - self._active_operation_since >= self._queue_timeout_seconds),
         }
 
     async def sync_remote(self) -> bool:
@@ -1825,16 +1888,12 @@ class Database:
 
     async def executemany(self, sql: str, seq: Iterable[Sequence[Any]]) -> None:
         items = list(seq)
-
-        def _run():
-            assert self._conn is not None
-            for params in items:
-                self._execute_write_compat_sync(sql, params)
-            self._commit_and_sync_sync()
-
-        await self._run_locked_with_retry(_run, retry_operation=False, operation_name="executemany")
+        await self.execute_transaction([(sql, params) for params in items])
 
     async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[Any]:
+        if self.uses_remote:
+            await self.connect()
+            return await self._read_replica(sql, params, many=False, timeout=5)
         def _run():
             assert self._conn is not None
             cur = self._execute_sync(sql, params)
@@ -1851,35 +1910,75 @@ class Database:
     async def fetchone_local(self, sql: str, params: Sequence[Any] = ()) -> Optional[Any]:
         """Read current replica state without waiting for a pending remote sync.
 
-        This is reserved for Discord interactions that must return a modal as
-        their initial response. The bot is the only writer, so its committed
-        local replica already contains the newest application state.
+        This short-deadline variant serves interactions and health probes.
+        Standard remote reads also use snapshots, with a longer deadline.
         """
 
         if not self._ready:
             return None
 
+        return await self._read_replica(sql, params, many=False, timeout=0.75)
+
+    async def fetchall_local(self, sql: str, params: Sequence[Any] = ()) -> List[Any]:
+        if not self._ready:
+            raise DatabaseBusyError("Replica is not initialized; no snapshot read was started")
+        return await self._read_replica(sql, params, many=True, timeout=5)
+
+    async def _read_replica(self, sql, params, *, many: bool, timeout: float):
+        deadline = time.monotonic() + timeout
         def read_snapshot():
             with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=0.2)) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA query_only=ON")
-                row = connection.execute(sql, tuple(params)).fetchone()
-                if row is None and self.uses_remote:
+                connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                cursor = connection.execute(sql, tuple(params))
+                result = cursor.fetchall() if many else cursor.fetchone()
+                if (not result if many else result is None) and self.uses_remote:
                     legacy = _legacy_where_params(sql, params)
                     if legacy is not None and legacy != tuple(params):
-                        row = connection.execute(sql, legacy).fetchone()
-                return row
+                        cursor = connection.execute(sql, legacy)
+                        result = cursor.fetchall() if many else cursor.fetchone()
+                return result
 
         started = time.perf_counter()
+        task = None
+        acquired = False
+        self._read_waiting += 1
         try:
-            row = await asyncio.wait_for(asyncio.to_thread(read_snapshot), timeout=0.75)
-        except Exception:
-            self._record_query_timing("fetchone_local", (time.perf_counter() - started) * 1000, failed=True)
+            async with asyncio.timeout(timeout):
+                await self._read_slots.acquire()
+                acquired = True
+                task = asyncio.create_task(asyncio.to_thread(read_snapshot))
+                result = await asyncio.shield(task)
+        except TimeoutError as exc:
+            self._record_query_timing("replica_read", (time.perf_counter() - started) * 1000, failed=True)
+            raise DatabaseBusyError("Replica read deadline exceeded; the write queue was not used") from exc
+        except Exception as exc:
+            if self.uses_remote and _is_replica_corruption_error(exc):
+                self._ready = False
+                self._replica_rebuild_required = True
+            self._record_query_timing("replica_read", (time.perf_counter() - started) * 1000, failed=True)
+            if isinstance(exc, sqlite3.OperationalError) and str(exc) == "interrupted" and time.monotonic() >= deadline:
+                raise DatabaseBusyError("Replica read deadline exceeded; the write queue was not used") from exc
             raise
-        self._record_query_timing("fetchone_local", (time.perf_counter() - started) * 1000, failed=False)
-        return row
+        finally:
+            self._read_waiting -= 1
+            if acquired:
+                if task is not None and not task.done():
+                    def release(completed):
+                        if not completed.cancelled():
+                            completed.exception()
+                        self._read_slots.release()
+                    task.add_done_callback(release)
+                else:
+                    self._read_slots.release()
+        self._record_query_timing("replica_read", (time.perf_counter() - started) * 1000, failed=False)
+        return result
 
     async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[Any]:
+        if self.uses_remote:
+            await self.connect()
+            return await self._read_replica(sql, params, many=True, timeout=5)
         def _run():
             assert self._conn is not None
             cur = self._execute_sync(sql, params)

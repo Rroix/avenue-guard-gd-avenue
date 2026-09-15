@@ -1,18 +1,17 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.22.1",
-  "title": "Runtime isolation and resilient recovery",
-  "summary": "Hardens the operations platform so database stalls do not freeze Discord interactions or hide incidents, and repairs reviewed request cards and interrupted deliveries safely.",
+  "version": "3.22.2",
+  "title": "Turso contention and request recovery",
+  "summary": "Keeps replica reads responsive during slow writes, makes activity retries safe against double-counting, and recovers missing request cards without undoing staff reviews.",
   "changes": [
-    "Isolated the native Turso driver in a bounded worker process to protect Discord heartbeats and interactions",
-    "Added bounded database queue waits, cancellation-safe connection ownership, and explicit degraded-write health",
-    "Removed database waits before review modals and restored persistent buttons before Discord login",
-    "Made error delivery independent of storage, added component and modal error handling, and displayed repeated incident counts without double-counting retries",
-    "Added a memory-only recovery dashboard and readiness checks for event-loop, storage, and background-task health",
-    "Hardened startup deadlines, reconnect initialization, missing-task recovery, supervisor independence, and default retention loading",
-    "Added interrupted outbox recovery, delivery receipts, recent-send deduplication, and durable disabling of reviewed request buttons",
-    "Automatically refreshed expired pending level validation snapshots and clarified stale evidence messages",
-    "Fixed reviewed-wave request repair and made deployment smoke-test failures visible during database outages",
-    "Expanded outage regression tests and updated the private architecture manual and incident diagnosis"
+    "Separated remote replica reads from the primary write queue so slow Turso writes do not block tracking, tickets, or diagnostics",
+    "Batched activity counters and cooldowns atomically with persistent retry receipts to prevent partial updates and double-counting",
+    "Drained activity before ranking and shutdown, and postponed weekly winner selection while that week's activity is unconfirmed",
+    "Removed idle outbox writes and made historical health sampling yield to interactive database work",
+    "Coalesced ticket-cache startup loads and backed off failed retries instead of retrying on every message",
+    "Recovered legacy request-message IDs and automatically recreated confirmed missing pending cards with deduplicated sends",
+    "Queued validation-card edits durably and guarded delivery against already reviewed or subsequently edited requests",
+    "Exposed slow write queues in the dashboard and readiness status, clarified busy errors, and prevented failed schema probes from triggering unnecessary migrations",
+    "Added contention, uncertain-commit, cancellation, backup, and request-recovery regression tests and deployment documentation"
   ]
 }

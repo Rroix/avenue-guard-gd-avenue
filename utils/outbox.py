@@ -79,6 +79,9 @@ class DiscordOutbox:
 
     async def recover_stale(self, *, stale_seconds: int = 120) -> int:
         cutoff = int(time.time()) - max(30, int(stale_seconds))
+        stale = await self.bot.db.fetchone("SELECT 1 FROM discord_outbox WHERE status='processing' AND updated_ts<? LIMIT 1", (cutoff,))
+        if stale is None:
+            return 0
         return await self.bot.db.execute_affected(
             "UPDATE discord_outbox SET status='pending',next_attempt_ts=?,updated_ts=?,last_error='worker interrupted before completion' "
             "WHERE status='processing' AND updated_ts<?",
@@ -255,6 +258,28 @@ class DiscordOutbox:
             )
             return int(getattr(sent, "id", 0) or 0)
         if action in {"edit_message", "delete_message"}:
+            guard = payload.get("request_validation_guard")
+            if action == "edit_message" and isinstance(guard, dict):
+                kind = guard.get("kind")
+                if kind not in {"wave", "weekly"} or not isinstance(guard.get("data_json"), str):
+                    raise PermanentOutboxError("invalid request validation guard")
+                cog = self.bot.get_cog("RequestLevelsCog")
+                if cog is None:
+                    raise RuntimeError("request validation delivery is waiting for its cog")
+                table = "weekly_request_reviews" if kind == "weekly" else "level_request_submissions"
+                async with cog._review_lock:
+                    current = await self.bot.db.fetchone(
+                        f"SELECT 1 FROM {table} WHERE guild_id=? AND request_message_id=? AND status='pending' AND data_json=?",  # nosec B608
+                        (int(row["guild_id"]), message_id, guard["data_json"]),
+                    )
+                    if current is None:
+                        return message_id
+                    from utils.views import LevelRequestReviewView
+                    channel = await self._channel(channel_id)
+                    message = await asyncio.wait_for(channel.fetch_message(message_id), timeout=15)
+                    await asyncio.wait_for(message.edit(content=content, embed=embed, allowed_mentions=mentions,
+                                                        view=LevelRequestReviewView()), timeout=15)
+                return message_id
             channel = await self._channel(channel_id)
             try:
                 message = await channel.fetch_message(message_id)

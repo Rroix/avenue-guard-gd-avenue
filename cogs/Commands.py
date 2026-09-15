@@ -1538,7 +1538,7 @@ class CommandsCog(commands.Cog):
         tracking = self.bot.get_cog("TrackingCog")
         if tracking is not None:
             try:
-                await tracking.flush_activity_counts()
+                await tracking.flush_activity_counts(drain=True)
             except Exception as e:
                 await log_error(self.bot, f"Impact report activity flush failed: {repr(e)}")
         background = self.bot.get_cog("BackgroundCog")
@@ -2400,6 +2400,13 @@ class CommandsCog(commands.Cog):
         if db_health.get("primary_write_degraded"):
             issues.append("Turso writes are failing even if local reads still work")
             repairs.append("Check the latest storage error, database availability, and token write permissions")
+        if float(db_health.get("active_operation_seconds", 0) or 0) >= 10:
+            issues.append(f"database write queue: `{db_health.get('active_operation') or 'maintenance'}` has held the connection for over 10 seconds")
+            repairs.append("Replica reads remain available; let the bounded writer finish and check Turso availability if stalls recur")
+        timeout_ts = int(db_health.get("last_queue_timeout_ts", 0) or 0)
+        if timeout_ts and int(time.time()) - timeout_ts < 300:
+            issues.append(f"recent database queue timeout: `{db_health.get('last_queue_timeout_operation') or 'write'}` <t:{timeout_ts}:R>")
+            repairs.append("That operation was not started; retry it after the current writer finishes")
         if bool(db_health.get("replica_rebuild_required")):
             issues.append("database replica: local cache is waiting to be rebuilt")
             repairs.append("Run `/resync`; restart only if the replica cannot rebuild automatically")
@@ -2695,6 +2702,7 @@ class CommandsCog(commands.Cog):
             name="Core",
             value=(
                 f"Database: **{db_note}**\n"
+                f"Writers waiting: **{db_health.get('waiting_operations', 0)}** | readers: **{db_health.get('read_waiting', 0)}**\n"
                 f"Replica rebuilds: **{int(db_health.get('replica_rebuild_count', 0) or 0)}**\n"
                 f"Historical IDs repaired: **{int(snowflake_repair.get('updated', 0) or 0)}**\n"
                 f"Latency: **{round(self.bot.latency * 1000)} ms**\n"
@@ -2774,7 +2782,8 @@ class CommandsCog(commands.Cog):
                 f"Worker alive: **{database.get('worker_alive')}**\n"
                 f"Primary writes degraded: **{database.get('primary_write_degraded', False)}**\n"
                 f"Active: `{database.get('active_operation') or 'none'}` ({database.get('active_operation_seconds', 0)}s)\n"
-                f"Waiting: **{database.get('waiting_operations', 0)}** | queue timeouts: **{database.get('queue_timeouts', 0)}**"), inline=False)
+                f"Writers waiting: **{database.get('waiting_operations', 0)}** | readers: **{database.get('read_waiting', 0)}**\n"
+                f"Queue timeouts: **{database.get('queue_timeouts', 0)}** | background deferrals: **{database.get('background_queue_deferrals', 0)}**"), inline=False)
             embed.add_field(name="Runtime", value=f"Responsive: **{health['responsive']}** | event loop lag: **{health.get('event_loop_lag_ms', 0)} ms**", inline=False)
             if operations:
                 embed.add_field(name="Tasks", value="\n".join(f"`{name}`: {state}" for name, state in operations.task_snapshot().items())[:1024] or "No task data", inline=False)

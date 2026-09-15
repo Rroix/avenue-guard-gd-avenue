@@ -19,6 +19,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Skips configured roles and channels.
 - Skips and logs repeated low-effort message farming patterns before they count.
 - Buffers activity writes briefly with `tracking.activity_flush_seconds` so busy chat does less SQLite work.
+- Flushes counters and cooldowns together in small atomic batches, with persistent receipts that prevent an uncertain commit from being counted twice.
 - Provides `/tracking top`, `/tracking me`, `/tracking reset`, `/tracking force_dm`, `/tracking disable_reward`, and `/tracking enable_reward`.
 - Tracks top-5 weekly streaks and shows streak markers in tracking embeds.
 - DMs weekly winners with a configurable request embed.
@@ -27,6 +28,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Weekly submitted requests use the same staff review/result workflow as live wave requests, but do not count toward or appear in any request wave summary.
 - Weekly submitted request embeds include submission timing and reviewer action buttons.
 - Admins can disable the automatic weekly request reward for the current tracking week.
+- Postpones weekly winner selection while that week's activity still awaits persistence confirmation.
 - Logs weekly request events, including manual `/tracking force_dm` outcomes, to SQLite and optionally to a log channel.
 - Logs weekly request recording failures instead of silently closing a claim when the staff request channel cannot be used.
 - Weekly request log embeds use readable event names, colors, member context, and structured details.
@@ -429,7 +431,13 @@ Discord IDs are unsigned 64-bit snowflakes. Avenue Guard binds large IDs as exac
 
 The native libSQL driver runs in a separate worker process. Its native calls can retain Python's GIL, so threads alone are not sufficient to keep Discord responsive. Worker RPCs have a 20-second default deadline and normal database operations share a 30-second budget; startup gets a longer migration budget. `TURSO_WORKER_TIMEOUT_SECONDS` optionally changes the per-RPC deadline. Queue acquisition times out after 10 seconds before starting that caller's operation. Cancellation retains connection ownership until the worker call finishes. Uncertain non-idempotent writes are not blindly replayed.
 
+Standard Turso reads now use independent read-only SQLite connections to the initialized replica, not the primary write queue. There are at most four concurrent readers, with a five-second deadline; short interaction/health reads use 0.75 seconds. Writes and recovery still own one serialized connection. A successful embedded-replica write updates that replica, while changes from other clients appear after a pull. Run only one production bot instance against this state; a snapshot read does not replace a guarded state transition.
+
+Activity flushes commit up to 50 counter rows, cooldowns, and a unique `activity_flush_batches` receipt together. Failed batches retain the same receipt ID for retry, so a lost confirmation cannot inflate the counters. Schema 6 adds this ledger without replacing business data. Normal background flushes yield after four chunks; ranking, impact reports, weekly processing, and graceful shutdown attempt to drain the remainder. An abrupt process loss can still discard activity that has not reached a successful commit. Health history yields after a 0.25-second queue wait, keeps its latest live sample in memory, and does not manufacture missing historical samples. Idle outbox polling no longer writes when no stale claims exist.
+
 Persistent buttons are registered before Discord login. Review buttons open their modal without waiting for the database; submission then checks the authoritative pending state. Review decisions queue both result delivery and an edit that disables the original buttons. The outbox recovers abandoned claims during runtime, remembers successful deliveries while receipt persistence is unavailable, and uses deterministic Discord nonces for recent-send deduplication. Discord's nonce window is limited, so this is not an unlimited exactly-once guarantee across crashes.
+
+Expired pending-card refreshes resolve legacy rounded message IDs before declaring a card missing. A confirmed missing card is recreated automatically; permission and transport errors never count as deletion. Its corrected pointer and queued validation edit commit together. Queued validation edits recheck the exact pending JSON under the review lock, so stale work cannot overwrite a user edit or restore reviewed buttons. Per-card retry backoff does not prevent other cards from refreshing.
 
 Error reporting prints immediately and sends Discord incident updates independently of database persistence. Repeated failures update their occurrence count, while a batch ledger prevents retrying an uncertain incident write from counting it twice. The dashboard has a memory-only fallback when full queries cannot finish. `/health` remains process liveness; `/ready` returns HTTP 503 when the gateway, event-loop heartbeat, storage worker, primary writes, or expected runtime tasks are unhealthy. Use `/ready` for a monitor intended to track usable bot service rather than just an open HTTP port.
 
@@ -444,10 +452,12 @@ pip install -r requirements-dev.txt
 ./scripts/quality_check.sh
 ```
 
-The current suite contains 167 passing tests. It checks migrations from an empty database, transaction rollback, concurrent ticket IDs, outbox idempotency and recovery, state-machine transitions, typed config validation, restore drills, forecasting, request SLA and wave comparison helpers, GD validation, request schedules and edit windows, cold-cache tracking ranks, runtime configuration persistence, URL and regex safety, daily-summary durability, lint, dependency vulnerabilities, and common security mistakes. Runtime resilience tests exercise a real isolated libSQL process, worker termination, database queue contention, cancellation, storage-independent incident delivery, uncertain-commit deduplication, cold command IDs, early persistent views, readiness, and review/validation races.
+The current suite contains 200 passing tests. It checks migrations from an empty database, transaction rollback, concurrent ticket IDs, outbox idempotency and recovery, state-machine transitions, typed config validation, restore drills, forecasting, request SLA and wave comparison helpers, GD validation, request schedules and edit windows, cold-cache tracking ranks, runtime configuration persistence, URL and regex safety, daily-summary durability, lint, dependency vulnerabilities, and common security mistakes. Runtime resilience tests exercise a real isolated libSQL process, worker termination, database queue contention, cancellation, storage-independent incident delivery, uncertain-commit deduplication, cold command IDs, early persistent views, readiness, and review/validation races. The Turso contention suite also covers independent readers behind a busy writer, atomic counter receipts and backup survival, single-flight/partial cache loading, background deferral, safe missing-card recovery, and stale queued edits.
 
 Use `TEST_CHECKLIST.md` for the full Discord-side test flow. It covers startup, moderation, live request waves, tracking, help sessions, ticket closure, transcript requests, sticky messages, forum reminders, required-word deletion, and fun commands.
 
 The workflow-by-workflow support diagnosis, state model, corrected failure modes, and residual external risks are recorded in `docs/SUPPORT_WORKFLOW_AUDIT_2026-07-29.md`. The latest complete function inventory and Turso migration diagnosis are recorded in `docs/BOT_FUNCTION_DIAGNOSIS_2026-09-13.md`.
 
 The September 15 runtime incident diagnosis, measured GIL blockage, recovery changes, deployment checks, and remaining external limits are documented in `docs/INCIDENT_DIAGNOSIS_2026-09-15.md`. The private architecture manual includes the revised process-isolation and incident-delivery model.
+
+The schema-6 follow-up, write-queue contention diagnosis, replica-read model, activity receipts, and request-card recovery boundaries are documented in `docs/TURSO_CONTENTION_RECOVERY_2026-09-15.md`.

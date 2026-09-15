@@ -2,6 +2,8 @@
 
 Private technical record for Rodrigo. Release proposal: **3.22.1**. Database schema: **5**.
 
+Subsequent queue-contention errors and the schema-6 repair are documented in [Turso Contention And Request Recovery](TURSO_CONTENTION_RECOVERY_2026-09-15.md), release 3.22.2. This initial record retains its original incident evidence and verification results.
+
 ## What Was Actually Established
 
 The screenshots show failed slash/component interactions, an undelivered DM, and stale Geometry Dash validation evidence. They do not contain a Render traceback or prove that all three symptoms have one cause. Local investigation did establish a runtime-blocking defect in the deployed native database driver and several independent recovery and observability defects.

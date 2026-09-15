@@ -51,6 +51,7 @@ def set_runtime_heartbeat(*, lag_ms: float, tasks: dict, database: dict, inciden
                 "connected", "uses_remote", "isolated_worker", "worker_alive", "waiting_operations",
                 "active_operation", "active_operation_seconds", "queue_timeouts",
                 "primary_write_degraded", "last_operation_error_ts",
+                "read_waiting", "background_queue_deferrals", "write_queue_stalled",
             )},
             "incident_count": len(incidents),
             "incident_occurrences": sum(int(item.get("count", 0)) for item in incidents),
@@ -67,7 +68,7 @@ def get_runtime_health() -> dict:
     responsive = bool(heartbeat and age is not None and age < 15)
     database = health.get("database", {})
     database_ok = (database.get("connected") is not False and (not database.get("uses_remote") or database.get("worker_alive") is True)
-                   and not database.get("primary_write_degraded"))
+                   and not database.get("primary_write_degraded") and not database.get("write_queue_stalled"))
     auxiliary = {"operations.smoke", "operations.bootstrap", "operations.restarts", "operations.timeline"}
     tasks_ok = not any(str(value).startswith(("failed", "stopped", "missing"))
                        for name, value in health.get("tasks", {}).items() if name not in auxiliary)

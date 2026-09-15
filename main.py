@@ -236,7 +236,7 @@ async def _close_runtime_storage(bot: discord.Bot) -> None:
     flush_activity = getattr(tracking, "flush_activity_counts", None)
     if callable(flush_activity):
         try:
-            await flush_activity()
+            await flush_activity(drain=True)
         except Exception as e:
             startup_log(f"Activity flush during shutdown failed: {type(e).__name__}: {e}")
 
