@@ -1,7 +1,6 @@
 import asyncio
 from contextlib import closing
 import sqlite3
-from types import SimpleNamespace
 
 import pytest
 
@@ -69,7 +68,7 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     schema_rows = await db.fetchall("SELECT component,schema_version FROM schema_metadata")
     schema_versions = {str(row["component"]): int(row["schema_version"]) for row in schema_rows}
     assert schema_versions == {
-        "database": 4,
+        "database": 5,
         "config": 2,
         "runtime_settings": 2,
         "embed_templates": 2,
@@ -466,7 +465,11 @@ async def test_corrupt_remote_replica_is_quarantined_and_rebuilt(tmp_path, monke
         conn.row_factory = sqlite3.Row
         return conn
 
-    monkeypatch.setattr(db_module, "libsql", SimpleNamespace(connect=connect))
+    class TestConnection:
+        def __new__(cls, database, **kwargs):
+            return connect(database, **kwargs)
+
+    monkeypatch.setattr(db_module, "IsolatedConnection", TestConnection)
     db = Database(
         str(path),
         remote_url="libsql://example.invalid",

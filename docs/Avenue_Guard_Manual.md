@@ -49,8 +49,9 @@ Generated from the current Avenue Guard codebase and configuration for Rodrigo.
 41. Impact And Backup Code Walkthrough
 42. Server Icon Rotation Code Walkthrough
 43. Durable Operations Platform 3 22
-44. Engineering Thinking Behind The Bot
-45. Debugging Notebook
+44. Runtime Isolation And Incident Recovery 3 22 1
+45. Engineering Thinking Behind The Bot
+46. Debugging Notebook
 
 ## 1. Private Manual Notice
 
@@ -179,7 +180,7 @@ The most customizable parts are the embed templates. Request submissions, review
 
 ## 7. Database And Persistence
 
-The SQLite layer is intentionally small and predictable. utils.db.Database owns one SQLite connection with check_same_thread disabled, serializes operations with an asyncio lock, and runs blocking database work inside threads. The migration code creates tables and adds columns for older databases so the bot can evolve without manual SQL work every time a feature is added.
+utils.db.Database owns the storage boundary. Local-only mode uses a SQLite connection in threads. Production Turso mode keeps the native libSQL connection in an isolated process because that extension can retain Python's interpreter lock even inside a thread. An asyncio lock serializes primary operations, bounded deadlines contain stalls, and cancellation preserves ownership until the operation finishes. The migration code creates tables and adds columns so the bot can evolve without manual SQL work every time a feature is added.
 
 The database is not only storage; it is the bot's memory. It knows the active request wave, scheduled openings, submitted users and level IDs, request edit history, validation cache, weekly claims, weekly sessions, weekly reviews, activity counts, tickets, transcript pointers, help submissions, cooldowns, daily stats, and impact snapshots.
 
@@ -187,8 +188,8 @@ The database is not only storage; it is the bot's memory. It knows the active re
 
 ```mermaid
 flowchart LR
-  S1["Render Persistent Disk path"]
-  S2["SQLite bot memory"]
+  S1["Turso remote primary"]
+  S2["Process-isolated local replica"]
   S3["Scheduled zipped backup"]
   S4["Discord backup channel"]
   S5["Impact and trend exports"]
@@ -198,13 +199,13 @@ flowchart LR
   S4 --> S5
 ```
 
-> The primary durable copy is the mounted SQLite file; backup attachments and exports provide recovery evidence.
+> Production durable truth lives in Turso. The host replica can be replaced; backup attachments and exports provide a second recovery path.
 
 ### Render Storage Rule
 
-On Render, the project source and cache can be wiped by redeploys or cache clears. Avenue Guard therefore resolves its SQLite path from AVENUE_GUARD_DB_PATH first, then database.path in config.json, then an auto-detected Render Persistent Disk path at /var/data/avenue-guard/bot.db, and only then the local fallback. For production, mount a Render Persistent Disk at /var/data or point AVENUE_GUARD_DB_PATH at another durable path.
+On Render, the project source and cache can be wiped by redeploys or cache clears. Turso mode therefore requires a database URL and valid database-scoped token before Discord login and rebuilds disposable replicas from the cloud. Only local-only mode resolves its SQLite path from AVENUE_GUARD_DB_PATH first, then database.path in config.json, then an auto-detected Render Persistent Disk path at /var/data/avenue-guard/bot.db, and only then the local fallback. For production, use Turso, or mount a persistent disk if deliberately choosing local-only SQLite.
 
-The /bot storage command checks the running path and the latest backup record. The /bot backup command creates a zipped copy immediately, and the background backup loop posts scheduled copies to the configured backup channel. If no persistent path is writable, the bot now starts with a local fallback and warns clearly, but that fallback should be treated as temporary.
+The /bot storage command checks the running path and the latest backup record. The /bot backup command creates a zipped copy immediately, and the background backup loop posts scheduled copies to the configured backup channel. If no persistent path is writable, production must not silently fall back to disposable storage. Incomplete Turso credentials prevent login; development local fallback is not a persistence guarantee.
 
 | Table | Purpose |
 | --- | --- |
@@ -607,15 +608,15 @@ This chapter is generated from the current source files. It gives you a quick st
 
 | File | Lines | Shape | Discord Hooks |
 | --- | --- | --- | --- |
-| main.py | 661 | 1 classes / 23 functions | 0 listeners / 0 loops |
+| main.py | 730 | 2 classes / 26 functions | 0 listeners / 0 loops |
 | cogs/Background.py | 1397 | 3 classes / 89 functions | 12 listeners / 5 loops |
-| cogs/Commands.py | 4803 | 3 classes / 142 functions | 0 listeners / 0 loops |
+| cogs/Commands.py | 4858 | 3 classes / 144 functions | 0 listeners / 0 loops |
 | cogs/Help.py | 4734 | 10 classes / 177 functions | 1 listeners / 0 loops |
 | cogs/MessageResponses.py | 201 | 1 classes / 9 functions | 1 listeners / 0 loops |
 | cogs/Mod.py | 351 | 1 classes / 11 functions | 3 listeners / 0 loops |
-| cogs/Operations.py | 567 | 1 classes / 22 functions | 0 listeners / 0 loops |
+| cogs/Operations.py | 633 | 1 classes / 26 functions | 0 listeners / 0 loops |
 | cogs/Release.py | 941 | 1 classes / 34 functions | 0 listeners / 0 loops |
-| cogs/RequestLevels.py | 4196 | 9 classes / 167 functions | 0 listeners / 0 loops |
+| cogs/RequestLevels.py | 4259 | 9 classes / 170 functions | 0 listeners / 0 loops |
 | cogs/Sticky.py | 634 | 1 classes / 28 functions | 2 listeners / 0 loops |
 | cogs/Tracking.py | 2379 | 2 classes / 67 functions | 1 listeners / 0 loops |
 | services/backups.py | 82 | 0 classes / 2 functions | 0 listeners / 0 loops |
@@ -626,10 +627,10 @@ This chapter is generated from the current source files. It gives you a quick st
 | services/request_validation.py | 29 | 0 classes / 3 functions | 0 listeners / 0 loops |
 | utils/config.py | 85 | 1 classes / 7 functions | 0 listeners / 0 loops |
 | utils/config_schema.py | 394 | 2 classes / 7 functions | 0 listeners / 0 loops |
-| utils/db.py | 1779 | 2 classes / 70 functions | 0 listeners / 0 loops |
-| utils/errors.py | 235 | 0 classes / 11 functions | 0 listeners / 0 loops |
-| utils/gd_validation.py | 440 | 0 classes / 17 functions | 0 listeners / 0 loops |
-| utils/outbox.py | 265 | 2 classes / 12 functions | 0 listeners / 0 loops |
+| utils/db.py | 1894 | 3 classes / 74 functions | 0 listeners / 0 loops |
+| utils/errors.py | 314 | 1 classes / 19 functions | 0 listeners / 0 loops |
+| utils/gd_validation.py | 443 | 0 classes / 17 functions | 0 listeners / 0 loops |
+| utils/outbox.py | 290 | 2 classes / 12 functions | 0 listeners / 0 loops |
 | utils/server_icons.py | 100 | 0 classes / 7 functions | 0 listeners / 0 loops |
 | utils/views.py | 355 | 11 classes / 25 functions | 0 listeners / 0 loops |
 | utils/workflows.py | 116 | 2 classes / 9 functions | 0 listeners / 0 loops |
@@ -710,6 +711,7 @@ This table is extracted from utils/db.py. It is one of the most useful quick-ref
 | database_backups | Posted backup metadata. |
 | database_restore_log | Persistent workflow state. |
 | discord_outbox | Durable retryable Discord actions and delivery IDs. |
+| error_incident_batches | Committed UUID batches prevent incident retries from counting twice. |
 | error_incidents | Grouped error fingerprints, counts, and resolution state. |
 | gd_level_validation_cache | Cached GD provider validation payloads. |
 | health_metrics | Historical runtime, query, gateway, and provider samples. |
@@ -752,294 +754,237 @@ The table names are grouped by feature family. activity_* and weekly_* belong to
 
 main.py is the bot's entry point. The most important startup choice is that production resolves a writable embedded replica and valid Turso credentials before Discord login. That prevents a briefly online but unusable bot and refuses an accidental fallback to disposable host storage.
 
-#### Database path resolution (main.py:258-325)
+#### Database path resolution excerpt (main.py:298-365)
 
 ```python
- 258: def resolve_db_path(config: Config) -> tuple[str, str, str, str, str]:
- 259:     warnings: list[str] = []
- 260:     require_remote = bool(config.get("database", "require_remote_when_configured", default=True))
- 261:     allow_local_fallback = os.getenv("ALLOW_LOCAL_DATABASE_FALLBACK", "").strip().casefold() in {
- 262:         "1",
- 263:         "true",
- 264:         "yes",
- 265:         "on",
- 266:     }
- 267:     turso_url = (
- 268:         os.getenv("TURSO_DATABASE_URL", "")
- 269:         or os.getenv("LIBSQL_URL", "")
- 270:         or str(config.get("database", "turso_url", default="") or "")
- 271:     ).strip()
- 272:     turso_token = (os.getenv("TURSO_AUTH_TOKEN", "") or os.getenv("LIBSQL_AUTH_TOKEN", "")).strip()
- 273:     if turso_url:
- 274:         if turso_token:
- 275:             replica_path = (
- 276:                 os.getenv("TURSO_REPLICA_PATH", "").strip()
- 277:                 or str(config.get("database", "turso_replica_path", default="") or "").strip()
- 278:                 or TURSO_REPLICA_PATH
- 279:             )
- 280:             ok, error = _database_path_usable(replica_path)
- 281:             if ok:
- 282:                 return replica_path, "Turso/libSQL embedded replica", "", turso_url, turso_token
- 283:             message = f"Turso replica path is not writable: {replica_path} ({error})"
- 284:             if require_remote and not allow_local_fallback:
- 285:                 raise PersistenceConfigurationError(
- 286:                     f"{message}. Refusing to start on disposable local storage. Fix TURSO_REPLICA_PATH or set "
- 287:                     "ALLOW_LOCAL_DATABASE_FALLBACK=1 for intentional local development."
- 288:                 )
- 289:             warnings.append(f"{message}; falling back to local SQLite")
- 290:         else:
- 291:             message = "A Turso/libSQL database URL is set but TURSO_AUTH_TOKEN is missing"
- 292:             if require_remote and not allow_local_fallback:
- 293:                 raise PersistenceConfigurationError(
- 294:                     f"{message}. Refusing to start on disposable local storage. Add the database token or set "
- 295:                     "ALLOW_LOCAL_DATABASE_FALLBACK=1 for intentional local development."
- 296:                 )
- 297:             warnings.append(f"{message}; falling back to local SQLite")
- 298:
- 299:     env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
- 300:     candidates: list[tuple[str, str, bool]] = []
- 301:     if env_path:
- 302:         candidates.append(("AVENUE_GUARD_DB_PATH", env_path, True))
- 303:     config_path = str(config.get("database", "path", default="") or "").strip()
- 304:     if config_path:
- 305:         candidates.append(("config.json database.path", config_path, False))
- 306:     candidates.append(("Render Persistent Disk auto-detect", RENDER_DISK_DB_PATH, False))
- 307:     candidates.append(("local fallback", DEFAULT_DB_PATH, False))
- 308:
- 309:     for source, path, explicit in candidates:
- 310:         ok, error = _database_path_usable(path)
- 311:         if ok:
- 312:             warning = " | ".join(warnings)
- 313:             if warning:
- 314:                 startup_log(warning)
- 315:             if source == "local fallback":
- 316:                 warning = (
- 317:                     f"{warning} | " if warning else ""
- 318:                 ) + "Using local fallback database; data can be lost if Render clears cache and no Persistent Disk is mounted."
- 319:             return path, source, warning, "", ""
- 320:         message = f"Database path from {source} is not writable: {path} ({error})"
- 321:         if explicit:
- 322:             message += "; falling back so the bot can start"
- 323:         warnings.append(message)
- 324:
- 325:     return DEFAULT_DB_PATH, "local fallback", "All configured database paths failed; using local fallback.", "", ""
+ 298: def resolve_db_path(config: Config) -> tuple[str, str, str, str, str]:
+ 299:     warnings: list[str] = []
+ 300:     require_remote = bool(config.get("database", "require_remote_when_configured", default=True))
+ 301:     allow_local_fallback = os.getenv("ALLOW_LOCAL_DATABASE_FALLBACK", "").strip().casefold() in {
+ 302:         "1",
+ 303:         "true",
+ 304:         "yes",
+ 305:         "on",
+ 306:     }
+ 307:     turso_url = (
+ 308:         os.getenv("TURSO_DATABASE_URL", "")
+ 309:         or os.getenv("LIBSQL_URL", "")
+ 310:         or str(config.get("database", "turso_url", default="") or "")
+ 311:     ).strip()
+ 312:     turso_token = (os.getenv("TURSO_AUTH_TOKEN", "") or os.getenv("LIBSQL_AUTH_TOKEN", "")).strip()
+ 313:     if turso_url:
+ 314:         if turso_token:
+ 315:             replica_path = (
+ 316:                 os.getenv("TURSO_REPLICA_PATH", "").strip()
+ 317:                 or str(config.get("database", "turso_replica_path", default="") or "").strip()
+ 318:                 or TURSO_REPLICA_PATH
+ 319:             )
+ 320:             ok, error = _database_path_usable(replica_path)
+ 321:             if ok:
+ 322:                 return replica_path, "Turso/libSQL embedded replica", "", turso_url, turso_token
+ 323:             message = f"Turso replica path is not writable: {replica_path} ({error})"
+ 324:             if require_remote and not allow_local_fallback:
+ 325:                 raise PersistenceConfigurationError(
+ 326:                     f"{message}. Refusing to start on disposable local storage. Fix TURSO_REPLICA_PATH or set "
+ 327:                     "ALLOW_LOCAL_DATABASE_FALLBACK=1 for intentional local development."
+ 328:                 )
+ 329:             warnings.append(f"{message}; falling back to local SQLite")
+ 330:         else:
+ 331:             message = "A Turso/libSQL database URL is set but TURSO_AUTH_TOKEN is missing"
+ 332:             if require_remote and not allow_local_fallback:
+ 333:                 raise PersistenceConfigurationError(
+ 334:                     f"{message}. Refusing to start on disposable local storage. Add the database token or set "
+ 335:                     "ALLOW_LOCAL_DATABASE_FALLBACK=1 for intentional local development."
+ 336:                 )
+ 337:             warnings.append(f"{message}; falling back to local SQLite")
+ 338:
+ 339:     env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
+ 340:     candidates: list[tuple[str, str, bool]] = []
+ 341:     if env_path:
+ 342:         candidates.append(("AVENUE_GUARD_DB_PATH", env_path, True))
+ 343:     config_path = str(config.get("database", "path", default="") or "").strip()
+ 344:     if config_path:
+ 345:         candidates.append(("config.json database.path", config_path, False))
+ 346:     candidates.append(("Render Persistent Disk auto-detect", RENDER_DISK_DB_PATH, False))
+ 347:     candidates.append(("local fallback", DEFAULT_DB_PATH, False))
+ 348:
+ 349:     for source, path, explicit in candidates:
+ 350:         ok, error = _database_path_usable(path)
+ 351:         if ok:
+ 352:             warning = " | ".join(warnings)
+ 353:             if warning:
+ 354:                 startup_log(warning)
+ 355:             if source == "local fallback":
+ 356:                 warning = (
+ 357:                     f"{warning} | " if warning else ""
+ 358:                 ) + "Using local fallback database; data can be lost if Render clears cache and no Persistent Disk is mounted."
+ 359:             return path, source, warning, "", ""
+ 360:         message = f"Database path from {source} is not writable: {path} ({error})"
+ 361:         if explicit:
+ 362:             message += "; falling back so the bot can start"
+ 363:         warnings.append(message)
+ 364:
+ 365:     return DEFAULT_DB_PATH, "local fallback", "All configured database paths failed; using local fallback.", "", ""
 ```
 
 When Turso is configured, the resolver requires both a database URL and database-scoped token, verifies the replica path, and refuses silent local fallback in production. Local-only mode still checks environment, config, mounted disk, and development paths with a real write probe before accepting one.
 
-#### Bot creation, outbox, and cog loading (main.py:327-377)
+#### Bot creation and outbox wiring excerpt (main.py:367-431)
 
 ```python
- 327: def create_bot() -> discord.Bot:
- 328:     intents = discord.Intents.default()
- 329:     for intent_name in (
- 330:         "bans",
- 331:         "dm_messages",
- 332:         "guild_messages",
- 333:         "guild_reactions",
- 334:         "members",
- 335:         "message_content",
- 336:         "messages",
- 337:         "moderation",
- 338:         "presences",
- 339:         "reactions",
- 340:         "voice_states",
- 341:     ):
- 342:         if hasattr(intents, intent_name):
- 343:             setattr(intents, intent_name, True)
- 344:     bot = discord.Bot(intents=intents)
- 345:     bot.config_write_lock = asyncio.Lock()
- 346:
- 347:     bot.config = Config("config.json")
- 348:     bot.db_path, bot.db_path_source, bot.db_path_warning, bot.db_remote_url, bot.db_remote_token = resolve_db_path(bot.config)
- 349:     startup_log(f"Using database path: {bot.db_path} ({bot.db_path_source})")
- 350:     bot.db = Database(bot.db_path, remote_url=bot.db_remote_url, auth_token=bot.db_remote_token)
- 351:     bot.outbox = DiscordOutbox(bot)
- 352:     _install_storage_close_hook(bot)
- 353:
- 354:     @bot.check_once
- 355:     async def attach_command_correlation(ctx: discord.ApplicationContext) -> bool:
- 356:         command = getattr(ctx, "command", None)
- 357:         command_name = str(
- 358:             getattr(command, "qualified_name", None)
- 359:             or getattr(command, "name", None)
- 360:             or "command"
- 361:         )
- 362:         ctx.correlation_id = begin_workflow_context(prefix=command_name)
- 363:         return True
- 364:
- 365:     @bot.event
- 366:     async def on_application_command_completion(
- 367:         ctx: discord.ApplicationContext,
- 368:     ) -> None:
- 369:         clear_workflow_context()
- 370:
- 371:     setup_global_error_handlers(bot)
- 372:
- 373:     def _load_cogs():
- 374:         bot.load_extension("cogs.Mod")
- 375:         bot.load_extension("cogs.Tracking")
- 376:         bot.load_extension("cogs.Help")
- 377:         bot.load_extension("cogs.MessageResponses")
+ 367: def create_bot() -> discord.Bot:
+ 368:     intents = discord.Intents.default()
+ 369:     for intent_name in (
+ 370:         "bans",
+ 371:         "dm_messages",
+ 372:         "guild_messages",
+ 373:         "guild_reactions",
+ 374:         "members",
+ 375:         "message_content",
+ 376:         "messages",
+ 377:         "moderation",
+ 378:         "presences",
+ 379:         "reactions",
+ 380:         "voice_states",
+ 381:     ):
+ 382:         if hasattr(intents, intent_name):
+ 383:             setattr(intents, intent_name, True)
+ 384:     bot = AvenueBot(intents=intents)
+ 385:     bot.config_write_lock = asyncio.Lock()
+ 386:     bot._runtime_initialization_lock = asyncio.Lock()
+ 387:     bot._runtime_initialized = False
+ 388:
+ 389:     bot.config = Config("config.json")
+ 390:     bot.db_path, bot.db_path_source, bot.db_path_warning, bot.db_remote_url, bot.db_remote_token = resolve_db_path(bot.config)
+ 391:     startup_log(f"Using database path: {bot.db_path} ({bot.db_path_source})")
+ 392:     bot.db = Database(bot.db_path, remote_url=bot.db_remote_url, auth_token=bot.db_remote_token)
+ 393:     bot.outbox = DiscordOutbox(bot)
+ 394:     _install_storage_close_hook(bot)
+ 395:
+ 396:     @bot.check_once
+ 397:     async def attach_command_correlation(ctx: discord.ApplicationContext) -> bool:
+ 398:         command = getattr(ctx, "command", None)
+ 399:         command_name = str(
+ 400:             getattr(command, "qualified_name", None)
+ 401:             or getattr(command, "name", None)
+ 402:             or "command"
+ 403:         )
+ 404:         ctx.correlation_id = begin_workflow_context(prefix=command_name)
+ 405:         return True
+ 406:
+ 407:     @bot.event
+ 408:     async def on_application_command_completion(
+ 409:         ctx: discord.ApplicationContext,
+ 410:     ) -> None:
+ 411:         clear_workflow_context()
+ 412:
+ 413:     setup_global_error_handlers(bot)
+ 414:
+ 415:     def _load_cogs():
+ 416:         bot.load_extension("cogs.Mod")
+ 417:         bot.load_extension("cogs.Tracking")
+ 418:         bot.load_extension("cogs.Help")
+ 419:         bot.load_extension("cogs.MessageResponses")
+ 420:         bot.load_extension("cogs.Sticky")
+ 421:         bot.load_extension("cogs.RequestLevels")
+ 422:         bot.load_extension("cogs.Release")
+ 423:         bot.load_extension("cogs.Commands")
+ 424:         bot.load_extension("cogs.Background")
+ 425:         bot.load_extension("cogs.Operations")
+ 426:
+ 427:     async def initialize_runtime():
+ 428:         await bot.register_persistent_views()
+ 429:         previous_gateway_state = str(
+ 430:             get_keepalive_status().get("state") or ""
+ 431:         )
 ```
 
-create_bot wires configuration, database, the durable outbox, command correlation, cogs, and on_ready behavior together. A preflight migration happens before login; on_ready then validates the guild, repairs legacy IDs, starts cog loops, starts the operations supervisor, and registers persistent views.
+create_bot wires configuration, database, the durable outbox, command correlation, cogs, and on_ready behavior together. Persistent views and preflight migration happen before login; on_ready then validates the guild, repairs legacy IDs, starts cog loops and the operations pillars exactly once. Reconnects do not repeat the whole initialization.
 
-#### Persistent view registration (main.py:534-545)
+#### Persistent view registration (main.py:598-610)
 
 ```python
- 534:         if callable(refresh_metrics):
- 535:             try:
- 536:                 await refresh_metrics(record_availability=False)
- 537:             except Exception as e:
- 538:                 await log_error(bot, f"Public bot status refresh after resume failed: {e!r}")
- 539:
- 540:     async def register_persistent_views():
- 541:         bot.add_view(TrackingDeclineConfirmView())
- 542:         bot.add_view(TicketClosePromptView())
- 543:         bot.add_view(HelpMenuView())
- 544:         bot.add_view(FormerMemberHelpView())
- 545:         bot.add_view(BanInfoGiveInfoView())
+ 598:     async def register_persistent_views():
+ 599:         if getattr(bot, "_persistent_views_registered", False):
+ 600:             return
+ 601:         bot.add_view(TrackingDeclineConfirmView())
+ 602:         bot.add_view(TicketClosePromptView())
+ 603:         bot.add_view(HelpMenuView())
+ 604:         bot.add_view(FormerMemberHelpView())
+ 605:         bot.add_view(BanInfoGiveInfoView())
+ 606:         bot.add_view(TranscriptRequestView())
+ 607:         bot.add_view(ReleaseApprovalView())
+ 608:         bot.add_view(LevelRequestButtonView())
+ 609:         bot.add_view(LevelRequestReviewView())
+ 610:         bot._persistent_views_registered = True
 ```
 
 Persistent view registration is easy to underestimate. Discord button messages can outlive the Python process. Without registering the views again after restart, users could click old buttons and Discord would not know which callback should run.
 
 ## 29. Database Code Walkthrough
 
-The Database wrapper is small because it has one job: make SQLite safe enough for an async Discord bot. SQLite calls are blocking, so the wrapper serializes access with an asyncio.Lock and runs the actual SQLite work inside asyncio.to_thread.
+The Database wrapper serializes primary access and preserves transaction ownership. Local SQLite calls use threads. Native libSQL calls use a process facade, with a parent thread waiting for IPC. Threads alone are insufficient when an extension retains the GIL; the runtime recovery chapter explains the measured failure and the isolation boundary.
 
-#### Connection, WAL, migration, and backup (utils/db.py:14-66)
+#### Local SQLite and isolated Turso connection (utils/db.py:449-473)
 
 ```python
-  14:
-  15: from utils.config_schema import (
-  16:     CONFIG_SCHEMA_VERSION,
-  17:     DATABASE_SCHEMA_VERSION,
-  18:     EMBED_SCHEMA_VERSION,
-  19:     RUNTIME_SCHEMA_VERSION,
-  20: )
-  21:
-  22: try:
-  23:     import libsql
-  24: except Exception:
-  25:     libsql = None
-  26:
-  27:
-  28: class DictRow(dict):
-  29:     """sqlite3.Row-like fallback for drivers that return tuples."""
-  30:
-  31:     def __init__(self, keys: Sequence[str], values: Sequence[Any]):
-  32:         super().__init__((str(key), values[index] if index < len(values) else None) for index, key in enumerate(keys))
-  33:         self._values = tuple(values)
-  34:
-  35:     def __getitem__(self, key: Any) -> Any:
-  36:         if isinstance(key, int):
-  37:             return self._values[key]
-  38:         return super().__getitem__(key)
-  39:
-  40:
-  41: def _row_get(row: Any, key: str, *, index: int = 0, default: Any = None) -> Any:
-  42:     if row is None:
-  43:         return default
-  44:     try:
-  45:         return row[key]
-  46:     except Exception:
-  47:         pass
-  48:     try:
-  49:         return row[index]
-  50:     except Exception:
-  51:         return default
-  52:
-  53:
-  54: def _normalize_row(cursor: Any, row: Any) -> Any:
-  55:     if row is None:
-  56:         return None
-  57:     try:
-  58:         _ = row["__avenue_guard_missing_column__"]
-  59:     except KeyError:
-  60:         return row
-  61:     except Exception:
-  62:         pass
-  63:     description = getattr(cursor, "description", None) or []
-  64:     keys = [str(col[0]) for col in description if col]
-  65:     if keys:
-  66:         return DictRow(keys, tuple(row))
+ 449:     def _open_connection_sync(self) -> Any:
+ 450:         if self.uses_remote:
+ 451:             if libsql is None:
+ 452:                 raise RuntimeError("TURSO_DATABASE_URL is configured, but the libsql Python package is not installed.")
+ 453:             if _looks_like_turso_platform_token(self.auth_token):
+ 454:                 raise RuntimeError(
+ 455:                     "TURSO_AUTH_TOKEN looks like a Turso platform/API token, not a database auth token. "
+ 456:                     "Create a database token with `turso db tokens create <database-name>` and use that value instead."
+ 457:                 )
+ 458:             conn = IsolatedConnection(str(self.path), sync_url=self.remote_url, auth_token=self.auth_token)
+ 459:         else:
+ 460:             conn = sqlite3.connect(str(self.path), check_same_thread=False)
+ 461:             conn.row_factory = sqlite3.Row
+ 462:             conn.execute("PRAGMA journal_mode=WAL;")
+ 463:         try:
+ 464:             conn.execute("PRAGMA foreign_keys=ON;")
+ 465:         except Exception:
+ 466:             pass
+ 467:         for pragma in ("PRAGMA busy_timeout=5000;", "PRAGMA synchronous=NORMAL;"):
+ 468:             try:
+ 469:                 conn.execute(pragma)
+ 470:             except Exception:
+ 471:                 pass
+ 472:         conn.commit()
+ 473:         return conn
 ```
 
 WAL mode helps SQLite handle concurrent readers while writes are happening. The lock still serializes bot-side operations, which prevents two coroutine paths from sharing one cursor incorrectly. This is less glamorous than a bigger database, but it fits a single-server bot well and keeps deployment simple.
 
-#### Atomic ticket sequence and query helpers (utils/db.py:935-1003)
+#### Atomic ticket sequence (utils/db.py:1537-1561)
 
 ```python
- 935:                 status TEXT NOT NULL,
- 936:                 created_ts INTEGER NOT NULL,
- 937:                 updated_ts INTEGER,
- 938:                 ticket_id INTEGER,
- 939:                 reviewed_by INTEGER,
- 940:                 reviewed_ts INTEGER,
- 941:                 error_text TEXT
- 942:             );""",
- 943:             """CREATE TABLE IF NOT EXISTS rps_streaks(
- 944:                 guild_id INTEGER NOT NULL,
- 945:                 user_id INTEGER NOT NULL,
- 946:                 streak INTEGER NOT NULL,
- 947:                 updated_ts INTEGER NOT NULL,
- 948:                 PRIMARY KEY (guild_id, user_id)
- 949:             );""",
- 950:             """CREATE TABLE IF NOT EXISTS level_request_state(
- 951:                 guild_id INTEGER PRIMARY KEY,
- 952:                 state TEXT NOT NULL DEFAULT 'closed',
- 953:                 wave_id INTEGER NOT NULL DEFAULT 0,
- 954:                 request_limit INTEGER,
- 955:                 close_ts INTEGER,
- 956:                 submitted_count INTEGER NOT NULL DEFAULT 0,
- 957:                 opened_ts INTEGER,
- 958:                 closed_ts INTEGER,
- 959:                 request_channel_id INTEGER,
- 960:                 request_message_id INTEGER,
- 961:                 request_type TEXT
- 962:             );""",
- 963:             """CREATE TABLE IF NOT EXISTS level_request_submissions(
- 964:                 guild_id INTEGER NOT NULL,
- 965:                 wave_id INTEGER NOT NULL,
- 966:                 user_id INTEGER NOT NULL,
- 967:                 level_id TEXT NOT NULL,
- 968:                 request_message_id INTEGER UNIQUE,
- 969:                 status TEXT NOT NULL,
- 970:                 result TEXT,
- 971:                 review_text TEXT,
- 972:                 reviewed_by INTEGER,
- 973:                 reviewed_ts INTEGER,
- 974:                 created_ts INTEGER NOT NULL,
- 975:                 data_json TEXT NOT NULL DEFAULT '{}',
- 976:                 PRIMARY KEY (guild_id, wave_id, user_id),
- 977:                 UNIQUE (guild_id, wave_id, level_id)
- 978:             );""",
- 979:             """CREATE TABLE IF NOT EXISTS level_request_wave_summaries(
- 980:                 guild_id INTEGER NOT NULL,
- 981:                 wave_id INTEGER NOT NULL,
- 982:                 channel_id INTEGER NOT NULL,
- 983:                 message_id INTEGER NOT NULL,
- 984:                 created_ts INTEGER NOT NULL,
- 985:                 updated_ts INTEGER NOT NULL,
- 986:                 PRIMARY KEY (guild_id, wave_id)
- 987:             );""",
- 988:             """CREATE TABLE IF NOT EXISTS level_request_scheduled_openings(
- 989:                 id INTEGER PRIMARY KEY AUTOINCREMENT,
- 990:                 guild_id INTEGER NOT NULL,
- 991:                 request_limit INTEGER,
- 992:                 close_minutes INTEGER,
- 993:                 open_ts INTEGER NOT NULL,
- 994:                 request_type TEXT,
- 995:                 open_message TEXT,
- 996:                 created_by INTEGER NOT NULL,
- 997:                 created_ts INTEGER NOT NULL,
- 998:                 status TEXT NOT NULL DEFAULT 'pending',
- 999:                 opened_wave_id INTEGER
-1000:             );""",
-1001:             """CREATE TABLE IF NOT EXISTS level_request_edit_audit(
-1002:                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-1003:                 guild_id INTEGER NOT NULL,
+1537:     async def next_ticket_id(self, guild_id: int) -> int:
+1538:         def _run():
+1539:             assert self._conn is not None
+1540:             cur = self._execute_sync(
+1541:                 "SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?",
+1542:                 (guild_id,),
+1543:             )
+1544:             row = cur.fetchone()
+1545:             if row is None:
+1546:                 next_id = 1
+1547:                 self._execute_sync(
+1548:                     "INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)",
+1549:                     (guild_id, 2),
+1550:                 )
+1551:                 self._commit_and_sync_sync()
+1552:                 return next_id
+1553:             next_id = int(_row_get(row, "next_ticket_id", index=0, default=1) or 1)
+1554:             self._execute_write_compat_sync(
+1555:                 "UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?",
+1556:                 (next_id + 1, guild_id),
+1557:             )
+1558:             self._commit_and_sync_sync()
+1559:             return next_id
+1560:
+1561:         return await self._run_locked_with_retry(_run, retry_operation=False, operation_name="next_ticket_id")
 ```
 
 The ticket ID function is the cleanest example of an atomic counter in this codebase. It reads and increments under the same database lock, commits before returning, and stores the next value by guild. This prevents two tickets opened at nearly the same time from receiving the same visible ticket number.
@@ -1110,50 +1055,59 @@ config.json is treated as a practical control plane. The Config class is intenti
 
 Many embeds use Python format_map with a SafeDict. If a template references a missing variable, the bot inserts an empty string instead of crashing the workflow. That is why template validation is useful: SafeDict keeps the bot alive, while config checks help you notice mistakes before users see blank fields.
 
-#### Request embed template renderer (cogs/RequestLevels.py:1024-1064)
+#### Request embed template renderer (cogs/RequestLevels.py:1568-1617)
 
 ```python
-1024:         return ""
-1025:
-1026:     def _provider_failure_cfg(self) -> tuple[int, int]:
-1027:         cfg = self._level_validation_cfg()
-1028:         try:
-1029:             threshold = max(1, int(cfg.get("provider_failure_threshold", 5)))
-1030:         except Exception:
-1031:             threshold = 5
-1032:         try:
-1033:             seconds = max(30, int(cfg.get("provider_circuit_breaker_seconds", 300)))
-1034:         except Exception:
-1035:             seconds = 300
-1036:         return threshold, seconds
-1037:
-1038:     def _provider_access_denied_backoff_seconds(self) -> int:
-1039:         try:
-1040:             return max(
-1041:                 300,
-1042:                 min(
-1043:                     86400,
-1044:                     int(
-1045:                         self._level_validation_cfg().get(
-1046:                             "provider_access_denied_backoff_seconds",
-1047:                             21600,
-1048:                         )
-1049:                     ),
-1050:                 ),
-1051:             )
-1052:         except Exception:
-1053:             return 21600
-1054:
-1055:     def _provider_retry_attempts(self) -> int:
-1056:         try:
-1057:             return max(
-1058:                 1,
-1059:                 min(
-1060:                     3,
-1061:                     int(self._level_validation_cfg().get("provider_retry_attempts", 2)),
-1062:                 ),
-1063:             )
-1064:         except Exception:
+1568:     def _embed_from_template(self, template: Dict[str, Any], variables: Dict[str, Any], default_color: str = "blurple") -> discord.Embed:
+1569:         if not isinstance(template, dict):
+1570:             template = {}
+1571:
+1572:         color_text = self._format(template.get("color", default_color), variables) or default_color
+1573:         title = self._format(template.get("title", ""), variables)
+1574:         description = self._format(template.get("description", ""), variables)
+1575:         embed = discord.Embed(
+1576:             title=title[:256] or None,
+1577:             description=description[:4096] or None,
+1578:             color=basic_color(color_text),
+1579:         )
+1580:
+1581:         fields = template.get("fields", []) or []
+1582:         if not isinstance(fields, list):
+1583:             fields = []
+1584:         total_chars = len(str(embed.title or "")) + len(str(embed.description or ""))
+1585:         for field in fields[:25]:
+1586:             if not isinstance(field, dict):
+1587:                 continue
+1588:             name = self._format(field.get("name", ""), variables)
+1589:             value = self._format(field.get("value", ""), variables)
+1590:             if not name or not value:
+1591:                 continue
+1592:             name = name[:256]
+1593:             value = value[:1024]
+1594:             if total_chars + len(name) + len(value) > 5700:
+1595:                 break
+1596:             embed.add_field(name=name, value=value, inline=bool(field.get("inline", False)))
+1597:             total_chars += len(name) + len(value)
+1598:
+1599:         footer = self._format(template.get("footer", ""), variables)
+1600:         if footer:
+1601:             footer = footer[: min(2048, max(0, 5850 - total_chars))]
+1602:             if footer:
+1603:                 embed.set_footer(text=footer)
+1604:                 total_chars += len(footer)
+1605:         thumbnail_url = self._format(template.get("thumbnail_url", ""), variables)
+1606:         if thumbnail_url:
+1607:             embed.set_thumbnail(url=thumbnail_url)
+1608:         image_url = self._format(template.get("image_url", ""), variables)
+1609:         if image_url:
+1610:             embed.set_image(url=image_url)
+1611:         author_name = self._format(template.get("author_name", ""), variables)
+1612:         if author_name:
+1613:             author_name = author_name[: min(256, max(0, 5950 - total_chars))]
+1614:             author_icon = self._format(template.get("author_icon_url", ""), variables)
+1615:             if author_name:
+1616:                 embed.set_author(name=author_name, icon_url=author_icon or None)
+1617:         return embed
 ```
 
 The embed renderer is shared by live request submissions, reviewed request embeds, result notifications, and wave summaries. It reads fields, footer, images, thumbnails, author info, color, title, and description from config. Workflow logic stays in Python; presentation stays in config.
@@ -1162,66 +1116,61 @@ The embed renderer is shared by live request submissions, reviewed request embed
 
 utils/views.py is the component router. It stores stable custom IDs and very small button/select classes. The view should not implement the business rules. It should only receive the click and call the owning cog.
 
-#### Request button and review button router (utils/views.py:149-205)
+#### Persistent request button router (utils/views.py:307-328)
 
 ```python
- 149:             discord.SelectOption(
- 150:                 label="Wanna partner?",
- 151:                 value="partnership",
- 152:                 description="Check the requirements and contact the partnership team",
- 153:             ),
- 154:             discord.SelectOption(
- 155:                 label="Appeal punishment",
- 156:                 value="appeal",
- 157:                 description="Ask staff to reconsider a punishment",
- 158:             ),
- 159:             discord.SelectOption(
- 160:                 label="Report a user",
- 161:                 value="report",
- 162:                 description="Privately report harmful behavior",
- 163:             ),
- 164:             discord.SelectOption(
- 165:                 label="Report a bot issue",
- 166:                 value="bot_issue",
- 167:                 description="Tell us about a broken command or workflow",
- 168:             ),
- 169:             discord.SelectOption(
- 170:                 label="Check my weekly status",
- 171:                 value="weekly_status",
- 172:                 description="See this week's message count and rank",
- 173:             ),
- 174:             discord.SelectOption(
- 175:                 label="Request transcript",
- 176:                 value="transcript",
- 177:                 description="Ask for a copy of one of your staff tickets",
- 178:             ),
- 179:             discord.SelectOption(
- 180:                 label="My submissions",
- 181:                 value="submission_status",
- 182:                 description="Check recent appeals, reports, bugs, and transcripts",
- 183:             ),
- 184:         ]
- 185:         options = [option for option in options if option.value not in exclude]
- 186:         super().__init__(
- 187:             placeholder="Select what you need help with…",
- 188:             min_values=1,
- 189:             max_values=1,
- 190:             options=options,
- 191:             custom_id=CID_HELP_MENU,
- 192:         )
- 193:
- 194:     async def callback(self, interaction: discord.Interaction):
- 195:         cog = interaction.client.get_cog("HelpCog")
- 196:         if cog:
- 197:             await cog.handle_help_selection(interaction, self.values[0])
- 198:         else:
- 199:             await interaction.response.send_message(
- 200:                 "Help system is unavailable right now. Please contact staff.",
- 201:                 ephemeral=True,
- 202:                 allowed_mentions=no_mentions(),
- 203:             )
- 204:
- 205:
+ 307: class LevelRequestButtonView(discord.ui.View):
+ 308:     def __init__(self, label: str = "Request your level!", disabled: bool = False):
+ 309:         super().__init__(timeout=None)
+ 310:         button = discord.ui.Button(
+ 311:             label=label or "Request your level!",
+ 312:             style=discord.ButtonStyle.primary,
+ 313:             custom_id=CID_LEVEL_REQUEST_BUTTON,
+ 314:             disabled=disabled,
+ 315:         )
+ 316:         button.callback = self.request
+ 317:         self.add_item(button)
+ 318:
+ 319:     async def request(self, interaction: discord.Interaction):
+ 320:         cog = interaction.client.get_cog("RequestLevelsCog")
+ 321:         if cog:
+ 322:             await cog.handle_request_button(interaction)
+ 323:         else:
+ 324:             await interaction.response.send_message(
+ 325:                 "Level requests are temporarily unavailable.",
+ 326:                 ephemeral=True,
+ 327:                 allowed_mentions=no_mentions(),
+ 328:             )
+```
+
+#### Persistent review button router (utils/views.py:331-355)
+
+```python
+ 331: class LevelRequestReviewView(discord.ui.View):
+ 332:     def __init__(self, disabled: bool = False):
+ 333:         super().__init__(timeout=None)
+ 334:         for label, style, custom_id, action in (
+ 335:             ("Send", discord.ButtonStyle.success, CID_LEVEL_REQUEST_SEND, "sent"),
+ 336:             ("Reject", discord.ButtonStyle.danger, CID_LEVEL_REQUEST_REJECT, "rejected"),
+ 337:             ("Other", discord.ButtonStyle.secondary, CID_LEVEL_REQUEST_OTHER, "other"),
+ 338:             ("Recheck", discord.ButtonStyle.secondary, CID_LEVEL_REQUEST_RECHECK, "recheck"),
+ 339:         ):
+ 340:             button = discord.ui.Button(label=label, style=style, custom_id=custom_id, disabled=disabled)
+ 341:             button.callback = self._make_callback(action)
+ 342:             self.add_item(button)
+ 343:
+ 344:     def _make_callback(self, action: str):
+ 345:         async def _callback(interaction: discord.Interaction):
+ 346:             cog = interaction.client.get_cog("RequestLevelsCog")
+ 347:             if cog:
+ 348:                 await cog.handle_review_button(interaction, action)
+ 349:             else:
+ 350:                 await interaction.response.send_message(
+ 351:                     "Request review controls are temporarily unavailable.",
+ 352:                     ephemeral=True,
+ 353:                     allowed_mentions=no_mentions(),
+ 354:                 )
+ 355:         return _callback
 ```
 
 This is why a request review button can still work after a restart. The custom ID is stable, the view is registered on startup, and the callback asks the live bot instance for RequestLevelsCog. The cog then reloads the real request state from SQLite.
@@ -1247,321 +1196,273 @@ flowchart LR
 
 The request button is deceptively complex. On click, the bot checks whether the user already has a current-wave request. If they do and the edit window is still open, the same button becomes an edit entry point. If not, it checks open/closed state, required roles, banned role, first-time request role logic, and then opens the modal.
 
-#### Request button state gate (cogs/RequestLevels.py:2078-2164)
+#### Request button state gate excerpt (cogs/RequestLevels.py:2936-3005)
 
 ```python
-2078:             note += f" Type: **{self._request_type_label(request_type)}**."
-2079:         note += " Announcement sent."
-2080:         if close_ts:
-2081:             note += f" Closes <t:{close_ts}:R> unless the limit is reached first."
-2082:         await interaction.message.edit(
-2083:             content=note,
-2084:             embed=self._scheduled_openings_embed(rows),
-2085:             view=ScheduledOpeningsView(self, interaction.user.id, rows),
-2086:         )
-2087:         await self._log_request_admin_action(
-2088:             interaction.guild,
-2089:             interaction.user.id,
-2090:             "scheduled_opening_opened_now",
-2091:             f"opening_id={opening_id} wave_id={wave_id} force={force} request_type={request_type or 'any'}",
-2092:         )
-2093:
-2094:     async def handle_scheduled_opening_edit_modal(
-2095:         self,
-2096:         interaction: discord.Interaction,
-2097:         opening_id: int,
-2098:         when: str,
-2099:         day: str,
-2100:         number: str,
-2101:         close_minutes: str,
-2102:         request_type: str,
-2103:     ):
-2104:         if interaction.guild is None:
-2105:             return await interaction.response.send_message("Wrong server.", ephemeral=True)
-2106:         member = self._cached_interaction_member(interaction)
-2107:         if member is None or not self._is_admin(member):
-2108:             return await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
-2109:
-2110:         try:
-2111:             day_int = int(day) if str(day or "").strip() else 0
-2112:         except Exception:
-2113:             return await interaction.response.send_message("Day must be a number between 1 and 31, or blank.", ephemeral=True)
-2114:         open_ts, error = self._parse_scheduled_open_ts(when, day_int)
-2115:         if open_ts is None:
-2116:             return await interaction.response.send_message(error or "I couldn't parse that opening time.", ephemeral=True)
-2117:
-2118:         def optional_positive(value: str, label: str, maximum: int) -> tuple[Optional[int], str]:
-2119:             text = str(value or "").strip()
-2120:             if not text:
-2121:                 return None, ""
-2122:             try:
-2123:                 parsed = int(text)
-2124:             except Exception:
-2125:                 return None, f"{label} must be a number, or blank."
-2126:             if parsed > maximum:
-2127:                 return None, f"{label} cannot be greater than {maximum:,}."
-2128:             return (parsed if parsed > 0 else None), ""
-2129:
-2130:         request_limit, limit_error = optional_positive(number, "Request limit", 10000)
-2131:         if limit_error:
-2132:             return await interaction.response.send_message(limit_error, ephemeral=True)
-2133:         close_value, close_error = optional_positive(close_minutes, "Close timer", 43200)
-2134:         if close_error:
-2135:             return await interaction.response.send_message(close_error, ephemeral=True)
-2136:         normalized_type = self._normalize_request_type(request_type)
-2137:         if normalized_type is None:
-2138:             return await interaction.response.send_message(
-2139:                 f"Unknown request type. Use one of: {self._request_type_help()}, or leave it blank.",
-2140:                 ephemeral=True,
-2141:             )
-2142:
-2143:         await interaction.response.defer(ephemeral=True)
-2144:         async with self._scheduled_lock:
-2145:             existing = await self.get_scheduled_opening(interaction.guild.id, opening_id)
-2146:             if existing is None:
-2147:                 return await interaction.followup.send("That opening is no longer pending.", ephemeral=True)
-2148:             await self.bot.db.execute(
-2149:                 "UPDATE level_request_scheduled_openings SET request_limit=?, close_minutes=?, open_ts=?, request_type=? WHERE guild_id=? AND id=? AND status='pending'",
-2150:                 (request_limit, close_value, open_ts, normalized_type or None, interaction.guild.id, opening_id),
-2151:             )
-2152:         await self._log_request_admin_action(
-2153:             interaction.guild,
-2154:             interaction.user.id,
-2155:             "scheduled_opening_edited",
-2156:             f"opening_id={opening_id} open_ts={open_ts} limit={request_limit} close_minutes={close_value} request_type={normalized_type or 'any'}",
-2157:         )
-2158:         await interaction.followup.send(
-2159:             f"Updated scheduled opening **#{opening_id}** for <t:{open_ts}:F> (<t:{open_ts}:R>).",
-2160:             ephemeral=True,
-2161:         )
-2162:
-2163:     def _data_vars(self, row, data: Dict[str, Any], result_key: str = "", review: str = "", reviewer_id: int = 0) -> Dict[str, Any]:
-2164:         level_showcase = str(data.get("level_showcase") or "").strip() or "Not provided"
+2936:     async def handle_request_button(self, interaction: discord.Interaction):
+2937:         if interaction.guild is None:
+2938:             return await interaction.response.send_message("Wrong server.", ephemeral=True)
+2939:
+2940:         # A modal must be the initial response. Replica-only reads avoid waiting
+2941:         # for Turso synchronization before Discord's response deadline.
+2942:         row = await self._get_state_local(interaction.guild.id)
+2943:         if row is None:
+2944:             return await interaction.response.send_message(
+2945:                 "The request system is still initializing. Please try again in a moment.",
+2946:                 ephemeral=True,
+2947:             )
+2948:
+2949:         now_ts = int(time_module.time())
+2950:         close_ts = self._row_value(row, "close_ts", None)
+2951:         timed_out = (
+2952:             str(row["state"]) == STATE_OPEN
+2953:             and close_ts is not None
+2954:             and int(close_ts) <= now_ts
+2955:         )
+2956:
+2957:         request_row = await self._current_user_submission_local(
+2958:             interaction.guild.id,
+2959:             int(row["wave_id"]),
+2960:             interaction.user.id,
+2961:         )
+2962:         if timed_out:
+2963:             self._start_background_task(
+2964:                 self._set_state_closed(interaction.guild, reason="time limit"),
+2965:                 label=f"Timed request close guild_id={interaction.guild.id}",
+2966:             )
+2967:             if request_row and self._can_edit_submission(row, request_row):
+2968:                 return await interaction.response.send_modal(
+2969:                     LevelRequestModal(
+2970:                         self,
+2971:                         interaction.user.id,
+2972:                         edit=True,
+2973:                         initial=self._request_initial_values(request_row),
+2974:                         edit_wave_id=int(request_row["wave_id"]),
+2975:                     )
+2976:                 )
+2977:             return await interaction.response.send_message(
+2978:                 self._message("closed", "Requests are closed :/"),
+2979:                 ephemeral=True,
+2980:             )
+2981:
+2982:         if request_row:
+2983:             if self._can_edit_submission(row, request_row):
+2984:                 return await interaction.response.send_modal(
+2985:                     LevelRequestModal(
+2986:                         self,
+2987:                         interaction.user.id,
+2988:                         edit=True,
+2989:                         initial=self._request_initial_values(request_row),
+2990:                         edit_wave_id=int(request_row["wave_id"]),
+2991:                     )
+2992:                 )
+2993:             if str(request_row["status"]) != "pending":
+2994:                 return await interaction.response.send_message("That request has already been reviewed.", ephemeral=True)
+2995:             if str(row["state"]) != STATE_OPEN:
+2996:                 return await interaction.response.send_message(self._message("edit_window_expired", "Your request can no longer be edited."), ephemeral=True)
+2997:             return await interaction.response.send_message(
+2998:                 self._message("already_submitted", "You already submitted a level during this request wave."),
+2999:                 ephemeral=True,
+3000:             )
+3001:
+3002:         if str(row["state"]) != STATE_OPEN:
+3003:             return await interaction.response.send_message(self._message("closed", "Requests are closed :/"), ephemeral=True)
+3004:
+3005:         member = self._cached_interaction_member(interaction)
 ```
 
 The submission handler uses a lock because request limits and duplicate checks must be consistent. Imagine a wave with one slot left and two users submit at the same moment. Without the lock, both could pass the count check. With the lock, one complete submission finishes before the next one evaluates the current state.
 
-#### Request form core transaction (cogs/RequestLevels.py:2166-2296)
+#### Request form submission excerpt (cogs/RequestLevels.py:3063-3152)
 
 ```python
-2166:         result_label = self._result_label(result_key)
-2167:         result_color = self._color_name(result_key, self._color_name("pending", "blurple"))
-2168:         requester_id = int(self._row_value(row, "user_id", 0) or 0)
-2169:         wave_raw = self._row_value(row, "wave_id", "")
-2170:         try:
-2171:             wave_id = int(wave_raw)
-2172:         except Exception:
-2173:             wave_id = str(wave_raw or "")
-2174:         created_ts = self._row_value(row, "created_ts", "")
-2175:         edit_deadline_ts = data.get("edit_deadline_ts") or self._row_value(row, "edit_deadline_ts", "")
-2176:         raw_thresholds = self._cfg("aging_threshold_hours", default=[12, 24, 48])
-2177:         thresholds = raw_thresholds if isinstance(raw_thresholds, list) else [12, 24, 48]
-2178:         age = request_age(created_ts, thresholds=thresholds)
-2179:         correlation_id = str(data.get("correlation_id") or self._row_value(row, "correlation_id", "") or "")
-2180:         variables = {
-2181:             **data,
-2182:             "level_id": data.get("level_id", ""),
-2183:             "level_name": data.get("level_name", ""),
-2184:             "creators": data.get("creators", ""),
-2185:             "request_type": str(data.get("request_type") or ""),
-2186:             "request_type_label": str(data.get("request_type_label") or self._request_type_label(data.get("request_type"))),
-2187:             "level_showcase": level_showcase,
-2188:             "showcase": level_showcase,
-2189:             "notes": notes,
-2190:             "requester_id": requester_id,
-2191:             "requester_mention": f"<@{requester_id}>",
-2192:             "wave_id": wave_id,
-2193:             "submitted_ts": created_ts,
-2194:             "submitted_ago": self._submitted_ago(created_ts),
-2195:             "sla_indicator": age.indicator,
-2196:             "sla_status": age.status,
-2197:             "sla_hours": f"{age.hours:.1f}",
-2198:             "correlation_id": correlation_id,
-2199:             "edit_deadline_ts": edit_deadline_ts,
-2200:             "edit_deadline": f"<t:{edit_deadline_ts}:R>" if edit_deadline_ts else "",
-2201:             "edit_count": data.get("edit_count", 0),
-2202:             "duplicate_history_warning": str(data.get("duplicate_history_warning") or ""),
-2203:             "level_validation_warning": str(data.get("level_validation_warning") or ""),
-2204:             "level_validation_sources": str(data.get("level_validation_sources") or ""),
-2205:             "level_validation_checked": str(data.get("level_validation_checked") or ""),
-2206:             "level_validation_refresh": str(data.get("level_validation_refresh") or ""),
-2207:             "level_exists": str(data.get("level_exists") or "unknown"),
-2208:             "level_rated": str(data.get("level_rated") or "unknown"),
-2209:             "level_requires_showcase": str(data.get("level_requires_showcase") or "unknown"),
-2210:             "gd_level_name": str(data.get("gd_level_name") or "Unknown"),
-2211:             "gd_creator": str(data.get("gd_creator") or "Unknown"),
-2212:             "gd_difficulty": str(data.get("gd_difficulty") or "Unknown"),
-2213:             "gd_length": str(data.get("gd_length") or "Unknown"),
-2214:             "gd_stars": str(data.get("gd_stars") or "Unknown"),
-2215:             "gd_rated": str(data.get("gd_rated") or "Unknown"),
-2216:             "gd_demon": str(data.get("gd_demon") or "Unknown"),
-2217:             "gd_platformer": str(data.get("gd_platformer") or "Unknown"),
-2218:             "gd_featured": str(data.get("gd_featured") or "Unknown"),
-2219:             "gd_epic": str(data.get("gd_epic") or "Unknown"),
-2220:             "gd_flags": str(data.get("gd_flags") or "Unknown"),
-2221:             "gd_info": str(data.get("gd_info") or "GD info is not available yet."),
-2222:             "result": result_label,
-2223:             "result_key": result_key,
-2224:             "review": review or "No review provided.",
-2225:             "reviewer_id": reviewer_id or "",
-2226:             "reviewer_mention": f"<@{reviewer_id}>" if reviewer_id else "Unknown",
-2227:             "pending_color": self._color_name("pending", "blurple"),
-2228:             "result_color": result_color,
-2229:         }
-2230:         return variables
-2231:
-2232:     def _weekly_data_vars(self, row, data: Dict[str, Any], result_key: str = "", review: str = "", reviewer_id: int = 0) -> Dict[str, Any]:
-2233:         rank = self._row_value(row, "rank", None)
-2234:         try:
-2235:             rank_text = f"#{int(rank)}"
-2236:         except Exception:
-2237:             rank_text = "Unknown"
-2238:         variables = self._data_vars(
-2239:             {
-2240:                 "user_id": int(self._row_value(row, "user_id", 0) or 0),
-2241:                 "wave_id": "Weekly",
-2242:                 "created_ts": self._row_value(row, "created_ts", ""),
-2243:             },
-2244:             data,
-2245:             result_key=result_key,
-2246:             review=review,
-2247:             reviewer_id=reviewer_id,
-2248:         )
-2249:         variables.update(
-2250:             {
-2251:                 "review_kind": "weekly",
-2252:                 "week_start": self._row_value(row, "week_start", ""),
-2253:                 "rank": rank_text,
-2254:                 "weekly_rank": rank_text,
-2255:                 "request_content": str(data.get("request_content") or ""),
-2256:             }
-2257:         )
-2258:         return variables
-2259:
-2260:     def _result_label(self, result_key: str) -> str:
-2261:         if result_key == "sent":
-2262:             return "Sent"
-2263:         if result_key == "rejected":
-2264:             return "Rejected"
-2265:         return OTHER_REASONS.get(result_key, result_key or "Pending")
-2266:
-2267:     def _status_channel_id(self, result_key: str) -> int:
-2268:         if result_key == "sent":
-2269:             return self._cfg_int("sent_channel")
-2270:         return self._cfg_int("rejected_channel")
-2271:
-2272:     def _result_template_key(self, result_key: str) -> str:
-2273:         if result_key == "sent":
-2274:             return "sent_result_embed"
-2275:         if result_key == "rejected":
-2276:             return "rejected_result_embed"
-2277:         return "other_result_embed"
-2278:
-2279:     async def _get_state(self, guild_id: int):
-2280:         row = await self.bot.db.fetchone("SELECT * FROM level_request_state WHERE guild_id=?", (guild_id,))
-2281:         if row is not None:
-2282:             return row
-2283:         await self.bot.db.execute(
-2284:             "INSERT OR IGNORE INTO level_request_state(guild_id,state,wave_id,submitted_count) VALUES(?,?,?,?)",
-2285:             (guild_id, STATE_CLOSED, 0, 0),
-2286:         )
-2287:         return await self.bot.db.fetchone("SELECT * FROM level_request_state WHERE guild_id=?", (guild_id,))
-2288:
-2289:     async def _get_state_local(self, guild_id: int):
-2290:         return await self.bot.db.fetchone_local(
-2291:             "SELECT * FROM level_request_state WHERE guild_id=?",
-2292:             (guild_id,),
-2293:         )
-2294:
-2295:     async def _set_state_closed(self, guild: discord.Guild, reason: str = "manual") -> None:
-2296:         changed = False
+3063:     async def handle_request_form(self, interaction: discord.Interaction, data: Dict[str, str]):
+3064:         if interaction.guild is None:
+3065:             return await self._reply_ephemeral(interaction, "Wrong server.")
+3066:         member = await self._resolve_member(interaction.guild, interaction.user)
+3067:         if member is None or not await self._requirements_ok(member):
+3068:             return await self._reply_ephemeral(
+3069:                 interaction,
+3070:                 self._message("no_requirements", "You don't meet the requirements, please read the requesting rules"),
+3071:             )
+3072:         if not data.get("level_id") or not data.get("level_name") or not data.get("creators"):
+3073:             return await self._reply_ephemeral(interaction, "Missing required fields.")
+3074:         validation_errors = self._validate_request_data(data)
+3075:         if validation_errors:
+3076:             return await self._reply_ephemeral(
+3077:                 interaction,
+3078:                 self._message_formatted(
+3079:                     "validation_error",
+3080:                     "Please fix your request before submitting: {errors}",
+3081:                     {"errors": " ".join(validation_errors)},
+3082:                 ),
+3083:             )
+3084:
+3085:         if not interaction.response.is_done():
+3086:             await interaction.response.defer(ephemeral=True)
+3087:
+3088:         external_errors, level_validation = await self._validate_level_external(data, interaction.guild.id, interaction.user.id)
+3089:         if external_errors:
+3090:             return await self._reply_ephemeral(
+3091:                 interaction,
+3092:                 self._message_formatted(
+3093:                     "validation_error",
+3094:                     "Please fix your request before submitting: {errors}",
+3095:                     {"errors": " ".join(external_errors)},
+3096:                 ),
+3097:             )
+3098:
+3099:         refresh_after_close = False
+3100:         closed_before_submit = False
+3101:         closed_by_timer = False
+3102:         async with self._state_lock, self._submit_lock:
+3103:             row = await self._get_state(interaction.guild.id)
+3104:             if str(row["state"]) != STATE_OPEN:
+3105:                 closed_before_submit = True
+3106:             elif row["close_ts"] is not None and int(row["close_ts"]) <= int(time_module.time()):
+3107:                 closed_ts = int(row["close_ts"])
+3108:                 await self.bot.db.execute_transaction(
+3109:                     (
+3110:                         (
+3111:                             "UPDATE level_request_state SET state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
+3112:                             (STATE_CLOSED, closed_ts, interaction.guild.id),
+3113:                         ),
+3114:                         (
+3115:                             "UPDATE level_request_submissions SET edit_deadline_ts=? "
+3116:                             "WHERE guild_id=? AND wave_id=? AND status='pending' AND edit_deadline_ts IS NULL",
+3117:                             (
+3118:                                 closed_ts + self._post_close_edit_seconds(),
+3119:                                 interaction.guild.id,
+3120:                                 int(row["wave_id"]),
+3121:                             ),
+3122:                         ),
+3123:                     ),
+3124:                     retry_safe=True,
+3125:                 )
+3126:                 refresh_after_close = True
+3127:                 closed_by_timer = True
+3128:
+3129:             if not closed_before_submit and not refresh_after_close:
+3130:                 wave_id = int(row["wave_id"])
+3131:                 user_id = interaction.user.id
+3132:                 normalized_level_id = self._normalize_level_id(data["level_id"])
+3133:                 request_type = self._request_type_from_row(row)
+3134:                 type_error = self._request_type_validation_error(request_type, data, level_validation)
+3135:                 if type_error:
+3136:                     return await self._reply_ephemeral(interaction, type_error)
+3137:
+3138:                 existing_user = await self.bot.db.fetchone(
+3139:                     "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+3140:                     (interaction.guild.id, wave_id, user_id),
+3141:                 )
+3142:                 if existing_user:
+3143:                     return await self._reply_ephemeral(interaction, self._message("already_submitted", "You already submitted a level during this request wave."))
+3144:
+3145:                 existing_level = await self.bot.db.fetchone(
+3146:                     "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND level_id=?",
+3147:                     (interaction.guild.id, wave_id, normalized_level_id),
+3148:                 )
+3149:                 if existing_level:
+3150:                     return await self._reply_ephemeral(interaction, self._message("duplicate_level", "That level ID has already been submitted during this request wave."))
+3151:
+3152:                 target_channel = await self._configured_channel(interaction.guild, "level_requested")
 ```
 
 Notice the order: validate local fields, defer the interaction, validate externally, enter the submit lock, reload current state, check duplicate user and duplicate level ID, send the review embed, store the Discord message ID, then increment the wave count. The request only counts after the staff queue message exists.
 
-#### Request edit audit trail (cogs/RequestLevels.py:2368-2447)
+#### Request edit audit trail excerpt (cogs/RequestLevels.py:3288-3377)
 
 ```python
-2368:                     if scheduled is None:
-2369:                         raise RuntimeError("That scheduled opening is no longer pending.")
-2370:                     correlation_id = str(
-2371:                         self._row_value(scheduled, "correlation_id", "")
-2372:                         or correlation_id
-2373:                     )
-2374:
-2375:                 current = await self._get_state(guild.id)
-2376:                 if current and str(current["state"]) == STATE_OPEN:
-2377:                     if not replace_active:
-2378:                         raise RuntimeError("Requests are already open.")
-2379:                     previous_wave_id = int(current["wave_id"])
-2380:
-2381:                 wave_id = int(current["wave_id"]) + 1
-2382:                 now_ts = int(time_module.time())
-2383:                 prior_wave_id = int(current["wave_id"])
-2384:                 prior_closed_ts = self._row_value(current, "closed_ts", None)
-2385:                 prior_edit_deadline = (
-2386:                     now_ts + self._post_close_edit_seconds()
-2387:                     if str(current["state"]) == STATE_OPEN
-2388:                     else int(prior_closed_ts or now_ts) + self._post_close_edit_seconds()
-2389:                 )
-2390:                 close_ts = now_ts + int(close_minutes) * 60 if close_minutes and int(close_minutes) > 0 else None
-2391:                 normalized_type = self._normalize_request_type(request_type) or ""
-2392:                 statements = [
-2393:                     (
-2394:                         "UPDATE level_request_state SET state=?, wave_id=?, request_limit=?, close_ts=?, "
-2395:                         "submitted_count=0, opened_ts=?, closed_ts=NULL, request_type=? WHERE guild_id=?",
-2396:                         (STATE_OPEN, wave_id, request_limit, close_ts, now_ts, normalized_type or None, guild.id),
-2397:                     )
-2398:                 ]
-2399:                 if prior_wave_id:
-2400:                     statements.insert(
-2401:                         0,
-2402:                         (
-2403:                             "UPDATE level_request_submissions SET edit_deadline_ts=? "
-2404:                             "WHERE guild_id=? AND wave_id=? AND status='pending' AND edit_deadline_ts IS NULL",
-2405:                             (prior_edit_deadline, guild.id, prior_wave_id),
-2406:                         ),
-2407:                     )
-2408:                 if scheduled_opening_id:
-2409:                     statements.append(
-2410:                         (
-2411:                             "UPDATE level_request_scheduled_openings SET status='opened', opened_wave_id=? "
-2412:                             "WHERE guild_id=? AND id=? AND status='pending'",
-2413:                             (wave_id, guild.id, int(scheduled_opening_id)),
-2414:                         )
-2415:                     )
-2416:                 await self.bot.db.execute_transaction(statements, retry_safe=True)
-2417:
-2418:         await record_workflow_event(
-2419:             self.bot.db,
-2420:             workflow_type="request_wave",
-2421:             entity_id=str(wave_id),
-2422:             event="opened",
-2423:             correlation_id=correlation_id,
-2424:             guild_id=guild.id,
-2425:             payload={
-2426:                 "request_limit": request_limit,
-2427:                 "close_minutes": close_minutes,
-2428:                 "close_ts": close_ts,
-2429:                 "request_type": normalized_type,
-2430:                 "scheduled_opening_id": int(scheduled_opening_id or 0),
-2431:                 "replaced_wave_id": previous_wave_id,
-2432:             },
-2433:         )
-2434:
-2435:         if previous_wave_id:
-2436:             try:
-2437:                 await self.update_wave_summary(guild, previous_wave_id)
-2438:             except Exception as e:
-2439:                 await log_error(self.bot, f"Could not finalize replaced wave {previous_wave_id} summary: {repr(e)}")
-2440:         try:
-2441:             message = await self.refresh_or_create_request_button(guild)
-2442:             if message is None:
-2443:                 await log_error(self.bot, f"Request wave {wave_id} opened but its button message could not be created.")
-2444:         except Exception as e:
-2445:             await log_error(self.bot, f"Request wave {wave_id} opened but button refresh failed: {repr(e)}")
-2446:         await self._send_open_announcement(
-2447:             guild,
+3288:     async def handle_request_edit_form(
+3289:         self,
+3290:         interaction: discord.Interaction,
+3291:         data: Dict[str, str],
+3292:         edit_wave_id: int = 0,
+3293:     ):
+3294:         if interaction.guild is None:
+3295:             return await self._reply_ephemeral(interaction, "Wrong server.")
+3296:         member = await self._resolve_member(interaction.guild, interaction.user)
+3297:         if member is None or not await self._requirements_ok(member):
+3298:             return await self._reply_ephemeral(
+3299:                 interaction,
+3300:                 self._message("no_requirements", "You don't meet the requirements, please read the requesting rules"),
+3301:             )
+3302:         if not data.get("level_id") or not data.get("level_name") or not data.get("creators"):
+3303:             return await self._reply_ephemeral(interaction, "Missing required fields.")
+3304:         validation_errors = self._validate_request_data(data)
+3305:         if validation_errors:
+3306:             return await self._reply_ephemeral(
+3307:                 interaction,
+3308:                 self._message_formatted(
+3309:                     "validation_error",
+3310:                     "Please fix your request before submitting: {errors}",
+3311:                     {"errors": " ".join(validation_errors)},
+3312:                 ),
+3313:             )
+3314:         if not interaction.response.is_done():
+3315:             await interaction.response.defer(ephemeral=True)
+3316:
+3317:         external_errors, level_validation = await self._validate_level_external(data, interaction.guild.id, interaction.user.id)
+3318:         if external_errors:
+3319:             return await self._reply_ephemeral(
+3320:                 interaction,
+3321:                 self._message_formatted(
+3322:                     "validation_error",
+3323:                     "Please fix your request before submitting: {errors}",
+3324:                     {"errors": " ".join(external_errors)},
+3325:                 ),
+3326:             )
+3327:
+3328:         async with self._state_lock, self._submit_lock:
+3329:             state_row = await self._get_state(interaction.guild.id)
+3330:             if (
+3331:                 str(state_row["state"]) == STATE_OPEN
+3332:                 and state_row["close_ts"] is not None
+3333:                 and int(state_row["close_ts"]) <= int(time_module.time())
+3334:             ):
+3335:                 closing_wave_id = int(state_row["wave_id"])
+3336:                 closed_ts = int(state_row["close_ts"])
+3337:                 await self.bot.db.execute_transaction(
+3338:                     (
+3339:                         (
+3340:                             "UPDATE level_request_state SET state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
+3341:                             (STATE_CLOSED, closed_ts, interaction.guild.id),
+3342:                         ),
+3343:                         (
+3344:                             "UPDATE level_request_submissions SET edit_deadline_ts=? "
+3345:                             "WHERE guild_id=? AND wave_id=? AND status='pending' AND edit_deadline_ts IS NULL",
+3346:                             (
+3347:                                 closed_ts + self._post_close_edit_seconds(),
+3348:                                 interaction.guild.id,
+3349:                                 closing_wave_id,
+3350:                             ),
+3351:                         ),
+3352:                     ),
+3353:                     retry_safe=True,
+3354:                 )
+3355:                 self._start_background_task(
+3356:                     self._refresh_closed_wave(interaction.guild, closing_wave_id),
+3357:                     label=f"Closed-wave refresh wave_id={closing_wave_id}",
+3358:                 )
+3359:                 state_row = await self._get_state(interaction.guild.id)
+3360:             wave_id = int(edit_wave_id or state_row["wave_id"])
+3361:             row = await self.bot.db.fetchone(
+3362:                 "SELECT * FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+3363:                 (interaction.guild.id, wave_id, interaction.user.id),
+3364:             )
+3365:             if not row:
+3366:                 return await self._reply_ephemeral(interaction, "That request could not be found.")
+3367:             if str(row["status"]) != "pending":
+3368:                 return await self._reply_ephemeral(interaction, "That request has already been reviewed.")
+3369:             if not self._can_edit_submission(state_row, row):
+3370:                 return await self._reply_ephemeral(interaction, self._message("edit_window_expired", "Your request can no longer be edited."))
+3371:
+3372:             old_data_json = row["data_json"] or "{}"
+3373:             old_data = self._safe_json_loads(old_data_json, {})
+3374:             normalized_level_id = self._normalize_level_id(data["level_id"])
+3375:             if wave_id == int(state_row["wave_id"]):
+3376:                 request_type = self._request_type_from_row(state_row)
+3377:             else:
 ```
 
 The edit path writes both the new data and an audit record. That lets reviewers know the request changed and lets you inspect what changed later. The audit table stores old and new JSON snapshots because request form data is template-driven and may gain fields over time.
@@ -1570,206 +1471,189 @@ The edit path writes both the new data and an audit record. That lets reviewers 
 
 Validation is split into two files. utils/gd_validation.py knows how to parse provider responses and combine them. RequestLevelsCog decides when to call validation, cache it, rate-limit it, and turn the result into user-facing errors or reviewer warnings.
 
-#### Provider result combiner (utils/gd_validation.py:197-264)
+#### Provider result combiner excerpt (utils/gd_validation.py:339-408)
 
 ```python
- 197:         "difficulty": difficulty or "Unknown",
- 198:         "length": length or "Unknown",
- 199:         "stars": stars,
- 200:         "rated": stars > 0 or featured or epic or cp > 0,
- 201:         "featured": featured,
- 202:         "epic": epic,
- 203:         "demon": demon,
- 204:         "platformer": platformer,
- 205:     }
- 206:
- 207:
- 208: def parse_boomlings_level(text: str, level_id: str) -> dict[str, Any]:
- 209:     raw = str(text or "").strip()
- 210:     if raw == "-1":
- 211:         return {"provider": "boomlings", "ok": True, "exists": False}
- 212:     if not raw or raw.startswith("<"):
- 213:         return _provider_error(
- 214:             "boomlings",
- 215:             "Unexpected response",
- 216:             failure_kind="invalid_response",
- 217:         )
- 218:
- 219:     sections = raw.split("#")
- 220:     levels_text = sections[0] if sections else ""
- 221:     creators = _boomlings_creator_map(sections[1] if len(sections) > 1 else "")
- 222:     level_parts = [part for part in levels_text.split("|") if part]
- 223:     if not level_parts:
- 224:         return _provider_error(
- 225:             "boomlings",
- 226:             "Response did not include level data",
- 227:             failure_kind="invalid_response",
- 228:         )
- 229:
- 230:     selected = None
- 231:     for item in level_parts:
- 232:         parsed = _kv_pairs(item)
- 233:         if str(parsed.get("1") or "") == str(level_id):
- 234:             selected = parsed
- 235:             break
- 236:     if selected is None:
- 237:         # Search endpoints can return related/popular levels even when the
- 238:         # exact ID is absent. Treating the first result as the requested level
- 239:         # can validate and display metadata for the wrong submission.
- 240:         return {"provider": "boomlings", "ok": True, "exists": False}
- 241:
- 242:     parsed_id = str(selected.get("1") or level_id)
- 243:     stars = _as_int(selected.get("18"), 0)
- 244:     feature_score = _as_int(selected.get("19"), 0)
- 245:     epic = _as_int(selected.get("42"), 0)
- 246:     demon = _as_bool(selected.get("17"))
- 247:     length_code = _as_int(selected.get("15"), -1)
- 248:     platformer = length_code == 5
- 249:     difficulty = _demon_difficulty(selected.get("43")) if demon else _classic_difficulty(selected.get("9"))
- 250:     if platformer and stars > 0:
- 251:         difficulty = f"{difficulty} Platformer" if difficulty != "Unknown" else "Platformer"
- 252:
- 253:     return {
- 254:         "provider": "boomlings",
- 255:         "ok": True,
- 256:         "exists": True,
- 257:         "level_id": parsed_id,
- 258:         "name": str(selected.get("2") or ""),
- 259:         "creator": creators.get(str(selected.get("6") or ""), ""),
- 260:         "difficulty": difficulty,
- 261:         "length": _length_name(length_code),
- 262:         "stars": stars,
- 263:         "rated": stars > 0 or feature_score > 0 or epic > 0,
- 264:         "featured": feature_score > 0,
+ 339: def combine_level_validation(
+ 340:     level_id: str,
+ 341:     provider_results: dict[str, dict[str, Any]],
+ 342:     checked_ts: int | None = None,
+ 343:     expires_ts: int | None = None,
+ 344: ) -> dict[str, Any]:
+ 345:     checked_ts = int(checked_ts or time.time())
+ 346:     expires_ts = int(expires_ts or checked_ts)
+ 347:     results = {str(k): dict(v or {}) for k, v in provider_results.items()}
+ 348:     successful = [result for result in results.values() if result.get("ok")]
+ 349:     existing = [result for result in successful if result.get("exists") is True]
+ 350:     missing = [result for result in successful if result.get("exists") is False]
+ 351:     failed = [result for result in results.values() if not result.get("ok")]
+ 352:     disagreement = bool(existing and missing)
+ 353:     all_requested_succeeded = bool(results) and not failed
+ 354:
+ 355:     if existing:
+ 356:         exists: bool | None = True
+ 357:     elif missing and all_requested_succeeded:
+ 358:         exists = False
+ 359:     else:
+ 360:         exists = None
+ 361:
+ 362:     missing_confident = exists is False and all_requested_succeeded and bool(missing)
+ 363:     rated = any(bool(result.get("rated")) for result in existing)
+ 364:     requires_showcase = any(bool(result.get("demon")) or bool(result.get("platformer")) for result in existing)
+ 365:     chosen = existing[0] if existing else {}
+ 366:
+ 367:     warnings: list[str] = []
+ 368:     if disagreement:
+ 369:         warnings.append("GDBrowser and the GD API disagreed. Please check this level manually.")
+ 370:     elif exists is None and missing:
+ 371:         warnings.append("This level doesn't seem to exist, but one validation source failed, so it was not auto-blocked.")
+ 372:     elif exists is None:
+ 373:         warnings.append("Level validation could not run right now. Please check this level manually.")
+ 374:     elif exists is False and not missing_confident:
+ 375:         warnings.append("This level doesn't seem to exist, but validation was not confident enough to block it.")
+ 376:     if rated:
+ 377:         warnings.append("This level seems to have been rated already.")
+ 378:     if requires_showcase:
+ 379:         warnings.append("This level appears to be a demon or platformer; a showcase is required.")
+ 380:
+ 381:     sources = []
+ 382:     for provider, result in sorted(results.items()):
+ 383:         if result.get("ok") and result.get("exists") is True:
+ 384:             status = "found"
+ 385:         elif result.get("ok") and result.get("exists") is False:
+ 386:             status = "missing"
+ 387:         else:
+ 388:             kind = str(
+ 389:                 result.get("circuit_reason")
+ 390:                 or result.get("failure_kind")
+ 391:                 or ""
+ 392:             ).replace("_", " ")
+ 393:             detail = kind or str(result.get("error") or "unknown")
+ 394:             status = f"unavailable ({detail})"
+ 395:         sources.append(f"{provider}: {status}")
+ 396:
+ 397:     return {
+ 398:         "level_id": str(level_id),
+ 399:         "checked_ts": checked_ts,
+ 400:         "expires_ts": expires_ts,
+ 401:         "providers": results,
+ 402:         "exists": exists,
+ 403:         "missing_confident": missing_confident,
+ 404:         "rated": rated,
+ 405:         "requires_showcase": requires_showcase,
+ 406:         "warnings": warnings,
+ 407:         "provider_disagreement": disagreement,
+ 408:         "level_name": str(chosen.get("name") or ""),
 ```
 
 The combiner does not pretend providers are always perfect. It tracks existing results, missing results, failed providers, disagreement, rating status, and whether a showcase appears required. This is why the bot can block confidently missing IDs but only warn when a provider failed or disagreed.
 
-#### Cached provider lookup and circuit breaker use (cogs/RequestLevels.py:833-912)
+#### Cached provider lookup excerpt (cogs/RequestLevels.py:1346-1415)
 
 ```python
- 833:         parts = []
- 834:         if request_limit:
- 835:             amount = int(request_limit)
- 836:             parts.append(f"{amount} request{'s' if amount != 1 else ''}")
- 837:         if close_minutes:
- 838:             minutes = int(close_minutes)
- 839:             parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
- 840:         if not parts:
- 841:             return "an indefinite wave"
- 842:         return " or ".join(parts)
- 843:
- 844:     async def _send_open_announcement(
- 845:         self,
- 846:         guild: discord.Guild,
- 847:         wave_id: int,
- 848:         request_limit: Optional[int],
- 849:         close_minutes: Optional[int],
- 850:         close_ts: Optional[int],
- 851:         request_type: str,
- 852:         open_message: Optional[str] = None,
- 853:     ) -> None:
- 854:         cfg = self._cfg("open_announcement", default={}) or {}
- 855:         if not isinstance(cfg, dict):
- 856:             cfg = {}
- 857:         custom_message = self._clean_open_message(open_message)
- 858:         disabled_words = {"off", "disable", "disabled", "none", "no"}
- 859:         if custom_message and custom_message.casefold() in disabled_words:
- 860:             return
- 861:         if not custom_message and not bool(cfg.get("enabled", True)):
- 862:             return
- 863:
- 864:         channel_id = 0
- 865:         try:
- 866:             channel_id = int(cfg.get("channel_id") or 0)
- 867:         except Exception:
- 868:             channel_id = 0
- 869:         channel = await self._channel_by_id(guild, channel_id) if channel_id else await self._configured_channel(guild, "request_channel")
- 870:         if channel is None:
- 871:             return
- 872:
- 873:         try:
- 874:             role_id = int(cfg.get("default_role_id") or 786245470636605440)
- 875:         except Exception:
- 876:             role_id = 786245470636605440
- 877:         condition_text = self._request_open_condition_text(request_limit, close_minutes)
- 878:         variables = {
- 879:             "wave_id": wave_id,
- 880:             "request_limit": "" if request_limit is None else int(request_limit),
- 881:             "close_minutes": "" if close_minutes is None else int(close_minutes),
- 882:             "close_ts": "" if close_ts is None else int(close_ts),
- 883:             "condition_text": condition_text,
- 884:             "request_type": request_type or "",
- 885:             "request_type_label": self._request_type_label(request_type),
- 886:             "role_id": role_id,
- 887:             "role_mention": f"<@&{role_id}>" if role_id else "",
- 888:         }
- 889:         template = custom_message or str(cfg.get("message") or "").strip()
- 890:         if not template:
- 891:             template = "{role_mention}, requests have been opened for {condition_text}"
- 892:         content = self._format(template, variables).strip()
- 893:         if not content:
- 894:             return
- 895:         try:
- 896:             await channel.send(content=content[:2000], allowed_mentions=user_and_role_mentions())
- 897:         except Exception as e:
- 898:             await log_error(self.bot, f"Could not send request open announcement wave_id={wave_id}: {repr(e)}")
- 899:
- 900:     def _color_name(self, key: str, default: str = "blurple") -> str:
- 901:         return str(self._cfg("colors", key, default=default) or default)
- 902:
- 903:     def _format(self, text: Any, variables: Dict[str, Any]) -> str:
- 904:         try:
- 905:             return str(text or "").format_map(_SafeDict({k: str(v) for k, v in variables.items()}))
- 906:         except Exception:
- 907:             return str(text or "")
- 908:
- 909:     def _submitted_ago(self, created_ts: Any) -> str:
- 910:         try:
- 911:             ts = int(created_ts)
- 912:         except Exception:
+1346:     async def _lookup_level_validation(self, level_id: str, force: bool = False) -> Dict[str, Any]:
+1347:         level_id = self._clean_level_id(level_id)
+1348:         if not self._level_validation_enabled() or not level_id:
+1349:             return {}
+1350:
+1351:         now_ts = int(time_module.time())
+1352:         if not force:
+1353:             cached = await self._cached_level_validation(level_id)
+1354:             if cached:
+1355:                 return cached
+1356:
+1357:             existing = self._validation_inflight.get(level_id)
+1358:             if existing is not None and not existing.done():
+1359:                 return await asyncio.shield(existing)
+1360:
+1361:             task = asyncio.create_task(self._lookup_level_validation(level_id, force=True))
+1362:             self._validation_inflight[level_id] = task
+1363:             try:
+1364:                 return await asyncio.shield(task)
+1365:             finally:
+1366:                 if self._validation_inflight.get(level_id) is task:
+1367:                     self._validation_inflight.pop(level_id, None)
+1368:
+1369:         providers = self._level_validation_providers()
+1370:         results: dict[str, dict[str, Any]] = {}
+1371:         ready_providers: list[str] = []
+1372:         for provider in ("gdbrowser", "boomlings"):
+1373:             if not providers.get(provider):
+1374:                 continue
+1375:             if self._provider_circuit_open(provider):
+1376:                 results[provider] = self._provider_circuit_result(provider)
+1377:             else:
+1378:                 ready_providers.append(provider)
+1379:
+1380:         if not ready_providers and not results:
+1381:             return {}
+1382:
+1383:         tasks = []
+1384:         if ready_providers:
+1385:             session = await self._get_level_validation_session()
+1386:             tasks = [
+1387:                 (provider, self._fetch_validation_provider(provider, session, level_id))
+1388:                 for provider in ready_providers
+1389:             ]
+1390:
+1391:         fetched = await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
+1392:         for (provider, _), result in zip(tasks, fetched, strict=True):
+1393:             if isinstance(result, Exception):
+1394:                 results[provider] = {"provider": provider, "ok": False, "exists": None, "error": type(result).__name__}
+1395:                 self._record_provider_validation_result(provider, results[provider])
+1396:             elif isinstance(result, dict):
+1397:                 results[provider] = result
+1398:             else:
+1399:                 results[provider] = {"provider": provider, "ok": False, "exists": None, "error": "Unexpected result"}
+1400:                 self._record_provider_validation_result(provider, results[provider])
+1401:
+1402:         successful_provider = any(result.get("ok") for result in results.values())
+1403:         cache_seconds = (
+1404:             self._level_validation_cache_seconds()
+1405:             if successful_provider
+1406:             else self._level_validation_failure_cache_seconds()
+1407:         )
+1408:         expires_ts = now_ts + cache_seconds
+1409:         combined = combine_level_validation(level_id, results, checked_ts=now_ts, expires_ts=expires_ts)
+1410:         try:
+1411:             await self.bot.db.execute(
+1412:                 "INSERT INTO gd_level_validation_cache(level_id,checked_ts,expires_ts,data_json) VALUES(?,?,?,?) "
+1413:                 "ON CONFLICT(level_id) DO UPDATE SET checked_ts=excluded.checked_ts, expires_ts=excluded.expires_ts, data_json=excluded.data_json",
+1414:                 (level_id, now_ts, expires_ts, json.dumps(combined, separators=(",", ":"))),
+1415:             )
 ```
 
-#### External validation policy (cogs/RequestLevels.py:976-1012)
+#### External validation policy (cogs/RequestLevels.py:1502-1529)
 
 ```python
- 976:         return {
- 977:             "gdbrowser": bool(providers.get("gdbrowser", True)),
- 978:             "boomlings": bool(providers.get("boomlings", True)),
- 979:         }
- 980:
- 981:     def _level_validation_rate_limit_message(self, guild_id: int, user_id: int) -> str:
- 982:         cfg = self._level_validation_cfg()
- 983:         try:
- 984:             window = max(10, int(cfg.get("per_user_window_seconds", 60)))
- 985:         except Exception:
- 986:             window = 60
- 987:         try:
- 988:             max_checks = max(1, int(cfg.get("per_user_max_checks", 6)))
- 989:         except Exception:
- 990:             max_checks = 6
- 991:         try:
- 992:             cooldown = max(0, int(cfg.get("per_user_cooldown_seconds", 20)))
- 993:         except Exception:
- 994:             cooldown = 20
- 995:
- 996:         now_ts = int(time_module.time())
- 997:         key = (int(guild_id or 0), int(user_id or 0))
- 998:         if len(self._validation_attempts) > 5000:
- 999:             stale_keys = [
-1000:                 attempt_key
-1001:                 for attempt_key, timestamps in self._validation_attempts.items()
-1002:                 if not timestamps or now_ts - int(timestamps[-1]) >= window
-1003:             ]
-1004:             for attempt_key in stale_keys[:1000]:
-1005:                 self._validation_attempts.pop(attempt_key, None)
-1006:         attempts = [ts for ts in self._validation_attempts.get(key, []) if now_ts - int(ts) < window]
-1007:         if cooldown and attempts and now_ts - int(attempts[-1]) < cooldown:
-1008:             wait = cooldown - (now_ts - int(attempts[-1]))
-1009:             self._validation_attempts[key] = attempts
-1010:             return f"Please wait {wait}s before validating another level ID."
-1011:         if len(attempts) >= max_checks:
-1012:             self._validation_attempts[key] = attempts
+1502:     async def _validate_level_external(self, data: Dict[str, str], guild_id: int = 0, user_id: int = 0) -> tuple[list[str], Dict[str, Any]]:
+1503:         if not self._level_validation_enabled():
+1504:             return [], {}
+1505:         level_id = self._clean_level_id(data.get("level_id"))
+1506:         if not re.fullmatch(r"\d{7,9}", level_id):
+1507:             return [], {}
+1508:         cached = await self._cached_level_validation(level_id)
+1509:         if not cached and guild_id and user_id and level_id not in self._validation_inflight:
+1510:             rate_limited = self._level_validation_rate_limit_message(guild_id, user_id)
+1511:             if rate_limited:
+1512:                 return [rate_limited], {}
+1513:
+1514:         validation = cached or await self._lookup_level_validation(level_id)
+1515:         errors: list[str] = []
+1516:         auto_reject = bool(self._level_validation_cfg().get("auto_reject_missing", True))
+1517:         if validation.get("missing_confident") and auto_reject:
+1518:             errors.append(self._level_validation_message("missing", "That level ID does not seem to exist. Please check the ID and try again."))
+1519:
+1520:         showcase = str(data.get("level_showcase") or "").strip()
+1521:         if validation.get("requires_showcase") and not self._valid_url(showcase):
+1522:             errors.append(
+1523:                 self._level_validation_message(
+1524:                     "showcase_required",
+1525:                     "This level appears to be a demon or platformer, so a showcase URL is required.",
+1526:                 )
+1527:             )
+1528:
+1529:         return errors, validation
 ```
 
 The cache is important for both speed and kindness to external services. The circuit breaker is a practical resilience feature: if one provider fails repeatedly, the bot temporarily stops using it instead of letting every submission wait on a broken service.
@@ -1778,241 +1662,193 @@ The cache is important for both speed and kindness to external services. The cir
 
 Review actions are shared between live wave requests and weekly request submissions. The handler first figures out whether the clicked message belongs to level_request_submissions or weekly_request_reviews, then applies the same result logic.
 
-#### Review target lookup and button gate (cogs/RequestLevels.py:2482-2521)
+#### Immediate review button routing (cogs/RequestLevels.py:3636-3650)
 
 ```python
-2482:                     continue
-2483:                 now_ts = int(time_module.time())
-2484:                 async with self._scheduled_lock:
-2485:                     rows = await self.bot.db.fetchall(
-2486:                         "SELECT id, request_limit, close_minutes, created_by, request_type, open_message FROM level_request_scheduled_openings "
-2487:                         "WHERE guild_id=? AND status='pending' AND open_ts<=? ORDER BY open_ts ASC LIMIT 5",
-2488:                         (guild.id, now_ts),
-2489:                     )
-2490:                     for row in rows:
-2491:                         opening_id = int(row["id"])
-2492:                         try:
-2493:                             state_row = await self._get_state(guild.id)
-2494:                             if state_row and str(state_row["state"]) == STATE_OPEN:
-2495:                                 # Keep overdue openings pending. They form a queue
-2496:                                 # and the oldest one opens after the active wave.
-2497:                                 break
-2498:                             request_limit = int(row["request_limit"]) if row["request_limit"] is not None else None
-2499:                             close_minutes = int(row["close_minutes"]) if row["close_minutes"] is not None else None
-2500:                             request_type = self._request_type_from_row(row)
-2501:                             await self._open_requests_now(
-2502:                                 guild,
-2503:                                 request_limit,
-2504:                                 close_minutes,
-2505:                                 request_type,
-2506:                                 self._row_value(row, "open_message", None),
-2507:                                 scheduled_opening_id=opening_id,
-2508:                             )
-2509:                         except RuntimeError as e:
-2510:                             if "already open" in str(e).casefold():
-2511:                                 break
-2512:                             await log_error(self.bot, f"Scheduled request opening {opening_id} failed: {repr(e)}")
-2513:                         except Exception as e:
-2514:                             await log_error(self.bot, f"Scheduled request opening {opening_id} failed: {repr(e)}")
-2515:             except asyncio.CancelledError:
-2516:                 return
-2517:             except Exception as e:
-2518:                 await log_error(self.bot, f"Scheduled request opening loop error: {repr(e)}")
-2519:
-2520:     def _in_allowed_guild(self, ctx: discord.ApplicationContext) -> bool:
-2521:         return ctx.guild is not None and ctx.guild.id == self.allowed_guild_id
+3636:     async def handle_review_button(self, interaction: discord.Interaction, action: str):
+3637:         if interaction.guild is None or interaction.message is None:
+3638:             return await interaction.response.send_message("Request not found.", ephemeral=True)
+3639:         member = self._cached_interaction_member(interaction)
+3640:         if member is None or not self._has_reviewer_role(member):
+3641:             return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
+3642:         if action == "recheck":
+3643:             await interaction.response.defer(ephemeral=True)
+3644:             return await self._recheck_review_validation(interaction, interaction.message.id)
+3645:         # The modal itself is the acknowledgement. Authoritative existence and
+3646:         # pending-state checks run after submission, never before this deadline.
+3647:         if action == "other":
+3648:             return await interaction.response.send_message("Choose a result:", view=OtherReasonView(self, interaction.message.id), ephemeral=True)
+3649:
+3650:         await interaction.response.send_modal(ReviewModal(self, interaction.message.id, action))
 ```
 
-#### Final review transaction (cogs/RequestLevels.py:2523-2613)
+#### Final review transaction excerpt (cogs/RequestLevels.py:3726-3815)
 
 ```python
-2523:     async def _defer_command(self, ctx: discord.ApplicationContext) -> None:
-2524:         response = getattr(getattr(ctx, "interaction", None), "response", None)
-2525:         if response is not None and response.is_done():
-2526:             return
-2527:         await ctx.defer(ephemeral=True)
-2528:
-2529:     def _cached_interaction_member(self, interaction: discord.Interaction) -> Optional[discord.Member]:
-2530:         if isinstance(interaction.user, discord.Member):
-2531:             return interaction.user
-2532:         if interaction.guild is None:
-2533:             return None
-2534:         return interaction.guild.get_member(int(interaction.user.id))
-2535:
-2536:     async def _resolve_member(self, guild: discord.Guild, user) -> Optional[discord.Member]:
-2537:         if isinstance(user, discord.Member):
-2538:             return user
-2539:
-2540:         user_id = getattr(user, "id", user)
-2541:         try:
-2542:             user_id = int(user_id)
-2543:         except Exception:
-2544:             return None
-2545:
-2546:         member = guild.get_member(user_id)
-2547:         if member is not None:
-2548:             return member
-2549:
-2550:         try:
-2551:             return await guild.fetch_member(user_id)
-2552:         except Exception:
-2553:             return None
-2554:
-2555:     def _is_admin(self, member: discord.Member) -> bool:
-2556:         return is_admin_or_owner(member, self.bot.config.get_int_list("roles", "admin_owner_role_ids"))
-2557:
-2558:     def _is_mod(self, member: discord.Member) -> bool:
-2559:         allow_manage_guild = bool(self.bot.config.get("permissions", "manage_guild_counts_as_mod", default=True))
-2560:         return is_mod(
-2561:             member,
-2562:             self.bot.config.get_int("roles", "MOD_ROLE_ID") or 0,
-2563:             allow_manage_guild=allow_manage_guild,
-2564:         )
-2565:
-2566:     async def _configured_channel(self, guild: discord.Guild, key: str) -> Optional[discord.TextChannel]:
-2567:         channel_id = self._cfg_int(key)
-2568:         channel = guild.get_channel(channel_id) if channel_id else None
-2569:         if channel is None and channel_id:
-2570:             try:
-2571:                 channel = await guild.fetch_channel(channel_id)
-2572:             except Exception:
-2573:                 channel = None
-2574:         return channel if isinstance(channel, discord.TextChannel) else None
-2575:
-2576:     async def refresh_or_create_request_button(self, guild: discord.Guild) -> Optional[discord.Message]:
-2577:         async with self._request_message_lock:
-2578:             return await self._refresh_or_create_request_button_unlocked(guild)
-2579:
-2580:     async def _refresh_or_create_request_button_unlocked(self, guild: discord.Guild) -> Optional[discord.Message]:
-2581:         row = await self._get_state(guild.id)
-2582:         channel = await self._configured_channel(guild, "request_channel")
-2583:         if channel is None:
-2584:             return None
-2585:
-2586:         embed = self._request_button_embed(row)
-2587:         view = LevelRequestButtonView(label=self._request_button_label(), disabled=False)
-2588:         message_id = row["request_message_id"]
-2589:         current_channel_id = row["request_channel_id"]
-2590:
-2591:         if message_id and current_channel_id:
-2592:             try:
-2593:                 old_channel, recovered_channel = await fetch_persisted_channel(
-2594:                     guild,
-2595:                     int(current_channel_id),
-2596:                 )
-2597:             except Exception as e:
-2598:                 raise RuntimeError(f"Could not fetch the saved request channel: {e}") from e
-2599:             if isinstance(old_channel, discord.TextChannel):
-2600:                 msg, recovered = await fetch_persisted_message(
-2601:                     old_channel,
-2602:                     int(message_id),
-2603:                     author_id=int(
-2604:                         getattr(getattr(self.bot, "user", None), "id", 0) or 0
-2605:                     ),
-2606:                 )
-2607:                 if msg is not None and old_channel.id == channel.id:
-2608:                     await msg.edit(embed=embed, view=view, allowed_mentions=no_mentions())
-2609:                     if recovered or recovered_channel:
-2610:                         await self.bot.db.execute(
-2611:                             "UPDATE level_request_state SET request_channel_id=?, request_message_id=? WHERE guild_id=?",
-2612:                             (old_channel.id, msg.id, guild.id),
-2613:                         )
+3726:     async def _finalize_review(self, interaction: discord.Interaction, message_id: int, result_key: str, review: str):
+3727:         if interaction.guild is None:
+3728:             return await self._reply_ephemeral(interaction, "Wrong server.")
+3729:
+3730:         if not interaction.response.is_done():
+3731:             await interaction.response.defer(ephemeral=True)
+3732:
+3733:         member = self._cached_interaction_member(interaction)
+3734:         if member is None or not self._has_reviewer_role(member):
+3735:             return await self._reply_ephemeral(interaction, "Only reviewers can use these controls.")
+3736:
+3737:         async with self._review_lock:
+3738:             target_kind, row = await self._review_target_by_message(interaction.guild.id, message_id)
+3739:             if not row:
+3740:                 return await self._reply_ephemeral(interaction, "Request not found.")
+3741:             if str(row["status"]) != "pending":
+3742:                 return await self._reply_ephemeral(interaction, "This request has already been reviewed.")
+3743:
+3744:             data = self._safe_json_loads(row["data_json"], {})
+3745:             if not isinstance(data, dict):
+3746:                 data = {}
+3747:             reviewer_id = interaction.user.id
+3748:             result_label = self._result_label(result_key)
+3749:             if target_kind == "weekly":
+3750:                 variables = self._weekly_data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
+3751:             else:
+3752:                 variables = self._data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
+3753:
+3754:             request_channel = await self._review_target_channel(interaction.guild, target_kind, row)
+3755:             if request_channel is None:
+3756:                 return await self._reply_ephemeral(interaction, "I couldn't find the original request channel, so I did not mark it reviewed.")
+3757:             msg = interaction.message
+3758:             if msg is None or int(msg.id) != int(message_id):
+3759:                 try:
+3760:                     msg = await request_channel.fetch_message(message_id)
+3761:                 except Exception as e:
+3762:                     await log_error(self.bot, f"Could not fetch reviewed level request {message_id}: {repr(e)}")
+3763:                     return await self._reply_ephemeral(interaction, "I couldn't find the original request message, so I did not mark it reviewed.")
+3764:
+3765:             result_channel_id = self._status_channel_id(result_key)
+3766:             if not result_channel_id:
+3767:                 return await self._reply_ephemeral(interaction, "I couldn't find the result channel, so I did not mark it reviewed.")
+3768:
+3769:             reviewed_ts = int(time_module.time())
+3770:             requester_id = int(self._row_value(row, "user_id", 0) or 0)
+3771:             preference_row = await self.bot.db.fetchone(
+3772:                 "SELECT request_result_mode FROM user_notification_preferences WHERE guild_id=? AND user_id=?",
+3773:                 (interaction.guild.id, requester_id),
+3774:             )
+3775:             default_mode = self._cfg("default_result_notification", default="channel")
+3776:             notification_mode = normalize_notification_mode(
+3777:                 preference_row["request_result_mode"] if preference_row else default_mode
+3778:             )
+3779:             correlation_id = str(
+3780:                 self._row_value(row, "correlation_id", "")
+3781:                 or data.get("correlation_id")
+3782:                 or new_correlation_id("review")
+3783:             )
+3784:             try:
+3785:                 result_embed = self._embed_from_template(
+3786:                     self._cfg(self._result_template_key(result_key), default={}) or {},
+3787:                     variables,
+3788:                     default_color=self._color_name(result_key, "red"),
+3789:                 )
+3790:                 final_embed = self._embed_from_template(
+3791:                     self._cfg("level_reviewed_embed", default={}) or {}, variables,
+3792:                     default_color=self._color_name(result_key, "red"),
+3793:                 )
+3794:                 REQUEST_REVIEW_STATES.require("pending", "reviewed")
+3795:                 update_sql = (
+3796:                     "UPDATE weekly_request_reviews SET request_message_id=?, status='reviewed', result=?, "
+3797:                     "review_text=?, reviewed_by=?, reviewed_ts=?, correlation_id=? "
+3798:                     "WHERE guild_id=? AND request_message_id=? AND status='pending'"
+3799:                     if target_kind == "weekly"
+3800:                     else
+3801:                     "UPDATE level_request_submissions SET request_message_id=?, status='reviewed', result=?, "
+3802:                     "review_text=?, reviewed_by=?, reviewed_ts=?, correlation_id=? "
+3803:                     "WHERE guild_id=? AND request_message_id=? AND status='pending'"
+3804:                 )
+3805:                 statements = [
+3806:                     (
+3807:                         update_sql,
+3808:                         (
+3809:                             message_id,
+3810:                             result_key,
+3811:                             review,
+3812:                             reviewer_id,
+3813:                             reviewed_ts,
+3814:                             correlation_id,
+3815:                             interaction.guild.id,
 ```
 
 The review lock has the same purpose as the submit lock: one reviewer should win the state transition. The database status must still be pending when the review is saved. After that, the original buttons are disabled so Discord's visible UI matches the stored result.
 
-#### Wave summary variables and reviewer stats (cogs/RequestLevels.py:1138-1226)
+#### Wave summary variables and reviewer stats (cogs/RequestLevels.py:1673-1739)
 
 ```python
-1138:             return
-1139:         failures = self._validation_provider_failures.get(provider, [])
-1140:         failures.append(now_ts)
-1141:         threshold, seconds = self._provider_failure_cfg()
-1142:         self._validation_provider_failures[provider] = [ts for ts in failures if now_ts - int(ts) < seconds]
-1143:         if len(self._validation_provider_failures[provider]) >= threshold:
-1144:             self._validation_provider_open_until[provider] = now_ts + seconds
-1145:             self._validation_provider_open_reason[provider] = "repeated failures"
-1146:             self._validation_provider_failures[provider] = []
-1147:
-1148:     def validation_provider_snapshot(self) -> dict[str, dict[str, Any]]:
-1149:         now_ts = int(time_module.time())
-1150:         enabled = self._level_validation_providers()
-1151:         snapshot: dict[str, dict[str, Any]] = {}
-1152:         for provider in ("gdbrowser", "boomlings"):
-1153:             open_until = int(self._validation_provider_open_until.get(provider, 0) or 0)
-1154:             is_open = bool(enabled.get(provider)) and open_until > now_ts
-1155:             last = self._validation_provider_last_result.get(provider, {})
-1156:             snapshot[provider] = {
-1157:                 "enabled": bool(enabled.get(provider)),
-1158:                 "available": bool(enabled.get(provider)) and not is_open,
-1159:                 "circuit_open": is_open,
-1160:                 "retry_after_seconds": max(0, open_until - now_ts),
-1161:                 "reason": self._validation_provider_open_reason.get(provider, ""),
-1162:                 "last_failure_kind": "" if last.get("ok") else str(last.get("failure_kind") or ""),
-1163:                 "last_status_code": last.get("status_code"),
-1164:                 **self._provider_telemetry(provider),
-1165:             }
-1166:         return snapshot
-1167:
-1168:     def _provider_telemetry(self, provider: str) -> dict[str, Any]:
-1169:         stats_by_provider = getattr(self, "_validation_provider_stats", None)
-1170:         if not isinstance(stats_by_provider, dict):
-1171:             stats_by_provider = {}
-1172:             self._validation_provider_stats = stats_by_provider
-1173:         stats = stats_by_provider.get(provider, {})
-1174:         calls = int(stats.get("calls", 0) or 0)
-1175:         return {
-1176:             "calls": calls,
-1177:             "successes": int(stats.get("successes", 0) or 0),
-1178:             "failures": int(stats.get("failures", 0) or 0),
-1179:             "average_latency_ms": round(float(stats.get("total_ms", 0.0) or 0.0) / calls, 2) if calls else 0.0,
-1180:             "last_latency_ms": round(float(stats.get("last_ms", 0.0) or 0.0), 2),
-1181:         }
-1182:
-1183:     def reset_validation_providers(self) -> None:
-1184:         self._validation_provider_failures.clear()
-1185:         self._validation_provider_open_until.clear()
-1186:         self._validation_provider_open_reason.clear()
-1187:         self._validation_provider_last_result.clear()
-1188:         self._validation_provider_stats.clear()
-1189:
-1190:     def _provider_min_interval(self, provider: str) -> float:
-1191:         configured = self._level_validation_cfg().get("provider_min_interval_seconds", {})
-1192:         defaults = {"boomlings": 0.55, "gdbrowser": 0.10}
-1193:         if isinstance(configured, dict):
-1194:             raw = configured.get(provider, defaults.get(provider, 0.0))
-1195:         else:
-1196:             raw = defaults.get(provider, 0.0)
-1197:         try:
-1198:             return max(0.0, min(10.0, float(raw)))
-1199:         except Exception:
-1200:             return defaults.get(provider, 0.0)
-1201:
-1202:     async def _fetch_validation_provider(
-1203:         self,
-1204:         provider: str,
-1205:         session: aiohttp.ClientSession,
-1206:         level_id: str,
-1207:     ) -> Dict[str, Any]:
-1208:         lock = self._validation_provider_locks.setdefault(provider, asyncio.Lock())
-1209:         async with lock:
-1210:             if self._provider_circuit_open(provider):
-1211:                 return self._provider_circuit_result(provider)
-1212:             result: Dict[str, Any] = {
-1213:                 "provider": provider,
-1214:                 "ok": False,
-1215:                 "exists": None,
-1216:                 "error": "Provider did not run",
-1217:             }
-1218:             for attempt in range(1, self._provider_retry_attempts() + 1):
-1219:                 interval = self._provider_min_interval(provider)
-1220:                 elapsed = time_module.monotonic() - self._validation_provider_last_call.get(provider, 0.0)
-1221:                 if elapsed < interval:
-1222:                     await asyncio.sleep(interval - elapsed)
-1223:                 request_started = time_module.perf_counter()
-1224:                 if provider == "gdbrowser":
-1225:                     result = await fetch_gdbrowser_level(session, level_id)
-1226:                 elif provider == "boomlings":
+1673:     async def _wave_summary_vars(self, guild_id: int, wave_id: int) -> Dict[str, Any]:
+1674:         rows = await self.bot.db.fetchall(
+1675:             "SELECT status, result, reviewed_by, reviewed_ts, created_ts, data_json FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
+1676:             (guild_id, wave_id),
+1677:         )
+1678:         total = len(rows)
+1679:         reviewed = sum(1 for row in rows if str(row["status"]) == "reviewed")
+1680:         sent = sum(1 for row in rows if str(row["status"]) == "reviewed" and str(row["result"]) == "sent")
+1681:         rejected = sum(1 for row in rows if str(row["status"]) == "reviewed" and str(row["result"]) == "rejected")
+1682:         level_doesnt_exist = sum(1 for row in rows if str(row["result"]) == "level_doesnt_exist")
+1683:         stolen_level = sum(1 for row in rows if str(row["result"]) == "stolen_level")
+1684:         already_rated = sum(1 for row in rows if str(row["result"]) == "already_rated")
+1685:         other = level_doesnt_exist + stolen_level + already_rated
+1686:         not_sent = rejected + other
+1687:         pending = max(total - reviewed, 0)
+1688:         reviewer_stats = await self._reviewer_stats_lines(rows)
+1689:         request_type = ""
+1690:         for row in rows:
+1691:             data = self._safe_json_loads(row["data_json"], {})
+1692:             if isinstance(data, dict):
+1693:                 request_type = str(data.get("request_type") or "")
+1694:                 if request_type:
+1695:                     break
+1696:         variables = {
+1697:             "wave_id": wave_id,
+1698:             "request_type": request_type,
+1699:             "request_type_label": self._request_type_label(request_type),
+1700:             "total_requests": total,
+1701:             "reviewed_count": reviewed,
+1702:             "sent_count": sent,
+1703:             "not_sent_count": not_sent,
+1704:             "rejected_count": rejected,
+1705:             "other_count": other,
+1706:             "level_doesnt_exist_count": level_doesnt_exist,
+1707:             "stolen_level_count": stolen_level,
+1708:             "already_rated_count": already_rated,
+1709:             "pending_count": pending,
+1710:             "left_to_review": pending,
+1711:             "reviewed_percent": self._pct(reviewed, total),
+1712:             "pending_percent": self._pct(pending, total),
+1713:             "sent_percent": self._pct(sent, total),
+1714:             "not_sent_percent": self._pct(not_sent, total),
+1715:             "sent_percent_reviewed": self._pct(sent, reviewed),
+1716:             "not_sent_percent_reviewed": self._pct(not_sent, reviewed),
+1717:             "reviewer_stats": reviewer_stats,
+1718:             "summary_color": self._color_name("sent" if pending == 0 else "pending", "blurple"),
+1719:         }
+1720:         previous_wave = await self.bot.db.fetchone(
+1721:             "SELECT MAX(wave_id) AS wave_id FROM level_request_submissions WHERE guild_id=? AND wave_id<?",
+1722:             (guild_id, wave_id),
+1723:         )
+1724:         previous: Optional[Dict[str, Any]] = None
+1725:         previous_wave_id = int(previous_wave["wave_id"] or 0) if previous_wave else 0
+1726:         if previous_wave_id:
+1727:             previous_rows = await self.bot.db.fetchall(
+1728:                 "SELECT status,result FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
+1729:                 (guild_id, previous_wave_id),
+1730:             )
+1731:             previous_reviewed = sum(1 for item in previous_rows if str(item["status"]) == "reviewed")
+1732:             previous = {
+1733:                 "wave_id": previous_wave_id,
+1734:                 "total_requests": len(previous_rows),
+1735:                 "reviewed_count": previous_reviewed,
+1736:                 "sent_count": sum(1 for item in previous_rows if str(item["result"]) == "sent"),
+1737:             }
+1738:         variables.update(compare_waves(variables, previous))
+1739:         return variables
 ```
 
 The summary is generated from the database, not from memory. That means it can be rebuilt later and it stays correct even if the bot restarts between reviews.
@@ -2021,149 +1857,154 @@ The summary is generated from the database, not from memory. That means it can b
 
 Scheduled request openings are stored as rows, not just sleeping tasks. This is deliberate. If the bot restarts, a sleeping task disappears, but the row in level_request_scheduled_openings remains. The scheduler loop can pick it up again when the bot is ready.
 
-#### Scheduling command branch (cogs/RequestLevels.py:1833-1879)
+#### Scheduling command excerpt (cogs/RequestLevels.py:2702-2771)
 
 ```python
-1833:                         pass
-1834:                     except Exception as e:
-1835:                         await log_error(self.bot, f"Old wave summary cleanup failed message_id={msg.id}: {repr(e)}")
-1836:                     return new_msg
-1837:
-1838:         if not create_if_missing:
-1839:             return None
-1840:
-1841:         msg = await channel.send(embed=embed, allowed_mentions=no_mentions())
-1842:         try:
-1843:             await self.bot.db.execute(
-1844:                 "INSERT INTO level_request_wave_summaries(guild_id,wave_id,channel_id,message_id,created_ts,updated_ts) VALUES(?,?,?,?,?,?) "
-1845:                 "ON CONFLICT(guild_id,wave_id) DO UPDATE SET channel_id=excluded.channel_id, message_id=excluded.message_id, updated_ts=excluded.updated_ts",
-1846:                 (guild.id, wave_id, channel.id, msg.id, now_ts, now_ts),
-1847:             )
-1848:         except Exception:
-1849:             try:
-1850:                 await msg.delete()
-1851:             except Exception:
-1852:                 pass
-1853:             raise
-1854:         return msg
-1855:
-1856:     def _base_state_vars(self, row) -> Dict[str, Any]:
-1857:         if not row:
-1858:             return {
-1859:                 "state": "Closed",
-1860:                 "wave_id": 0,
-1861:                 "submitted_count": 0,
-1862:                 "request_limit": "",
-1863:                 "close_ts": "",
-1864:                 "request_type": "",
-1865:                 "request_type_label": self._request_type_label(""),
-1866:                 "request_type_line": "",
-1867:             }
-1868:         close_ts = row["close_ts"]
-1869:         request_type = self._request_type_from_row(row) if str(row["state"]) == STATE_OPEN else ""
-1870:         request_type_label = self._request_type_label(request_type)
-1871:         return {
-1872:             "state": self._state_label(str(row["state"])),
-1873:             "wave_id": int(row["wave_id"]),
-1874:             "submitted_count": int(row["submitted_count"]),
-1875:             "request_limit": "" if row["request_limit"] is None else int(row["request_limit"]),
-1876:             "close_ts": "" if close_ts is None else int(close_ts),
-1877:             "request_type": request_type,
-1878:             "request_type_label": request_type_label,
-1879:             "request_type_line": "" if not request_type else f"Type: **{request_type_label}**",
+2702:     async def open_requests(
+2703:         self,
+2704:         ctx: discord.ApplicationContext,
+2705:         number: int = 0,
+2706:         time: int = 0,
+2707:         when: str = "",
+2708:         day: int = 0,
+2709:         request_type: str = "",
+2710:         open_message: str = "",
+2711:     ):
+2712:         if not self._in_allowed_guild(ctx):
+2713:             return await ctx.respond("Wrong server.", ephemeral=True)
+2714:         await self._defer_command(ctx)
+2715:         member = await self._resolve_member(ctx.guild, ctx.user)
+2716:         if member is None or not self._is_admin(member):
+2717:             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+2718:
+2719:         request_limit = int(number) if number and int(number) > 0 else None
+2720:         close_minutes = int(time) if time and int(time) > 0 else None
+2721:         if int(number or 0) < 0 or int(number or 0) > 10000:
+2722:             return await ctx.respond("Request limit must be between 0 and 10,000.", ephemeral=True)
+2723:         if int(time or 0) < 0 or int(time or 0) > 43200:
+2724:             return await ctx.respond("Close timer must be between 0 and 43,200 minutes (30 days).", ephemeral=True)
+2725:         normalized_type = self._normalize_request_type(request_type)
+2726:         if normalized_type is None:
+2727:             return await ctx.respond(f"Unknown request type. Use one of: {self._request_type_help()}, or leave it blank.", ephemeral=True)
+2728:         type_label = self._request_type_label(normalized_type)
+2729:         cleaned_open_message = self._clean_open_message(open_message)
+2730:
+2731:         if str(when or "").strip():
+2732:             open_ts, error = self._parse_scheduled_open_ts(when, day)
+2733:             if open_ts is None:
+2734:                 return await ctx.respond(error or "I couldn't parse that opening time.", ephemeral=True)
+2735:             await self.bot.db.execute(
+2736:                 "INSERT INTO level_request_scheduled_openings(guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,status,request_type,open_message,correlation_id) "
+2737:                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
+2738:                 (
+2739:                     ctx.guild.id,
+2740:                     request_limit,
+2741:                     close_minutes,
+2742:                     open_ts,
+2743:                     ctx.user.id,
+2744:                     int(time_module.time()),
+2745:                     "pending",
+2746:                     normalized_type or None,
+2747:                     cleaned_open_message,
+2748:                     new_correlation_id("scheduled"),
+2749:                 ),
+2750:             )
+2751:             details = [f"Request opening scheduled for <t:{open_ts}:F> (<t:{open_ts}:R>)."]
+2752:             if normalized_type:
+2753:                 details.append(f"Type: **{type_label}**.")
+2754:             details.append("Announcement: **custom**." if cleaned_open_message else "Announcement: **default role ping**.")
+2755:             if request_limit:
+2756:                 details.append(f"Limit: **{request_limit}** successful requests.")
+2757:             if close_minutes:
+2758:                 details.append(f"Requests will close after **{close_minutes}** minutes unless the limit is reached first.")
+2759:             details.append("Use `/pending-openings` to edit, delete, or open it early.")
+2760:             await self._log_request_admin_action(
+2761:                 ctx.guild,
+2762:                 ctx.user.id,
+2763:                 "scheduled_opening_created",
+2764:                 f"open_ts={open_ts} limit={request_limit} close_minutes={close_minutes} request_type={normalized_type or 'any'} announcement={'custom' if cleaned_open_message else 'default'}",
+2765:             )
+2766:             return await ctx.respond(" ".join(details), ephemeral=True)
+2767:
+2768:         try:
+2769:             wave_id, close_ts = await self._open_requests_now(
+2770:                 ctx.guild,
+2771:                 request_limit,
 ```
 
-#### Pending opening edit/list branch (cogs/RequestLevels.py:1881-1968)
+#### Pending opening edit/list excerpt (cogs/RequestLevels.py:2797-2866)
 
 ```python
-1881:
-1882:     def _row_value(self, row, key: str, default: Any = "") -> Any:
-1883:         if isinstance(row, dict):
-1884:             return row.get(key, default)
-1885:         try:
-1886:             return row[key]
-1887:         except Exception:
-1888:             return default
-1889:
-1890:     async def _duplicate_history_warning(
-1891:         self,
-1892:         guild_id: int,
-1893:         normalized_level_id: str,
-1894:         current_wave_id: int = 0,
-1895:         current_user_id: int = 0,
-1896:     ) -> str:
-1897:         if not normalized_level_id:
-1898:             return ""
-1899:         rows = await self.bot.db.fetchall(
-1900:             "SELECT wave_id, user_id, status, result, created_ts FROM level_request_submissions "
-1901:             "WHERE guild_id=? AND level_id=? AND NOT (wave_id=? AND user_id=?) "
-1902:             "ORDER BY created_ts DESC LIMIT 5",
-1903:             (guild_id, normalized_level_id, current_wave_id, current_user_id),
-1904:         )
-1905:         if not rows:
-1906:             return ""
-1907:         lines = ["This level was requested before:"]
-1908:         for row in rows[:4]:
-1909:             result = str(row["result"] or row["status"] or "pending").replace("_", " ")
-1910:             lines.append(
-1911:                 f"- Wave **{int(row['wave_id'])}** by <@{int(row['user_id'])}> "
-1912:                 f"{self._submitted_ago(row['created_ts'])} ({result})"
-1913:             )
-1914:         return "\n".join(lines)[:1024]
-1915:
-1916:     def _days_in_month(self, year: int, month: int) -> int:
-1917:         return calendar.monthrange(year, month)[1]
-1918:
-1919:     def _add_month(self, year: int, month: int) -> tuple[int, int]:
-1920:         month += 1
-1921:         if month > 12:
-1922:             return year + 1, 1
-1923:         return year, month
-1924:
-1925:     def _scheduled_local_time_exists(self, candidate: datetime) -> bool:
-1926:         return local_time_round_trip(candidate, TZ)
-1927:
-1928:     def _parse_scheduled_open_ts(self, when: str, day: int = 0) -> tuple[Optional[int], str]:
-1929:         when_text = str(when or "").strip()
-1930:         if not when_text:
-1931:             return None, ""
-1932:         match = re.fullmatch(r"\s*(\d{1,2})(?::?(\d{2}))?\s*", when_text)
-1933:         if not match:
-1934:             return None, "Use `HH:MM`, for example `18:30`."
-1935:
-1936:         hour = int(match.group(1))
-1937:         minute = int(match.group(2) or 0)
-1938:         if hour > 23 or minute > 59:
-1939:             return None, "Hour must be 0-23 and minute must be 0-59."
-1940:
-1941:         now = now_madrid()
-1942:         if day and int(day) > 0:
-1943:             target_day = int(day)
-1944:             if target_day > 31:
-1945:                 return None, "Day must be between 1 and 31."
-1946:             year, month = now.year, now.month
-1947:             for _ in range(24):
-1948:                 if target_day <= self._days_in_month(year, month):
-1949:                     candidate = datetime(year, month, target_day, hour, minute, tzinfo=TZ)
-1950:                     if candidate > now:
-1951:                         if not self._scheduled_local_time_exists(candidate):
-1952:                             return (
-1953:                                 None,
-1954:                                 "That local time does not exist because of a daylight-saving clock change. Choose another time.",
-1955:                             )
-1956:                         return int(candidate.timestamp()), ""
-1957:                 year, month = self._add_month(year, month)
-1958:             return None, "I couldn't find that day in the next 24 months."
-1959:
-1960:         candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-1961:         if candidate <= now:
-1962:             candidate = candidate + timedelta(days=1)
-1963:         if not self._scheduled_local_time_exists(candidate):
-1964:             return (
-1965:                 None,
-1966:                 "That local time does not exist because of a daylight-saving clock change. Choose another time.",
-1967:             )
-1968:         return int(candidate.timestamp()), ""
+2797:     async def pending_openings(
+2798:         self,
+2799:         ctx: discord.ApplicationContext,
+2800:         action: str = "list",
+2801:         opening_id: int = 0,
+2802:         number: int = -1,
+2803:         time: int = -1,
+2804:         when: str = "",
+2805:         day: int = 0,
+2806:         request_type: str = "",
+2807:         open_message: str = "",
+2808:     ):
+2809:         if not self._in_allowed_guild(ctx):
+2810:             return await ctx.respond("Wrong server.", ephemeral=True)
+2811:         await self._defer_command(ctx)
+2812:         member = await self._resolve_member(ctx.guild, ctx.user)
+2813:         if member is None or not self._is_admin(member):
+2814:             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+2815:
+2816:         action = str(action or "list").strip().casefold()
+2817:         if action in {"delete", "remove", "cancel"}:
+2818:             if not opening_id:
+2819:                 return await ctx.respond("Please provide the scheduled opening ID to delete.", ephemeral=True)
+2820:             async with self._scheduled_lock:
+2821:                 existing = await self.get_scheduled_opening(ctx.guild.id, opening_id)
+2822:                 if existing is None:
+2823:                     return await ctx.respond("I couldn't find a pending opening with that ID.", ephemeral=True)
+2824:                 await self.bot.db.execute(
+2825:                     "UPDATE level_request_scheduled_openings SET status='deleted' WHERE guild_id=? AND id=? AND status='pending'",
+2826:                     (ctx.guild.id, opening_id),
+2827:                 )
+2828:             await self._log_request_admin_action(ctx.guild, ctx.user.id, "scheduled_opening_deleted", f"opening_id={opening_id}")
+2829:             return await ctx.respond(f"Deleted scheduled opening **#{opening_id}** if it was still pending.", ephemeral=True)
+2830:
+2831:         if action in {"edit", "update"}:
+2832:             if not opening_id:
+2833:                 return await ctx.respond("Please provide the scheduled opening ID to edit.", ephemeral=True)
+2834:             row = await self.bot.db.fetchone(
+2835:                 "SELECT * FROM level_request_scheduled_openings WHERE guild_id=? AND id=? AND status='pending'",
+2836:                 (ctx.guild.id, opening_id),
+2837:             )
+2838:             if not row:
+2839:                 return await ctx.respond("I couldn't find a pending opening with that ID.", ephemeral=True)
+2840:
+2841:             new_limit = row["request_limit"]
+2842:             new_close = row["close_minutes"]
+2843:             new_open_ts = int(row["open_ts"])
+2844:             new_type = row["request_type"] if "request_type" in row.keys() else None
+2845:             new_message = self._row_value(row, "open_message", None)
+2846:             if number < -1 or time < -1:
+2847:                 return await ctx.respond("Use -1 to keep a value, 0 to clear it, or a positive number.", ephemeral=True)
+2848:             if number > 10000:
+2849:                 return await ctx.respond("Request limit cannot be greater than 10,000.", ephemeral=True)
+2850:             if time > 43200:
+2851:                 return await ctx.respond("Close timer cannot be greater than 43,200 minutes (30 days).", ephemeral=True)
+2852:             if number >= 0:
+2853:                 new_limit = int(number) if int(number) > 0 else None
+2854:             if time >= 0:
+2855:                 new_close = int(time) if int(time) > 0 else None
+2856:             if str(request_type or "").strip():
+2857:                 parsed_type = self._normalize_request_type(request_type)
+2858:                 if parsed_type is None:
+2859:                     return await ctx.respond(
+2860:                         f"Unknown request type. Use one of: {self._request_type_help()}, or use `any` to clear it.",
+2861:                         ephemeral=True,
+2862:                     )
+2863:                 new_type = parsed_type or None
+2864:             if str(open_message or "").strip():
+2865:                 new_message = self._clean_open_message(open_message)
+2866:             if str(when or "").strip():
 ```
 
 The command accepts immediate openings and scheduled openings through the same entry point. The when/day options create a future row; leaving when empty opens immediately. This keeps the admin interface compact while the stored state remains explicit.
@@ -2174,146 +2015,245 @@ The command accepts immediate openings and scheduled openings through the same e
 
 TrackingCog counts activity without writing to SQLite on every message. That would be slow and noisy. Instead, it keeps small in-memory buffers and periodically flushes them with UPSERT statements. If the flush fails, it puts the counts back into the buffer so they can be retried.
 
-#### Message counting gate (cogs/Tracking.py:608-668)
+#### Message counting gate (cogs/Tracking.py:982-1043)
 
 ```python
- 608:                             "INSERT INTO weekly_sessions(guild_id,week_start,user_id,stage,expires_ts,active) VALUES(?,?,?,?,?,1) "
- 609:                             "ON CONFLICT(guild_id,week_start,user_id) DO UPDATE SET "
- 610:                             "stage='awaiting_request', expires_ts=excluded.expires_ts, active=1, decline_prompt_message_id=NULL",
- 611:                             (guild.id, week_start_iso, user_id, "awaiting_request", expires),
- 612:                         ),
- 613:                     ),
- 614:                     retry_safe=True,
- 615:                 )
- 616:                 event = "dm_sent" if offer_message is not None else "dm_recovery_ambiguous"
- 617:                 event_detail = (
- 618:                     "recovered_existing_offer=true"
- 619:                     if offer_message is not None
- 620:                     else "old_delivery_finalized_without_resend=true"
- 621:                 )
- 622:                 await self._log_weekly(
- 623:                     guild,
- 624:                     week_start_iso,
- 625:                     user_id,
- 626:                     event,
- 627:                     event_detail,
- 628:                 )
- 629:             except Exception as e:
- 630:                 # The DM was delivered. Keep the reservation so another member
- 631:                 # is not offered the same reward while storage recovers.
- 632:                 await self._log_background_error(
- 633:                     "weekly_recovery_finalize",
- 634:                     f"Recovered weekly DM sent but state finalize failed for user_id={user_id}: {repr(e)}",
- 635:                 )
- 636:
- 637:     def on_config_reload(self) -> None:
- 638:         # no cached config in this cog
- 639:         pass
- 640:
- 641:     # ----------------------------
- 642:     # Public API: used by Help cog
- 643:     # ----------------------------
- 644:     async def user_in_weekly_process(self, user_id: int) -> bool:
- 645:         allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
- 646:         if not allowed_guild_id:
- 647:             return False
- 648:         reader = getattr(self.bot.db, "fetchone_local", self.bot.db.fetchone)
- 649:         row = await reader(
- 650:             "SELECT 1 FROM weekly_sessions WHERE guild_id=? AND user_id=? AND active=1 LIMIT 1",
- 651:             (allowed_guild_id, user_id),
- 652:         )
- 653:         return row is not None
- 654:
- 655:     async def weekly_reward_disabled(self, guild_id: int, week_start_iso: str) -> bool:
- 656:         row = await self.bot.db.fetchone(
- 657:             "SELECT 1 FROM weekly_reward_disabled WHERE guild_id=? AND week_start=?",
- 658:             (guild_id, week_start_iso),
- 659:         )
- 660:         return row is not None
- 661:
- 662:     async def disable_weekly_reward_for_current_week(self, guild: discord.Guild, disabled_by: int) -> str:
- 663:         week_start_iso = week_start_sunday(now_madrid()).isoformat()
- 664:         await self.bot.db.execute_transaction(
- 665:             (
- 666:                 (
- 667:                     "INSERT OR REPLACE INTO weekly_reward_disabled(guild_id, week_start, disabled_ts, disabled_by) VALUES(?,?,?,?)",
- 668:                     (guild.id, week_start_iso, int(time.time()), int(disabled_by)),
+ 982:     async def on_message(self, message: discord.Message):
+ 983:         if message.author.bot:
+ 984:             return
+ 985:
+ 986:         # DM handling for weekly request process
+ 987:         if message.guild is None:
+ 988:             await self._handle_dm(message)
+ 989:             return
+ 990:
+ 991:         allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
+ 992:         if not ensure_allowed_guild_id(message.guild, allowed_guild_id):
+ 993:             return
+ 994:
+ 995:         # Exclude blacklisted roles
+ 996:         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
+ 997:         if excluded_role_ids:
+ 998:             m = await self._resolve_member(message.guild, message.author)
+ 999:             if m and any(r.id in excluded_role_ids for r in m.roles):
+1000:                 return
+1001:
+1002:         # Exclude channels
+1003:         excluded_channels = set(self._cfg_int_list("channels", "excluded_tracking_channel_ids")) | set(
+1004:             self._cfg_int_list("channels", "bot_commands_channel_ids")
+1005:         )
+1006:         review_access_channel_id = self._cfg_int("channels", "review_access_channel_id", 0)
+1007:         if review_access_channel_id:
+1008:             excluded_channels.add(review_access_channel_id)
+1009:         if message.channel.id in excluded_channels:
+1010:             return
+1011:
+1012:         now = int(time.time())
+1013:         if len(self._last_counted_cache) > 20000:
+1014:             oldest = sorted(self._last_counted_cache.items(), key=lambda item: item[1])[:5000]
+1015:             for old_key, _ in oldest:
+1016:                 self._last_counted_cache.pop(old_key, None)
+1017:         anti_farm_reason = await self._anti_farm_reason(message, now)
+1018:         if anti_farm_reason:
+1019:             await self._record_anti_farm_event(message, anti_farm_reason, now)
+1020:             return
+1021:
+1022:         cd = max(0, min(3600, self._cfg_int("tracking", "count_cooldown_seconds", 10)))
+1023:         cache_key = (message.guild.id, message.author.id)
+1024:
+1025:         last_counted = self._last_counted_cache.get(cache_key)
+1026:         if last_counted is None:
+1027:             row = await self.bot.db.fetchone(
+1028:                 "SELECT last_counted_ts FROM activity_last_counted WHERE guild_id=? AND user_id=?",
+1029:                 (message.guild.id, message.author.id),
+1030:             )
+1031:             last_counted = int(row["last_counted_ts"]) if row else 0
+1032:             self._last_counted_cache[cache_key] = last_counted
+1033:
+1034:         if last_counted and now - int(last_counted) < cd:
+1035:             return
+1036:
+1037:         ws_iso = week_start_sunday(now_madrid()).isoformat()
+1038:         self._last_counted_cache[cache_key] = now
+1039:
+1040:         async with self._activity_lock:
+1041:             count_key = (message.guild.id, message.author.id, ws_iso)
+1042:             self._pending_activity_counts[count_key] = self._pending_activity_counts.get(count_key, 0) + 1
+1043:             self._pending_last_counted[cache_key] = now
 ```
 
-#### Buffered activity flush (cogs/Tracking.py:675-710)
+#### Buffered activity flush (cogs/Tracking.py:1056-1096)
 
 ```python
- 675:                     "UPDATE weekly_sessions SET active=0, decline_prompt_message_id=NULL WHERE guild_id=? AND week_start=?",
- 676:                     (guild.id, week_start_iso),
- 677:                 ),
- 678:             ),
- 679:             retry_safe=True,
- 680:         )
- 681:         await self._log_weekly(guild, week_start_iso, disabled_by, "weekly_reward_disabled", "Reward disabled for this tracking week")
- 682:         return week_start_iso
- 683:
- 684:     async def enable_weekly_reward_for_current_week(self, guild: discord.Guild, enabled_by: int) -> tuple[str, bool]:
- 685:         week_start_iso = week_start_sunday(now_madrid()).isoformat()
- 686:         was_disabled = await self.weekly_reward_disabled(guild.id, week_start_iso)
- 687:         disabled_claims = await self.bot.db.fetchall(
- 688:             "SELECT user_id,rank FROM weekly_claims "
- 689:             "WHERE guild_id=? AND week_start=? AND status='disabled' ORDER BY rank ASC",
- 690:             (guild.id, week_start_iso),
- 691:         )
- 692:         timeout_hours = max(1, self._cfg_int("tracking", "dm_timeout_hours", 48))
- 693:         now_ts = int(time.time())
- 694:         expires_ts = now_ts + timeout_hours * 3600
- 695:         statements: list[tuple[str, tuple]] = [
- 696:             (
- 697:                 "DELETE FROM weekly_reward_disabled WHERE guild_id=? AND week_start=?",
- 698:                 (guild.id, week_start_iso),
- 699:             ),
- 700:         ]
- 701:         for row in disabled_claims:
- 702:             statements.append(
- 703:                 (
- 704:                     "INSERT INTO weekly_sessions(guild_id,week_start,user_id,stage,expires_ts,active) "
- 705:                     "VALUES(?,?,?,?,?,1) "
- 706:                     "ON CONFLICT(guild_id,week_start,user_id) DO UPDATE SET "
- 707:                     "stage='awaiting_request',expires_ts=excluded.expires_ts,active=1,decline_prompt_message_id=NULL",
- 708:                     (guild.id, week_start_iso, int(row["user_id"]), "awaiting_request", expires_ts),
- 709:                 )
- 710:             )
+1056:     async def flush_activity_counts(self) -> None:
+1057:         async with self._activity_lock:
+1058:             counts = self._pending_activity_counts
+1059:             last_seen = self._pending_last_counted
+1060:             self._pending_activity_counts = {}
+1061:             self._pending_last_counted = {}
+1062:
+1063:         if not counts and not last_seen:
+1064:             return
+1065:
+1066:         if counts:
+1067:             try:
+1068:                 await self.bot.db.executemany(
+1069:                     "INSERT INTO activity_counts(guild_id,user_id,week_start,count) VALUES(?,?,?,?) "
+1070:                     "ON CONFLICT(guild_id,user_id,week_start) DO UPDATE SET count=count+excluded.count",
+1071:                     [(guild_id, user_id, week_start, amount) for (guild_id, user_id, week_start), amount in counts.items()],
+1072:                 )
+1073:             except Exception as e:
+1074:                 async with self._activity_lock:
+1075:                     for key, amount in counts.items():
+1076:                         self._pending_activity_counts[key] = self._pending_activity_counts.get(key, 0) + amount
+1077:                     for key, ts in last_seen.items():
+1078:                         self._pending_last_counted[key] = max(self._pending_last_counted.get(key, 0), ts)
+1079:                 await self._log_background_error("activity_flush_counts", f"Activity count flush failed: {repr(e)}")
+1080:                 # Do not persist a cooldown timestamp for a message whose
+1081:                 # count did not persist. Otherwise a restart can lose the
+1082:                 # message permanently while still suppressing the next one.
+1083:                 return
+1084:
+1085:         if last_seen:
+1086:             try:
+1087:                 await self.bot.db.executemany(
+1088:                     "INSERT INTO activity_last_counted(guild_id,user_id,last_counted_ts) VALUES(?,?,?) "
+1089:                     "ON CONFLICT(guild_id,user_id) DO UPDATE SET last_counted_ts=excluded.last_counted_ts",
+1090:                     [(guild_id, user_id, ts) for (guild_id, user_id), ts in last_seen.items()],
+1091:                 )
+1092:             except Exception as e:
+1093:                 async with self._activity_lock:
+1094:                     for key, ts in last_seen.items():
+1095:                         self._pending_last_counted[key] = max(self._pending_last_counted.get(key, 0), ts)
+1096:                 await self._log_background_error("activity_flush_last_seen", f"Activity cooldown flush failed: {repr(e)}")
 ```
 
 The ON CONFLICT SQL is doing the increment atomically at database level: if a row already exists for that user and week, count becomes count + excluded.count. That keeps weekly totals correct even though the bot flushes multiple messages together.
 
-#### Weekly job runner (cogs/Tracking.py:1176-1233)
+#### Weekly job runner (cogs/Tracking.py:1784-1826)
 
 ```python
-1176:                 if prompt is not None:
-1177:                     try:
-1178:                         await prompt.delete()
-1179:                     except Exception:
-1180:                         pass
-1181:                 await self._log_background_error(
-1182:                     "weekly_decline_prompt",
-1183:                     f"Weekly decline confirmation setup failed for user_id={message.author.id}: {repr(e)}",
-1184:                 )
-1185:             return
-1186:
-1187:         if sess["stage"] == "confirm_decline":
-1188:             return
-1189:
-1190:         missing = self._weekly_request_missing_fields(content)
-1191:         if not missing:
-1192:             async with self._weekly_submit_lock:
-1193:                 await self._record_request(guild, message.author.id, sess["week_start"], content)
-1194:             return
-1195:
-1196:         try:
-1197:             await message.channel.send(
-1198:                 "Please send your request using the format provided. "
-1199:                 f"Missing: **{', '.join(missing)}**."
-1200:             )
-1201:         except Exception:
-1202:             pass
-1203:
+1784:     async def run_weekly_job(self, week_start_iso: str):
+1785:         allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
+1786:         guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
+1787:         if guild is None:
+1788:             return
+1789:         await self.flush_activity_counts()
+1790:
+1791:         top_limit = max(1, min(500, self._cfg_int("tracking", "top_limit", 20)))
+1792:         winners_to_dm = max(0, min(top_limit, self._cfg_int("tracking", "winners_to_dm", 1)))
+1793:         timeout_h = max(1, min(24 * 30, self._cfg_int("tracking", "dm_timeout_hours", 48)))
+1794:
+1795:         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_start", f"top_limit={top_limit} winners_to_dm={winners_to_dm} timeout_h={timeout_h}")
+1796:
+1797:         ranked: List[int] = []
+1798:         ranked_rows = await self._ranked_rows_for_week(
+1799:             guild,
+1800:             week_start_iso,
+1801:             top_limit,
+1802:             include_unresolved=False,
+1803:         )
+1804:         for r in ranked_rows:
+1805:             uid = int(r["user_id"])
+1806:             ranked.append(uid)
+1807:
+1808:         try:
+1809:             await self._update_weekly_streaks(guild, week_start_iso, ranked)
+1810:         except Exception as e:
+1811:             await self._log_background_error("weekly_streaks", f"Weekly streak update failed: {repr(e)}")
+1812:
+1813:         if await self.weekly_reward_disabled(guild.id, week_start_iso):
+1814:             await self._log_weekly(guild, week_start_iso, 0, "weekly_reward_skipped", "Reward disabled for this tracking week")
+1815:             await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted=0 eligible_ranked={len(ranked)}")
+1816:             return
+1817:
+1818:         contacted = 0
+1819:         for idx, uid in enumerate(ranked, start=1):
+1820:             if contacted >= winners_to_dm:
+1821:                 break
+1822:             ok = await self._contact_user_for_week(guild, week_start_iso, uid, rank=idx, timeout_hours=timeout_h)
+1823:             if ok:
+1824:                 contacted += 1
+1825:
+1826:         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted={contacted} eligible_ranked={len(ranked)}")
+```
+
+The weekly job flushes pending activity first, ranks users, updates streaks, respects the weekly reward disabled switch, contacts winners, writes the weekly_runs idempotency row, and creates a private recap. The weekly_runs table prevents the same week from being processed repeatedly by the scheduler.
+
+## 37. Weekly Request Workflow Walkthrough
+
+Weekly request rewards happen in DMs. A winner receives a formatted request prompt, replies with the required fields, and TrackingCog parses the message into the same shape that RequestLevelsCog understands for review embeds.
+
+#### Weekly DM request parser (cogs/Tracking.py:162-223)
+
+```python
+ 162:     def _weekly_request_review_data(self, content: str, apply_defaults: bool = True) -> dict[str, str]:
+ 163:         aliases = {
+ 164:             "name": "level_name",
+ 165:             "level name": "level_name",
+ 166:             "id": "level_id",
+ 167:             "level id": "level_id",
+ 168:             "creator": "creators",
+ 169:             "creators": "creators",
+ 170:             "creator s": "creators",
+ 171:             "level showcase": "level_showcase",
+ 172:             "showcase": "level_showcase",
+ 173:             "video": "level_showcase",
+ 174:             "notes": "notes",
+ 175:             "note": "notes",
+ 176:         }
+ 177:         data: dict[str, str] = {"request_content": str(content or "").strip()}
+ 178:         current_key: Optional[str] = None
+ 179:
+ 180:         for raw_line in str(content or "").splitlines():
+ 181:             line = raw_line.strip()
+ 182:             if line.startswith(">"):
+ 183:                 line = line.lstrip("> ").strip()
+ 184:             if not line:
+ 185:                 continue
+ 186:
+ 187:             if ":" in line:
+ 188:                 raw_key, value = line.split(":", 1)
+ 189:                 normalized = re.sub(r"[^a-z0-9]+", " ", raw_key.casefold()).strip()
+ 190:                 field_key = aliases.get(normalized)
+ 191:                 if field_key:
+ 192:                     current_key = field_key
+ 193:                     if value.strip() or field_key not in data:
+ 194:                         data[field_key] = value.strip()
+ 195:                     continue
+ 196:
+ 197:             if current_key:
+ 198:                 previous = str(data.get(current_key) or "").strip()
+ 199:                 data[current_key] = f"{previous}\n{line}".strip() if previous else line
+ 200:
+ 201:         if not data.get("level_id"):
+ 202:             match = re.search(r"\b(?:level\s*)?id\s*[:#-]?\s*([0-9]{7,9})\b", str(content or ""), flags=re.I)
+ 203:             if match:
+ 204:                 data["level_id"] = match.group(1)
+ 205:         if not data.get("level_name"):
+ 206:             match = re.search(r"\b(?:level\s*)?name\s*[:#-]?\s*(.+)", str(content or ""), flags=re.I)
+ 207:             if match:
+ 208:                 data["level_name"] = match.group(1).strip()
+ 209:         if not data.get("creators"):
+ 210:             match = re.search(r"\bcreators?\s*[:#-]?\s*(.+)", str(content or ""), flags=re.I)
+ 211:             if match:
+ 212:                 data["creators"] = match.group(1).strip()
+ 213:
+ 214:         if not apply_defaults:
+ 215:             return data
+ 216:
+ 217:         data["level_id"] = str(data.get("level_id") or "Not provided").strip()
+ 218:         data["level_id_normalized"] = data["level_id"].casefold()
+ 219:         data["level_name"] = str(data.get("level_name") or "Weekly request").strip()
+ 220:         data["creators"] = str(data.get("creators") or "Not provided").strip()
+ 221:         data["level_showcase"] = str(data.get("level_showcase") or "Not provided").strip()
+ 222:         data["notes"] = str(data.get("notes") or data["request_content"] or "No notes provided").strip()
+ 223:         return data
+```
+
+#### Weekly request recording excerpt (cogs/Tracking.py:1204-1273)
+
+```python
 1204:     async def _record_request(self, guild: discord.Guild, user_id: int, week_start_iso: str, content: str):
 1205:         active = await self.bot.db.fetchone(
 1206:             "SELECT c.rank AS rank FROM weekly_claims c "
@@ -2344,197 +2284,7 @@ The ON CONFLICT SQL is doing the increment atomically at database level: if a ro
 1231:             return
 1232:         created_ts = int(time.time())
 1233:         correlation_id = new_correlation_id("weekly-request")
-```
-
-The weekly job flushes pending activity first, ranks users, updates streaks, respects the weekly reward disabled switch, contacts winners, writes the weekly_runs idempotency row, and creates a private recap. The weekly_runs table prevents the same week from being processed repeatedly by the scheduler.
-
-## 37. Weekly Request Workflow Walkthrough
-
-Weekly request rewards happen in DMs. A winner receives a formatted request prompt, replies with the required fields, and TrackingCog parses the message into the same shape that RequestLevelsCog understands for review embeds.
-
-#### Weekly DM request parser (cogs/Tracking.py:98-168)
-
-```python
-  98:                 raw = cfg.get(section, key, default=[])
-  99:                 vals = raw
- 100:             except Exception:
- 101:                 vals = []
- 102:         if not vals:
- 103:             return []
- 104:         out: list[int] = []
- 105:         for v in vals:
- 106:             try:
- 107:                 out.append(int(v))
- 108:             except Exception:
- 109:                 continue
- 110:         return out
- 111:
- 112:     def _format_template(self, value: object, variables: dict[str, object]) -> str:
- 113:         class _SafeDict(dict):
- 114:             def __missing__(self, key):
- 115:                 return ""
- 116:
- 117:         try:
- 118:             return str(value or "").format_map(_SafeDict({k: str(v) for k, v in variables.items()}))
- 119:         except Exception:
- 120:             return str(value or "")
- 121:
- 122:     def _embed_from_template(self, template: dict, variables: dict[str, object], default_title: str, default_color: str) -> discord.Embed:
- 123:         if not isinstance(template, dict):
- 124:             template = {}
- 125:
- 126:         title = self._format_template(template.get("title", default_title), variables)
- 127:         description = self._format_template(template.get("description", ""), variables)
- 128:         embed = discord.Embed(
- 129:             title=title[:256] or None,
- 130:             description=description[:4096] or None,
- 131:             color=basic_color(self._format_template(template.get("color", default_color), variables) or default_color),
- 132:         )
- 133:         fields = template.get("fields", []) or []
- 134:         if not isinstance(fields, list):
- 135:             fields = []
- 136:         total_chars = len(str(embed.title or "")) + len(str(embed.description or ""))
- 137:         for field in fields[:25]:
- 138:             if not isinstance(field, dict):
- 139:                 continue
- 140:             name = self._format_template(field.get("name", ""), variables)
- 141:             value = self._format_template(field.get("value", ""), variables)
- 142:             if name and value:
- 143:                 name = name[:256]
- 144:                 value = value[:1024]
- 145:                 if total_chars + len(name) + len(value) > 5800:
- 146:                     break
- 147:                 embed.add_field(name=name, value=value, inline=bool(field.get("inline", False)))
- 148:                 total_chars += len(name) + len(value)
- 149:         footer = self._format_template(template.get("footer", ""), variables)
- 150:         if footer:
- 151:             footer = footer[: min(2048, max(0, 5900 - total_chars))]
- 152:             if footer:
- 153:                 embed.set_footer(text=footer)
- 154:         thumbnail_url = self._format_template(template.get("thumbnail_url", ""), variables)
- 155:         if thumbnail_url:
- 156:             embed.set_thumbnail(url=thumbnail_url)
- 157:         image_url = self._format_template(template.get("image_url", ""), variables)
- 158:         if image_url:
- 159:             embed.set_image(url=image_url)
- 160:         return embed
- 161:
- 162:     def _weekly_request_review_data(self, content: str, apply_defaults: bool = True) -> dict[str, str]:
- 163:         aliases = {
- 164:             "name": "level_name",
- 165:             "level name": "level_name",
- 166:             "id": "level_id",
- 167:             "level id": "level_id",
- 168:             "creator": "creators",
-```
-
-#### Weekly request recording (cogs/Tracking.py:772-868)
-
-```python
- 772:             "weekly_job_done": ("Weekly scan finished", discord.Color.green()),
- 773:             "dm_sent": ("Request DM sent", discord.Color.green()),
- 774:             "dm_failed": ("Request DM failed", discord.Color.red()),
- 775:             "dm_closed": ("DMs closed", discord.Color.red()),
- 776:             "dm_recovery_ambiguous": (
- 777:                 "Old DM state recovered without a repeat",
- 778:                 discord.Color.gold(),
- 779:             ),
- 780:             "timeout_dm_sent": ("Timeout notice sent", discord.Color.orange()),
- 781:             "timed_out": ("Request timed out", discord.Color.orange()),
- 782:             "reminder_sent": ("Reminder sent", discord.Color.gold()),
- 783:             "reminder_failed": ("Reminder failed", discord.Color.red()),
- 784:             "request_recorded": ("Request recorded", discord.Color.green()),
- 785:             "request_record_failed": ("Request record failed", discord.Color.red()),
- 786:             "declined": ("Request declined", discord.Color.orange()),
- 787:             "offered_next": ("Offered to next member", discord.Color.blurple()),
- 788:             "no_eligible_member": ("No eligible member", discord.Color.dark_grey()),
- 789:             "skipped_already_contacted": ("Skipped already contacted member", discord.Color.dark_grey()),
- 790:             "weekly_reward_disabled": ("Weekly reward disabled", discord.Color.red()),
- 791:             "weekly_reward_enabled": ("Weekly reward enabled", discord.Color.green()),
- 792:             "weekly_reward_skipped": ("Weekly reward skipped", discord.Color.red()),
- 793:             "skipped_reward_disabled": ("Skipped while reward disabled", discord.Color.dark_grey()),
- 794:             "next_offer_skipped_reward_disabled": ("Next offer skipped", discord.Color.dark_grey()),
- 795:             "force_dm_sent": ("Force DM sent", discord.Color.green()),
- 796:             "force_dm_failed": ("Force DM failed", discord.Color.red()),
- 797:             "force_dm_blocked": ("Force DM blocked", discord.Color.orange()),
- 798:             "force_dm_override": ("Force DM override", discord.Color.gold()),
- 799:         }
- 800:         return mapping.get(str(event), (str(event).replace("_", " ").title(), discord.Color.blurple()))
- 801:
- 802:     def _weekly_detail_lines(self, detail: str) -> str:
- 803:         detail = str(detail or "").strip()
- 804:         if not detail:
- 805:             return "No extra details."
- 806:
- 807:         parts = detail.split()
- 808:         if parts and all("=" in part for part in parts):
- 809:             lines = []
- 810:             for part in parts:
- 811:                 key, value = part.split("=", 1)
- 812:                 label = key.replace("_", " ").title()
- 813:                 lines.append(f"**{label}:** {value}")
- 814:             return "\n".join(lines)[:1024]
- 815:         return detail[:1024]
- 816:
- 817:     async def _log_weekly(self, guild: discord.Guild, week_start: str, user_id: int, event: str, detail: str = "") -> None:
- 818:         # DB log (best-effort)
- 819:         try:
- 820:             await self.bot.db.execute(
- 821:                 "INSERT INTO weekly_dm_log(guild_id, week_start, user_id, event, detail, ts) VALUES(?,?,?,?,?,?)",
- 822:                 (guild.id, week_start, int(user_id), str(event), str(detail)[:500], int(time.time())),
- 823:             )
- 824:         except Exception as e:
- 825:             await self._log_background_error("weekly_db_log", f"Weekly workflow database log failed: {repr(e)}")
- 826:
- 827:         # Optional channel log
- 828:         log_channel_id = self._cfg_int("tracking", "log_channel_id", 0)
- 829:         if not log_channel_id:
- 830:             log_channel_id = self._cfg_int("channels", "general_logging_channel_id", 0)
- 831:
- 832:         ch = guild.get_channel(log_channel_id) if log_channel_id else None
- 833:         if ch is None and log_channel_id:
- 834:             try:
- 835:                 ch = await guild.fetch_channel(log_channel_id)
- 836:             except Exception:
- 837:                 ch = None
- 838:         if isinstance(ch, discord.TextChannel):
- 839:             try:
- 840:                 label, color = self._weekly_log_meta(event)
- 841:                 emb = discord.Embed(
- 842:                     title=f"Weekly Request: {label}",
- 843:                     description="A weekly request workflow event was recorded.",
- 844:                     color=color,
- 845:                     timestamp=now_madrid(),
- 846:                 )
- 847:                 emb.add_field(name="Event", value=f"`{event}`", inline=True)
- 848:                 emb.add_field(name="Week", value=week_start, inline=True)
- 849:                 if user_id:
- 850:                     emb.add_field(name="Member", value=f"<@{user_id}>\n`{user_id}`", inline=True)
- 851:                 else:
- 852:                     emb.add_field(name="Member", value="Server-wide", inline=True)
- 853:                 emb.add_field(name="Details", value=self._weekly_detail_lines(detail), inline=False)
- 854:                 emb.set_footer(text="Weekly request workflow")
- 855:                 await ch.send(embed=emb, allowed_mentions=no_mentions())
- 856:             except Exception as e:
- 857:                 await self._log_background_error("weekly_channel_log", f"Weekly workflow channel log failed: {repr(e)}")
- 858:
- 859:     def _anti_farm_cfg(self) -> dict:
- 860:         cfg = self.bot.config.get("tracking", "anti_farm", default={}) or {}
- 861:         return cfg if isinstance(cfg, dict) else {}
- 862:
- 863:     def _anti_farm_enabled(self) -> bool:
- 864:         return bool(self._anti_farm_cfg().get("enabled", False))
- 865:
- 866:     def _message_signature(self, content: str) -> str:
- 867:         text = re.sub(r"https?://\S+", "", str(content or "").casefold())
- 868:         text = re.sub(r"[^a-z0-9]+", " ", text)
-```
-
-The important bridge is LevelRequestReviewView. Weekly submissions are not part of a live wave, but they still use the same Send, Reject, and Other buttons. The review row lives in weekly_request_reviews, and RequestLevelsCog's review finalizer handles it.
-
-#### Weekly contact state (cogs/Tracking.py:1235-1297)
-
-```python
+1234:         review_data["correlation_id"] = correlation_id
 1235:         variables = {
 1236:             **review_data,
 1237:             "user_id": user_id,
@@ -2574,30 +2324,83 @@ The important bridge is LevelRequestReviewView. Weekly submissions are not part 
 1271:                 user = await self._resolve_dm_user(guild, user_id)
 1272:                 await user.send("I couldn't record your request right now because I could not send it to the staff channel. Please contact staff.")
 1273:             except Exception:
-1274:                 pass
-1275:             return
-1276:
-1277:         try:
-1278:             await self.bot.db.execute_transaction(
-1279:                 (
-1280:                     (
-1281:                         "INSERT INTO weekly_request_reviews("
-1282:                         "guild_id,request_message_id,channel_id,user_id,week_start,rank,status,created_ts,data_json,correlation_id"
-1283:                         ") VALUES(?,?,?,?,?,?,?,?,?,?)",
-1284:                         (
-1285:                             guild.id,
-1286:                             msg.id,
-1287:                             channel.id,
-1288:                             user_id,
-1289:                             week_start_iso,
-1290:                             rank,
-1291:                             "pending",
-1292:                             created_ts,
-1293:                             json.dumps(review_data, separators=(",", ":")),
-1294:                             correlation_id,
-1295:                         ),
-1296:                     ),
-1297:                     (
+```
+
+The important bridge is LevelRequestReviewView. Weekly submissions are not part of a live wave, but they still use the same Send, Reject, and Other buttons. The review row lives in weekly_request_reviews, and RequestLevelsCog's review finalizer handles it.
+
+#### Weekly contact state excerpt (cogs/Tracking.py:1828-1897)
+
+```python
+1828:     async def _contact_user_for_week(self, guild: discord.Guild, week_start_iso: str, user_id: int, rank: int, timeout_hours: int, force: bool = False) -> bool:
+1829:         if not force and await self.weekly_reward_disabled(guild.id, week_start_iso):
+1830:             await self._log_weekly(guild, week_start_iso, user_id, "skipped_reward_disabled", "")
+1831:             return False
+1832:
+1833:         member = await self._resolve_member(guild, user_id)
+1834:         if member is None or member.bot:
+1835:             await self._log_weekly(guild, week_start_iso, user_id, "no_eligible_member", "reason=member_missing_or_bot")
+1836:             return False
+1837:         if not force:
+1838:             excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
+1839:             if excluded_role_ids and any(role.id in excluded_role_ids for role in member.roles):
+1840:                 await self._log_weekly(guild, week_start_iso, user_id, "no_eligible_member", "reason=excluded_role")
+1841:                 return False
+1842:
+1843:         now_ts = int(time.time())
+1844:         timeout_hours = max(1, int(timeout_hours))
+1845:         expires = now_ts + timeout_hours * 3600
+1846:
+1847:         # Reserve the offer before sending the DM. Concurrent scheduler/force
+1848:         # runs now see `contacting` and cannot send the same offer twice.
+1849:         async with self._weekly_offer_lock:
+1850:             row = await self.bot.db.fetchone(
+1851:                 "SELECT status FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
+1852:                 (guild.id, week_start_iso, user_id),
+1853:             )
+1854:             if row is not None:
+1855:                 await self._log_weekly(
+1856:                     guild,
+1857:                     week_start_iso,
+1858:                     user_id,
+1859:                     "skipped_already_contacted",
+1860:                     f"status={row['status']}",
+1861:                 )
+1862:                 return False
+1863:             await self.bot.db.execute(
+1864:                 "INSERT INTO weekly_claims("
+1865:                 "guild_id,week_start,user_id,rank,status,contacted_ts,offer_expires_ts"
+1866:                 ") VALUES(?,?,?,?,?,?,?)",
+1867:                 (
+1868:                     guild.id,
+1869:                     week_start_iso,
+1870:                     user_id,
+1871:                     rank,
+1872:                     "contacting",
+1873:                     now_ts,
+1874:                     expires,
+1875:                 ),
+1876:             )
+1877:
+1878:         offer_message = None
+1879:         dm_channel = None
+1880:         try:
+1881:             offer_message, dm_channel = await self._send_weekly_offer_message(
+1882:                 member,
+1883:                 timeout_hours=timeout_hours,
+1884:                 expires_ts=expires,
+1885:             )
+1886:         except Exception as e:
+1887:             await self.bot.db.execute(
+1888:                 "UPDATE weekly_claims SET status='dm_closed' "
+1889:                 "WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
+1890:                 (guild.id, week_start_iso, user_id),
+1891:             )
+1892:             await self._log_weekly(guild, week_start_iso, user_id, "dm_failed", type(e).__name__)
+1893:
+1894:             log_ch_id = self._cfg_int("channels", "dm_fail_log_channel_id", 0)
+1895:             log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
+1896:             if log_ch is None and log_ch_id:
+1897:                 try:
 ```
 
 force_dm is an intentional override path. Normal weekly rewards respect exclusions and the disabled switch; manual force-DM can be used for exceptions and is logged so the override is visible later.
@@ -2606,321 +2409,278 @@ force_dm is an intentional override path. Normal weekly rewards respect exclusio
 
 HelpCog is a state machine for DMs and ticket channels. The user's current help stage is stored in help_sessions. A typed message or button action reads the stage, updates the session, and sends the next prompt.
 
-#### Help session message router (cogs/Help.py:1042-1117)
+#### Help session message router excerpt (cogs/Help.py:2057-2126)
 
 ```python
-1042:     async def _remaining_help_cooldown(self, guild_id: int, user_id: int, action: str, cooldown_seconds: int) -> int:
-1043:         row = await self.bot.db.fetchone(
-1044:             "SELECT last_used_ts FROM help_cooldowns WHERE guild_id=? AND user_id=? AND action=?",
-1045:             (guild_id, user_id, action),
-1046:         )
-1047:         if not row:
-1048:             return 0
-1049:         last_ts = int(row["last_used_ts"])
-1050:         return max(0, cooldown_seconds - (int(time.time()) - last_ts))
-1051:
-1052:     async def _touch_help_cooldown(self, guild_id: int, user_id: int, action: str) -> None:
-1053:         await self.bot.db.execute(
-1054:             "INSERT INTO help_cooldowns(guild_id,user_id,action,last_used_ts) VALUES(?,?,?,?) "
-1055:             "ON CONFLICT(guild_id,user_id,action) DO UPDATE SET last_used_ts=excluded.last_used_ts",
-1056:             (guild_id, user_id, action, int(time.time())),
-1057:         )
-1058:
-1059:     async def _cooldown_until(self, guild_id: int, user_id: int, action: str, cooldown_seconds: int) -> int:
-1060:         row = await self.bot.db.fetchone(
-1061:             "SELECT last_used_ts FROM help_cooldowns WHERE guild_id=? AND user_id=? AND action=?",
-1062:             (guild_id, user_id, action),
-1063:         )
-1064:         if not row:
-1065:             return 0
-1066:         until_ts = int(row["last_used_ts"]) + int(cooldown_seconds)
-1067:         return until_ts if until_ts > int(time.time()) else 0
-1068:
-1069:     async def _cooldown_embed(self, guild_id: int, user_id: int, action: str, title: str, seconds: int) -> discord.Embed:
-1070:         until_ts = await self._cooldown_until(guild_id, user_id, action, seconds)
-1071:         embed = self._help_embed("Still cooling down", color="orange")
-1072:         if until_ts:
-1073:             embed.description = f"`{title}` will be available <t:{until_ts}:R>.\nYou can still use the dashboard, FAQ, status, or open an existing ticket."
-1074:         else:
-1075:             embed.description = f"`{title}` should be available now. Please try again."
-1076:         return embed
-1077:
-1078:     def _flow_start_limit_message(self, user_id: int) -> str:
-1079:         now = int(time.time())
-1080:         try:
-1081:             window = max(
-1082:                 10,
-1083:                 min(
-1084:                     3600,
-1085:                     int(
-1086:                         self.bot.config.get(
-1087:                             "help",
-1088:                             "flow_start_window_seconds",
-1089:                             default=60,
-1090:                         )
-1091:                         or 60
-1092:                     ),
-1093:                 ),
-1094:             )
-1095:         except Exception:
-1096:             window = 60
-1097:         try:
-1098:             max_starts = max(
-1099:                 1,
-1100:                 min(
-1101:                     50,
-1102:                     int(
-1103:                         self.bot.config.get(
-1104:                             "help",
-1105:                             "max_flow_starts_per_window",
-1106:                             default=6,
-1107:                         )
-1108:                         or 6
-1109:                     ),
-1110:                 ),
-1111:             )
-1112:         except Exception:
-1113:             max_starts = 6
-1114:         attempts = [ts for ts in self._flow_start_attempts.get(user_id, []) if now - int(ts) < window]
-1115:         if len(self._flow_start_attempts) > 5000:
-1116:             stale_users = [uid for uid, values in self._flow_start_attempts.items() if not values or now - int(values[-1]) >= window]
-1117:             for stale_user_id in stale_users[:1000]:
+2057:     async def _handle_help_session_message_locked(self, guild: discord.Guild, message: discord.Message) -> bool:
+2058:         sess = await self._get_help_session(message.author.id, guild.id)
+2059:         if not sess:
+2060:             return False
+2061:
+2062:         stage = sess["stage"]
+2063:         data = sess["data"]
+2064:         content = (message.content or "").strip()
+2065:
+2066:         if content.casefold() in {"cancel", "stop", "never mind", "nevermind"}:
+2067:             await self._clear_help_session(message.author.id, guild.id)
+2068:             await self._send_dm_dashboard(message.channel, guild, message.author.id)
+2069:             return True
+2070:
+2071:         if content.casefold() in {"back", "go back"}:
+2072:             await self._handle_typed_back(guild, message)
+2073:             return True
+2074:
+2075:         if content.casefold() in {"start over", "restart help", "home", "dashboard"}:
+2076:             await self._clear_help_session(message.author.id, guild.id)
+2077:             await self._send_dm_dashboard(message.channel, guild, message.author.id)
+2078:             return True
+2079:
+2080:         if len(content) > self._help_max_submission_chars():
+2081:             await message.channel.send(
+2082:                 f"That message is too long. Please keep it under {self._help_max_submission_chars()} characters.",
+2083:                 view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=True),
+2084:                 allowed_mentions=no_mentions(),
+2085:             )
+2086:             return True
+2087:
+2088:         text_stages = {
+2089:             "appeal_punishment",
+2090:             "appeal_reason",
+2091:             "appeal_behavior",
+2092:             "report_details",
+2093:             "bot_issue_details",
+2094:             "transcript_ticket",
+2095:         }
+2096:         if stage in text_stages and not content:
+2097:             await message.channel.send(
+2098:                 "Please send a written answer before continuing.",
+2099:                 view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=stage != "appeal_punishment"),
+2100:                 allowed_mentions=no_mentions(),
+2101:             )
+2102:             return True
+2103:
+2104:         if stage == "appeal_punishment":
+2105:             data["punishment"] = content
+2106:             self._merge_attachments(data, self._attachment_data(message))
+2107:             await self._start_help_session(message.author.id, guild.id, "appeal_reason", data)
+2108:             embed = self._help_embed(
+2109:                 "Appeal ban" if data.get("appeal_type") == "ban" else "Appeal punishment",
+2110:                 "Why should staff revoke this punishment? Add any context they should consider.",
+2111:                 "gold",
+2112:             )
+2113:             await message.channel.send(
+2114:                 embed=embed,
+2115:                 view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=True),
+2116:                 allowed_mentions=no_mentions(),
+2117:             )
+2118:             return True
+2119:
+2120:         if stage == "appeal_reason":
+2121:             data["reason"] = content
+2122:             self._merge_attachments(data, self._attachment_data(message))
+2123:             await self._start_help_session(message.author.id, guild.id, "appeal_behavior", data)
+2124:             embed = self._help_embed(
+2125:                 "One last question",
+2126:                 "What will change in your behavior if we revoke your punishment?",
 ```
 
 The preview step exists to prevent accidental submissions. For appeals, reports, and bot issues, the user can review the embed, edit the last answer, cancel, or submit. The staff log only receives the item after the preview is confirmed.
 
-#### Help submission insert and staff log (cogs/Help.py:1001-1040)
+#### Help submission insert and staff log (cogs/Help.py:2005-2044)
 
 ```python
-1001:             else:
-1002:                 self._active_ticket_channels.discard(message.channel.id)
-1003:             return
-1004:
-1005:         # DM help
-1006:         if message.guild is None:
-1007:             if guild is None:
-1008:                 return
-1009:
-1010:             # An explicitly started support flow owns the next DM. This keeps
-1011:             # the weekly reward listener from interpreting support answers as
-1012:             # level-request text.
-1013:             if await self.has_active_help_session(guild.id, message.author.id):
-1014:                 self._claim_dm_message(getattr(message, "id", 0))
-1015:                 if await self._handle_help_session_message(guild, message):
-1016:                     return
-1017:
-1018:             member = await self._resolve_member(guild, message.author.id)
-1019:             if member is not None:
-1020:                 tracking = self.bot.get_cog("TrackingCog")
-1021:                 if tracking:
-1022:                     try:
-1023:                         if await tracking.user_in_weekly_process(message.author.id):
-1024:                             return
-1025:                     except Exception as e:
-1026:                         await self._log_background_error(
-1027:                             "dm_weekly_session_check",
-1028:                             f"Weekly DM session check failed for user_id={message.author.id}: {e!r}",
-1029:                         )
-1030:
-1031:             try:
-1032:                 await self._send_dm_dashboard(message.channel, guild, message.author.id)
-1033:             except Exception as e:
-1034:                 await self._log_background_error(
-1035:                     "dm_dashboard",
-1036:                     f"DM support dashboard failed user_id={message.author.id}: {e!r}",
-1037:                 )
-1038:
-1039:     # -----------------------------
-1040:     # Cooldowns (help actions)
+2005:     async def _submit_help_submission(self, guild: discord.Guild, user_id: int, kind: str, data: Dict[str, Any]) -> tuple[bool, str, str]:
+2006:         if await self._is_duplicate_help_submission(guild.id, user_id, kind, data):
+2007:             return False, "This looks like a duplicate of a recent submission. Add new details or wait before sending it again.", ""
+2008:         channel = await self._submission_log_channel(guild, kind)
+2009:         if channel is None:
+2010:             await log_error(self.bot, f"{kind} submission failed: configured log channel is missing or invalid.")
+2011:             return False, "I couldn't send this to staff because the log channel is not configured correctly.", ""
+2012:
+2013:         submission_id = await self._insert_help_submission(guild.id, user_id, kind, data)
+2014:         if not submission_id:
+2015:             return False, "I couldn't create a help submission ID. Please try again.", ""
+2016:         code = self._submission_code(kind, submission_id)
+2017:         msg = None
+2018:         try:
+2019:             msg = await channel.send(
+2020:                 embed=self._submission_staff_embed(guild, user_id, kind, submission_id, data),
+2021:                 allowed_mentions=no_mentions(),
+2022:             )
+2023:             await self.bot.db.execute(
+2024:                 "UPDATE help_submissions SET log_channel_id=?, log_message_id=?, updated_ts=? WHERE id=?",
+2025:                 (channel.id, msg.id, int(time.time()), submission_id),
+2026:             )
+2027:         except Exception as e:
+2028:             await log_error(self.bot, f"{kind} submission failed: {repr(e)}")
+2029:             if msg is not None:
+2030:                 try:
+2031:                     await msg.delete()
+2032:                 except Exception:
+2033:                     pass
+2034:             await self.bot.db.execute(
+2035:                 "UPDATE help_submissions SET status='failed', updated_ts=? WHERE id=?",
+2036:                 (int(time.time()), submission_id),
+2037:             )
+2038:             return False, "I created the submission but couldn't send it to staff. Please contact staff directly.", code
+2039:
+2040:         action = {"appeal": "appeal", "report": "report_user", "bot_issue": "bot_issue"}.get(kind)
+2041:         if action:
+2042:             await self._touch_help_cooldown(guild.id, user_id, action)
+2043:         await self._log_help_action(guild, user_id, f"{kind}_submitted", f"id={code}")
+2044:         return True, f"Sent to staff as `{code}`. You can check it later from **My submissions**.", code
 ```
 
-#### Ticket creation (cogs/Help.py:1689-1765)
+#### Ticket creation excerpt (cogs/Help.py:4057-4126)
 
 ```python
-1689:             key
-1690:             for key, value in cache.items()
-1691:             if now - int(value.get("created_ts") or 0) > lifetime
-1692:         ]
-1693:         stale_tombstone_keys = [
-1694:             key
-1695:             for key, cleared_ts in tombstones.items()
-1696:             if now - int(cleared_ts or 0) > lifetime
-1697:         ]
-1698:         for key in stale_cache_keys[:1000]:
-1699:             cache.pop(key, None)
-1700:         for key in stale_tombstone_keys[:1000]:
-1701:             tombstones.pop(key, None)
-1702:         for key, lock in list(locks.items())[:1000]:
-1703:             if key not in cache and key not in tombstones and not lock.locked():
-1704:                 locks.pop(key, None)
-1705:
-1706:     def _help_session_lifetime(self) -> int:
-1707:         try:
-1708:             return max(
-1709:                 300,
-1710:                 min(24 * 3600, int(self.bot.config.get("help", "session_timeout_seconds", default=3600) or 3600)),
-1711:             )
-1712:         except Exception:
-1713:             return 3600
-1714:
-1715:     async def _log_help_session_storage_error(self, action: str, user_id: int, exc: Exception) -> None:
-1716:         try:
-1717:             await self._log_background_error(
-1718:                 f"help_session_{action}",
-1719:                 f"Help session {action} failed for user_id={user_id}; using live memory state: {exc!r}",
-1720:             )
-1721:         except Exception:
-1722:             pass
-1723:
-1724:     async def _start_help_session(self, user_id: int, guild_id: int, stage: str, data: Dict[str, Any]):
-1725:         user_id = int(user_id)
-1726:         guild_id = int(guild_id)
-1727:         created_ts = int(time.time())
-1728:         payload = json.loads(json.dumps(data))
-1729:         self._prune_help_session_memory()
-1730:         self._help_session_tombstone_store().pop((guild_id, user_id), None)
-1731:         self._help_session_cache_store()[(guild_id, user_id)] = {
-1732:             "stage": str(stage),
-1733:             "created_ts": created_ts,
-1734:             "data": payload,
-1735:         }
-1736:         try:
-1737:             await self.bot.db.execute(
-1738:                 "INSERT INTO help_sessions(guild_id,user_id,stage,created_ts,data_json) VALUES(?,?,?,?,?) "
-1739:                 "ON CONFLICT(guild_id,user_id) DO UPDATE SET stage=excluded.stage, created_ts=excluded.created_ts, data_json=excluded.data_json",
-1740:                 (guild_id, user_id, stage, created_ts, json.dumps(payload)),
-1741:             )
-1742:         except Exception as e:
-1743:             await self._log_help_session_storage_error("save", user_id, e)
-1744:
-1745:     async def _clear_help_session(self, user_id: int, guild_id: int):
-1746:         user_id = int(user_id)
-1747:         guild_id = int(guild_id)
-1748:         key = (guild_id, user_id)
-1749:         self._help_session_cache_store().pop(key, None)
-1750:         self._help_session_tombstone_store()[key] = int(time.time())
-1751:         self._prune_help_session_memory()
-1752:         try:
-1753:             await self.bot.db.execute(
-1754:                 "DELETE FROM help_sessions WHERE guild_id=? AND user_id=?",
-1755:                 (guild_id, user_id),
-1756:             )
-1757:         except Exception as e:
-1758:             await self._log_help_session_storage_error("clear", user_id, e)
-1759:
-1760:     async def _get_help_session(self, user_id: int, guild_id: int) -> Optional[Dict[str, Any]]:
-1761:         user_id = int(user_id)
-1762:         guild_id = int(guild_id)
-1763:         key = (guild_id, user_id)
-1764:         cleared_ts = self._help_session_tombstone_store().get(key)
-1765:         if cleared_ts is not None:
+4057:     async def _create_staff_ticket_locked(
+4058:         self,
+4059:         interaction: discord.Interaction,
+4060:         guild: discord.Guild,
+4061:         topic_key: str,
+4062:         topic_label: str,
+4063:         *,
+4064:         ping_role_id: Optional[int] = None,
+4065:     ):
+4066:         cfg = self.bot.config
+4067:
+4068:         member = await self._resolve_member(guild, interaction.user.id)
+4069:         if member is None:
+4070:             return await self._respond_interaction(interaction, "You must be in the server to create a ticket", ephemeral=True)
+4071:
+4072:         try:
+4073:             cooldown_h = float(
+4074:                 cfg.get(
+4075:                     "tickets",
+4076:                     "ticket_creation_cooldown_hours",
+4077:                     default=24,
+4078:                 )
+4079:                 or 24
+4080:             )
+4081:             if not 0 <= cooldown_h <= 720:
+4082:                 raise ValueError
+4083:         except (TypeError, ValueError):
+4084:             cooldown_h = 24.0
+4085:         row = await self.bot.db.fetchone(
+4086:             "SELECT last_created_ts FROM ticket_cooldowns WHERE guild_id=? AND user_id=?",
+4087:             (guild.id, member.id),
+4088:         )
+4089:         now = int(time.time())
+4090:         cooldown_seconds = int(cooldown_h * 3600)
+4091:         if row and now - int(row["last_created_ts"]) < cooldown_seconds:
+4092:             remaining = cooldown_seconds - (now - int(row["last_created_ts"]))
+4093:             until_ts = now + remaining
+4094:             return await self._respond_interaction(
+4095:                 interaction,
+4096:                 f"You can create another ticket <t:{until_ts}:R>.",
+4097:                 ephemeral=True,
+4098:             )
+4099:
+4100:         category_id = cfg.get_int("tickets", "ticket_category_id")
+4101:         mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID")
+4102:         if not category_id or not mod_role_id:
+4103:             return await self._respond_interaction(
+4104:                 interaction,
+4105:                 "The ticket system is missing a required channel or role. Please contact an administrator.",
+4106:                 ephemeral=True,
+4107:             )
+4108:
+4109:         category = guild.get_channel(category_id)
+4110:         if not isinstance(category, discord.CategoryChannel):
+4111:             return await self._respond_interaction(interaction, "Ticket category is missing or invalid (please contact staff)", ephemeral=True)
+4112:
+4113:         mod_role = guild.get_role(mod_role_id)
+4114:         if mod_role is None:
+4115:             return await self._respond_interaction(
+4116:                 interaction,
+4117:                 "The configured staff role is missing, so I did not create a private ticket. "
+4118:                 "Please contact an administrator.",
+4119:                 ephemeral=True,
+4120:             )
+4121:         notification_role_id = (
+4122:             int(ping_role_id)
+4123:             if ping_role_id is not None
+4124:             else cfg.get_int("tickets", "staff_ping_role_id", default=0)
+4125:         )
+4126:         notification_role = guild.get_role(notification_role_id) if notification_role_id else None
 ```
 
 Ticket IDs come from the database counter, not from Discord channel IDs. That creates short human labels like T123 while still preserving the real channel ID for lookups, transcript indexing, and closure.
 
-#### Ticket closure safety (cogs/Help.py:1850-1949)
+#### Ticket closure safety excerpt (cogs/Help.py:4578-4647)
 
 ```python
-1850:                 "Send your **ticket channel** (mention or channel ID), or your **Ticket ID** such as `T21`.",
-1851:                 "blurple",
-1852:             )
-1853:         else:
-1854:             embed = self._help_embed("Continue support", "Send your answer as your next DM.", "blurple")
-1855:         embed.set_footer(text="Send your answer as your next DM")
-1856:         return embed
-1857:
-1858:     def _preview_stage(self, kind: str) -> str:
-1859:         return f"preview_{kind}"
-1860:
-1861:     def _edit_stage_for_kind(self, kind: str) -> str:
-1862:         return {
-1863:             "appeal": "appeal_punishment",
-1864:             "report": "report_details",
-1865:             "bot_issue": "bot_issue_details",
-1866:         }.get(kind, "")
-1867:
-1868:     def _fresh_edit_data(self, kind: str, data: Dict[str, Any]) -> Dict[str, Any]:
-1869:         if kind == "appeal":
-1870:             return {
-1871:                 "appeal_type": str(data.get("appeal_type") or "punishment"),
-1872:                 "former_member": bool(data.get("former_member", False)),
-1873:             }
-1874:         return {}
-1875:
-1876:     def _submission_core_text(self, kind: str, data: Dict[str, Any]) -> str:
-1877:         if kind == "report":
-1878:             return str(data.get("report") or "")
-1879:         if kind == "bot_issue":
-1880:             return str(data.get("issue") or "")
-1881:         if kind == "appeal":
-1882:             return f"{data.get('punishment', '')}\n{data.get('reason', '')}\n{data.get('behavior_change', '')}"
-1883:         return json.dumps(data, sort_keys=True)
-1884:
-1885:     def _submission_preview_embed(self, kind: str, data: Dict[str, Any]) -> discord.Embed:
-1886:         embed = self._help_embed(f"Review {self._submission_label(kind)}", "Check the details before staff sees them.", "gold")
-1887:         if kind == "appeal":
-1888:             punishment_label = "What happened before the ban" if data.get("appeal_type") == "ban" else "Punishment / What happened"
-1889:             embed.add_field(name=punishment_label, value=self._short_text(data.get("punishment"), 1024), inline=False)
-1890:             embed.add_field(name="Why it should be lifted", value=self._short_text(data.get("reason"), 1024), inline=False)
-1891:             embed.add_field(
-1892:                 name="What will change",
-1893:                 value=self._short_text(data.get("behavior_change"), 1024),
-1894:                 inline=False,
-1895:             )
-1896:         elif kind == "report":
-1897:             embed.add_field(name="Report details", value=self._short_text(data.get("report"), 1024), inline=False)
-1898:         elif kind == "bot_issue":
-1899:             embed.add_field(name="Issue details", value=self._short_text(data.get("issue"), 1024), inline=False)
-1900:         if self._has_attachments(data):
-1901:             embed.add_field(name="Attachments", value=self._attachments_text(data), inline=False)
-1902:         embed.set_footer(text="Submit sends this to staff. Edit replaces the answers and attachments.")
-1903:         return embed
-1904:
-1905:     async def _show_submission_preview(self, channel, user_id: int, guild_id: int, kind: str, data: Dict[str, Any]) -> None:
-1906:         await self._start_help_session(user_id, guild_id, self._preview_stage(kind), data)
-1907:         await channel.send(
-1908:             embed=self._submission_preview_embed(kind, data),
-1909:             view=HelpSubmissionPreviewView(self, user_id, guild_id, kind),
-1910:             allowed_mentions=no_mentions(),
-1911:         )
-1912:
-1913:     async def _is_duplicate_help_submission(self, guild_id: int, user_id: int, kind: str, data: Dict[str, Any]) -> bool:
-1914:         if kind not in {"report", "bot_issue"}:
-1915:             return False
-1916:         try:
-1917:             window_hours = max(
-1918:                 1,
-1919:                 min(
-1920:                     720,
-1921:                     int(
-1922:                         self.bot.config.get(
-1923:                             "help",
-1924:                             "duplicate_window_hours",
-1925:                             default=24,
-1926:                         )
-1927:                         or 24
-1928:                     ),
-1929:                 ),
-1930:             )
-1931:         except Exception:
-1932:             window_hours = 24
-1933:         cutoff = int(time.time()) - window_hours * 3600
-1934:         new_text = self._normalize_duplicate_text(self._submission_core_text(kind, data))
-1935:         if not new_text:
-1936:             return False
-1937:         rows = await self.bot.db.fetchall(
-1938:             "SELECT data_json FROM help_submissions WHERE guild_id=? AND user_id=? AND kind=? AND created_ts>=? ORDER BY created_ts DESC LIMIT 10",
-1939:             (guild_id, user_id, kind, cutoff),
-1940:         )
-1941:         for row in rows:
-1942:             try:
-1943:                 old_data = json.loads(row["data_json"] or "{}")
-1944:             except Exception:
-1945:                 old_data = {}
-1946:             if self._normalize_duplicate_text(self._submission_core_text(kind, old_data)) == new_text:
-1947:                 return True
-1948:         return False
-1949:
+4578:     async def _close_ticket_channel_locked(self, guild: discord.Guild, channel_id: int) -> bool:
+4579:         cfg = self.bot.config
+4580:         log_channel_id = cfg.get_int("channels", "general_logging_channel_id")
+4581:         log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
+4582:         if log_channel is None and log_channel_id:
+4583:             try:
+4584:                 log_channel = await guild.fetch_channel(log_channel_id)
+4585:             except Exception:
+4586:                 log_channel = None
+4587:         channel = guild.get_channel(channel_id)
+4588:         if channel is None:
+4589:             try:
+4590:                 channel = await guild.fetch_channel(channel_id)
+4591:             except Exception:
+4592:                 channel = None
+4593:
+4594:         if not isinstance(channel, discord.TextChannel):
+4595:             return False
+4596:
+4597:         row = await self.bot.db.fetchone(
+4598:             "SELECT ticket_id, creator_id, created_ts, status_tag, opening_message_id "
+4599:             "FROM tickets WHERE channel_id=?",
+4600:             (channel_id,),
+4601:         )
+4602:         ticket_id = int(row["ticket_id"]) if row and row["ticket_id"] is not None else None
+4603:         creator_id = int(row["creator_id"]) if row and row["creator_id"] is not None else 0
+4604:         created_ts = int(row["created_ts"]) if row and row["created_ts"] is not None else 0
+4605:         previous_status_tag = str(row["status_tag"] or "waiting_staff") if row else "waiting_staff"
+4606:         if row and creator_id:
+4607:             creator_id = await self._recover_ticket_creator_id(
+4608:                 guild,
+4609:                 channel,
+4610:                 creator_id,
+4611:                 int(row["opening_message_id"] or 0),
+4612:             )
+4613:
+4614:         async def _restore_open_status() -> None:
+4615:             try:
+4616:                 await self.bot.db.execute(
+4617:                     "UPDATE tickets SET status='open', status_tag=?, closed_ts=NULL, closing_prompt_message_id=NULL "
+4618:                     "WHERE channel_id=? AND status<>'closed'",
+4619:                     (previous_status_tag, channel_id),
+4620:                 )
+4621:                 self._active_ticket_channels.add(channel_id)
+4622:                 await self.update_ticket_opening_status(guild, channel_id, previous_status_tag)
+4623:             except Exception as restore_error:
+4624:                 await log_error(self.bot, f"Ticket status restore failed channel_id={channel_id}: {repr(restore_error)}")
+4625:
+4626:         if not isinstance(log_channel, discord.TextChannel):
+4627:             try:
+4628:                 await channel.send("I couldn't close this ticket because the transcript log channel is not configured.")
+4629:             except Exception:
+4630:                 pass
+4631:             return False
+4632:
+4633:         try:
+4634:             try:
+4635:                 await self.bot.db.execute(
+4636:                     "UPDATE tickets SET status_tag='resolved', closed_ts=? WHERE channel_id=?",
+4637:                     (int(time.time()), channel_id),
+4638:                 )
+4639:                 await self.update_ticket_opening_status(guild, channel_id, "resolved")
+4640:             except Exception as status_error:
+4641:                 await log_error(self.bot, f"Ticket resolved status update before transcript failed channel_id={channel_id}: {repr(status_error)}")
+4642:
+4643:             transcript_path = await build_text_transcript(channel)
+4644:             embed = self._staff_log_embed(
+4645:                 guild,
+4646:                 "Ticket Transcript",
+4647:                 f"{channel.mention} was closed and its transcript was saved",
 ```
 
 Ticket close is cautious. It marks the ticket resolved, builds a transcript, posts the transcript to the log channel, indexes the transcript, deletes the channel, and prompts satisfaction. If a dangerous middle step fails, it restores the previous status instead of deleting the channel blindly.
@@ -2929,23 +2689,9 @@ Ticket close is cautious. It marks the ticket resolved, builds a transcript, pos
 
 BackgroundCog turns many Discord events into a daily payload. The dataclass keeps today's counters in memory, while daily_stats stores snapshots so restart and impact reporting do not wipe the day.
 
-#### DailyStats shape (cogs/Background.py:61-86)
+#### DailyStats shape (cogs/Background.py:75-99)
 
 ```python
-  61:     if previous is None:
-  62:         return "no previous day"
-  63:     diff = int(current) - int(previous)
-  64:     if diff == 0:
-  65:         return "no change"
-  66:     sign = "+" if diff > 0 else ""
-  67:     return f"{sign}{diff:,}"
-  68:
-  69: def _fmt_percent(part: int, total: int) -> str:
-  70:     if total <= 0:
-  71:         return "0%"
-  72:     return f"{(part / total) * 100:.1f}%"
-  73:
-  74: @dataclass
   75: class DailyStats:
   76:     messages: int = 0
   77:     edits: int = 0
@@ -2958,231 +2704,146 @@ BackgroundCog turns many Discord events into a daily payload. The dataclass keep
   84:     unbans: int = 0
   85:
   86:     boosts: int = 0
+  87:     unboosts: int = 0
+  88:
+  89:     voice_minutes: int = 0
+  90:     peak_voice_users: int = 0
+  91:     peak_online_members: int = 0
+  92:
+  93:     commands: int = 0
+  94:     command_errors: int = 0
+  95:     commands_by_name: Dict[str, int] = field(default_factory=dict)
+  96:     commands_by_user: Dict[int, int] = field(default_factory=dict)
+  97:
+  98:     by_channel: Dict[int, int] = field(default_factory=dict)
+  99:     by_user: Dict[int, int] = field(default_factory=dict)
 ```
 
-#### Daily stat persistence (cogs/Background.py:473-515)
+#### Daily stat persistence (cogs/Background.py:735-740)
 
 ```python
- 473:
- 474:     async def _persist_server_icon_state(self, cfg: dict) -> None:
- 475:         await persist_server_icon_config(self.bot, cfg)
- 476:         try:
- 477:             self.bot.config.save()
- 478:         except Exception as e:
- 479:             await log_error(self.bot, f"Server icon state persisted remotely but local config save failed: {repr(e)}")
- 480:
- 481:     async def _remember_server_icon_error(self, cfg: dict, message: str) -> None:
- 482:         cfg["last_error"] = str(message or "")[:500]
- 483:         cfg["last_error_ts"] = int(time.time())
- 484:         try:
- 485:             await self._persist_server_icon_state(cfg)
- 486:         except Exception as e:
- 487:             await log_error(self.bot, f"Server icon error state could not be persisted: {repr(e)}")
- 488:
- 489:     def _config_write_lock(self) -> asyncio.Lock:
- 490:         lock = getattr(self.bot, "config_write_lock", None)
- 491:         if isinstance(lock, asyncio.Lock):
- 492:             return lock
- 493:         lock = asyncio.Lock()
- 494:         self.bot.config_write_lock = lock
- 495:         return lock
- 496:
- 497:     async def rotate_server_icon_once(
- 498:         self,
- 499:         guild: discord.Guild,
- 500:         *,
- 501:         force: bool = False,
- 502:         actor_id: int = 0,
- 503:         target_index: int = -1,
- 504:     ) -> tuple[bool, str]:
- 505:         async with self._server_icon_lock, self._config_write_lock():
- 506:             return await self._rotate_server_icon_once_locked(
- 507:                 guild,
- 508:                 force=force,
- 509:                 actor_id=actor_id,
- 510:                 target_index=target_index,
- 511:             )
- 512:
- 513:     async def _rotate_server_icon_once_locked(
- 514:         self,
- 515:         guild: discord.Guild,
+ 735:     async def _persist_daily_stats(self, guild_id: int, day_key: str, snapshot: DailyStats) -> None:
+ 736:         payload = self._stats_payload(day_key, snapshot)
+ 737:         await self.bot.db.execute(
+ 738:             "INSERT OR REPLACE INTO daily_stats(guild_id, day_key, payload_json, created_ts) VALUES(?,?,?,?)",
+ 739:             (guild_id, day_key, json.dumps(payload, separators=(',', ':')), int(time.time())),
+ 740:         )
 ```
 
 The rollover logic is subtle because voice time can span midnight. The bot calculates minutes up to the boundary, persists the old day, then starts a fresh day with current voice sessions carried forward from the guild state.
 
-#### Daily message listener (cogs/Background.py:588-602)
+#### Daily message listener (cogs/Background.py:820-833)
 
 ```python
- 588:                 return "0"
- 589:
- 590:         now = now_madrid()
- 591:         members = guild.member_count or len(getattr(guild, 'members', []) or [])
- 592:         # online can be approximate depending on intents/Discord caching
- 593:         try:
- 594:             online = sum(1 for m in guild.members if (not m.bot) and m.status != discord.Status.offline)
- 595:         except Exception:
- 596:             online = 0
- 597:
- 598:         ws_iso = week_start_sunday(now).isoformat()
- 599:         week_msgs = 0
- 600:         week_top = ""
- 601:         open_tickets = 0
- 602:         today_msgs = int(getattr(self.stats, 'messages', 0) or 0)
+ 820:     async def on_message(self, message: discord.Message):
+ 821:         if message.author.bot or message.guild is None:
+ 822:             return
+ 823:         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
+ 824:         if not ensure_allowed_guild_id(message.guild, allowed):
+ 825:             return
+ 826:         if message.channel.id in self._excluded_channels():
+ 827:             return
+ 828:
+ 829:         self._rollover_if_needed(message.guild)
+ 830:         snapshot = self.stats
+ 831:         snapshot.messages += 1
+ 832:         snapshot.by_channel[message.channel.id] = snapshot.by_channel.get(message.channel.id, 0) + 1
+ 833:         snapshot.by_user[message.author.id] = snapshot.by_user.get(message.author.id, 0) + 1
 ```
 
-#### Daily report embed (cogs/Background.py:933-1082)
+#### Daily report data and delivery excerpt (cogs/Background.py:1200-1289)
 
 ```python
- 933:             if joined_ts:
- 934:                 minutes = int((now_ts - joined_ts) // 60)
- 935:                 if minutes > 0:
- 936:                     snapshot.voice_minutes += minutes
- 937:         elif after.channel and not before.channel:
- 938:             self.voice_sessions[member.id] = now_ts
- 939:
- 940:         # Peak voice users snapshot
- 941:         try:
- 942:             in_voice = sum(1 for m in member.guild.members if (not m.bot) and m.voice and m.voice.channel)
- 943:             snapshot.peak_voice_users = max(snapshot.peak_voice_users, in_voice)
- 944:         except Exception as e:
- 945:             await log_error(self.bot, f"Voice snapshot update failed: {repr(e)}")
- 946:
- 947:     @commands.Cog.listener()
- 948:     async def on_application_command_completion(self, ctx: discord.ApplicationContext):
- 949:         if ctx.guild is None:
- 950:             return
- 951:         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
- 952:         if not ensure_allowed_guild_id(ctx.guild, allowed):
- 953:             return
- 954:         self._rollover_if_needed(ctx.guild)
- 955:         snapshot = self.stats
- 956:         snapshot.commands += 1
- 957:         name = getattr(ctx.command, "qualified_name", None) or getattr(ctx.command, "name", "unknown")
- 958:         snapshot.commands_by_name[str(name)] = snapshot.commands_by_name.get(str(name), 0) + 1
- 959:         user_id = int(getattr(getattr(ctx, "user", None), "id", 0) or 0)
- 960:         if user_id:
- 961:             snapshot.commands_by_user[user_id] = snapshot.commands_by_user.get(user_id, 0) + 1
- 962:
- 963:     @commands.Cog.listener()
- 964:     async def on_application_command_error(self, ctx: discord.ApplicationContext, error: Exception):
- 965:         if ctx.guild is None:
- 966:             return
- 967:         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
- 968:         if not ensure_allowed_guild_id(ctx.guild, allowed):
- 969:             return
- 970:         self._rollover_if_needed(ctx.guild)
- 971:         snapshot = self.stats
- 972:         snapshot.commands += 1
- 973:         snapshot.command_errors += 1
- 974:         name = getattr(ctx.command, "qualified_name", None) or getattr(ctx.command, "name", "unknown")
- 975:         snapshot.commands_by_name[str(name)] = snapshot.commands_by_name.get(str(name), 0) + 1
- 976:         user_id = int(getattr(getattr(ctx, "user", None), "id", 0) or 0)
- 977:         if user_id:
- 978:             snapshot.commands_by_user[user_id] = snapshot.commands_by_user.get(user_id, 0) + 1
- 979:
- 980:     # --------------------
- 981:     # Tasks
- 982:     # --------------------
- 983:     @tasks.loop(minutes=5)
- 984:     async def update_snapshot(self):
- 985:         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
- 986:         guild = self.bot.get_guild(allowed) if allowed else None
- 987:         if guild is None:
- 988:             return
- 989:         self._rollover_if_needed(guild)
- 990:         snapshot = self.stats
- 991:         try:
- 992:             online = sum(1 for m in guild.members if (not m.bot) and m.status != discord.Status.offline)
- 993:             snapshot.peak_online_members = max(snapshot.peak_online_members, online)
- 994:         except Exception as e:
- 995:             await log_error(self.bot, f"Presence snapshot update failed: {repr(e)}")
- 996:         try:
- 997:             await self._persist_current_day()
- 998:         except Exception as e:
- 999:             await self._log_snapshot_failure(e)
-1000:         if self._daily_summary_enabled() and self._daily_summary_due():
-1001:             report_day = _day_key(now_madrid() - timedelta(days=1))
-1002:             try:
-1003:                 await self._send_daily_summary_for_day(guild, report_day)
-1004:             except Exception as e:
-1005:                 await log_error(self.bot, f"Daily summary retry failed for {report_day}: {repr(e)}")
-1006:
-1007:     async def _log_snapshot_failure(self, error: Exception) -> None:
-1008:         await log_error(self.bot, f"Daily snapshot persist failed: {repr(error)}")
-1009:
-1010:     @update_snapshot.before_loop
-1011:     async def _before_snapshot(self):
-1012:         await self.bot.wait_until_ready()
-1013:
-1014:     @update_snapshot.error
-1015:     async def _snapshot_error(self, error: Exception):
-1016:         await log_error(self.bot, f"Daily snapshot task error: {repr(error)}")
-1017:
-1018:     @tasks.loop(minutes=5)
-1019:     async def database_backup(self):
-1020:         if not self._database_backup_enabled():
-1021:             return
-1022:         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
-1023:         guild = self.bot.get_guild(allowed) if allowed else None
-1024:         if guild is None:
-1025:             return
-1026:
-1027:         now_ts = int(time.time())
-1028:         interval = self._database_backup_interval_seconds()
-1029:         try:
-1030:             row = await self.bot.db.fetchone(
-1031:                 "SELECT backup_ts FROM database_backups WHERE guild_id=? ORDER BY backup_ts DESC LIMIT 1",
-1032:                 (int(guild.id),),
-1033:             )
-1034:             if row and row["backup_ts"] is not None:
-1035:                 self._last_db_backup_ts = max(self._last_db_backup_ts, int(row["backup_ts"]))
-1036:         except Exception as e:
-1037:             await log_error(self.bot, f"Database backup schedule lookup failed: {repr(e)}")
-1038:
-1039:         if self._last_db_backup_ts and now_ts - self._last_db_backup_ts < interval:
-1040:             return
-1041:
-1042:         commands_cog = self.bot.get_cog("CommandsCog")
-1043:         if commands_cog is None or not hasattr(commands_cog, "_post_database_backup"):
-1044:             await log_error(self.bot, "Database backup task could not find CommandsCog backup helper.")
-1045:             return
-1046:         try:
-1047:             sent = await commands_cog._post_database_backup(guild, reason="scheduled", requested_by=0)
-1048:             if sent is not None:
-1049:                 self._last_db_backup_ts = now_ts
-1050:         except Exception as e:
-1051:             await log_error(self.bot, f"Scheduled database backup failed: {repr(e)}")
-1052:
-1053:     @database_backup.before_loop
-1054:     async def _before_database_backup(self):
-1055:         await self.bot.wait_until_ready()
-1056:
-1057:     @database_backup.error
-1058:     async def _database_backup_error(self, error: Exception):
-1059:         await log_error(self.bot, f"Database backup task error: {repr(error)}")
-1060:
-1061:     @tasks.loop(seconds=10)
-1062:     async def rotate_status(self):
-1063:         if not self._status_rotation_enabled():
-1064:             return
-1065:         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
-1066:         guild = self.bot.get_guild(allowed) if allowed else None
-1067:         if guild is None:
-1068:             return
-1069:         interval = max(10, self._status_rotation_interval())
-1070:         now = time.time()
-1071:         if now - self._last_status_swap < interval:
-1072:             return
-1073:         self._last_status_swap = now
-1074:
-1075:         statuses = self._status_list()
-1076:         if not statuses:
-1077:             return
-1078:
-1079:         self._status_index = (self._status_index + 1) % len(statuses)
-1080:         item = statuses[self._status_index]
-1081:         t = item["type"]
-1082:         txt = item["text"]
+1200:     async def _send_daily_summary_for_day_locked(
+1201:         self,
+1202:         guild: discord.Guild,
+1203:         report_day: Optional[str] = None,
+1204:     ) -> bool:
+1205:         today = _day_key()
+1206:         report_day = report_day or (self._current_day if self._current_day != today else _day_key(now_madrid() - timedelta(days=1)))
+1207:         if await self._daily_summary_already_sent(guild.id, report_day):
+1208:             return False
+1209:
+1210:         snapshot = self.stats if report_day == self._current_day else self._completed_day_stats.get(report_day)
+1211:         if snapshot is None:
+1212:             snapshot = await self._load_daily_stats(guild.id, report_day)
+1213:         if snapshot is None:
+1214:             snapshot = DailyStats()
+1215:         day_key = report_day
+1216:
+1217:         prev_snapshot = None
+1218:         try:
+1219:             report_dt = datetime.strptime(day_key, "%Y-%m-%d").replace(tzinfo=TZ)
+1220:             prev_day_key = (report_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+1221:             prev_snapshot = await self._load_daily_stats(guild.id, prev_day_key)
+1222:         except Exception:
+1223:             prev_snapshot = None
+1224:
+1225:         voice_minutes = int(snapshot.voice_minutes)
+1226:         report_boundary_ts = self._rollover_boundary_ts(day_key)
+1227:         if day_key == self._current_day:
+1228:             if day_key != today:
+1229:                 # Close active sessions at the exact day boundary before the
+1230:                 # old snapshot is persisted. Previously this time appeared in
+1231:                 # the embed but disappeared from historical/impact data.
+1232:                 self._add_voice_until(snapshot, report_boundary_ts)
+1233:                 self.voice_sessions = self._voice_sessions_from_guild(guild, report_boundary_ts)
+1234:                 voice_minutes = int(snapshot.voice_minutes)
+1235:             else:
+1236:                 now_ts = int(time.time())
+1237:                 for joined_ts in self.voice_sessions.values():
+1238:                     try:
+1239:                         minutes = int((now_ts - int(joined_ts)) // 60)
+1240:                         if minutes > 0:
+1241:                             voice_minutes += minutes
+1242:                     except Exception:
+1243:                         continue
+1244:
+1245:         # Persist the exact snapshot before sending. If Discord accepts the
+1246:         # summary and the process exits immediately afterwards, impact history
+1247:         # must already contain the day that was announced.
+1248:         try:
+1249:             await self._persist_daily_stats(guild.id, day_key, snapshot)
+1250:         except Exception as e:
+1251:             await log_error(self.bot, f"Daily summary stats persist failed for {day_key}: {repr(e)}")
+1252:             return False
+1253:
+1254:         active_channels = len(snapshot.by_channel)
+1255:         active_members = len(snapshot.by_user)
+1256:         net_members = int(snapshot.joins) - int(snapshot.leaves)
+1257:         moderation_actions = int(snapshot.deletes) + int(snapshot.bans) + int(snapshot.unbans)
+1258:         command_successes = max(int(snapshot.commands) - int(snapshot.command_errors), 0)
+1259:         command_success_rate = _fmt_percent(command_successes, int(snapshot.commands))
+1260:         avg_messages = (snapshot.messages / active_members) if active_members else 0.0
+1261:         reaction_rate = _fmt_percent(snapshot.reactions, snapshot.messages)
+1262:
+1263:         top_channels = sorted(snapshot.by_channel.items(), key=lambda kv: kv[1], reverse=True)[:5]
+1264:         top_users = sorted(snapshot.by_user.items(), key=lambda kv: kv[1], reverse=True)[:5]
+1265:         top_cmds = sorted(snapshot.commands_by_name.items(), key=lambda kv: kv[1], reverse=True)[:5]
+1266:
+1267:         busiest_channel = f"<#{top_channels[0][0]}> with **{_fmt_num(top_channels[0][1])}** messages" if top_channels else "No active channel"
+1268:         most_active_member = f"<@{top_users[0][0]}> with **{_fmt_num(top_users[0][1])}** messages" if top_users else "No active member"
+1269:         top_command = f"`/{top_cmds[0][0]}` used **{_fmt_num(top_cmds[0][1])}** times" if top_cmds else "No commands used"
+1270:         previous_messages = int(prev_snapshot.messages) if prev_snapshot else None
+1271:         previous_commands = int(prev_snapshot.commands) if prev_snapshot else None
+1272:
+1273:         embed = discord.Embed(
+1274:             title=f"Daily Server Summary - {day_key}",
+1275:             description=(
+1276:                 f"Messages: **{_fmt_num(snapshot.messages)}** ({_fmt_delta(snapshot.messages, previous_messages)} vs previous day)\n"
+1277:                 f"Active members: **{_fmt_num(active_members)}** across **{_fmt_num(active_channels)}** channels\n"
+1278:                 f"Member movement: **{net_members:+,}** net"
+1279:             ),
+1280:             color=self._summary_color(snapshot, net_members),
+1281:             timestamp=now_madrid(),
+1282:         )
+1283:         try:
+1284:             if guild.icon:
+1285:                 embed.set_thumbnail(url=guild.icon.url)
+1286:         except Exception:
+1287:             pass
+1288:
+1289:         embed.add_field(
 ```
 
 The summary embed is built from the stored counters plus derived values: net member movement, command success rate, average messages per active member, top channels, top users, and top commands. This is the raw material for later impact reports.
@@ -3191,176 +2852,121 @@ The summary embed is built from the stored counters plus derived values: net mem
 
 StickyCog has two different jobs that both involve keeping instructions visible: channel sticky messages and forum first messages. It also enforces the required-word rule for forum threads.
 
-#### Sticky debounced repost (cogs/Sticky.py:120-181)
+#### Sticky debounced repost (cogs/Sticky.py:196-216)
 
 ```python
- 120:             or fallback.get("required_word_match_mode")
- 121:             or "contains"
- 122:         ).strip().casefold()
- 123:         if match_mode not in {"contains", "whole_word", "regex"}:
- 124:             match_mode = "contains"
- 125:
- 126:         return {
- 127:             "word": word,
- 128:             "dm_message": dm_message,
- 129:             "delete_delay_seconds": max(0.0, min(delay, 3600.0)),
- 130:             "match_mode": match_mode,
- 131:         }
- 132:
- 133:     def _get_sticky_for_channel(self, channel_id: int) -> Optional[Dict[str, Any]]:
- 134:         for e in self._sticky_entries:
- 135:             try:
- 136:                 if int(e.get("channel_id")) == channel_id:
- 137:                     return e
- 138:             except Exception:
- 139:                 continue
- 140:         return None
- 141:
- 142:     # ---------------------------
- 143:     # Sticky message feature
- 144:     # ---------------------------
- 145:     @commands.Cog.listener()
- 146:     async def on_message(self, message: discord.Message):
- 147:         if message.author.bot or message.guild is None:
- 148:             return
- 149:
- 150:         cfg = self.bot.config
- 151:         allowed_guild_id = cfg.get_int("guild", "allowed_guild_id")
- 152:         if not ensure_allowed_guild_id(message.guild, allowed_guild_id):
- 153:             return
- 154:         review_access_channel_id = cfg.get_int("channels", "review_access_channel_id")
- 155:         if review_access_channel_id and message.channel.id == review_access_channel_id:
- 156:             return
- 157:
- 158:         # Forum-first-message fallback:
- 159:         # Normal path (on_thread_create) should run first. This fallback:
- 160:         # - checks if the bot already posted in the thread (manual check)
- 161:         # - if yes, does nothing
- 162:         # - if no, sends
- 163:         try:
- 164:             if isinstance(message.channel, discord.Thread) and message.channel.parent_id in self._forum_rules:
- 165:                 self._start_background_task(
- 166:                     self._forum_first_message_flow(message.channel, prefer_normal=False),
- 167:                     label=f"Forum fallback for thread {message.channel.id}",
- 168:                 )
- 169:         except Exception as e:
- 170:             await log_error(self.bot, f"Could not schedule forum fallback for channel_id={message.channel.id}: {repr(e)}")
- 171:
- 172:         entry = self._get_sticky_for_channel(message.channel.id)
- 173:         if not entry:
- 174:             return
- 175:
- 176:         # debounce per channel
- 177:         task = self._debounce_tasks.get(message.channel.id)
- 178:         if task and not task.done():
- 179:             task.cancel()
- 180:
- 181:         try:
+ 196:     async def _do_sticky(self, channel: discord.TextChannel, guild: discord.Guild, entry: Dict[str, Any], delay: float):
+ 197:         try:
+ 198:             await asyncio.sleep(delay)
+ 199:         except asyncio.CancelledError:
+ 200:             return
+ 201:
+ 202:         text = str(entry.get("message", "") or "")
+ 203:         if not text:
+ 204:             return
+ 205:
+ 206:         # Once replacement begins, let it finish even if another message
+ 207:         # resets the debounce timer. Cancelling between send and DB save would
+ 208:         # leave an untracked sticky that the next refresh could duplicate.
+ 209:         critical = self._start_background_task(
+ 210:             self._replace_sticky(channel, guild, text),
+ 211:             label=f"Sticky replacement for channel {channel.id}",
+ 212:         )
+ 213:         try:
+ 214:             await asyncio.shield(critical)
+ 215:         except asyncio.CancelledError:
+ 216:             return
 ```
 
-#### Required word detection (cogs/Sticky.py:276-324)
+#### Required word detection (cogs/Sticky.py:416-444)
 
 ```python
- 276:                         await log_error(self.bot, f"Sticky cleanup could not delete duplicate sticky message_id={old.id} channel_id={channel.id}: {repr(e)}")
- 277:             except Exception as e:
- 278:                 await log_error(self.bot, f"Sticky cleanup history scan failed for channel_id={channel.id}: {repr(e)}")
- 279:
- 280:         sent = None
- 281:         try:
- 282:             sent = await channel.send(text, allowed_mentions=no_mentions())
- 283:             if row:
- 284:                 # UPDATE lets the database compatibility layer locate a row
- 285:                 # whose guild/channel keys were rounded by old libsql builds
- 286:                 # and rewrite those keys with Discord's exact values.
- 287:                 await db.execute(
- 288:                     "UPDATE sticky_state SET guild_id=?, channel_id=?, last_sticky_message_id=? "
- 289:                     "WHERE guild_id=? AND channel_id=?",
- 290:                     (guild.id, channel.id, sent.id, guild.id, channel.id),
- 291:                 )
- 292:             else:
- 293:                 await db.execute(
- 294:                     "INSERT INTO sticky_state(guild_id, channel_id, last_sticky_message_id) "
- 295:                     "VALUES(?,?,?)",
- 296:                     (guild.id, channel.id, sent.id),
- 297:                 )
- 298:         except Exception as e:
- 299:             if sent is not None:
- 300:                 try:
- 301:                     await sent.delete()
- 302:                 except discord.NotFound:
- 303:                     pass
- 304:                 except Exception as cleanup_error:
- 305:                     await log_error(
- 306:                         self.bot,
- 307:                         f"Untracked sticky cleanup failed message_id={sent.id} channel_id={channel.id}: {repr(cleanup_error)}",
- 308:                     )
- 309:             await log_error(self.bot, f"Sticky send/state update failed for channel_id={channel.id}: {repr(e)}")
- 310:
- 311:     # ---------------------------
- 312:     # Forum first-message feature
- 313:     # ---------------------------
- 314:     def _get_thread_lock(self, thread_id: int) -> asyncio.Lock:
- 315:         self._trim_forum_runtime_state()
- 316:         lock = self._forum_thread_locks.get(thread_id)
- 317:         if lock is None:
- 318:             lock = asyncio.Lock()
- 319:             self._forum_thread_locks[thread_id] = lock
- 320:         return lock
- 321:
- 322:     def _trim_forum_runtime_state(self) -> None:
- 323:         max_items = 5000
- 324:         for runtime_set in (self._forum_sent_threads, self._forum_required_checked_threads):
+ 416:     async def _thread_contains_required_word(self, thread: discord.Thread, required_word: str, match_mode: str = "contains") -> bool:
+ 417:         needle = self._normalize_required_word_text(required_word).strip()
+ 418:         text_parts = [thread.name or ""]
+ 419:         try:
+ 420:             async for msg in thread.history(limit=10, oldest_first=True):
+ 421:                 if msg.author and msg.author.bot:
+ 422:                     continue
+ 423:                 if msg.content:
+ 424:                     text_parts.append(msg.content)
+ 425:                 for embed in msg.embeds:
+ 426:                     if embed.title:
+ 427:                         text_parts.append(embed.title)
+ 428:                     if embed.description:
+ 429:                         text_parts.append(embed.description)
+ 430:         except Exception:
+ 431:             # If history cannot be read, avoid deleting a valid thread by mistake.
+ 432:             return True
+ 433:
+ 434:         haystack = self._normalize_required_word_text("\n".join(text_parts))[:20000]
+ 435:         if not needle:
+ 436:             return True
+ 437:         if match_mode == "whole_word":
+ 438:             pattern = rf"(?<![0-9A-Za-z_]){re.escape(needle)}(?![0-9A-Za-z_])"
+ 439:             return re.search(pattern, haystack) is not None
+ 440:         if match_mode == "regex":
+ 441:             if not self._required_regex_is_safe(required_word):
+ 442:                 return needle in haystack
+ 443:             return re.search(required_word, haystack[:4000], re.IGNORECASE) is not None
+ 444:         return needle in haystack
 ```
 
-#### Required word deletion flow (cogs/Sticky.py:354-399)
+#### Required word deletion flow (cogs/Sticky.py:498-549)
 
 ```python
- 354:                 if not msg.author or msg.author.id != me.id:
- 355:                     continue
- 356:                 for embed in msg.embeds:
- 357:                     if (embed.title or "") == expected_title and (embed.description or "") == expected_description:
- 358:                         return True
- 359:         except Exception:
- 360:             # If we can't read history, play safe and avoid double posting.
- 361:             return True
- 362:         return False
- 363:
- 364:     async def _send_forum_first_message(self, thread: discord.Thread) -> bool:
- 365:         """Send the configured first-message embed once. Returns True if sent."""
- 366:         if thread.guild is None:
- 367:             return False
- 368:
- 369:         if thread.parent_id not in self._forum_rules:
- 370:             return False
- 371:         template = self._forum_template_for_thread(thread)
- 372:
- 373:         title = str(template.get("title", "") or "")[:256]
- 374:         desc = str(template.get("description", "") or "")[:4096]
- 375:         color = basic_color(str(template.get("color", "") or "blurple"))
- 376:         embed = discord.Embed(title=title or None, description=desc or None, color=color)
- 377:
- 378:         await thread.send(embed=embed, allowed_mentions=no_mentions())
- 379:         return True
- 380:
- 381:     def _schedule_required_word_check(self, thread: discord.Thread) -> None:
- 382:         if thread.parent_id not in self._forum_required_rules:
- 383:             return
- 384:         if thread.id in self._forum_required_checked_threads:
- 385:             return
- 386:         self._forum_required_checked_threads.add(thread.id)
- 387:         self._start_background_task(
- 388:             self._enforce_required_word(thread),
- 389:             label=f"Required-word check for thread {thread.id}",
- 390:         )
- 391:
- 392:     def _normalize_required_word_text(self, value: Any) -> str:
- 393:         text = str(value or "")
- 394:         text = re.sub(r"[\u200b-\u200f\ufeff]", "", text)
- 395:         return text.casefold()
- 396:
- 397:     def _required_regex_is_safe(self, pattern: str) -> bool:
- 398:         """Allow useful search regexes while rejecting high-risk constructs."""
- 399:         if not pattern or len(pattern) > 128:
+ 498:     async def _enforce_required_word(self, thread: discord.Thread) -> None:
+ 499:         rule = self._forum_required_rules.get(thread.parent_id)
+ 500:         if not rule:
+ 501:             return
+ 502:
+ 503:         delay = float(rule.get("delete_delay_seconds", 10.0) or 10.0)
+ 504:         if delay:
+ 505:             try:
+ 506:                 await asyncio.sleep(delay)
+ 507:             except asyncio.CancelledError:
+ 508:                 return
+ 509:
+ 510:         required_word = str(rule.get("word", "") or "").strip()
+ 511:         if not required_word:
+ 512:             return
+ 513:
+ 514:         match_mode = str(rule.get("match_mode") or "contains")
+ 515:         if await self._thread_contains_required_word(thread, required_word, match_mode):
+ 516:             return
+ 517:
+ 518:         owner = await self._find_thread_owner(thread)
+ 519:         try:
+ 520:             try:
+ 521:                 if getattr(thread, "archived", False) or getattr(thread, "locked", False):
+ 522:                     await thread.edit(archived=False, locked=False)
+ 523:             except Exception:
+ 524:                 pass
+ 525:             await thread.delete()
+ 526:         except Exception as e:
+ 527:             await log_error(self.bot, f"Could not delete thread {thread.id} missing required word {required_word!r}: {repr(e)}")
+ 528:             return
+ 529:
+ 530:         dm_template = str(rule.get("dm_message", "") or "")
+ 531:         if owner and dm_template:
+ 532:             try:
+ 533:                 dm_text = dm_template.format(
+ 534:                     required_word=required_word,
+ 535:                     thread_name=thread.name,
+ 536:                     guild=thread.guild.name if thread.guild else "",
+ 537:                 )
+ 538:             except Exception:
+ 539:                 dm_text = dm_template
+ 540:             try:
+ 541:                 await owner.send(dm_text, allowed_mentions=no_mentions())
+ 542:             except Exception as e:
+ 543:                 await log_error(
+ 544:                     self.bot,
+ 545:                     f"Required-word infraction DM failed thread_id={thread.id} "
+ 546:                     f"owner_id={getattr(owner, 'id', 0)}: {repr(e)}",
+ 547:                 )
+ 548:
+ 549:         await self._log_required_word_deletion(thread, owner, required_word, match_mode)
 ```
 
 The required-word delete flow is intentionally conservative. If the bot cannot read history, it avoids deletion to prevent false positives. It DMs the thread owner when possible, logs the deletion with author and forum context, unarchives/unlocks if needed, and then deletes the thread.
@@ -3369,227 +2975,229 @@ The required-word delete flow is intentionally conservative. If the bot cannot r
 
 The impact system is a reporting pipeline built on top of the bot's existing persistent tables. It does not invent numbers; it aggregates workflow records the bot already stores.
 
-#### Database backup posting (cogs/Commands.py:291-360)
+#### Database backup posting excerpt (cogs/Commands.py:479-548)
 
 ```python
- 291:
- 292:         @bot.slash_command(name="rock-paper-scissors", description="Play Rock Paper Scissors", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
- 293:         async def rps(ctx: discord.ApplicationContext):
- 294:             await self._rps(ctx)
- 295:
- 296:         @bot.slash_command(name="gambling", description="Try your luck in a quick slots game", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
- 297:         async def gambling(ctx: discord.ApplicationContext):
- 298:             await self._gambling(ctx)
- 299:
- 300:     def _in_allowed_guild(self, ctx: discord.ApplicationContext) -> bool:
- 301:         return ctx.guild is not None and ctx.guild.id == self.allowed_guild_id
- 302:
- 303:     async def _defer(self, ctx: discord.ApplicationContext, ephemeral: bool = True) -> None:
- 304:         response = getattr(getattr(ctx, "interaction", None), "response", None)
- 305:         if response is not None and response.is_done():
- 306:             return
- 307:         # Do not swallow an expired interaction here. Mutating commands must
- 308:         # stop instead of completing an operation the user sees as failed.
- 309:         await ctx.defer(ephemeral=ephemeral)
- 310:
- 311:     async def _send(self, ctx: discord.ApplicationContext, *args, **kwargs):
- 312:         # Pycord routes Interaction.respond to the initial response or the
- 313:         # follow-up webhook depending on whether the command was deferred.
- 314:         return await ctx.respond(*args, **kwargs)
- 315:
- 316:     @staticmethod
- 317:     def _claim_fun_cooldown(
- 318:         cache: dict[int, float],
- 319:         user_id: int,
- 320:         *,
- 321:         cooldown_seconds: float = 10.0,
- 322:         max_entries: int = 5000,
- 323:     ) -> int:
- 324:         """Claim a monotonic cooldown and keep its per-user cache bounded."""
- 325:         now = time.monotonic()
- 326:         last = cache.get(int(user_id), 0.0)
- 327:         elapsed = now - last
- 328:         if elapsed < cooldown_seconds:
- 329:             return max(1, int(cooldown_seconds - elapsed + 0.999))
- 330:
- 331:         cache[int(user_id)] = now
- 332:         if len(cache) > max_entries:
- 333:             stale_before = now - max(60.0, cooldown_seconds * 2)
- 334:             for stale_user in [
- 335:                 key for key, claimed_at in cache.items() if claimed_at < stale_before
- 336:             ]:
- 337:                 cache.pop(stale_user, None)
- 338:             if len(cache) > max_entries:
- 339:                 for stale_user, _ in sorted(
- 340:                     cache.items(),
- 341:                     key=lambda item: item[1],
- 342:                 )[: len(cache) - max_entries]:
- 343:                     cache.pop(stale_user, None)
- 344:         return 0
- 345:
- 346:     async def _log_admin_action(self, guild: discord.Guild, user_id: int, action: str, detail: str = "") -> None:
- 347:         channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
- 348:         channel = guild.get_channel(channel_id) if channel_id else None
- 349:         if not isinstance(channel, discord.TextChannel):
- 350:             return
- 351:         embed = discord.Embed(
- 352:             title="Admin Action",
- 353:             description=str(action).replace("_", " ").title(),
- 354:             color=discord.Color.blurple(),
- 355:             timestamp=now_madrid(),
- 356:         )
- 357:         embed.add_field(name="Admin", value=f"<@{int(user_id)}>\n`{int(user_id)}`", inline=True)
- 358:         embed.add_field(name="Action", value=f"`{str(action)[:120]}`", inline=True)
- 359:         if detail:
- 360:             embed.add_field(name="Details", value=str(detail)[:1024], inline=False)
+ 479:     async def _post_database_backup(self, guild: discord.Guild, reason: str = "manual", requested_by: int = 0) -> discord.Message | None:
+ 480:         backup_dir = self._backup_local_dir()
+ 481:         backup_dir.mkdir(parents=True, exist_ok=True)
+ 482:         ts = int(time.time())
+ 483:         slug = now_madrid().strftime("%Y%m%d-%H%M%S")
+ 484:         raw_path = backup_dir / f"avenue-guard-db-{slug}.sqlite3"
+ 485:         try:
+ 486:             size_bytes = await self.bot.db.backup_to(raw_path)
+ 487:             await self._validate_restore_database(raw_path)
+ 488:             zip_path = await asyncio.to_thread(self._zip_backup_file, raw_path, slug)
+ 489:         finally:
+ 490:             try:
+ 491:                 raw_path.unlink()
+ 492:             except FileNotFoundError:
+ 493:                 pass
+ 494:         await asyncio.to_thread(self._prune_local_backups)
+ 495:         channel_id = self._backup_channel_id()
+ 496:         channel = guild.get_channel(channel_id) if channel_id else None
+ 497:         if channel is None and channel_id:
+ 498:             try:
+ 499:                 channel = await guild.fetch_channel(channel_id)
+ 500:             except Exception:
+ 501:                 channel = None
+ 502:         if not isinstance(channel, discord.TextChannel):
+ 503:             await log_error(self.bot, f"Database backup created locally but backup channel is missing: {zip_path}")
+ 504:             return None
+ 505:
+ 506:         zipped_size = int(zip_path.stat().st_size)
+ 507:         storage_note, storage_ok = self._database_storage_note()
+ 508:         embed = discord.Embed(
+ 509:             title="Database Backup",
+ 510:             description="A zipped copy of the bot database is attached.",
+ 511:             color=discord.Color.green() if storage_ok else discord.Color.gold(),
+ 512:             timestamp=now_madrid(),
+ 513:         )
+ 514:         embed.add_field(name="Reason", value=str(reason).replace("_", " ").title(), inline=True)
+ 515:         embed.add_field(name="Raw Size", value=f"{_fmt_num(size_bytes)} bytes", inline=True)
+ 516:         embed.add_field(name="Zip Size", value=f"{_fmt_num(zipped_size)} bytes", inline=True)
+ 517:         embed.add_field(name="Storage", value=storage_note[:1024], inline=False)
+ 518:         if requested_by:
+ 519:             embed.add_field(name="Requested By", value=f"<@{int(requested_by)}>\n`{int(requested_by)}`", inline=True)
+ 520:
+ 521:         if zipped_size > 24 * 1024 * 1024:
+ 522:             await channel.send(
+ 523:                 "Database backup was created locally, but the compressed file is too large for a Discord attachment.",
+ 524:                 embed=embed,
+ 525:                 allowed_mentions=no_mentions(),
+ 526:             )
+ 527:             await log_error(self.bot, f"Database backup too large for Discord attachment: {zip_path} ({zipped_size} bytes)")
+ 528:             return None
+ 529:
+ 530:         sent = await channel.send(
+ 531:             embed=embed,
+ 532:             file=discord.File(str(zip_path), filename=zip_path.name),
+ 533:             allowed_mentions=no_mentions(),
+ 534:         )
+ 535:         try:
+ 536:             await self.bot.db.execute(
+ 537:                 "INSERT OR REPLACE INTO database_backups(guild_id,backup_ts,channel_id,message_id,size_bytes,reason,requested_by,filename) VALUES(?,?,?,?,?,?,?,?)",
+ 538:                 (
+ 539:                     int(guild.id),
+ 540:                     ts,
+ 541:                     int(channel.id),
+ 542:                     int(sent.id),
+ 543:                     int(zipped_size),
+ 544:                     str(reason),
+ 545:                     int(requested_by or 0),
+ 546:                     str(zip_path.name),
+ 547:                 ),
+ 548:             )
 ```
 
-#### Impact metric collection entry (cogs/Commands.py:564-642)
+#### Impact metric collection entry (cogs/Commands.py:922-991)
 
 ```python
- 564:             raise ValueError("Upload a `.sqlite3`, `.sqlite`, `.db`, `.db3`, or `.zip` backup file.")
- 565:
- 566:         upload_dir = self._restore_upload_dir()
- 567:         slug = f"{int(time.time())}-{secrets.token_hex(4)}"
- 568:         uploaded_path = upload_dir / f"{slug}-{original_name}"
- 569:         await attachment.save(str(uploaded_path))
- 570:         return uploaded_path, original_name
- 571:
- 572:     def _extract_sqlite_restore_file(self, uploaded_path: Path) -> Path:
- 573:         suffix = uploaded_path.suffix.casefold()
- 574:         if suffix in SQLITE_RESTORE_EXTENSIONS:
- 575:             return uploaded_path
- 576:         if suffix not in SQLITE_ARCHIVE_EXTENSIONS:
- 577:             raise ValueError("Unsupported backup file type.")
- 578:
- 579:         with zipfile.ZipFile(uploaded_path, "r") as zf:
- 580:             members = [info for info in zf.infolist() if not info.is_dir()]
- 581:             sqlite_members = []
- 582:             for info in members:
- 583:                 member_path = Path(info.filename)
- 584:                 if member_path.is_absolute() or ".." in member_path.parts:
- 585:                     raise ValueError("The zip archive contains an unsafe file path.")
- 586:                 if member_path.suffix.casefold() in SQLITE_RESTORE_EXTENSIONS:
- 587:                     sqlite_members.append(info)
- 588:             if len(sqlite_members) != 1:
- 589:                 raise ValueError("The zip archive must contain exactly one SQLite database file.")
- 590:
- 591:             selected = sqlite_members[0]
- 592:             if int(selected.file_size or 0) > SQLITE_RESTORE_MAX_BYTES:
- 593:                 raise ValueError("The SQLite file inside the zip is too large.")
- 594:             extracted_path = uploaded_path.with_suffix("").with_name(f"{uploaded_path.stem}-extracted{Path(selected.filename).suffix}")
- 595:             with zf.open(selected, "r") as src, extracted_path.open("wb") as dest:
- 596:                 shutil.copyfileobj(src, dest)
- 597:         return extracted_path
- 598:
- 599:     async def _validate_restore_database(self, db_path: Path) -> dict:
- 600:         def _run() -> dict:
- 601:             if not db_path.exists() or not db_path.is_file():
- 602:                 raise ValueError("The uploaded database file could not be found after upload.")
- 603:             with closing(
- 604:                 sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
- 605:             ) as conn:
- 606:                 integrity_row = conn.execute("PRAGMA integrity_check;").fetchone()
- 607:                 integrity = str(integrity_row[0] if integrity_row else "")
- 608:                 if integrity.casefold() != "ok":
- 609:                     raise ValueError(f"SQLite integrity check failed: {integrity}")
- 610:                 table_rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
- 611:                 tables = {str(row[0]) for row in table_rows}
- 612:                 known_tables = sorted(tables & AVENUE_GUARD_CORE_TABLES)
- 613:                 if not known_tables:
- 614:                     raise ValueError("This SQLite file does not look like an Avenue Guard database.")
- 615:             return {
- 616:                 "size_bytes": int(db_path.stat().st_size),
- 617:                 "tables_count": len(tables),
- 618:                 "known_tables": known_tables,
- 619:             }
- 620:
- 621:         return await asyncio.to_thread(_run)
- 622:
- 623:     async def _impact_scalar(self, sql: str, params: tuple = ()) -> int:
- 624:         row = await self.bot.db.fetchone(sql, params)
- 625:         if not row:
- 626:             return 0
- 627:         try:
- 628:             return int(row["value"] or 0)
- 629:         except Exception:
- 630:             try:
- 631:                 return int(row[0] or 0)
- 632:             except Exception:
- 633:                 return 0
- 634:
- 635:     async def _impact_float(self, sql: str, params: tuple = ()) -> float:
- 636:         row = await self.bot.db.fetchone(sql, params)
- 637:         if not row:
- 638:             return 0.0
- 639:         try:
- 640:             return round(float(row["value"] or 0), 2)
- 641:         except Exception:
- 642:             try:
+ 922:     async def _collect_impact_metrics(self, guild: discord.Guild, generated_by_id: int) -> dict:
+ 923:         guild_id = int(guild.id)
+ 924:         snapshot_ts = int(time.time())
+ 925:         daily = await self._impact_daily_totals(guild_id)
+ 926:
+ 927:         unique_rows = await self.bot.db.fetchall(
+ 928:             """
+ 929:             SELECT DISTINCT user_id FROM (
+ 930:                 SELECT user_id FROM activity_counts WHERE guild_id=?
+ 931:                 UNION SELECT user_id FROM weekly_claims WHERE guild_id=?
+ 932:                 UNION SELECT user_id FROM weekly_sessions WHERE guild_id=?
+ 933:                 UNION SELECT user_id FROM weekly_dm_log WHERE guild_id=?
+ 934:                 UNION SELECT user_id FROM weekly_request_reviews WHERE guild_id=?
+ 935:                 UNION SELECT creator_id AS user_id FROM tickets WHERE guild_id=?
+ 936:                 UNION SELECT user_id FROM help_submissions WHERE guild_id=?
+ 937:                 UNION SELECT user_id FROM ban_info_requests WHERE guild_id=?
+ 938:                 UNION SELECT requester_id AS user_id FROM transcript_requests WHERE guild_id=?
+ 939:                 UNION SELECT user_id FROM level_request_submissions WHERE guild_id=?
+ 940:                 UNION SELECT user_id FROM anti_farm_events WHERE guild_id=?
+ 941:             ) WHERE user_id IS NOT NULL AND user_id>0
+ 942:             """,
+ 943:             (guild_id,) * 11,
+ 944:         )
+ 945:         unique_user_ids = {
+ 946:             int(row["user_id"])
+ 947:             for row in unique_rows
+ 948:             if row["user_id"] is not None and int(row["user_id"]) > 0
+ 949:         }
+ 950:         unique_user_ids.update(int(user_id) for user_id in daily.get("unique_user_ids", []) if int(user_id) > 0)
+ 951:         unique_touched = len(unique_user_ids)
+ 952:         activity_messages = await self._impact_scalar(
+ 953:             "SELECT COALESCE(SUM(count), 0) AS value FROM activity_counts WHERE guild_id=?",
+ 954:             (guild_id,),
+ 955:         )
+ 956:         active_members = await self._impact_scalar(
+ 957:             "SELECT COUNT(DISTINCT user_id) AS value FROM activity_counts WHERE guild_id=?",
+ 958:             (guild_id,),
+ 959:         )
+ 960:         tracked_weeks = await self._impact_scalar(
+ 961:             "SELECT COUNT(DISTINCT week_start) AS value FROM activity_counts WHERE guild_id=?",
+ 962:             (guild_id,),
+ 963:         )
+ 964:
+ 965:         live_requests = await self._impact_scalar(
+ 966:             "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=?",
+ 967:             (guild_id,),
+ 968:         )
+ 969:         live_reviewed = await self._impact_scalar(
+ 970:             "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=? AND status='reviewed'",
+ 971:             (guild_id,),
+ 972:         )
+ 973:         live_pending = await self._impact_scalar(
+ 974:             "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=? AND status='pending'",
+ 975:             (guild_id,),
+ 976:         )
+ 977:         live_avg_review_hours = await self._impact_float(
+ 978:             "SELECT AVG(reviewed_ts - created_ts) / 3600.0 AS value FROM level_request_submissions "
+ 979:             "WHERE guild_id=? AND status='reviewed' AND reviewed_ts IS NOT NULL AND reviewed_ts>=created_ts",
+ 980:             (guild_id,),
+ 981:         )
+ 982:         live_waves = await self._impact_scalar(
+ 983:             "SELECT COUNT(DISTINCT wave_id) AS value FROM level_request_submissions WHERE guild_id=?",
+ 984:             (guild_id,),
+ 985:         )
+ 986:         request_edits = await self._impact_scalar(
+ 987:             "SELECT COUNT(*) AS value FROM level_request_edit_audit WHERE guild_id=?",
+ 988:             (guild_id,),
+ 989:         )
+ 990:         request_level_ids = await self._impact_scalar(
+ 991:             "SELECT COUNT(DISTINCT level_id) AS value FROM level_request_submissions WHERE guild_id=?",
 ```
 
-#### Impact report persistence (cogs/Commands.py:1106-1164)
+#### Impact report persistence (cogs/Commands.py:1530-1599)
 
 ```python
-1106:             (guild_id,),
-1107:         )
-1108:         state_payload = {
-1109:             "state": str(request_state["state"] if request_state else "closed"),
-1110:             "wave_id": int(request_state["wave_id"] or 0) if request_state else 0,
-1111:             "submitted_count": int(request_state["submitted_count"] or 0) if request_state else 0,
-1112:             "request_limit": int(request_state["request_limit"]) if request_state and request_state["request_limit"] is not None else 0,
-1113:             "close_ts": int(request_state["close_ts"]) if request_state and request_state["close_ts"] is not None else 0,
-1114:             "request_type": str(request_state["request_type"] or "") if request_state else "",
-1115:         }
-1116:
-1117:         message_events = max(int(activity_messages), int(daily.get("messages", 0) or 0))
-1118:         review_events = int(live_reviewed) + int(weekly_reviewed)
-1119:         tracked_event_total = (
-1120:             message_events
-1121:             + int(daily.get("reactions", 0) or 0)
-1122:             + int(daily.get("commands", 0) or 0)
-1123:             + int(live_requests)
-1124:             + int(weekly_reviews)
-1125:             + int(weekly_claims)
-1126:             + int(weekly_dm_logs)
-1127:             + int(tickets)
-1128:             + int(help_submissions)
-1129:             + int(ban_info_requests)
-1130:             + int(transcript_requests)
-1131:             + int(transcripts_saved)
-1132:             + int(request_edits)
-1133:             + int(review_events)
-1134:             + int(anti_farm_events)
-1135:             + int(database_backups)
-1136:             + int(database_restores)
-1137:         )
-1138:
-1139:         support_items = int(tickets) + int(help_submissions) + int(ban_info_requests) + int(transcript_requests)
-1140:         level_requests_total = int(live_requests) + int(weekly_reviews)
-1141:         current_members = int(getattr(guild, "member_count", 0) or 0)
-1142:         cached_members = len(getattr(guild, "members", []) or [])
-1143:         forecast = self._impact_forecast(daily.get("series", []), int(live_pending) + int(weekly_pending))
-1144:
-1145:         return {
-1146:             "report": {
-1147:                 "guild_id": guild_id,
-1148:                 "guild_name": str(guild.name),
-1149:                 "snapshot_ts": snapshot_ts,
-1150:                 "snapshot_label": now_madrid().strftime("%Y-%m-%d %H:%M"),
-1151:                 "generated_by_user_id": int(generated_by_id),
-1152:             },
-1153:             "headline": {
-1154:                 "current_members": current_members,
-1155:                 "unique_members_touched": int(unique_touched),
-1156:                 "tracked_event_total": int(tracked_event_total),
-1157:                 "support_items": int(support_items),
-1158:                 "level_requests_total": int(level_requests_total),
-1159:             },
-1160:             "community": {
-1161:                 "current_members": current_members,
-1162:                 "cached_members": int(cached_members),
-1163:                 "unique_members_touched": int(unique_touched),
-1164:                 "tracked_active_members": int(active_members),
+1530:     async def bot_impact(self, ctx: discord.ApplicationContext):
+1531:         if not self._in_allowed_guild(ctx):
+1532:             return await ctx.respond("Wrong server.", ephemeral=True)
+1533:
+1534:         await self._defer(ctx, ephemeral=True)
+1535:         if not await self._is_impact_owner_ctx(ctx):
+1536:             return await self._send(ctx, "You don't have permission to use this.", ephemeral=True)
+1537:
+1538:         tracking = self.bot.get_cog("TrackingCog")
+1539:         if tracking is not None:
+1540:             try:
+1541:                 await tracking.flush_activity_counts()
+1542:             except Exception as e:
+1543:                 await log_error(self.bot, f"Impact report activity flush failed: {repr(e)}")
+1544:         background = self.bot.get_cog("BackgroundCog")
+1545:         if background is not None:
+1546:             try:
+1547:                 await background._persist_current_day()
+1548:             except Exception as e:
+1549:                 await log_error(self.bot, f"Impact report daily snapshot flush failed: {repr(e)}")
+1550:         metrics = await self._collect_impact_metrics(ctx.guild, ctx.user.id)
+1551:         embed = self._impact_report_embed(metrics)
+1552:         channel_id = self.bot.config.get_int("impact", "report_channel_id", default=0)
+1553:         if not channel_id:
+1554:             channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
+1555:         channel = ctx.guild.get_channel(channel_id) if channel_id else None
+1556:
+1557:         sent = None
+1558:         if isinstance(channel, discord.TextChannel):
+1559:             try:
+1560:                 sent = await channel.send(
+1561:                     content="Avenue Guard impact report generated. The CSV exports can be imported into Google Sheets.",
+1562:                     embed=embed,
+1563:                     files=self._impact_files(metrics),
+1564:                     allowed_mentions=no_mentions(),
+1565:                 )
+1566:             except Exception as e:
+1567:                 await log_error(self.bot, f"Could not send impact report attachments: {repr(e)}")
+1568:
+1569:         if sent is None:
+1570:             try:
+1571:                 await self._send(
+1572:                     ctx,
+1573:                     "Impact report generated, but no valid report channel was available. Here are the files directly.",
+1574:                     embed=embed,
+1575:                     files=self._impact_files(metrics),
+1576:                     ephemeral=True,
+1577:                 )
+1578:             except Exception as e:
+1579:                 await log_error(self.bot, f"Could not send fallback impact report attachments: {repr(e)}")
+1580:                 await self._send(ctx, "Impact report generated, but I could not attach the files. Check the error log.", embed=embed, ephemeral=True)
+1581:
+1582:         metrics["report"]["report_channel_id"] = int(getattr(getattr(sent, "channel", None), "id", 0) or 0)
+1583:         metrics["report"]["report_message_id"] = int(getattr(sent, "id", 0) or 0)
+1584:         await self.bot.db.execute(
+1585:             "INSERT OR REPLACE INTO impact_snapshots(guild_id,snapshot_ts,report_channel_id,report_message_id,payload_json) VALUES(?,?,?,?,?)",
+1586:             (
+1587:                 int(ctx.guild.id),
+1588:                 int(metrics["report"]["snapshot_ts"]),
+1589:                 int(metrics["report"]["report_channel_id"]),
+1590:                 int(metrics["report"]["report_message_id"]),
+1591:                 json.dumps(metrics, separators=(",", ":")),
+1592:             ),
+1593:         )
+1594:
+1595:         if sent is not None:
+1596:             link = f"https://discord.com/channels/{ctx.guild.id}/{sent.channel.id}/{sent.id}"
+1597:             msg = f"Impact report saved and posted: {link}"
+1598:         else:
+1599:             msg = "Impact report snapshot saved in the database. Configure `impact.report_channel_id` for persistent Discord attachments."
 ```
 
 A backup is a zipped SQLite copy posted to Discord and recorded in database_backups. An impact report is a Markdown/CSV/JSON bundle posted to Discord and recorded in impact_snapshots. The two systems serve different purposes: backup is recovery; impact is evidence and forecasting.
@@ -3615,183 +3223,96 @@ flowchart LR
 
 Server icon rotation is a good example of making a visually simple feature reliable. The feature needs config validation, URL cleaning, mode selection, interval enforcement, download checks, state persistence, and commands for manual control.
 
-#### Icon config normalization (utils/server_icons.py:8-57)
+#### Icon config normalization (utils/server_icons.py:75-100)
 
 ```python
-   8:
-   9:
-  10: def normalize_server_icon_mode(value: Any) -> str:
-  11:     mode = str(value or "disabled").strip().casefold()
-  12:     return mode if mode in VALID_SERVER_ICON_MODES else "disabled"
-  13:
-  14:
-  15: def is_valid_icon_url(value: Any) -> bool:
-  16:     url = str(value or "").strip()
-  17:     if not url or len(url) > 2000:
-  18:         return False
-  19:     parsed = urlparse(url)
-  20:     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-  21:         return False
-  22:     if parsed.username is not None or parsed.password is not None:
-  23:         return False
-  24:     hostname = parsed.hostname.casefold().rstrip(".")
-  25:     if hostname == "localhost" or hostname.endswith(".localhost"):
-  26:         return False
-  27:     try:
-  28:         address = ipaddress.ip_address(hostname)
-  29:     except ValueError:
-  30:         return True
-  31:     return address.is_global
-  32:
-  33:
-  34: def is_expiring_discord_attachment_url(value: Any) -> bool:
-  35:     url = str(value or "").strip()
-  36:     parsed = urlparse(url)
-  37:     host = parsed.netloc.casefold()
-  38:     if not (host.endswith("discordapp.net") or host.endswith("discordapp.com")):
-  39:         return False
-  40:     if "/attachments/" not in parsed.path:
-  41:         return False
-  42:     query = parse_qs(parsed.query)
-  43:     return bool({"ex", "is", "hm"} & set(query))
-  44:
-  45:
-  46: def server_icon_url_warning(value: Any) -> str:
-  47:     if is_expiring_discord_attachment_url(value):
-  48:         return "Discord attachment URLs expire and eventually return 404. Use a permanent image URL instead."
-  49:     return ""
-  50:
-  51:
-  52: def clean_icon_urls(value: Any) -> list[str]:
-  53:     if not isinstance(value, list):
-  54:         return []
-  55:     out: list[str] = []
-  56:     seen: set[str] = set()
-  57:     for item in value:
+  75: def ensure_server_icon_config(config) -> dict:
+  76:     background = config.data.setdefault("background", {})
+  77:     rotation = background.setdefault("server_icon_rotation", {})
+  78:     rotation.setdefault(
+  79:         "_comment",
+  80:         "Rotates the server icon from configured image URLs. mode is disabled, linear, or random.",
+  81:     )
+  82:     rotation["mode"] = normalize_server_icon_mode(rotation.get("mode", "disabled"))
+  83:     try:
+  84:         rotation["interval_seconds"] = max(300, int(rotation.get("interval_seconds", 86400) or 86400))
+  85:     except Exception:
+  86:         rotation["interval_seconds"] = 86400
+  87:     rotation["urls"] = clean_icon_urls(rotation.get("urls", []))
+  88:     rotation["current_index"] = parse_server_icon_index(rotation.get("current_index", -1), len(rotation["urls"]))
+  89:     current_url = str(rotation.get("current_url", "") or "").strip()
+  90:     rotation["current_url"] = current_url if current_url in rotation["urls"] else ""
+  91:     try:
+  92:         rotation["last_changed_ts"] = max(0, int(rotation.get("last_changed_ts", 0) or 0))
+  93:     except Exception:
+  94:         rotation["last_changed_ts"] = 0
+  95:     rotation["last_error"] = str(rotation.get("last_error", "") or "")[:500]
+  96:     try:
+  97:         rotation["last_error_ts"] = max(0, int(rotation.get("last_error_ts", 0) or 0))
+  98:     except Exception:
+  99:         rotation["last_error_ts"] = 0
+ 100:     return rotation
 ```
 
-#### Automatic icon rotation loop (cogs/Background.py:857-879)
+#### Automatic icon rotation loop (cogs/Background.py:1112-1134)
 
 ```python
- 857:         self._rollover_if_needed(message.guild)
- 858:         snapshot = self.stats
- 859:         snapshot.deletes += 1
- 860:
- 861:     @commands.Cog.listener()
- 862:     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User):
- 863:         if user.bot or reaction.message.guild is None:
- 864:             return
- 865:         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
- 866:         if not ensure_allowed_guild_id(reaction.message.guild, allowed):
- 867:             return
- 868:         if reaction.message.channel.id in self._excluded_channels():
- 869:             return
- 870:         self._rollover_if_needed(reaction.message.guild)
- 871:         snapshot = self.stats
- 872:         snapshot.reactions += 1
- 873:
- 874:     @commands.Cog.listener()
- 875:     async def on_member_join(self, member: discord.Member):
- 876:         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
- 877:         if member.bot or not ensure_allowed_guild_id(member.guild, allowed):
- 878:             return
- 879:         self._rollover_if_needed(member.guild)
+1112:     async def rotate_server_icon(self):
+1113:         if not self._server_icon_rotation_enabled():
+1114:             return
+1115:         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
+1116:         guild = self.bot.get_guild(allowed) if allowed else None
+1117:         if guild is None:
+1118:             return
+1119:
+1120:         cfg = ensure_server_icon_config(self.bot.config)
+1121:         interval = self._server_icon_interval()
+1122:         now_ts = int(time.time())
+1123:         last_changed = int(cfg.get("last_changed_ts", 0) or 0)
+1124:         if last_changed and now_ts - last_changed < interval:
+1125:             return
+1126:         last_error_ts = int(cfg.get("last_error_ts", 0) or 0)
+1127:         if last_error_ts:
+1128:             failure_backoff = max(900, min(interval, 3600))
+1129:             if now_ts - last_error_ts < failure_backoff:
+1130:                 return
+1131:
+1132:         ok, message = await self.rotate_server_icon_once(guild)
+1133:         if not ok:
+1134:             await log_error(self.bot, f"Server icon rotation skipped: {message}")
 ```
 
-#### Server icon command surface (cogs/Commands.py:1375-1465)
+#### Server icon mode command (cogs/Commands.py:2116-2143)
 
 ```python
-1375:                 f"- Current review backlog: **{_fmt_num(forecast.get('review_backlog', 0))}** pending requests",
-1376:                 "",
-1377:                 "### Suggested Actions",
-1378:                 "",
-1379:                 *[f"- {item}" for item in recommendations],
-1380:                 "",
-1381:                 "## Community Reach",
-1382:                 "",
-1383:                 f"- Current server size: **{_fmt_num(metrics['community']['current_members'])}** members",
-1384:                 f"- Unique members touched by tracked workflows: **{_fmt_num(metrics['community']['unique_members_touched'])}**",
-1385:                 f"- Members with tracked weekly activity: **{_fmt_num(metrics['community']['tracked_active_members'])}**",
-1386:                 f"- Weeks with activity history: **{_fmt_num(metrics['community']['tracked_weeks'])}**",
-1387:                 "",
-1388:                 "## Activity And Commands",
-1389:                 "",
-1390:                 f"- Tracked messages: **{_fmt_num(activity['tracked_messages'])}**",
-1391:                 f"- Reactions recorded in daily summaries: **{_fmt_num(activity['reactions'])}**",
-1392:                 f"- Slash commands recorded in daily summaries: **{_fmt_num(activity['commands'])}**",
-1393:                 f"- Command errors recorded: **{_fmt_num(activity['command_errors'])}**",
-1394:                 f"- Voice time recorded: **{_fmt_num(activity['voice_minutes'])} minutes**",
-1395:                 f"- Top command: **/{activity['top_command'] or 'none'}** ({_fmt_num(activity['top_command_count'])} uses)",
-1396:                 "",
-1397:                 "## Level Requests",
-1398:                 "",
-1399:                 f"- Current request state: **{live_state['state']}**, wave **{live_state['wave_id']}**",
-1400:                 f"- Live wave requests: **{_fmt_num(requests['live_total'])}** total, **{_fmt_num(requests['live_reviewed'])}** reviewed, **{_fmt_num(requests['live_pending'])}** pending ({requests['live_review_rate']} reviewed)",
-1401:                 f"- Average live request review time: **{requests['live_avg_review_hours']} hours**",
-1402:                 f"- Weekly request submissions: **{_fmt_num(requests['weekly_total'])}** total, **{_fmt_num(requests['weekly_reviewed'])}** reviewed, **{_fmt_num(requests['weekly_pending'])}** pending ({requests['weekly_review_rate']} reviewed)",
-1403:                 f"- Average weekly request review time: **{requests['weekly_avg_review_hours']} hours**",
-1404:                 f"- Request waves handled: **{_fmt_num(requests['live_waves'])}**",
-1405:                 f"- Unique live level IDs submitted: **{_fmt_num(requests['unique_live_level_ids'])}**",
-1406:                 f"- Request edit audit entries: **{_fmt_num(requests['edit_audit_entries'])}**",
-1407:                 f"- Scheduled openings currently pending: **{_fmt_num(requests['pending_openings'])}**",
-1408:                 "",
-1409:                 "## Tickets And Help",
-1410:                 "",
-1411:                 f"- Tickets opened: **{_fmt_num(support['tickets_total'])}**",
-1412:                 f"- Tickets closed/resolved: **{_fmt_num(support['tickets_closed'])}**",
-1413:                 f"- Average ticket close time: **{support['avg_ticket_close_hours']} hours**",
-1414:                 f"- Ticket transcripts saved: **{_fmt_num(support['ticket_transcripts_saved'])}**",
-1415:                 f"- Satisfaction responses: **{_fmt_num(support['satisfaction_responses'])}** with average **{support['satisfaction_average']}**",
-1416:                 f"- Help submissions: **{_fmt_num(support['help_submissions_total'])}**",
-1417:                 f"- Ban information requests: **{_fmt_num(support['ban_info_requests_total'])}** total, **{_fmt_num(support['ban_info_delivered'])}** delivered",
-1418:                 f"- Transcript requests: **{_fmt_num(support['transcript_requests_total'])}**",
-1419:                 "",
-1420:                 "## Weekly Rewards And Safety",
-1421:                 "",
-1422:                 f"- Weekly reward claim records: **{_fmt_num(weekly['claims'])}**",
-1423:                 f"- Weekly DM log events: **{_fmt_num(weekly['dm_log_events'])}**",
-1424:                 f"- Members with repeated top-5 streaks: **{_fmt_num(weekly['members_with_streaks'])}**",
-1425:                 f"- Best top-5 streak: **{_fmt_num(weekly['best_top5_streak'])} weeks**",
-1426:                 f"- Anti-farm events logged: **{_fmt_num(operations['anti_farm_events'])}**",
-1427:                 "",
-1428:                 "## Persistence Notes",
-1429:                 "",
-1430:                 f"- Database backups recorded: **{_fmt_num(operations['database_backups'])}**",
-1431:                 f"- Database restores recorded: **{_fmt_num(operations['database_restores'])}**",
-1432:                 "This report was saved into the bot database and posted as Markdown, CSV, trend CSV, breakdown CSV, and raw JSON attachments. The CSV files can be imported directly into Google Sheets for charts, CV evidence, forecasting, or future portfolio reporting.",
-1433:                 "",
-1434:             ]
-1435:         )
-1436:
-1437:     def _impact_report_embed(self, metrics: dict) -> discord.Embed:
-1438:         headline = metrics["headline"]
-1439:         requests = metrics["requests"]
-1440:         support = metrics["support"]
-1441:         activity = metrics["activity"]
-1442:         forecast = metrics.get("forecast", {})
-1443:         embed = discord.Embed(
-1444:             title="Avenue Guard Impact And Forecast Report",
-1445:             description=(
-1446:                 f"Generated <t:{int(metrics['report']['snapshot_ts'])}:R>. "
-1447:                 "Files are attached for long-term records, spreadsheet import, and trend tracking."
-1448:             ),
-1449:             color=discord.Color.blurple(),
-1450:             timestamp=now_madrid(),
-1451:         )
-1452:         embed.add_field(
-1453:             name="CV Headline",
-1454:             value=(
-1455:                 f"Community: **{_fmt_num(headline['current_members'])}** members\n"
-1456:                 f"Unique members touched: **{_fmt_num(headline['unique_members_touched'])}**\n"
-1457:                 f"Tracked events: **{_fmt_num(headline['tracked_event_total'])}**"
-1458:             ),
-1459:             inline=False,
-1460:         )
-1461:         embed.add_field(
-1462:             name="Requests",
-1463:             value=(
-1464:                 f"Live: **{_fmt_num(requests['live_total'])}** ({requests['live_review_rate']} reviewed)\n"
-1465:                 f"Weekly: **{_fmt_num(requests['weekly_total'])}** ({requests['weekly_review_rate']} reviewed)\n"
+2116:     async def server_icon_mode(
+2117:         self,
+2118:         ctx: discord.ApplicationContext,
+2119:         mode: discord.Option(
+2120:             str,
+2121:             "Rotation mode to use",
+2122:             choices=[
+2123:                 discord.OptionChoice("Random", "random"),
+2124:                 discord.OptionChoice("Linear", "linear"),
+2125:                 discord.OptionChoice("Disabled", "disabled"),
+2126:             ],
+2127:         ),
+2128:     ):
+2129:         if not self._in_allowed_guild(ctx):
+2130:             return await ctx.respond("Wrong server.", ephemeral=True)
+2131:         await self._defer(ctx, ephemeral=True)
+2132:         if not await self._is_admin_ctx(ctx):
+2133:             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+2134:
+2135:         raw_mode = str(mode or "").strip().casefold()
+2136:         if raw_mode not in VALID_SERVER_ICON_MODES:
+2137:             return await ctx.respond("Mode must be `random`, `linear`, or `disabled`.", ephemeral=True)
+2138:         async with self._server_icon_operation_lock(), self._config_write_lock():
+2139:             cfg = ensure_server_icon_config(self.bot.config)
+2140:             cfg["mode"] = raw_mode
+2141:             if not await self._save_server_icon_config(ctx, "server_icon_mode_updated", f"mode={raw_mode}"):
+2142:                 return
+2143:         await ctx.respond(f"Server icon rotation mode is now `{raw_mode}`.", ephemeral=True)
 ```
 
 The current_index and current_url fields prevent linear rotation from getting stuck and help the bot know what it last tried. The interval is normalized to at least five minutes to respect Discord rate limits and avoid accidental rapid icon changes.
@@ -3823,133 +3344,138 @@ flowchart LR
 
 A direct channel.send followed by a database update has an unavoidable failure window. If Discord accepts the message and Turso fails before the second write, the bot may send the same result again after restart. If the database changes first and Discord fails, the workflow looks complete while the user never receives the result. The transactional outbox closes most of this gap by writing the business result and the delivery intent in one transaction.
 
-#### Durable action creation and idempotency (utils/outbox.py:35-76)
+#### Durable action creation and idempotency (utils/outbox.py:37-78)
 
 ```python
-  35:     async def enqueue(
-  36:         self,
-  37:         action_type: str,
-  38:         *,
-  39:         payload: dict[str, Any] | None = None,
-  40:         guild_id: int = 0,
-  41:         channel_id: int = 0,
-  42:         user_id: int = 0,
-  43:         message_id: int = 0,
-  44:         correlation_id: str = "",
-  45:         idempotency_key: str = "",
-  46:     ) -> int:
-  47:         action = str(action_type).strip().casefold()
-  48:         if action not in SUPPORTED_ACTIONS:
-  49:             raise ValueError(f"unsupported outbox action: {action}")
-  50:         correlation = str(correlation_id or new_correlation_id("outbox"))
-  51:         key = str(idempotency_key or f"{correlation}:{action}")[:180]
-  52:         now = int(time.time())
-  53:         await self.bot.db.execute(
-  54:             "INSERT OR IGNORE INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) "
-  55:             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-  56:             (
-  57:                 correlation,
-  58:                 key,
-  59:                 action,
-  60:                 int(guild_id or 0),
-  61:                 int(channel_id or 0),
-  62:                 int(user_id or 0),
-  63:                 int(message_id or 0),
-  64:                 json.dumps(payload or {}, separators=(",", ":"), ensure_ascii=False),
-  65:                 "pending",
-  66:                 0,
-  67:                 now,
-  68:                 now,
+  37:     async def enqueue(
+  38:         self,
+  39:         action_type: str,
+  40:         *,
+  41:         payload: dict[str, Any] | None = None,
+  42:         guild_id: int = 0,
+  43:         channel_id: int = 0,
+  44:         user_id: int = 0,
+  45:         message_id: int = 0,
+  46:         correlation_id: str = "",
+  47:         idempotency_key: str = "",
+  48:     ) -> int:
+  49:         action = str(action_type).strip().casefold()
+  50:         if action not in SUPPORTED_ACTIONS:
+  51:             raise ValueError(f"unsupported outbox action: {action}")
+  52:         correlation = str(correlation_id or new_correlation_id("outbox"))
+  53:         key = str(idempotency_key or f"{correlation}:{action}")[:180]
+  54:         now = int(time.time())
+  55:         await self.bot.db.execute(
+  56:             "INSERT OR IGNORE INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) "
+  57:             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+  58:             (
+  59:                 correlation,
+  60:                 key,
+  61:                 action,
+  62:                 int(guild_id or 0),
+  63:                 int(channel_id or 0),
+  64:                 int(user_id or 0),
+  65:                 int(message_id or 0),
+  66:                 json.dumps(payload or {}, separators=(",", ":"), ensure_ascii=False),
+  67:                 "pending",
+  68:                 0,
   69:                 now,
-  70:             ),
-  71:         )
-  72:         row = await self.bot.db.fetchone(
-  73:             "SELECT id FROM discord_outbox WHERE idempotency_key=?",
-  74:             (key,),
-  75:         )
-  76:         return int(row["id"] or 0) if row else 0
+  70:                 now,
+  71:                 now,
+  72:             ),
+  73:         )
+  74:         row = await self.bot.db.fetchone(
+  75:             "SELECT id FROM discord_outbox WHERE idempotency_key=?",
+  76:             (key,),
+  77:         )
+  78:         return int(row["id"] or 0) if row else 0
 ```
 
-#### Atomic claim, retry, and delivered state (utils/outbox.py:102-172)
+#### Atomic claim, receipts, and delivered state excerpt (utils/outbox.py:115-190)
 
 ```python
- 102:     async def _process_row(self, row) -> str:
- 103:         outbox_id = int(row["id"])
- 104:         source = str(row["status"])
- 105:         OUTBOX_STATES.require(source, "processing")
- 106:         now = int(time.time())
- 107:         claimed_count = await self.bot.db.execute_affected(
- 108:             "UPDATE discord_outbox SET status='processing',attempts=attempts+1,updated_ts=? "
- 109:             "WHERE id=? AND status=?",
- 110:             (now, outbox_id, source),
- 111:         )
- 112:         if claimed_count != 1:
- 113:             return "retried"
- 114:         claimed = await self.bot.db.fetchone(
- 115:             "SELECT * FROM discord_outbox WHERE id=? AND status='processing'",
- 116:             (outbox_id,),
- 117:         )
- 118:         if claimed is None:
- 119:             return "retried"
- 120:         attempts = int(claimed["attempts"] or 1)
- 121:         try:
- 122:             delivered_message_id = await self._deliver(claimed)
- 123:         except Exception as exc:
- 124:             terminal = self._terminal_failure(exc) or attempts >= self.max_attempts
- 125:             target = "dead" if terminal else "pending"
- 126:             OUTBOX_STATES.require("processing", target)
- 127:             delay = 0 if terminal else min(3600, 5 * (2 ** min(attempts - 1, 9)))
- 128:             await self.bot.db.execute(
- 129:                 "UPDATE discord_outbox SET status=?,next_attempt_ts=?,updated_ts=?,last_error=? WHERE id=?",
- 130:                 (
- 131:                     target,
- 132:                     int(time.time()) + delay,
- 133:                     int(time.time()),
- 134:                     f"{type(exc).__name__}: {exc}"[:1000],
- 135:                     outbox_id,
- 136:                 ),
- 137:             )
- 138:             await record_workflow_event(
- 139:                 self.bot.db,
- 140:                 workflow_type="discord_outbox",
- 141:                 entity_id=str(outbox_id),
- 142:                 event=target,
- 143:                 correlation_id=str(claimed["correlation_id"] or ""),
- 144:                 guild_id=int(claimed["guild_id"] or 0),
- 145:                 payload={
- 146:                     "action": claimed["action_type"],
- 147:                     "attempts": attempts,
- 148:                     "error": str(exc)[:300],
- 149:                 },
- 150:             )
- 151:             return "dead" if terminal else "retried"
- 152:         OUTBOX_STATES.require("processing", "delivered")
- 153:         await self.bot.db.execute(
- 154:             "UPDATE discord_outbox SET status='delivered',delivered_ts=?,updated_ts=?,"
- 155:             "delivered_message_id=?,last_error=NULL WHERE id=?",
- 156:             (
- 157:                 int(time.time()),
- 158:                 int(time.time()),
- 159:                 int(delivered_message_id or 0) or None,
- 160:                 outbox_id,
- 161:             ),
- 162:         )
- 163:         await record_workflow_event(
- 164:             self.bot.db,
- 165:             workflow_type="discord_outbox",
- 166:             entity_id=str(outbox_id),
- 167:             event="delivered",
- 168:             correlation_id=str(claimed["correlation_id"] or ""),
- 169:             guild_id=int(claimed["guild_id"] or 0),
- 170:             payload={"action": claimed["action_type"], "attempts": attempts},
- 171:         )
- 172:         return "delivered"
+ 115:     async def _process_row(self, row) -> str:
+ 116:         outbox_id = int(row["id"])
+ 117:         source = str(row["status"])
+ 118:         OUTBOX_STATES.require(source, "processing")
+ 119:         now = int(time.time())
+ 120:         claimed_count = await self.bot.db.execute_affected(
+ 121:             "UPDATE discord_outbox SET status='processing',attempts=attempts+1,updated_ts=? "
+ 122:             "WHERE id=? AND status=?",
+ 123:             (now, outbox_id, source),
+ 124:         )
+ 125:         if claimed_count != 1:
+ 126:             return "retried"
+ 127:         claimed = await self.bot.db.fetchone(
+ 128:             "SELECT * FROM discord_outbox WHERE id=? AND status='processing'",
+ 129:             (outbox_id,),
+ 130:         )
+ 131:         if claimed is None:
+ 132:             return "retried"
+ 133:         attempts = int(claimed["attempts"] or 1)
+ 134:         try:
+ 135:             if outbox_id in self._delivery_receipts:
+ 136:                 delivered_message_id = self._delivery_receipts[outbox_id]
+ 137:             else:
+ 138:                 delivered_message_id = await asyncio.wait_for(self._deliver(claimed), timeout=45)
+ 139:                 self._delivery_receipts[outbox_id] = int(delivered_message_id or 0)
+ 140:         except Exception as exc:
+ 141:             terminal = self._terminal_failure(exc) or attempts >= self.max_attempts
+ 142:             target = "dead" if terminal else "pending"
+ 143:             OUTBOX_STATES.require("processing", target)
+ 144:             delay = 0 if terminal else min(3600, 5 * (2 ** min(attempts - 1, 9)))
+ 145:             await self.bot.db.execute(
+ 146:                 "UPDATE discord_outbox SET status=?,next_attempt_ts=?,updated_ts=?,last_error=? WHERE id=?",
+ 147:                 (
+ 148:                     target,
+ 149:                     int(time.time()) + delay,
+ 150:                     int(time.time()),
+ 151:                     f"{type(exc).__name__}: {exc}"[:1000],
+ 152:                     outbox_id,
+ 153:                 ),
+ 154:             )
+ 155:             await record_workflow_event(
+ 156:                 self.bot.db,
+ 157:                 workflow_type="discord_outbox",
+ 158:                 entity_id=str(outbox_id),
+ 159:                 event=target,
+ 160:                 correlation_id=str(claimed["correlation_id"] or ""),
+ 161:                 guild_id=int(claimed["guild_id"] or 0),
+ 162:                 payload={
+ 163:                     "action": claimed["action_type"],
+ 164:                     "attempts": attempts,
+ 165:                     "error": str(exc)[:300],
+ 166:                 },
+ 167:             )
+ 168:             return "dead" if terminal else "retried"
+ 169:         OUTBOX_STATES.require("processing", "delivered")
+ 170:         await self.bot.db.execute(
+ 171:             "UPDATE discord_outbox SET status='delivered',delivered_ts=?,updated_ts=?,"
+ 172:             "delivered_message_id=?,last_error=NULL WHERE id=?",
+ 173:             (
+ 174:                 int(time.time()),
+ 175:                 int(time.time()),
+ 176:                 int(delivered_message_id or 0) or None,
+ 177:                 outbox_id,
+ 178:             ),
+ 179:         )
+ 180:         self._delivery_receipts.pop(outbox_id, None)
+ 181:         await record_workflow_event(
+ 182:             self.bot.db,
+ 183:             workflow_type="discord_outbox",
+ 184:             entity_id=str(outbox_id),
+ 185:             event="delivered",
+ 186:             correlation_id=str(claimed["correlation_id"] or ""),
+ 187:             guild_id=int(claimed["guild_id"] or 0),
+ 188:             payload={"action": claimed["action_type"], "attempts": attempts},
+ 189:         )
+ 190:         return "delivered"
 ```
 
 | Outbox State | Meaning | Recovery Rule |
 | --- | --- | --- |
 | pending | Ready to be claimed by a worker. | A worker atomically changes exactly one matching row to processing. |
-| processing | A worker owns this attempt. | Startup recovers rows abandoned by an interrupted process. |
+| processing | A worker owns this attempt. | Startup and runtime recover abandoned claims after a bounded lease. |
 | delivered | Discord accepted the operation. | The Discord message ID is stored when one exists. |
 | dead | The error is permanent or attempts are exhausted. | The dashboard exposes it for explicit retry or repair. |
 
@@ -3958,7 +3484,7 @@ A direct channel.send followed by a database update has an unavoidable failure w
 ```python
 # 1. Store the irreversible business decision.
 statements = [
-    ("UPDATE level_request_submissions SET status='reviewed' WHERE message_id=?", (message_id,)),
+    ("UPDATE level_request_submissions SET status='reviewed' WHERE request_message_id=?", (message_id,)),
 
     # 2. Store what Discord must receive in the SAME transaction.
     #    The unique idempotency key prevents a second queue row for this result.
@@ -3974,157 +3500,102 @@ await db.execute_transaction(statements, retry_safe=True)
 
 A task that exists is not necessarily a healthy task. asyncio tasks can finish after an uncaught exception, while the process and slash commands stay online. OperationsCog inventories the expected loops in every cog, recognizes when optional work is deliberately disabled, records state changes, and asks each affected cog to start its work again.
 
-#### Task inventory and restart decision (cogs/Operations.py:108-199)
+#### Task inventory and restart decision (cogs/Operations.py:207-243)
 
 ```python
- 108:
- 109:     def _external_task_specs(self):
- 110:         return (
- 111:             ("tracking.weekly", "TrackingCog", "_weekly_task"),
- 112:             ("tracking.timeouts", "TrackingCog", "_timeout_task"),
- 113:             ("tracking.flush", "TrackingCog", "_activity_flush_task"),
- 114:             ("tracking.recap", "TrackingCog", "_recap_task"),
- 115:             ("help.ticket_scan", "HelpCog", "_ticket_scan_task"),
- 116:             ("requests.auto_close", "RequestLevelsCog", "_close_task"),
- 117:             ("requests.scheduled", "RequestLevelsCog", "_scheduled_open_task"),
- 118:             ("release.metrics", "ReleaseCog", "_metrics_task"),
- 119:             ("background.daily", "BackgroundCog", "daily_report"),
- 120:             ("background.snapshot", "BackgroundCog", "update_snapshot"),
- 121:             ("background.backup", "BackgroundCog", "database_backup"),
- 122:             ("background.status", "BackgroundCog", "rotate_status"),
- 123:             ("background.icon", "BackgroundCog", "rotate_server_icon"),
- 124:         )
- 125:
- 126:     def _task_expected(self, label: str, cog: Any) -> bool:
- 127:         checks = {
- 128:             "background.daily": "_daily_summary_enabled",
- 129:             "background.backup": "_database_backup_enabled",
- 130:             "background.status": "_status_rotation_enabled",
- 131:             "background.icon": "_server_icon_rotation_enabled",
- 132:         }
- 133:         method_name = checks.get(label)
- 134:         if method_name is None:
- 135:             return True
- 136:         check = getattr(cog, method_name, None)
- 137:         if not callable(check):
- 138:             return False
- 139:         try:
- 140:             return bool(check())
- 141:         except Exception:
- 142:             return False
- 143:
- 144:     @staticmethod
- 145:     def _task_state(value: Any) -> str:
- 146:         if value is None:
- 147:             return "missing"
- 148:         is_running = getattr(value, "is_running", None)
- 149:         if callable(is_running):
- 150:             try:
- 151:                 return "running" if is_running() else "stopped"
- 152:             except Exception:
- 153:                 return "unknown"
- 154:         done = getattr(value, "done", None)
- 155:         if callable(done):
- 156:             try:
- 157:                 if not done():
- 158:                     return "running"
- 159:                 exception = value.exception()
- 160:                 return f"failed:{type(exception).__name__}" if exception else "stopped"
- 161:             except (asyncio.CancelledError, Exception):
- 162:                 return "stopped"
- 163:         return "unknown"
- 164:
- 165:     async def restart_stopped_tasks(self, *, force: bool = False) -> dict[str, str]:
- 166:         affected_cogs: set[str] = set()
- 167:         before: dict[str, str] = {}
- 168:         cancelled_tasks: list[asyncio.Task] = []
- 169:         for label, cog_name, attr in self._external_task_specs():
- 170:             cog = self.bot.get_cog(cog_name)
- 171:             if cog is not None and not self._task_expected(label, cog):
- 172:                 before[label] = "disabled"
- 173:                 continue
- 174:             value = getattr(cog, attr, None) if cog else None
- 175:             state = self._task_state(value)
- 176:             before[label] = state
- 177:             if force or state not in {"running", "missing"}:
- 178:                 affected_cogs.add(cog_name)
- 179:             if force and value is not None:
- 180:                 cancel = getattr(value, "cancel", None)
- 181:                 if callable(cancel):
- 182:                     cancel()
- 183:                     if isinstance(value, asyncio.Task):
- 184:                         cancelled_tasks.append(value)
- 185:         if cancelled_tasks:
- 186:             await asyncio.gather(*cancelled_tasks, return_exceptions=True)
- 187:         if force:
- 188:             await asyncio.sleep(0)
- 189:         for cog_name in sorted(affected_cogs):
- 190:             cog = self.bot.get_cog(cog_name)
- 191:             start = getattr(cog, "start_background", None)
- 192:             if callable(start):
- 193:                 try:
- 194:                     await start()
- 195:                 except Exception as exc:
- 196:                     await log_error(
- 197:                         self.bot,
- 198:                         f"Task supervisor could not restart {cog_name}: {exc!r}",
- 199:                     )
+ 207:     async def restart_stopped_tasks(self, *, force: bool = False) -> dict[str, str]:
+ 208:         affected_cogs: set[str] = set()
+ 209:         before: dict[str, str] = {}
+ 210:         cancelled_tasks: list[asyncio.Task] = []
+ 211:         for label, cog_name, attr in self._external_task_specs():
+ 212:             cog = self.bot.get_cog(cog_name)
+ 213:             if cog is not None and not self._task_expected(label, cog):
+ 214:                 before[label] = "disabled"
+ 215:                 continue
+ 216:             value = getattr(cog, attr, None) if cog else None
+ 217:             state = self._task_state(value)
+ 218:             before[label] = state
+ 219:             if cog is not None and (force or state not in {"running", "unknown"}):
+ 220:                 affected_cogs.add(cog_name)
+ 221:             if force and value is not None:
+ 222:                 cancel = getattr(value, "cancel", None)
+ 223:                 if callable(cancel):
+ 224:                     cancel()
+ 225:                     actual_task = value if isinstance(value, asyncio.Task) else getattr(value, "get_task", lambda: None)()
+ 226:                     if actual_task is not None:
+ 227:                         cancelled_tasks.append(actual_task)
+ 228:         if cancelled_tasks:
+ 229:             await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+ 230:         if force:
+ 231:             await asyncio.sleep(0)
+ 232:         for cog_name in sorted(affected_cogs):
+ 233:             cog = self.bot.get_cog(cog_name)
+ 234:             start = getattr(cog, "start_background", None)
+ 235:             if callable(start):
+ 236:                 try:
+ 237:                     await start_cog_background(self.bot, cog_name)
+ 238:                 except Exception as exc:
+ 239:                     await log_error(
+ 240:                         self.bot,
+ 241:                         f"Task supervisor could not restart {cog_name}: {exc!r}",
+ 242:                     )
+ 243:         return before
 ```
 
-#### Supervisor loop and state-change timeline (cogs/Operations.py:218-268)
+#### Independent supervisor and timeline (cogs/Operations.py:264-314)
 
 ```python
- 218:
- 219:     async def _supervisor_loop(self) -> None:
- 220:         while not self.bot.is_closed():
- 221:             try:
- 222:                 changed: list[tuple[str, str, str]] = []
- 223:                 for label, cog_name, attr in self._external_task_specs():
- 224:                     cog = self.bot.get_cog(cog_name)
- 225:                     if cog is not None and not self._task_expected(label, cog):
- 226:                         state = "disabled"
- 227:                     else:
- 228:                         state = self._task_state(
- 229:                             getattr(cog, attr, None) if cog else None
- 230:                         )
- 231:                     previous = self._task_states.get(label)
- 232:                     self._task_states[label] = state
- 233:                     if previous is not None and state != previous:
- 234:                         changed.append((label, previous, state))
- 235:                 failed = [
- 236:                     label
- 237:                     for label, state in self._task_states.items()
- 238:                     if state.startswith(("failed", "stopped"))
- 239:                 ]
- 240:                 if failed:
- 241:                     await self.restart_stopped_tasks()
- 242:                 internal_factories = {
- 243:                     "outbox": self._outbox_loop,
- 244:                     "health": self._health_loop,
- 245:                     "maintenance": self._maintenance_loop,
- 246:                 }
- 247:                 for name, factory in internal_factories.items():
- 248:                     task = self._tasks.get(name)
- 249:                     if task is not None and task.done():
- 250:                         self._tasks[name] = asyncio.create_task(
- 251:                             factory(),
- 252:                             name=f"avenue-guard:{name}",
- 253:                         )
- 254:                         changed.append((f"operations.{name}", "stopped", "running"))
- 255:                 for label, previous, state in changed:
- 256:                     await record_workflow_event(
- 257:                         self.bot.db,
- 258:                         workflow_type="background_task",
- 259:                         entity_id=label,
- 260:                         event="state_changed",
- 261:                         payload={"from": previous, "to": state},
- 262:                     )
- 263:             except asyncio.CancelledError:
- 264:                 raise
- 265:             except Exception as exc:
- 266:                 await log_error(self.bot, f"Background task supervisor error: {exc!r}")
- 267:             await asyncio.sleep(
- 268:                 operations_settings(self.bot.config.data).supervisor_interval_seconds
+ 264:     async def _supervisor_loop(self) -> None:
+ 265:         while not self.bot.is_closed():
+ 266:             try:
+ 267:                 changed: list[tuple[str, str, str]] = []
+ 268:                 for label, cog_name, attr in self._external_task_specs():
+ 269:                     cog = self.bot.get_cog(cog_name)
+ 270:                     if cog is not None and not self._task_expected(label, cog):
+ 271:                         state = "disabled"
+ 272:                     else:
+ 273:                         state = self._task_state(
+ 274:                             getattr(cog, attr, None) if cog else None
+ 275:                         )
+ 276:                     previous = self._task_states.get(label)
+ 277:                     self._task_states[label] = state
+ 278:                     if previous is not None and state != previous:
+ 279:                         changed.append((label, previous, state))
+ 280:                 failed = [
+ 281:                     label
+ 282:                     for label, state in self._task_states.items()
+ 283:                     if state.startswith(("failed", "stopped", "missing"))
+ 284:                 ]
+ 285:                 if failed:
+ 286:                     restart = self._tasks.get("restarts")
+ 287:                     if restart is None or restart.done():
+ 288:                         self._tasks["restarts"] = asyncio.create_task(self.restart_stopped_tasks(), name="avenue-guard:restarts")
+ 289:                 internal_factories = {
+ 290:                     "outbox": self._outbox_loop,
+ 291:                     "health": self._health_loop,
+ 292:                     "maintenance": self._maintenance_loop,
+ 293:                     "watchdog": self._watchdog_loop,
+ 294:                 }
+ 295:                 for name, factory in internal_factories.items():
+ 296:                     task = self._tasks.get(name)
+ 297:                     if task is None or task.done():
+ 298:                         if task is not None and not task.cancelled() and task.exception() is not None:
+ 299:                             await log_error(self.bot, f"Operations {name} task failed; restarting: {task.exception()!r}")
+ 300:                         self._tasks[name] = asyncio.create_task(
+ 301:                             factory(),
+ 302:                             name=f"avenue-guard:{name}",
+ 303:                         )
+ 304:                         changed.append((f"operations.{name}", "stopped", "running"))
+ 305:                 timeline = self._tasks.get("timeline")
+ 306:                 if changed and (timeline is None or timeline.done()):
+ 307:                     self._tasks["timeline"] = asyncio.create_task(self._record_task_changes(changed), name="avenue-guard:timeline")
+ 308:             except asyncio.CancelledError:
+ 309:                 raise
+ 310:             except Exception as exc:
+ 311:                 await log_error(self.bot, f"Background task supervisor error: {exc!r}")
+ 312:             await asyncio.sleep(
+ 313:                 operations_settings(self.bot.config.data).supervisor_interval_seconds
+ 314:             )
 ```
 
 > **Important distinction:** Disabled is a valid configured state. Stopped or failed is an operational problem. Treating both as the same would make the supervisor repeatedly start features that the owner intentionally turned off.
@@ -4258,7 +3729,7 @@ The original Config object remains the convenient runtime reader, but config_sch
    7: CONFIG_SCHEMA_VERSION = 2
    8: RUNTIME_SCHEMA_VERSION = 2
    9: EMBED_SCHEMA_VERSION = 2
-  10: DATABASE_SCHEMA_VERSION = 4
+  10: DATABASE_SCHEMA_VERSION = 5
   11:
   12:
   13: @dataclass(frozen=True)
@@ -4418,111 +3889,102 @@ The original Config object remains the convenient runtime reader, but config_sch
 | Config | 2 | The checked-in JSON structure and supported option types. |
 | Runtime | 2 | Persisted settings written by slash commands and maintenance controls. |
 | Embed templates | 2 | Allowed request placeholders and Discord field shapes. |
-| Database | 4 | Tables and columns expected by the deployed code. |
+| Database | 5 | Tables and columns expected by the deployed code, including incident batch deduplication. |
 
 ### Historical Health Rather Than A Snapshot
 
 The dashboard still answers what is happening now, but OperationsCog also stores what happened over time. A sample contains gateway latency, a measured database probe, internal database health, per-operation query timing, command errors, task state, and provider latency. Provider samples make it possible to distinguish a slow external level API from a slow database or Discord connection.
 
-#### Persistent runtime and provider samples (cogs/Operations.py:270-325)
+#### Persistent runtime and provider samples (cogs/Operations.py:324-379)
 
 ```python
- 270:
- 271:     async def collect_health_sample(self) -> dict[str, Any]:
- 272:         started = time.perf_counter()
- 273:         db_ok = True
- 274:         try:
- 275:             await self.bot.db.fetchone("SELECT 1 AS ready")
- 276:         except Exception:
- 277:             db_ok = False
- 278:         db_probe_ms = round((time.perf_counter() - started) * 1000, 2)
- 279:         background = self.bot.get_cog("BackgroundCog")
- 280:         stats = getattr(background, "stats", None)
- 281:         request_cog = self.bot.get_cog("RequestLevelsCog")
- 282:         providers = (
- 283:             request_cog.validation_provider_snapshot()
- 284:             if request_cog is not None
- 285:             and hasattr(request_cog, "validation_provider_snapshot")
- 286:             else {}
- 287:         )
- 288:         payload = {
- 289:             "gateway_latency_ms": round(
- 290:                 float(getattr(self.bot, "latency", 0.0) or 0.0) * 1000, 2
- 291:             ),
- 292:             "db_ok": db_ok,
- 293:             "db_probe_ms": db_probe_ms,
- 294:             "db": self.bot.db.health_snapshot(),
- 295:             "query_timing": self.bot.db.query_timing_snapshot(reset=True),
- 296:             "tasks": self.task_snapshot(),
- 297:             "daily_commands": int(getattr(stats, "commands", 0) or 0),
- 298:             "daily_command_errors": int(getattr(stats, "command_errors", 0) or 0),
- 299:             "providers": providers,
- 300:             "sample_ts": int(time.time()),
- 301:         }
- 302:         guild_id = int(
- 303:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
- 304:         )
- 305:         await self.bot.db.execute(
- 306:             "INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) VALUES(?,?,?,?,?)",
- 307:             (
- 308:                 guild_id,
- 309:                 payload["sample_ts"],
- 310:                 "runtime",
- 311:                 db_probe_ms,
- 312:                 json.dumps(payload, separators=(",", ":")),
- 313:             ),
- 314:         )
- 315:         for provider, provider_payload in providers.items():
- 316:             await self.bot.db.execute(
- 317:                 "INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) VALUES(?,?,?,?,?)",
- 318:                 (
- 319:                     guild_id,
- 320:                     payload["sample_ts"],
- 321:                     f"provider:{provider}",
- 322:                     float(provider_payload.get("average_latency_ms", 0) or 0),
- 323:                     json.dumps(provider_payload, separators=(",", ":")),
- 324:                 ),
- 325:             )
+ 324:     async def collect_health_sample(self) -> dict[str, Any]:
+ 325:         started = time.perf_counter()
+ 326:         db_ok = True
+ 327:         try:
+ 328:             await self.bot.db.fetchone("SELECT 1 AS ready")
+ 329:         except Exception:
+ 330:             db_ok = False
+ 331:         db_probe_ms = round((time.perf_counter() - started) * 1000, 2)
+ 332:         background = self.bot.get_cog("BackgroundCog")
+ 333:         stats = getattr(background, "stats", None)
+ 334:         request_cog = self.bot.get_cog("RequestLevelsCog")
+ 335:         providers = (
+ 336:             request_cog.validation_provider_snapshot()
+ 337:             if request_cog is not None
+ 338:             and hasattr(request_cog, "validation_provider_snapshot")
+ 339:             else {}
+ 340:         )
+ 341:         payload = {
+ 342:             "gateway_latency_ms": round(
+ 343:                 float(getattr(self.bot, "latency", 0.0) or 0.0) * 1000, 2
+ 344:             ),
+ 345:             "db_ok": db_ok,
+ 346:             "db_probe_ms": db_probe_ms,
+ 347:             "db": self.bot.db.health_snapshot(),
+ 348:             "query_timing": self.bot.db.query_timing_snapshot(reset=True),
+ 349:             "tasks": self.task_snapshot(),
+ 350:             "daily_commands": int(getattr(stats, "commands", 0) or 0),
+ 351:             "daily_command_errors": int(getattr(stats, "command_errors", 0) or 0),
+ 352:             "providers": providers,
+ 353:             "sample_ts": int(time.time()),
+ 354:         }
+ 355:         guild_id = int(
+ 356:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
+ 357:         )
+ 358:         await self.bot.db.execute(
+ 359:             "INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) VALUES(?,?,?,?,?)",
+ 360:             (
+ 361:                 guild_id,
+ 362:                 payload["sample_ts"],
+ 363:                 "runtime",
+ 364:                 db_probe_ms,
+ 365:                 json.dumps(payload, separators=(",", ":")),
+ 366:             ),
+ 367:         )
+ 368:         for provider, provider_payload in providers.items():
+ 369:             await self.bot.db.execute(
+ 370:                 "INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) VALUES(?,?,?,?,?)",
+ 371:                 (
+ 372:                     guild_id,
+ 373:                     payload["sample_ts"],
+ 374:                     f"provider:{provider}",
+ 375:                     float(provider_payload.get("average_latency_ms", 0) or 0),
+ 376:                     json.dumps(provider_payload, separators=(",", ":")),
+ 377:                 ),
+ 378:             )
+ 379:         return payload
 ```
 
 Error logging follows the same principle. The message text is normalized and hashed into a fingerprint. Repeated failures update one incident with an occurrence count and latest correlation ID instead of behaving like unrelated errors. Permission drift is stored similarly, including when a previously missing permission is resolved.
 
 ### Retention, Restore Drills, And Monthly Impact
 
-#### Allowlisted retention and restore drill entry (cogs/Operations.py:361-391)
+#### Allowlisted retention (cogs/Operations.py:415-436)
 
 ```python
- 361:
- 362:     async def run_retention(self) -> dict[str, int]:
- 363:         settings = operations_settings(self.bot.config.data)
- 364:         now = int(time.time())
- 365:         removed: dict[str, int] = {}
- 366:         for table, days in settings.retention_days.items():
- 367:             target = RETENTION_TARGETS.get(table)
- 368:             if target is None:
- 369:                 continue
- 370:             column, condition = target
- 371:             cutoff = now - int(days) * 86400
- 372:             removed[table] = await self.bot.db.execute_affected(  # nosec B608
- 373:                 f"DELETE FROM {table} WHERE {column}<? {condition}",
- 374:                 (cutoff,),
- 375:             )
- 376:         await self.bot.db.execute(
- 377:             "UPDATE error_incidents SET status='resolved',resolved_ts=? WHERE status='open' AND last_seen_ts<?",
- 378:             (now, now - 7 * 86400),
- 379:         )
- 380:         self._last_retention_run = now
- 381:         await self._persist_maintenance_timestamps()
- 382:         return removed
- 383:
- 384:     async def run_restore_drill(self, *, trigger: str = "manual") -> dict[str, object]:
- 385:         guild_id = int(
- 386:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
- 387:         )
- 388:         result = await run_restore_drill(
- 389:             self.bot.db, guild_id=guild_id, trigger=trigger
- 390:         )
- 391:         self._last_restore_drill = int(time.time())
+ 415:     async def run_retention(self) -> dict[str, int]:
+ 416:         settings = operations_settings(self.bot.config.data)
+ 417:         now = int(time.time())
+ 418:         removed: dict[str, int] = {}
+ 419:         for table, days in settings.retention_days.items():
+ 420:             target = RETENTION_TARGETS.get(table)
+ 421:             if target is None:
+ 422:                 continue
+ 423:             column, condition = target
+ 424:             cutoff = now - int(days) * 86400
+ 425:             # Identifiers and predicates come only from RETENTION_TARGETS.
+ 426:             removed[table] = await self.bot.db.execute_affected(
+ 427:                 f"DELETE FROM {table} WHERE {column}<? {condition}",  # nosec B608
+ 428:                 (cutoff,),
+ 429:             )
+ 430:         await self.bot.db.execute(
+ 431:             "UPDATE error_incidents SET status='resolved',resolved_ts=? WHERE status='open' AND last_seen_ts<?",
+ 432:             (now, now - 7 * 86400),
+ 433:         )
+ 434:         self._last_retention_run = now
+ 435:         await self._persist_maintenance_timestamps()
+ 436:         return removed
 ```
 
 #### Non-destructive SQLite restore drill (services/backups.py:22-82)
@@ -4593,59 +4055,59 @@ Error logging follows the same principle. The message text is normalized and has
 
 Retention is allowlisted, not arbitrary SQL supplied by a command. Only operational history tables can be trimmed, each with a bounded number of days. Business records such as tickets, requests, reviews, and tracking history are outside that map. A restore drill creates a temporary backup, opens it read-only, runs PRAGMA integrity_check, verifies core tables, stores the result, and then deletes the temporary directory without replacing production data.
 
-#### Idempotent monthly impact delivery (cogs/Operations.py:393-442)
+#### Idempotent monthly impact delivery excerpt (cogs/Operations.py:448-497)
 
 ```python
- 393:
- 394:     async def generate_monthly_report(self, *, force: bool = False) -> bool:
- 395:         settings = operations_settings(self.bot.config.data)
- 396:         now = now_madrid()
- 397:         month_key = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
- 398:         guild_id = int(
- 399:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
- 400:         )
- 401:         guild = self.bot.get_guild(guild_id)
- 402:         commands_cog = self.bot.get_cog("CommandsCog")
- 403:         if guild is None or commands_cog is None:
- 404:             return False
- 405:         exists = await self.bot.db.fetchone(
- 406:             "SELECT status FROM monthly_impact_reports WHERE guild_id=? AND month_key=?",
- 407:             (guild_id, month_key),
- 408:         )
- 409:         if exists and not force:
- 410:             return False
- 411:         metrics = await commands_cog._collect_impact_metrics(guild, 0)
- 412:         embed = commands_cog._impact_report_embed(metrics)
- 413:         channel_id = int(
- 414:             settings.monthly_report_channel_id
- 415:             or self.bot.config.get_int("impact", "report_channel_id", default=0)
- 416:             or 0
- 417:         )
- 418:         if not channel_id:
- 419:             return False
- 420:         correlation = new_correlation_id("impact")
- 421:         await self.bot.outbox.enqueue(
- 422:             "send_channel",
- 423:             guild_id=guild_id,
- 424:             channel_id=channel_id,
- 425:             correlation_id=correlation,
- 426:             idempotency_key=f"monthly-impact:{guild_id}:{month_key}",
- 427:             payload={
- 428:                 "content": f"Avenue Guard monthly impact report for {month_key}",
- 429:                 "embed": embed.to_dict(),
- 430:             },
- 431:         )
- 432:         await self.bot.db.execute(
- 433:             "INSERT OR REPLACE INTO monthly_impact_reports(guild_id,month_key,generated_ts,channel_id,payload_json,status) VALUES(?,?,?,?,?,?)",
- 434:             (
- 435:                 guild_id,
- 436:                 month_key,
- 437:                 int(time.time()),
- 438:                 channel_id,
- 439:                 json.dumps(metrics, separators=(",", ":")),
- 440:                 "queued",
- 441:             ),
- 442:         )
+ 448:     async def generate_monthly_report(self, *, force: bool = False) -> bool:
+ 449:         settings = operations_settings(self.bot.config.data)
+ 450:         now = now_madrid()
+ 451:         month_key = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+ 452:         guild_id = int(
+ 453:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
+ 454:         )
+ 455:         guild = self.bot.get_guild(guild_id)
+ 456:         commands_cog = self.bot.get_cog("CommandsCog")
+ 457:         if guild is None or commands_cog is None:
+ 458:             return False
+ 459:         exists = await self.bot.db.fetchone(
+ 460:             "SELECT status FROM monthly_impact_reports WHERE guild_id=? AND month_key=?",
+ 461:             (guild_id, month_key),
+ 462:         )
+ 463:         if exists and not force:
+ 464:             return False
+ 465:         metrics = await commands_cog._collect_impact_metrics(guild, 0)
+ 466:         embed = commands_cog._impact_report_embed(metrics)
+ 467:         channel_id = int(
+ 468:             settings.monthly_report_channel_id
+ 469:             or self.bot.config.get_int("impact", "report_channel_id", default=0)
+ 470:             or 0
+ 471:         )
+ 472:         if not channel_id:
+ 473:             return False
+ 474:         correlation = new_correlation_id("impact")
+ 475:         await self.bot.outbox.enqueue(
+ 476:             "send_channel",
+ 477:             guild_id=guild_id,
+ 478:             channel_id=channel_id,
+ 479:             correlation_id=correlation,
+ 480:             idempotency_key=f"monthly-impact:{guild_id}:{month_key}",
+ 481:             payload={
+ 482:                 "content": f"Avenue Guard monthly impact report for {month_key}",
+ 483:                 "embed": embed.to_dict(),
+ 484:             },
+ 485:         )
+ 486:         await self.bot.db.execute(
+ 487:             "INSERT OR REPLACE INTO monthly_impact_reports(guild_id,month_key,generated_ts,channel_id,payload_json,status) VALUES(?,?,?,?,?,?)",
+ 488:             (
+ 489:                 guild_id,
+ 490:                 month_key,
+ 491:                 int(time.time()),
+ 492:                 channel_id,
+ 493:                 json.dumps(metrics, separators=(",", ":")),
+ 494:                 "queued",
+ 495:             ),
+ 496:         )
+ 497:         return True
 ```
 
 #### Monthly Impact Report Lifecycle
@@ -4754,58 +4216,517 @@ The wave summary combines total demand, reviewed and pending work, sent rate, st
 
 After a short configurable delay, the operations layer probes the database, confirms the configured guild, validates typed config, checks its outbox worker and request cog, compares schema versions, and inventories slash commands. This is an in-process release check, not a full staging environment. It catches incomplete deployments and startup wiring mistakes while the dashboard can still explain them.
 
-#### Post-deployment smoke checks (cogs/Operations.py:502-545)
+#### Post-deployment smoke checks excerpt (cogs/Operations.py:559-628)
 
 ```python
- 502:
- 503:     async def _post_deploy_smoke_test(self) -> None:
- 504:         delay = operations_settings(self.bot.config.data).smoke_test_delay_seconds
- 505:         if delay:
- 506:             await asyncio.sleep(delay)
- 507:         checks: dict[str, bool] = {}
- 508:         details: dict[str, str] = {}
- 509:         try:
- 510:             checks["database"] = bool(await self.bot.db.fetchone("SELECT 1 AS ready"))
- 511:         except Exception as exc:
- 512:             checks["database"] = False
- 513:             details["database"] = f"{type(exc).__name__}: {exc}"[:300]
- 514:         guild_id = int(
- 515:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
- 516:         )
- 517:         checks["guild"] = self.bot.get_guild(guild_id) is not None
- 518:         checks["config"] = not any(
- 519:             issue.severity == "error" for issue in self.bot.config.validation_issues
- 520:         )
- 521:         checks["outbox"] = not self._tasks.get("outbox", asyncio.current_task()).done()
- 522:         checks["request_cog"] = self.bot.get_cog("RequestLevelsCog") is not None
- 523:         schema_rows = await self.bot.db.fetchall(
- 524:             "SELECT component,schema_version FROM schema_metadata"
- 525:         )
- 526:         schema_versions = {
- 527:             str(row["component"]): int(row["schema_version"]) for row in schema_rows
- 528:         }
- 529:         expected_schemas = {
- 530:             "database": DATABASE_SCHEMA_VERSION,
- 531:             "config": CONFIG_SCHEMA_VERSION,
- 532:             "runtime_settings": RUNTIME_SCHEMA_VERSION,
- 533:             "embed_templates": EMBED_SCHEMA_VERSION,
- 534:         }
- 535:         checks["schema_versions"] = schema_versions == expected_schemas
- 536:         if not checks["schema_versions"]:
- 537:             details["schema_versions"] = (
- 538:                 f"expected={expected_schemas} actual={schema_versions}"
- 539:             )
- 540:         command_count = sum(1 for _ in self.bot.walk_application_commands())
- 541:         checks["slash_commands"] = command_count >= 17
- 542:         details["slash_commands"] = str(command_count)
- 543:         status = "passed" if all(checks.values()) else "failed"
- 544:         correlation = await record_workflow_event(
- 545:             self.bot.db,
+ 559:     async def _post_deploy_smoke_test(self) -> None:
+ 560:         delay = operations_settings(self.bot.config.data).smoke_test_delay_seconds
+ 561:         if delay:
+ 562:             await asyncio.sleep(delay)
+ 563:         checks: dict[str, bool] = {}
+ 564:         details: dict[str, str] = {}
+ 565:         try:
+ 566:             checks["database"] = bool(await self.bot.db.fetchone("SELECT 1 AS ready"))
+ 567:         except Exception as exc:
+ 568:             checks["database"] = False
+ 569:             details["database"] = f"{type(exc).__name__}: {exc}"[:300]
+ 570:         guild_id = int(
+ 571:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
+ 572:         )
+ 573:         checks["guild"] = self.bot.get_guild(guild_id) is not None
+ 574:         checks["config"] = not any(
+ 575:             issue.severity == "error" for issue in self.bot.config.validation_issues
+ 576:         )
+ 577:         outbox_task = self._tasks.get("outbox")
+ 578:         checks["outbox"] = outbox_task is not None and not outbox_task.done()
+ 579:         checks["request_cog"] = self.bot.get_cog("RequestLevelsCog") is not None
+ 580:         try:
+ 581:             schema_rows = await self.bot.db.fetchall(
+ 582:                 "SELECT component,schema_version FROM schema_metadata"
+ 583:             )
+ 584:         except Exception as exc:
+ 585:             schema_rows = []
+ 586:             details["schema_versions"] = f"{type(exc).__name__}: {exc}"[:300]
+ 587:         schema_versions = {
+ 588:             str(row["component"]): int(row["schema_version"]) for row in schema_rows
+ 589:         }
+ 590:         expected_schemas = {
+ 591:             "database": DATABASE_SCHEMA_VERSION,
+ 592:             "config": CONFIG_SCHEMA_VERSION,
+ 593:             "runtime_settings": RUNTIME_SCHEMA_VERSION,
+ 594:             "embed_templates": EMBED_SCHEMA_VERSION,
+ 595:         }
+ 596:         checks["schema_versions"] = schema_versions == expected_schemas
+ 597:         if not checks["schema_versions"]:
+ 598:             details.setdefault("schema_versions", (
+ 599:                 f"expected={expected_schemas} actual={schema_versions}"
+ 600:             ))
+ 601:         command_count = sum(1 for _ in self.bot.walk_application_commands())
+ 602:         checks["slash_commands"] = command_count >= 17
+ 603:         details["slash_commands"] = str(command_count)
+ 604:         status = "passed" if all(checks.values()) else "failed"
+ 605:         correlation = new_correlation_id("deployment")
+ 606:         self._last_smoke_result = {
+ 607:             "status": status,
+ 608:             "checks": checks,
+ 609:             "details": details,
+ 610:             "correlation_id": correlation,
+ 611:             "ts": int(time.time()),
+ 612:         }
+ 613:         try:
+ 614:             await record_workflow_event(
+ 615:                 self.bot.db,
+ 616:                 workflow_type="deployment",
+ 617:                 entity_id=str(getattr(self.bot.user, "id", 0) or 0),
+ 618:                 event=f"smoke_test_{status}",
+ 619:                 correlation_id=correlation,
+ 620:                 guild_id=guild_id,
+ 621:                 payload={"checks": checks, "details": details},
+ 622:             )
+ 623:         except Exception as exc:
+ 624:             await log_error(self.bot, f"Smoke test history persistence deferred: {exc!r}")
+ 625:         if status == "failed":
+ 626:             failed = ", ".join(key for key, passed in checks.items() if not passed)
+ 627:             await log_error(
+ 628:                 self.bot, f"Post-deployment smoke test failed: {failed} [{correlation}]"
 ```
 
 > **Mental model:** Cogs own Discord workflows. Services own reusable business rules. Utils own infrastructure. Turso owns durable truth. OperationsCog watches the watchers, and the outbox turns important Discord effects into recoverable work.
 
-## 44. Engineering Thinking Behind The Bot
+## 44. Runtime Isolation And Incident Recovery 3 22 1
+
+The September 15 review found an important distinction: putting a native call in a thread does not prove it is safe for an asyncio application. The installed libSQL extension can retain Python's GIL during database work. Our local threaded-query experiment took about 0.402 seconds while a separate heartbeat paused for about 0.411 seconds. This demonstrates interpreter contention, not the exact length or sole cause of the production outage.
+
+### Why Threads Were Not Enough
+
+The GIL is Python's interpreter execution lock. asyncio normally cooperates by yielding control at await points. A thread future lets the coroutine yield, but the main interpreter still needs the GIL to resume any Python code. If a Rust extension retains that lock while waiting for a database result, the event loop cannot reliably run heartbeats, interaction responses, watchdogs, or error delivery. CPU cores alone do not solve this ownership problem.
+
+#### The Shared Interpreter Failure
+
+```mermaid
+flowchart LR
+  S1["async handler awaits thread"]
+  S2["native driver retains GIL"]
+  S3["main interpreter waits"]
+  S4["Discord acknowledgement expires"]
+  S1 --> S2
+  S2 --> S3
+  S3 --> S4
+```
+
+> An await is useful only if the code that must resume can actually acquire interpreter execution time.
+
+### The Process Boundary
+
+A worker process has a separate Python interpreter and its own GIL. IsolatedConnection starts that worker with multiprocessing spawn and gives it the path, remote URL, and token in memory. The parent waits on a pipe inside a thread; that wait does not retain the parent's interpreter lock. Only materialized SQL results cross the pipe. There is one primary worker connection, not a fleet of writers and not a silent switch to disposable local storage.
+
+#### Worker operations and materialized result boundary (utils/libsql_worker.py:18-57)
+
+```python
+  18: def _worker_main(pipe, path: str, remote_url: str, token: str) -> None:
+  19:     import libsql
+  20:
+  21:     connection = None
+  22:     try:
+  23:         while True:
+  24:             request = pipe.recv()
+  25:             action, args = request
+  26:             try:
+  27:                 if action == "open":
+  28:                     options = {"sync_url": remote_url, "auth_token": token} if remote_url else {}
+  29:                     connection = libsql.connect(path, **options)
+  30:                     result = None
+  31:                 elif action == "close":
+  32:                     if connection is not None:
+  33:                         connection.close()
+  34:                     pipe.send((True, None))
+  35:                     return
+  36:                 elif connection is None:
+  37:                     raise RuntimeError("database worker connection is not open")
+  38:                 elif action in {"execute", "executescript"}:
+  39:                     cursor = getattr(connection, action)(*args)
+  40:                     description = getattr(cursor, "description", None)
+  41:                     result = {
+  42:                         "description": description,
+  43:                         "rows": cursor.fetchall() if description else [],
+  44:                         "rowcount": getattr(cursor, "rowcount", -1),
+  45:                         "lastrowid": getattr(cursor, "lastrowid", None),
+  46:                     }
+  47:                 elif action in {"commit", "rollback", "sync"}:
+  48:                     result = getattr(connection, action)()
+  49:                 else:
+  50:                     raise ValueError("unsupported database worker operation")
+  51:                 pipe.send((True, result))
+  52:             except Exception as exc:
+  53:                 pipe.send((False, (type(exc).__name__, str(exc))))
+  54:     except (EOFError, BrokenPipeError, OSError):
+  55:         pass
+  56:     finally:
+  57:         pipe.close()
+```
+
+#### Bounded worker RPC (utils/libsql_worker.py:125-146)
+
+```python
+ 125:     def _call(self, action: str, *args):
+ 126:         if not self.alive:
+ 127:             raise DatabaseWorkerError("Turso worker is unavailable; reconnect required")
+ 128:         remaining = min(self.timeout, self._deadline - time.monotonic())
+ 129:         if remaining <= 0:
+ 130:             self.terminate()
+ 131:             raise DatabaseWorkerTimeout("Turso worker timed out; operation completion is unknown")
+ 132:         try:
+ 133:             self._pipe.send((action, args))
+ 134:             if not self._pipe.poll(remaining):
+ 135:                 self.terminate()
+ 136:                 raise DatabaseWorkerTimeout("Turso worker timed out; operation completion is unknown")
+ 137:             successful, result = self._pipe.recv()
+ 138:         except (EOFError, BrokenPipeError, OSError) as exc:
+ 139:             self.terminate()
+ 140:             raise DatabaseWorkerError("Turso worker exited; operation completion is unknown") from exc
+ 141:         if not successful:
+ 142:             name, message = result
+ 143:             if name == "ValueError":
+ 144:                 raise ValueError(message)
+ 145:             raise DatabaseWorkerError(f"{name}: {message}")
+ 146:         return result
+```
+
+#### The Isolated Runtime
+
+```mermaid
+flowchart LR
+  S1["Discord interpreter remains responsive"]
+  S2["thread waits on IPC"]
+  S3["worker interpreter runs libSQL"]
+  S4["rows or bounded failure return"]
+  S1 --> S2
+  S2 --> S3
+  S3 --> S4
+```
+
+> A worker can be terminated without killing the Discord event loop. Remote durability still depends on Turso.
+
+### Deadlines And Cancellation Ownership
+
+The queue has a ten-second acquisition deadline. A queue timeout means this caller never started its operation. A worker RPC defaults to twenty seconds, with a shared thirty-second budget for normal work on an existing connection and a longer ninety-second startup budget. Reconnection and safe retries are separate phases; these are bounded phases rather than a promise that every end-to-end command finishes in thirty seconds.
+
+#### Bounded queue ownership (utils/db.py:302-315)
+
+```python
+ 302:     async def _guard(self):
+ 303:         self._waiting_operations += 1
+ 304:         try:
+ 305:             try:
+ 306:                 await asyncio.wait_for(self._lock.acquire(), self._queue_timeout_seconds)
+ 307:             except asyncio.TimeoutError as exc:
+ 308:                 self._queue_timeouts += 1
+ 309:                 raise DatabaseBusyError("Database busy; this operation was not started, please retry") from exc
+ 310:         finally:
+ 311:             self._waiting_operations -= 1
+ 312:         try:
+ 313:             yield
+ 314:         finally:
+ 315:             self._lock.release()
+```
+
+#### Cancellation retains ownership until the thread finishes (utils/db.py:317-338)
+
+```python
+ 317:     async def _thread_call(self, function, *args, budget: float = 30):
+ 318:         def invoke():
+ 319:             if isinstance(self._conn, IsolatedConnection):
+ 320:                 self._conn.set_deadline(budget)
+ 321:             return function(*args)
+ 322:
+ 323:         task = asyncio.create_task(asyncio.to_thread(invoke))
+ 324:         try:
+ 325:             return await asyncio.shield(task)
+ 326:         except asyncio.CancelledError:
+ 327:             # Cancelling to_thread does not stop its thread. Retain the lock
+ 328:             # until it has exited so a second caller cannot race the connection.
+ 329:             while not task.done():
+ 330:                 try:
+ 331:                     await asyncio.shield(task)
+ 332:                 except asyncio.CancelledError:
+ 333:                     continue
+ 334:                 except Exception:
+ 335:                     break
+ 336:             if task.done() and not task.cancelled():
+ 337:                 task.exception()
+ 338:             raise
+```
+
+#### Simplified cancellation rule with commentary
+
+```python
+async with connection_lock:
+    # shield prevents cancelling the asyncio caller from cancelling the
+    # Future that represents our still-running database thread.
+    running = asyncio.create_task(asyncio.to_thread(worker_call))
+    try:
+        return await asyncio.shield(running)
+    except asyncio.CancelledError:
+        # This line represents a helper that waits despite repeated
+        # cancellation. Another caller must not own the connection yet.
+        await wait_until_thread_finishes(running)
+        raise
+
+# Only after the thread exits may reconnect, close, or another query
+# acquire this lock. Cancelling a Future cannot stop a native thread.
+```
+
+> **Timeout does not mean no write happened:** A terminated worker may have committed remotely before its reply was lost. Completion is unknown. Never blindly repeat a non-idempotent write; check saved state or use a guarded transaction with a stable idempotency key.
+
+Deadlines use time.monotonic so an operating-system wall-clock correction cannot extend or shorten a timeout. Business timestamps use epoch time for records and Discord timestamps. This distinction is about elapsed versus calendar time; the bot does not depend on a separate atomic-clock service.
+
+### Acknowledge First Validate The Decision Later
+
+Discord requires the initial response within three seconds. A modal must be that initial response, so deferring and later opening the same modal is not valid. Review buttons therefore open their modal without querying storage. The final submission checks the configured reviewer roles, source channel, current pending row, and current decision. An immediately opened form does not grant permission or guarantee the level is still pending.
+
+#### Review modal initial response (cogs/RequestLevels.py:3636-3650)
+
+```python
+3636:     async def handle_review_button(self, interaction: discord.Interaction, action: str):
+3637:         if interaction.guild is None or interaction.message is None:
+3638:             return await interaction.response.send_message("Request not found.", ephemeral=True)
+3639:         member = self._cached_interaction_member(interaction)
+3640:         if member is None or not self._has_reviewer_role(member):
+3641:             return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
+3642:         if action == "recheck":
+3643:             await interaction.response.defer(ephemeral=True)
+3644:             return await self._recheck_review_validation(interaction, interaction.message.id)
+3645:         # The modal itself is the acknowledgement. Authoritative existence and
+3646:         # pending-state checks run after submission, never before this deadline.
+3647:         if action == "other":
+3648:             return await interaction.response.send_message("Choose a result:", view=OtherReasonView(self, interaction.message.id), ephemeral=True)
+3649:
+3650:         await interaction.response.send_modal(ReviewModal(self, interaction.message.id, action))
+```
+
+Persistent views are registered before preflight and login so saved button custom IDs have handlers from the start. Known slash command names also resolve using the interaction's actual guild if the command-ID cache is cold. An invocation does not force a REST command-sync round trip before its initial acknowledgement.
+
+### Error Reporting Must Survive Its Own Storage Failure
+
+The old database-first logger could disappear behind the same database stall it was reporting. log_error now redacts and prints immediately, then adds an incident to a bounded memory buffer. Independent workers update a Discord embed and persist counts. Component and modal callbacks have central handlers alongside command/event handlers. A repeated failure updates its occurrence count and last-seen timestamp instead of being silently hidden.
+
+#### Immediate log recording (utils/errors.py:257-263)
+
+```python
+ 257: async def log_error(bot: discord.Client, message: str) -> None:
+ 258:     message = _compact_error_message(_redact_secrets(message))
+ 259:     print(f"[Avenue Guard error] {message}", flush=True)
+ 260:     reporter = getattr(bot, "_error_reporter", None)
+ 261:     if reporter is None:
+ 262:         reporter = bot._error_reporter = ErrorReporter(bot)
+ 263:     reporter.record(message)
+```
+
+#### Retry-safe incident batches (utils/errors.py:189-225)
+
+```python
+ 189:     async def _persist_loop(self):
+ 190:         while True:
+ 191:             await self._persistence_event.wait()
+ 192:             self._persistence_event.clear()
+ 193:             for key, entry in list(self.entries.items()):
+ 194:                 delta = entry["pending"]
+ 195:                 try:
+ 196:                     if delta:
+ 197:                         batch_id, delta = entry.setdefault("batch", (uuid4().hex, delta))
+ 198:                         await self.bot.db.execute_transaction([
+ 199:                             (
+ 200:                                 "INSERT INTO error_incidents(fingerprint,category,status,first_seen_ts,last_seen_ts,occurrence_count,last_message,last_correlation_id,log_message_id) "
+ 201:                                 "SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM error_incident_batches WHERE batch_id=?) "
+ 202:                                 "ON CONFLICT(fingerprint) DO UPDATE SET status='open',last_seen_ts=excluded.last_seen_ts,"
+ 203:                                 "occurrence_count=error_incidents.occurrence_count+excluded.occurrence_count,last_message=excluded.last_message,"
+ 204:                                 "last_correlation_id=excluded.last_correlation_id,log_message_id=COALESCE(excluded.log_message_id,error_incidents.log_message_id),resolved_ts=NULL",
+ 205:                                 (key, entry["category"], "open", entry["first_ts"], entry["last_ts"], delta,
+ 206:                                  entry["message"], entry.get("correlation") or None, entry["message_id"] or None, batch_id),
+ 207:                             ),
+ 208:                             ("INSERT OR IGNORE INTO error_incident_batches(batch_id,fingerprint,created_ts) VALUES(?,?,?)",
+ 209:                              (batch_id, key, int(time.time()))),
+ 210:                         ], retry_safe=True)
+ 211:                         entry["pending"] -= delta
+ 212:                         entry.pop("batch", None)
+ 213:                         row = await self.bot.db.fetchone("SELECT occurrence_count,log_message_id FROM error_incidents WHERE fingerprint=?", (key,))
+ 214:                         if row:
+ 215:                             entry["count"] = int(row["occurrence_count"]) + entry["pending"]
+ 216:                             entry["message_id"] = entry["message_id"] or int(row["log_message_id"] or 0)
+ 217:                             entry["dirty"] = True
+ 218:                             self._delivery_event.set()
+ 219:                     elif entry["message_id"]:
+ 220:                         await self.bot.db.execute("UPDATE error_incidents SET log_message_id=? WHERE fingerprint=?", (entry["message_id"], key))
+ 221:                 except Exception as exc:
+ 222:                     print(f"[Avenue Guard error] Incident persistence deferred: {_compact_error_message(_redact_secrets(str(exc)), 300)}", flush=True)
+ 223:             if any(entry["pending"] for entry in self.entries.values()):
+ 224:                 await asyncio.sleep(self.persistence_retry_seconds)
+ 225:                 self._persistence_event.set()
+```
+
+#### Independent Evidence Paths
+
+```mermaid
+flowchart LR
+  S1["redacted error"]
+  S2["immediate deployment stdout"]
+  S3["memory occurrence and Discord update"]
+  S4["retry-safe Turso batch"]
+  S1 --> S2
+  S2 --> S3
+  S3 --> S4
+```
+
+> The Discord and database paths are independent workers. Database failure does not prevent a notification attempt.
+
+A batch UUID solves a subtle retry bug. Suppose Turso commits an increment, but its reply is lost. Retrying an ordinary increment doubles the count. Schema 5 commits the incident delta and its unique batch ID together; the same batch is ignored on retry. The buffer supports 512 incident groups, not unlimited durable memory. If the process dies before cloud persistence succeeds, pending memory-only counts can be lost. Deployment logs provide separate evidence subject to the host's retention policy.
+
+### The Watchers Must Not Wait For Their Database
+
+Operations starts its supervisor, watchdog, health, outbox, maintenance, and smoke work before awaiting persisted bootstrap settings. Bootstrap retries independently. The supervisor dispatches restart and history jobs rather than waiting for database-dependent work itself. A shared per-cog lock prevents initial startup and supervisor repair from starting the same feature concurrently. Missing tasks are repaired; deliberately disabled features remain off.
+
+#### Shared startup and repair ownership (utils/supervision.py:6-16)
+
+```python
+   6: async def start_cog_background(bot, cog_name: str) -> None:
+   7:     """Serialize initial startup and supervisor repairs for each cog."""
+   8:     locks = getattr(bot, "_background_start_locks", None)
+   9:     if locks is None:
+  10:         locks = bot._background_start_locks = {}
+  11:     lock = locks.setdefault(cog_name, asyncio.Lock())
+  12:     async with lock:
+  13:         cog = bot.get_cog(cog_name)
+  14:         start = getattr(cog, "start_background", None)
+  15:         if callable(start):
+  16:             await start()
+```
+
+#### Memory-only watchdog heartbeat (cogs/Operations.py:130-148)
+
+```python
+ 130:     async def _watchdog_loop(self) -> None:
+ 131:         previous = time.monotonic()
+ 132:         while not self.bot.is_closed():
+ 133:             now = time.monotonic()
+ 134:             lag_ms = max(0.0, (now - previous - 1) * 1000)
+ 135:             previous = now
+ 136:             reporter = getattr(self.bot, "_error_reporter", None)
+ 137:             set_runtime_heartbeat(
+ 138:                 lag_ms=lag_ms,
+ 139:                 tasks=self.task_snapshot(),
+ 140:                 database=self.bot.db.health_snapshot(),
+ 141:                 incidents=reporter.snapshot() if reporter else [],
+ 142:             )
+ 143:             supervisor = self._tasks.get("supervisor")
+ 144:             if supervisor is None or supervisor.done():
+ 145:                 await self.start_background()
+ 146:             if lag_ms >= 2000:
+ 147:                 await log_error(self.bot, f"Event loop stalled for {lag_ms / 1000:.1f}s; Discord acknowledgements may have expired")
+ 148:             await asyncio.sleep(1)
+```
+
+### Liveness Is Not Readiness
+
+| Signal | Question | Failure behavior |
+| --- | --- | --- |
+| /health | Is the web process alive | Remains HTTP 200 while diagnostics can still answer |
+| /ready | Can the initialized bot perform useful work | HTTP 503 for stale heartbeat, offline gateway, storage trouble, or stopped critical work |
+| /api/bot | What may the public website disclose | Sanitized ready/responsive state and Degraded or Unavailable status |
+| Recovery dashboard | What can we inspect without SQL | Worker state, queue, active operation, event-loop lag, tasks, and pending incident counts |
+
+#### Readiness combines independent runtime signals (utils/keepalive.py:61-75)
+
+```python
+  61: def get_runtime_health() -> dict:
+  62:     with _status_lock:
+  63:         heartbeat = _runtime_heartbeat
+  64:         health = dict(_runtime_health)
+  65:         state = str(_status.get("state") or "")
+  66:     age = time.monotonic() - heartbeat if heartbeat else None
+  67:     responsive = bool(heartbeat and age is not None and age < 15)
+  68:     database = health.get("database", {})
+  69:     database_ok = (database.get("connected") is not False and (not database.get("uses_remote") or database.get("worker_alive") is True)
+  70:                    and not database.get("primary_write_degraded"))
+  71:     auxiliary = {"operations.smoke", "operations.bootstrap", "operations.restarts", "operations.timeline"}
+  72:     tasks_ok = not any(str(value).startswith(("failed", "stopped", "missing"))
+  73:                        for name, value in health.get("tasks", {}).items() if name not in auxiliary)
+  74:     return {**health, "heartbeat_age_seconds": round(age, 2) if age is not None else None,
+  75:             "responsive": responsive, "ready": state == "online" and responsive and database_ok and tasks_ok}
+```
+
+The watchdog writes a memory-only heartbeat once a second. The HTTP thread can read it even if the asyncio loop stalls, and readiness fails when the heartbeat is fifteen seconds old. The full dashboard build has a five-second shielded deadline; a memory-only fallback appears while a cached build may finish in the background. Neither a health poll nor a Discord reconnect is treated as a new process start for service uptime.
+
+### Recovering Discord Effects And Stale Evidence
+
+The review transaction now queues a disabled-button edit alongside the decision and result notifications. If the immediate edit fails, the durable outbox still repairs that original card. Abandoned processing claims recover during runtime after two minutes. Successful sends have in-process receipts if their database confirmation fails, and deterministic enforced nonces reduce recent duplicate Discord sends after a crash. Discord nonce deduplication has a limited window; this is not an unlimited exactly-once guarantee.
+
+Pending validation refreshes run in small batches. External lookups happen outside the review lock, then the handler reloads the row and checks pending status and level ID before a compare-and-set JSON update. This prevents stale provider results overwriting an edit or reopening buttons after review. Missing Discord messages remain a repair condition rather than a reason to recreate cards on every loop. A Boomlings 403 remains denied upstream access; another provider's positive evidence is retained.
+
+#### Safe validation refresh against concurrent review (cogs/RequestLevels.py:3666-3718)
+
+```python
+3666:     async def _refresh_review_validation(self, guild, target_kind, row, *, message=None):
+3667:         data = self._safe_json_loads(row["data_json"], {})
+3668:         if not isinstance(data, dict):
+3669:             data = {}
+3670:         level_id = str(data.get("level_id") or self._row_value(row, "level_id", "")).strip()
+3671:         if str(row["status"]) != "pending" or not level_id:
+3672:             return {}
+3673:         validation = await self._lookup_level_validation(level_id, force=True)
+3674:         if not validation:
+3675:             return {}
+3676:         message_id = int(row["request_message_id"])
+3677:         async with self._review_lock:
+3678:             target_kind, row = await self._review_target_by_message(guild.id, message_id)
+3679:             if row is None:
+3680:                 return {}
+3681:             if str(row["status"]) != "pending":
+3682:                 return {}
+3683:             data = self._safe_json_loads(row["data_json"], {})
+3684:             if not isinstance(data, dict):
+3685:                 data = {}
+3686:             current_level_id = str(data.get("level_id") or self._row_value(row, "level_id", "")).strip()
+3687:             if current_level_id != level_id:
+3688:                 return {}
+3689:             data = self._apply_level_validation_vars(data, validation)
+3690:             data_json = json.dumps(data, separators=(",", ":"))
+3691:             table = "weekly_request_reviews" if target_kind == "weekly" else "level_request_submissions"
+3692:             changed = await self.bot.db.execute_affected(
+3693:                 f"UPDATE {table} SET data_json=? WHERE guild_id=? AND request_message_id=? AND status='pending' AND data_json=?",  # nosec B608
+3694:                 (data_json, guild.id, message_id, row["data_json"]),
+3695:             )
+3696:             if changed != 1:
+3697:                 return {}
+3698:             variables = (
+3699:                 self._weekly_data_vars(row, data)
+3700:                 if target_kind == "weekly"
+3701:                 else self._data_vars(row, data)
+3702:             )
+3703:             template_key = "weekly_request_submitted_embed" if target_kind == "weekly" else "level_requested_embed"
+3704:             embed = self._embed_from_template(
+3705:                 self._cfg(template_key, default={}) or {},
+3706:                 variables,
+3707:                 default_color=self._color_name("pending", "blurple"),
+3708:             )
+3709:             if message is None:
+3710:                 channel = await self._review_target_channel(guild, target_kind, row)
+3711:                 if channel is not None:
+3712:                     try:
+3713:                         message = await channel.fetch_message(message_id)
+3714:                     except discord.NotFound:
+3715:                         await log_error(self.bot, f"Pending request message is missing during validation refresh: {message_id}; use request repair")
+3716:             if message is not None:
+3717:                 await message.edit(embed=embed, view=LevelRequestReviewView())
+3718:         return validation
+```
+
+> **Do not confuse Discord delivery denial with a bot callback:** If Clyde refuses a user's DM, the bot receives no event to fix or log. Check mutual-server membership, privacy, blocks, and Discord screening separately. Runtime repair cannot bypass a message that Discord never delivered.
+
+### How We Verified The Boundary
+
+The regression suite exercises the real installed native driver in an isolated process, a hard worker deadline, cancellation while another caller waits, a locked primary with a readable snapshot, uncertain incident commits, repeated Discord logs during a stalled database, cold command IDs, early saved views, a failed original review edit, post-send receipt failure, readiness degradation, and refresh/review races. These tests validate mechanisms locally. Render deployment and real Discord smoke checks still establish whether the current production configuration is healthy. The detailed evidence and changed-file inventory live in docs/INCIDENT_DIAGNOSIS_2026-09-15.md.
+
+## 45. Engineering Thinking Behind The Bot
 
 Avenue Guard's best design choices are about recovering from imperfect reality. Discord is not a database. Messages disappear, permissions change, users close DMs, external APIs fail, and hosted storage can be wiped. The bot works because the important truth lives in SQLite and visible Discord messages are treated as projections that can be refreshed or rebuilt.
 
@@ -4823,7 +4744,7 @@ The bot is not architected as many isolated mini-bots. It is one coherent system
 
 > **How we planned it:** The pattern was usually: identify a manual staff pain, decide what state must survive, store that state, expose a Discord UI, log the outcome, then add a repair or diagnostic path for the ways Discord can drift.
 
-## 45. Debugging Notebook
+## 46. Debugging Notebook
 
 When something breaks, resist the urge to read everything. Use the failure type to choose the shortest path.
 

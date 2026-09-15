@@ -19,6 +19,8 @@ from utils.config_schema import (
     operations_settings,
 )
 from utils.errors import log_error
+from utils.keepalive import set_runtime_heartbeat
+from utils.supervision import start_cog_background
 from utils.timeutils import now_madrid
 from utils.workflows import new_correlation_id, record_workflow_event
 
@@ -46,6 +48,7 @@ class OperationsCog(commands.Cog):
         self._last_restore_drill = 0
         self._last_monthly_check = 0
         self._last_smoke_result: dict[str, Any] = {}
+        self._bootstrap_ready = asyncio.Event()
 
     def cog_unload(self) -> None:
         for task in self._tasks.values():
@@ -66,11 +69,39 @@ class OperationsCog(commands.Cog):
         self._tasks.clear()
 
     async def start_background(self) -> None:
-        if self._started and all(not task.done() for task in self._tasks.values()):
-            return
         self._started = True
+        factories = {
+            "outbox": self._outbox_loop,
+            "supervisor": self._supervisor_loop,
+            "watchdog": self._watchdog_loop,
+            "health": self._health_loop,
+            "maintenance": self._maintenance_loop,
+            "smoke": self._post_deploy_smoke_test,
+            "bootstrap": self._bootstrap_loop,
+        }
+        for name, factory in factories.items():
+            task = self._tasks.get(name)
+            if name in {"smoke", "bootstrap"} and task is not None and task.done() and not task.cancelled() and task.exception() is None:
+                continue
+            if task is None or task.done():
+                self._tasks[name] = asyncio.create_task(factory(), name=f"avenue-guard:{name}")
+
+    async def _bootstrap_loop(self) -> None:
+        while True:
+            try:
+                await self._load_persisted_operations()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await log_error(self.bot, f"Operations bootstrap deferred: {exc!r}")
+            finally:
+                self._bootstrap_ready.set()
+            await asyncio.sleep(30)
+
+    async def _load_persisted_operations(self) -> None:
         retention_override = await self.bot.db.get_runtime_setting(
-            "operations.retention_days", default={}
+            "operations.retention_days", default=None
         )
         if isinstance(retention_override, dict):
             operations = self.bot.config.data.setdefault("operations", {})
@@ -86,25 +117,35 @@ class OperationsCog(commands.Cog):
         )
         self._last_restore_drill = int(drill_row["ts"] or 0) if drill_row else 0
         await self.bot.outbox.recover_stale()
-        factories = {
-            "outbox": self._outbox_loop,
-            "supervisor": self._supervisor_loop,
-            "health": self._health_loop,
-            "maintenance": self._maintenance_loop,
-            "smoke": self._post_deploy_smoke_test,
-        }
-        for name, factory in factories.items():
-            task = self._tasks.get(name)
-            if task is None or task.done():
-                self._tasks[name] = asyncio.create_task(
-                    factory(), name=f"avenue-guard:{name}"
-                )
 
     def task_snapshot(self) -> dict[str, str]:
         snapshot = dict(self._task_states)
         for name, task in self._tasks.items():
-            snapshot[f"operations.{name}"] = "stopped" if task.done() else "running"
+            state = self._task_state(task)
+            if name in {"smoke", "bootstrap", "restarts", "timeline"} and task.done() and not task.cancelled() and task.exception() is None:
+                state = "completed"
+            snapshot[f"operations.{name}"] = state
         return snapshot
+
+    async def _watchdog_loop(self) -> None:
+        previous = time.monotonic()
+        while not self.bot.is_closed():
+            now = time.monotonic()
+            lag_ms = max(0.0, (now - previous - 1) * 1000)
+            previous = now
+            reporter = getattr(self.bot, "_error_reporter", None)
+            set_runtime_heartbeat(
+                lag_ms=lag_ms,
+                tasks=self.task_snapshot(),
+                database=self.bot.db.health_snapshot(),
+                incidents=reporter.snapshot() if reporter else [],
+            )
+            supervisor = self._tasks.get("supervisor")
+            if supervisor is None or supervisor.done():
+                await self.start_background()
+            if lag_ms >= 2000:
+                await log_error(self.bot, f"Event loop stalled for {lag_ms / 1000:.1f}s; Discord acknowledgements may have expired")
+            await asyncio.sleep(1)
 
     def _external_task_specs(self):
         return (
@@ -115,6 +156,7 @@ class OperationsCog(commands.Cog):
             ("help.ticket_scan", "HelpCog", "_ticket_scan_task"),
             ("requests.auto_close", "RequestLevelsCog", "_close_task"),
             ("requests.scheduled", "RequestLevelsCog", "_scheduled_open_task"),
+            ("requests.validation", "RequestLevelsCog", "_validation_refresh_task"),
             ("release.metrics", "ReleaseCog", "_metrics_task"),
             ("background.daily", "BackgroundCog", "daily_report"),
             ("background.snapshot", "BackgroundCog", "update_snapshot"),
@@ -174,14 +216,15 @@ class OperationsCog(commands.Cog):
             value = getattr(cog, attr, None) if cog else None
             state = self._task_state(value)
             before[label] = state
-            if force or state not in {"running", "missing"}:
+            if cog is not None and (force or state not in {"running", "unknown"}):
                 affected_cogs.add(cog_name)
             if force and value is not None:
                 cancel = getattr(value, "cancel", None)
                 if callable(cancel):
                     cancel()
-                    if isinstance(value, asyncio.Task):
-                        cancelled_tasks.append(value)
+                    actual_task = value if isinstance(value, asyncio.Task) else getattr(value, "get_task", lambda: None)()
+                    if actual_task is not None:
+                        cancelled_tasks.append(actual_task)
         if cancelled_tasks:
             await asyncio.gather(*cancelled_tasks, return_exceptions=True)
         if force:
@@ -191,7 +234,7 @@ class OperationsCog(commands.Cog):
             start = getattr(cog, "start_background", None)
             if callable(start):
                 try:
-                    await start()
+                    await start_cog_background(self.bot, cog_name)
                 except Exception as exc:
                     await log_error(
                         self.bot,
@@ -200,8 +243,10 @@ class OperationsCog(commands.Cog):
         return before
 
     async def _outbox_loop(self) -> None:
+        await self._bootstrap_ready.wait()
         while not self.bot.is_closed():
             try:
+                await self.bot.outbox.recover_stale()
                 result = await self.bot.outbox.process_once(limit=15)
                 if result.get("dead"):
                     await log_error(
@@ -235,31 +280,31 @@ class OperationsCog(commands.Cog):
                 failed = [
                     label
                     for label, state in self._task_states.items()
-                    if state.startswith(("failed", "stopped"))
+                    if state.startswith(("failed", "stopped", "missing"))
                 ]
                 if failed:
-                    await self.restart_stopped_tasks()
+                    restart = self._tasks.get("restarts")
+                    if restart is None or restart.done():
+                        self._tasks["restarts"] = asyncio.create_task(self.restart_stopped_tasks(), name="avenue-guard:restarts")
                 internal_factories = {
                     "outbox": self._outbox_loop,
                     "health": self._health_loop,
                     "maintenance": self._maintenance_loop,
+                    "watchdog": self._watchdog_loop,
                 }
                 for name, factory in internal_factories.items():
                     task = self._tasks.get(name)
-                    if task is not None and task.done():
+                    if task is None or task.done():
+                        if task is not None and not task.cancelled() and task.exception() is not None:
+                            await log_error(self.bot, f"Operations {name} task failed; restarting: {task.exception()!r}")
                         self._tasks[name] = asyncio.create_task(
                             factory(),
                             name=f"avenue-guard:{name}",
                         )
                         changed.append((f"operations.{name}", "stopped", "running"))
-                for label, previous, state in changed:
-                    await record_workflow_event(
-                        self.bot.db,
-                        workflow_type="background_task",
-                        entity_id=label,
-                        event="state_changed",
-                        payload={"from": previous, "to": state},
-                    )
+                timeline = self._tasks.get("timeline")
+                if changed and (timeline is None or timeline.done()):
+                    self._tasks["timeline"] = asyncio.create_task(self._record_task_changes(changed), name="avenue-guard:timeline")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -267,6 +312,14 @@ class OperationsCog(commands.Cog):
             await asyncio.sleep(
                 operations_settings(self.bot.config.data).supervisor_interval_seconds
             )
+
+    async def _record_task_changes(self, changed):
+        try:
+            for label, previous, state in changed:
+                await record_workflow_event(self.bot.db, workflow_type="background_task", entity_id=label,
+                                            event="state_changed", payload={"from": previous, "to": state})
+        except Exception as exc:
+            await log_error(self.bot, f"Task timeline persistence deferred: {exc!r}")
 
     async def collect_health_sample(self) -> dict[str, Any]:
         started = time.perf_counter()
@@ -369,8 +422,9 @@ class OperationsCog(commands.Cog):
                 continue
             column, condition = target
             cutoff = now - int(days) * 86400
-            removed[table] = await self.bot.db.execute_affected(  # nosec B608
-                f"DELETE FROM {table} WHERE {column}<? {condition}",
+            # Identifiers and predicates come only from RETENTION_TARGETS.
+            removed[table] = await self.bot.db.execute_affected(
+                f"DELETE FROM {table} WHERE {column}<? {condition}",  # nosec B608
                 (cutoff,),
             )
         await self.bot.db.execute(
@@ -471,6 +525,8 @@ class OperationsCog(commands.Cog):
         return changed
 
     async def _maintenance_loop(self) -> None:
+        await self._bootstrap_ready.wait()
+        await asyncio.sleep(60)
         while not self.bot.is_closed():
             try:
                 async with self._maintenance_lock:
@@ -518,11 +574,16 @@ class OperationsCog(commands.Cog):
         checks["config"] = not any(
             issue.severity == "error" for issue in self.bot.config.validation_issues
         )
-        checks["outbox"] = not self._tasks.get("outbox", asyncio.current_task()).done()
+        outbox_task = self._tasks.get("outbox")
+        checks["outbox"] = outbox_task is not None and not outbox_task.done()
         checks["request_cog"] = self.bot.get_cog("RequestLevelsCog") is not None
-        schema_rows = await self.bot.db.fetchall(
-            "SELECT component,schema_version FROM schema_metadata"
-        )
+        try:
+            schema_rows = await self.bot.db.fetchall(
+                "SELECT component,schema_version FROM schema_metadata"
+            )
+        except Exception as exc:
+            schema_rows = []
+            details["schema_versions"] = f"{type(exc).__name__}: {exc}"[:300]
         schema_versions = {
             str(row["component"]): int(row["schema_version"]) for row in schema_rows
         }
@@ -534,21 +595,14 @@ class OperationsCog(commands.Cog):
         }
         checks["schema_versions"] = schema_versions == expected_schemas
         if not checks["schema_versions"]:
-            details["schema_versions"] = (
+            details.setdefault("schema_versions", (
                 f"expected={expected_schemas} actual={schema_versions}"
-            )
+            ))
         command_count = sum(1 for _ in self.bot.walk_application_commands())
         checks["slash_commands"] = command_count >= 17
         details["slash_commands"] = str(command_count)
         status = "passed" if all(checks.values()) else "failed"
-        correlation = await record_workflow_event(
-            self.bot.db,
-            workflow_type="deployment",
-            entity_id=str(getattr(self.bot.user, "id", 0) or 0),
-            event=f"smoke_test_{status}",
-            guild_id=guild_id,
-            payload={"checks": checks, "details": details},
-        )
+        correlation = new_correlation_id("deployment")
         self._last_smoke_result = {
             "status": status,
             "checks": checks,
@@ -556,6 +610,18 @@ class OperationsCog(commands.Cog):
             "correlation_id": correlation,
             "ts": int(time.time()),
         }
+        try:
+            await record_workflow_event(
+                self.bot.db,
+                workflow_type="deployment",
+                entity_id=str(getattr(self.bot.user, "id", 0) or 0),
+                event=f"smoke_test_{status}",
+                correlation_id=correlation,
+                guild_id=guild_id,
+                payload={"checks": checks, "details": details},
+            )
+        except Exception as exc:
+            await log_error(self.bot, f"Smoke test history persistence deferred: {exc!r}")
         if status == "failed":
             failed = ", ".join(key for key, passed in checks.items() if not passed)
             await log_error(

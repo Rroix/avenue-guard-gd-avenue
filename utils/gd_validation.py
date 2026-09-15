@@ -436,5 +436,8 @@ def validation_notice(result: dict[str, Any]) -> str:
     if checked_ts:
         parts.append(f"Checked <t:{checked_ts}:R>.")
     if expires_ts:
-        parts.append(f"Refreshes <t:{expires_ts}:R>.")
+        if expires_ts <= int(time.time()):
+            parts.append("Snapshot expired: use Recheck for current information.")
+        else:
+            parts.append(f"Refresh due <t:{expires_ts}:R>.")
     return "\n".join(parts)[:1024]

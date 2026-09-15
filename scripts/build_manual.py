@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import ast
+import builtins
+import io
+import keyword
 import re
+import tokenize
 from pathlib import Path
 
 from docx import Document
@@ -90,6 +94,71 @@ def source_code(title: str, rel_path: str, start: int, end: int, language: str =
     except Exception as exc:
         text = f"# Could not load {rel_path}:{start}-{end}: {type(exc).__name__}"
     return code(f"{title} ({rel_path}:{start}-{end})", language, text)
+
+
+def source_function(title: str, rel_path: str, name: str, max_lines: int = 70) -> tuple:
+    """Find excerpts by function name so routine edits cannot shift their subject."""
+    path = ROOT / rel_path
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    node = next(node for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name)
+    end = min(node.end_lineno or node.lineno, node.lineno + max_lines - 1)
+    return source_code(title, rel_path, node.lineno, end)
+
+
+def code_spans(text: str, language: str) -> list[list[tuple[str, str]]]:
+    """Color lexical tokens without executing snippets or requiring an editor."""
+    raw = str(text or "").splitlines() or [""]
+    prefixes = []
+    source = []
+    for line in raw:
+        match = re.match(r"^(\s*\d+: ?)(.*)$", line)
+        prefixes.append(match.group(1) if match else "")
+        source.append(match.group(2) if match else line)
+    colors_by_character = [["333333"] * len(line) for line in source]
+    if language == "python":
+        tokens = []
+        try:
+            for token in tokenize.generate_tokens(io.StringIO("\n".join(source)).readline):
+                tokens.append(token)
+        except (tokenize.TokenError, IndentationError):
+            # An excerpt may intentionally stop inside a multiline expression.
+            pass
+        for index, token in enumerate(tokens):
+            color = "333333"
+            if token.type == tokenize.COMMENT:
+                color = "008000"
+            elif token.type == tokenize.STRING:
+                color = "A31515"
+            elif token.type == tokenize.NUMBER:
+                color = "098658"
+            elif token.type == tokenize.NAME:
+                if keyword.iskeyword(token.string):
+                    color = "0000FF"
+                elif token.string in vars(builtins):
+                    color = "267F99"
+                elif (index and tokens[index - 1].string in {"def", "class"}) or (index + 1 < len(tokens) and tokens[index + 1].string == "("):
+                    color = "795E26"
+                else:
+                    color = "001080"
+            first_line, first_column = token.start
+            last_line, last_column = token.end
+            for line_index in range(max(0, first_line - 1), min(len(source), last_line)):
+                start = first_column if line_index == first_line - 1 else 0
+                end = last_column if line_index == last_line - 1 else len(source[line_index])
+                start = min(start, len(source[line_index]))
+                end = min(end, len(source[line_index]))
+                colors_by_character[line_index][start:end] = [color] * max(0, end - start)
+    rendered = []
+    for prefix, line, palette in zip(prefixes, source, colors_by_character, strict=True):
+        spans = [(prefix, "808080")] if prefix else []
+        for character, color in zip(line, palette, strict=True):
+            if spans and spans[-1][1] == color:
+                spans[-1] = (spans[-1][0] + character, color)
+            else:
+                spans.append((character, color))
+        rendered.append(spans)
+    return rendered
 
 
 CHAPTERS = [
@@ -307,9 +376,10 @@ CHAPTERS = [
         "Database And Persistence",
         [
             p(
-                "The SQLite layer is intentionally small and predictable. utils.db.Database owns one SQLite connection with "
-                "check_same_thread disabled, serializes operations with an asyncio lock, and runs blocking database work inside "
-                "threads. The migration code creates tables and adds columns for older databases so the bot can evolve without "
+                "utils.db.Database owns the storage boundary. Local-only mode uses a SQLite connection in threads. Production "
+                "Turso mode keeps the native libSQL connection in an isolated process because that extension can retain Python's "
+                "interpreter lock even inside a thread. An asyncio lock serializes primary operations, bounded deadlines contain "
+                "stalls, and cancellation preserves ownership until the operation finishes. The migration code creates tables and adds columns so the bot can evolve without "
                 "manual SQL work every time a feature is added."
             ),
             p(
@@ -320,25 +390,28 @@ CHAPTERS = [
             diagram(
                 "Persistence Safety Model",
                 [
-                    "Render Persistent Disk path",
-                    "SQLite bot memory",
+                    "Turso remote primary",
+                    "Process-isolated local replica",
                     "Scheduled zipped backup",
                     "Discord backup channel",
                     "Impact and trend exports",
                 ],
-                "The primary durable copy is the mounted SQLite file; backup attachments and exports provide recovery evidence.",
+                "Production durable truth lives in Turso. The host replica can be replaced; backup attachments and exports provide a second recovery path.",
             ),
             h2("Render Storage Rule"),
             p(
-                "On Render, the project source and cache can be wiped by redeploys or cache clears. Avenue Guard therefore resolves "
+                "On Render, the project source and cache can be wiped by redeploys or cache clears. Turso mode therefore requires "
+                "a database URL and valid database-scoped token before Discord login and rebuilds disposable replicas from the cloud. "
+                "Only local-only mode resolves "
                 "its SQLite path from AVENUE_GUARD_DB_PATH first, then database.path in config.json, then an auto-detected "
                 "Render Persistent Disk path at /var/data/avenue-guard/bot.db, and only then the local fallback. For production, "
-                "mount a Render Persistent Disk at /var/data or point AVENUE_GUARD_DB_PATH at another durable path."
+                "use Turso, or mount a persistent disk if deliberately choosing local-only SQLite."
             ),
             p(
                 "The /bot storage command checks the running path and the latest backup record. The /bot backup command creates a zipped "
                 "copy immediately, and the background backup loop posts scheduled copies to the configured backup channel. If no persistent "
-                "path is writable, the bot now starts with a local fallback and warns clearly, but that fallback should be treated as temporary."
+                "path is writable, production must not silently fall back to disposable storage. Incomplete Turso credentials prevent login; "
+                "development local fallback is not a persistence guarantee."
             ),
             table(
                 ["Table", "Purpose"],
@@ -1028,6 +1101,7 @@ def _database_table_rows() -> list[list[str]]:
         "discord_outbox": "Durable retryable Discord actions and delivery IDs.",
         "workflow_events": "Correlation-based workflow and task timeline.",
         "error_incidents": "Grouped error fingerprints, counts, and resolution state.",
+        "error_incident_batches": "Committed UUID batches prevent incident retries from counting twice.",
         "health_metrics": "Historical runtime, query, gateway, and provider samples.",
         "permission_drift_events": "Open and resolved channel or role permission drift.",
         "user_notification_preferences": "Per-user request result delivery choice.",
@@ -1143,19 +1217,19 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "and valid Turso credentials before Discord login. That prevents a briefly online but unusable bot and refuses an accidental "
                     "fallback to disposable host storage."
                 ),
-                source_code("Database path resolution", "main.py", 258, 325),
+                source_function("Database path resolution excerpt", "main.py", "resolve_db_path"),
                 p(
                     "When Turso is configured, the resolver requires both a database URL and database-scoped token, verifies the replica path, "
                     "and refuses silent local fallback in production. Local-only mode still checks environment, config, mounted disk, and development "
                     "paths with a real write probe before accepting one."
                 ),
-                source_code("Bot creation, outbox, and cog loading", "main.py", 327, 377),
+                source_function("Bot creation and outbox wiring excerpt", "main.py", "create_bot", 65),
                 p(
                     "create_bot wires configuration, database, the durable outbox, command correlation, cogs, and on_ready behavior together. "
-                    "A preflight migration happens before login; on_ready then validates the guild, repairs legacy IDs, starts cog loops, starts the "
-                    "operations supervisor, and registers persistent views."
+                    "Persistent views and preflight migration happen before login; on_ready then validates the guild, repairs legacy IDs, starts "
+                    "cog loops and the operations pillars exactly once. Reconnects do not repeat the whole initialization."
                 ),
-                source_code("Persistent view registration", "main.py", 534, 545),
+                source_function("Persistent view registration", "main.py", "register_persistent_views"),
                 p(
                     "Persistent view registration is easy to underestimate. Discord button messages can outlive the Python process. Without "
                     "registering the views again after restart, users could click old buttons and Discord would not know which callback should run."
@@ -1166,16 +1240,17 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
             "Database Code Walkthrough",
             [
                 p(
-                    "The Database wrapper is small because it has one job: make SQLite safe enough for an async Discord bot. SQLite calls are "
-                    "blocking, so the wrapper serializes access with an asyncio.Lock and runs the actual SQLite work inside asyncio.to_thread."
+                    "The Database wrapper serializes primary access and preserves transaction ownership. Local SQLite calls use threads. "
+                    "Native libSQL calls use a process facade, with a parent thread waiting for IPC. Threads alone are insufficient when an "
+                    "extension retains the GIL; the runtime recovery chapter explains the measured failure and the isolation boundary."
                 ),
-                source_code("Connection, WAL, migration, and backup", "utils/db.py", 14, 66),
+                source_function("Local SQLite and isolated Turso connection", "utils/db.py", "_open_connection_sync"),
                 p(
                     "WAL mode helps SQLite handle concurrent readers while writes are happening. The lock still serializes bot-side operations, "
                     "which prevents two coroutine paths from sharing one cursor incorrectly. This is less glamorous than a bigger database, but it "
                     "fits a single-server bot well and keeps deployment simple."
                 ),
-                source_code("Atomic ticket sequence and query helpers", "utils/db.py", 935, 1003),
+                source_function("Atomic ticket sequence", "utils/db.py", "next_ticket_id"),
                 p(
                     "The ticket ID function is the cleanest example of an atomic counter in this codebase. It reads and increments under the "
                     "same database lock, commits before returning, and stores the next value by guild. This prevents two tickets opened at nearly "
@@ -1202,7 +1277,7 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "string instead of crashing the workflow. That is why template validation is useful: SafeDict keeps the bot alive, while "
                     "config checks help you notice mistakes before users see blank fields."
                 ),
-                source_code("Request embed template renderer", "cogs/RequestLevels.py", 1024, 1064),
+                source_function("Request embed template renderer", "cogs/RequestLevels.py", "_embed_from_template"),
                 p(
                     "The embed renderer is shared by live request submissions, reviewed request embeds, result notifications, and wave summaries. "
                     "It reads fields, footer, images, thumbnails, author info, color, title, and description from config. Workflow logic stays in "
@@ -1217,7 +1292,8 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "utils/views.py is the component router. It stores stable custom IDs and very small button/select classes. The view should "
                     "not implement the business rules. It should only receive the click and call the owning cog."
                 ),
-                source_code("Request button and review button router", "utils/views.py", 149, 205),
+                source_function("Persistent request button router", "utils/views.py", "LevelRequestButtonView"),
+                source_function("Persistent review button router", "utils/views.py", "LevelRequestReviewView"),
                 p(
                     "This is why a request review button can still work after a restart. The custom ID is stable, the view is registered on "
                     "startup, and the callback asks the live bot instance for RequestLevelsCog. The cog then reloads the real request state from SQLite."
@@ -1243,19 +1319,19 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "If they do and the edit window is still open, the same button becomes an edit entry point. If not, it checks open/closed "
                     "state, required roles, banned role, first-time request role logic, and then opens the modal."
                 ),
-                source_code("Request button state gate", "cogs/RequestLevels.py", 2078, 2164),
+                source_function("Request button state gate excerpt", "cogs/RequestLevels.py", "handle_request_button"),
                 p(
                     "The submission handler uses a lock because request limits and duplicate checks must be consistent. Imagine a wave with one "
                     "slot left and two users submit at the same moment. Without the lock, both could pass the count check. With the lock, one "
                     "complete submission finishes before the next one evaluates the current state."
                 ),
-                source_code("Request form core transaction", "cogs/RequestLevels.py", 2166, 2296),
+                source_function("Request form submission excerpt", "cogs/RequestLevels.py", "handle_request_form", 90),
                 p(
                     "Notice the order: validate local fields, defer the interaction, validate externally, enter the submit lock, reload current "
                     "state, check duplicate user and duplicate level ID, send the review embed, store the Discord message ID, then increment the "
                     "wave count. The request only counts after the staff queue message exists."
                 ),
-                source_code("Request edit audit trail", "cogs/RequestLevels.py", 2368, 2447),
+                source_function("Request edit audit trail excerpt", "cogs/RequestLevels.py", "handle_request_edit_form", 90),
                 p(
                     "The edit path writes both the new data and an audit record. That lets reviewers know the request changed and lets you inspect "
                     "what changed later. The audit table stores old and new JSON snapshots because request form data is template-driven and may "
@@ -1271,14 +1347,14 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "RequestLevelsCog decides when to call validation, cache it, rate-limit it, and turn the result into user-facing errors "
                     "or reviewer warnings."
                 ),
-                source_code("Provider result combiner", "utils/gd_validation.py", 197, 264),
+                source_function("Provider result combiner excerpt", "utils/gd_validation.py", "combine_level_validation"),
                 p(
                     "The combiner does not pretend providers are always perfect. It tracks existing results, missing results, failed providers, "
                     "disagreement, rating status, and whether a showcase appears required. This is why the bot can block confidently missing IDs "
                     "but only warn when a provider failed or disagreed."
                 ),
-                source_code("Cached provider lookup and circuit breaker use", "cogs/RequestLevels.py", 833, 912),
-                source_code("External validation policy", "cogs/RequestLevels.py", 976, 1012),
+                source_function("Cached provider lookup excerpt", "cogs/RequestLevels.py", "_lookup_level_validation"),
+                source_function("External validation policy", "cogs/RequestLevels.py", "_validate_level_external"),
                 p(
                     "The cache is important for both speed and kindness to external services. The circuit breaker is a practical resilience feature: "
                     "if one provider fails repeatedly, the bot temporarily stops using it instead of letting every submission wait on a broken service."
@@ -1292,14 +1368,14 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "Review actions are shared between live wave requests and weekly request submissions. The handler first figures out whether "
                     "the clicked message belongs to level_request_submissions or weekly_request_reviews, then applies the same result logic."
                 ),
-                source_code("Review target lookup and button gate", "cogs/RequestLevels.py", 2482, 2521),
-                source_code("Final review transaction", "cogs/RequestLevels.py", 2523, 2613),
+                source_function("Immediate review button routing", "cogs/RequestLevels.py", "handle_review_button"),
+                source_function("Final review transaction excerpt", "cogs/RequestLevels.py", "_finalize_review", 90),
                 p(
                     "The review lock has the same purpose as the submit lock: one reviewer should win the state transition. The database status "
                     "must still be pending when the review is saved. After that, the original buttons are disabled so Discord's visible UI matches "
                     "the stored result."
                 ),
-                source_code("Wave summary variables and reviewer stats", "cogs/RequestLevels.py", 1138, 1226),
+                source_function("Wave summary variables and reviewer stats", "cogs/RequestLevels.py", "_wave_summary_vars"),
                 p(
                     "The summary is generated from the database, not from memory. That means it can be rebuilt later and it stays correct even if "
                     "the bot restarts between reviews."
@@ -1313,8 +1389,8 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "Scheduled request openings are stored as rows, not just sleeping tasks. This is deliberate. If the bot restarts, a sleeping "
                     "task disappears, but the row in level_request_scheduled_openings remains. The scheduler loop can pick it up again when the bot is ready."
                 ),
-                source_code("Scheduling command branch", "cogs/RequestLevels.py", 1833, 1879),
-                source_code("Pending opening edit/list branch", "cogs/RequestLevels.py", 1881, 1968),
+                source_function("Scheduling command excerpt", "cogs/RequestLevels.py", "open_requests"),
+                source_function("Pending opening edit/list excerpt", "cogs/RequestLevels.py", "pending_openings"),
                 p(
                     "The command accepts immediate openings and scheduled openings through the same entry point. The when/day options create a "
                     "future row; leaving when empty opens immediately. This keeps the admin interface compact while the stored state remains explicit."
@@ -1334,13 +1410,13 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "small in-memory buffers and periodically flushes them with UPSERT statements. If the flush fails, it puts the counts back "
                     "into the buffer so they can be retried."
                 ),
-                source_code("Message counting gate", "cogs/Tracking.py", 608, 668),
-                source_code("Buffered activity flush", "cogs/Tracking.py", 675, 710),
+                source_function("Message counting gate", "cogs/Tracking.py", "on_message"),
+                source_function("Buffered activity flush", "cogs/Tracking.py", "flush_activity_counts"),
                 p(
                     "The ON CONFLICT SQL is doing the increment atomically at database level: if a row already exists for that user and week, "
                     "count becomes count + excluded.count. That keeps weekly totals correct even though the bot flushes multiple messages together."
                 ),
-                source_code("Weekly job runner", "cogs/Tracking.py", 1176, 1233),
+                source_function("Weekly job runner", "cogs/Tracking.py", "run_weekly_job"),
                 p(
                     "The weekly job flushes pending activity first, ranks users, updates streaks, respects the weekly reward disabled switch, "
                     "contacts winners, writes the weekly_runs idempotency row, and creates a private recap. The weekly_runs table prevents the "
@@ -1355,13 +1431,13 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "Weekly request rewards happen in DMs. A winner receives a formatted request prompt, replies with the required fields, and "
                     "TrackingCog parses the message into the same shape that RequestLevelsCog understands for review embeds."
                 ),
-                source_code("Weekly DM request parser", "cogs/Tracking.py", 98, 168),
-                source_code("Weekly request recording", "cogs/Tracking.py", 772, 868),
+                source_function("Weekly DM request parser", "cogs/Tracking.py", "_weekly_request_review_data"),
+                source_function("Weekly request recording excerpt", "cogs/Tracking.py", "_record_request"),
                 p(
                     "The important bridge is LevelRequestReviewView. Weekly submissions are not part of a live wave, but they still use the same "
                     "Send, Reject, and Other buttons. The review row lives in weekly_request_reviews, and RequestLevelsCog's review finalizer handles it."
                 ),
-                source_code("Weekly contact state", "cogs/Tracking.py", 1235, 1297),
+                source_function("Weekly contact state excerpt", "cogs/Tracking.py", "_contact_user_for_week"),
                 p(
                     "force_dm is an intentional override path. Normal weekly rewards respect exclusions and the disabled switch; manual force-DM "
                     "can be used for exceptions and is logged so the override is visible later."
@@ -1375,18 +1451,18 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "HelpCog is a state machine for DMs and ticket channels. The user's current help stage is stored in help_sessions. A typed "
                     "message or button action reads the stage, updates the session, and sends the next prompt."
                 ),
-                source_code("Help session message router", "cogs/Help.py", 1042, 1117),
+                source_function("Help session message router excerpt", "cogs/Help.py", "_handle_help_session_message_locked"),
                 p(
                     "The preview step exists to prevent accidental submissions. For appeals, reports, and bot issues, the user can review the "
                     "embed, edit the last answer, cancel, or submit. The staff log only receives the item after the preview is confirmed."
                 ),
-                source_code("Help submission insert and staff log", "cogs/Help.py", 1001, 1040),
-                source_code("Ticket creation", "cogs/Help.py", 1689, 1765),
+                source_function("Help submission insert and staff log", "cogs/Help.py", "_submit_help_submission"),
+                source_function("Ticket creation excerpt", "cogs/Help.py", "_create_staff_ticket_locked"),
                 p(
                     "Ticket IDs come from the database counter, not from Discord channel IDs. That creates short human labels like T123 while "
                     "still preserving the real channel ID for lookups, transcript indexing, and closure."
                 ),
-                source_code("Ticket closure safety", "cogs/Help.py", 1850, 1949),
+                source_function("Ticket closure safety excerpt", "cogs/Help.py", "_close_ticket_channel_locked"),
                 p(
                     "Ticket close is cautious. It marks the ticket resolved, builds a transcript, posts the transcript to the log channel, indexes "
                     "the transcript, deletes the channel, and prompts satisfaction. If a dangerous middle step fails, it restores the previous status "
@@ -1401,14 +1477,14 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "BackgroundCog turns many Discord events into a daily payload. The dataclass keeps today's counters in memory, while "
                     "daily_stats stores snapshots so restart and impact reporting do not wipe the day."
                 ),
-                source_code("DailyStats shape", "cogs/Background.py", 61, 86),
-                source_code("Daily stat persistence", "cogs/Background.py", 473, 515),
+                source_function("DailyStats shape", "cogs/Background.py", "DailyStats"),
+                source_function("Daily stat persistence", "cogs/Background.py", "_persist_daily_stats"),
                 p(
                     "The rollover logic is subtle because voice time can span midnight. The bot calculates minutes up to the boundary, persists "
                     "the old day, then starts a fresh day with current voice sessions carried forward from the guild state."
                 ),
-                source_code("Daily message listener", "cogs/Background.py", 588, 602),
-                source_code("Daily report embed", "cogs/Background.py", 933, 1082),
+                source_function("Daily message listener", "cogs/Background.py", "on_message"),
+                source_function("Daily report data and delivery excerpt", "cogs/Background.py", "_send_daily_summary_for_day_locked", 90),
                 p(
                     "The summary embed is built from the stored counters plus derived values: net member movement, command success rate, average "
                     "messages per active member, top channels, top users, and top commands. This is the raw material for later impact reports."
@@ -1422,9 +1498,9 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "StickyCog has two different jobs that both involve keeping instructions visible: channel sticky messages and forum first "
                     "messages. It also enforces the required-word rule for forum threads."
                 ),
-                source_code("Sticky debounced repost", "cogs/Sticky.py", 120, 181),
-                source_code("Required word detection", "cogs/Sticky.py", 276, 324),
-                source_code("Required word deletion flow", "cogs/Sticky.py", 354, 399),
+                source_function("Sticky debounced repost", "cogs/Sticky.py", "_do_sticky"),
+                source_function("Required word detection", "cogs/Sticky.py", "_thread_contains_required_word"),
+                source_function("Required word deletion flow", "cogs/Sticky.py", "_enforce_required_word"),
                 p(
                     "The required-word delete flow is intentionally conservative. If the bot cannot read history, it avoids deletion to prevent "
                     "false positives. It DMs the thread owner when possible, logs the deletion with author and forum context, unarchives/unlocks if "
@@ -1439,9 +1515,9 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "The impact system is a reporting pipeline built on top of the bot's existing persistent tables. It does not invent numbers; "
                     "it aggregates workflow records the bot already stores."
                 ),
-                source_code("Database backup posting", "cogs/Commands.py", 291, 360),
-                source_code("Impact metric collection entry", "cogs/Commands.py", 564, 642),
-                source_code("Impact report persistence", "cogs/Commands.py", 1106, 1164),
+                source_function("Database backup posting excerpt", "cogs/Commands.py", "_post_database_backup"),
+                source_function("Impact metric collection entry", "cogs/Commands.py", "_collect_impact_metrics"),
+                source_function("Impact report persistence", "cogs/Commands.py", "bot_impact"),
                 p(
                     "A backup is a zipped SQLite copy posted to Discord and recorded in database_backups. An impact report is a Markdown/CSV/JSON "
                     "bundle posted to Discord and recorded in impact_snapshots. The two systems serve different purposes: backup is recovery; impact "
@@ -1467,9 +1543,9 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "Server icon rotation is a good example of making a visually simple feature reliable. The feature needs config validation, "
                     "URL cleaning, mode selection, interval enforcement, download checks, state persistence, and commands for manual control."
                 ),
-                source_code("Icon config normalization", "utils/server_icons.py", 8, 57),
-                source_code("Automatic icon rotation loop", "cogs/Background.py", 857, 879),
-                source_code("Server icon command surface", "cogs/Commands.py", 1375, 1465),
+                source_function("Icon config normalization", "utils/server_icons.py", "ensure_server_icon_config"),
+                source_function("Automatic icon rotation loop", "cogs/Background.py", "rotate_server_icon"),
+                source_function("Server icon mode command", "cogs/Commands.py", "server_icon_mode"),
                 p(
                     "The current_index and current_url fields prevent linear rotation from getting stuck and help the bot know what it last tried. "
                     "The interval is normalized to at least five minutes to respect Discord rate limits and avoid accidental rapid icon changes."
@@ -1504,13 +1580,13 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "database changes first and Discord fails, the workflow looks complete while the user never receives the result. "
                     "The transactional outbox closes most of this gap by writing the business result and the delivery intent in one transaction."
                 ),
-                source_code("Durable action creation and idempotency", "utils/outbox.py", 35, 76),
-                source_code("Atomic claim, retry, and delivered state", "utils/outbox.py", 102, 172),
+                source_function("Durable action creation and idempotency", "utils/outbox.py", "enqueue"),
+                source_function("Atomic claim, receipts, and delivered state excerpt", "utils/outbox.py", "_process_row", 100),
                 table(
                     ["Outbox State", "Meaning", "Recovery Rule"],
                     [
                         ["pending", "Ready to be claimed by a worker.", "A worker atomically changes exactly one matching row to processing."],
-                        ["processing", "A worker owns this attempt.", "Startup recovers rows abandoned by an interrupted process."],
+                        ["processing", "A worker owns this attempt.", "Startup and runtime recover abandoned claims after a bounded lease."],
                         ["delivered", "Discord accepted the operation.", "The Discord message ID is stored when one exists."],
                         ["dead", "The error is permanent or attempts are exhausted.", "The dashboard exposes it for explicit retry or repair."],
                     ],
@@ -1520,7 +1596,7 @@ def _private_deep_dive_chapters() -> list[tuple[str, list[tuple]]]:
                     "python",
                     """# 1. Store the irreversible business decision.
 statements = [
-    (\"UPDATE level_request_submissions SET status='reviewed' WHERE message_id=?\", (message_id,)),
+    (\"UPDATE level_request_submissions SET status='reviewed' WHERE request_message_id=?\", (message_id,)),
 
     # 2. Store what Discord must receive in the SAME transaction.
     #    The unique idempotency key prevents a second queue row for this result.
@@ -1537,8 +1613,8 @@ await db.execute_transaction(statements, retry_safe=True)
                     "the process and slash commands stay online. OperationsCog inventories the expected loops in every cog, recognizes "
                     "when optional work is deliberately disabled, records state changes, and asks each affected cog to start its work again."
                 ),
-                source_code("Task inventory and restart decision", "cogs/Operations.py", 108, 199),
-                source_code("Supervisor loop and state-change timeline", "cogs/Operations.py", 218, 268),
+                source_function("Task inventory and restart decision", "cogs/Operations.py", "restart_stopped_tasks"),
+                source_function("Independent supervisor and timeline", "cogs/Operations.py", "_supervisor_loop"),
                 callout(
                     "Important distinction",
                     "Disabled is a valid configured state. Stopped or failed is an operational problem. Treating both as the same would make the supervisor repeatedly start features that the owner intentionally turned off.",
@@ -1570,7 +1646,7 @@ await db.execute_transaction(statements, retry_safe=True)
                         ["Config", "2", "The checked-in JSON structure and supported option types."],
                         ["Runtime", "2", "Persisted settings written by slash commands and maintenance controls."],
                         ["Embed templates", "2", "Allowed request placeholders and Discord field shapes."],
-                        ["Database", "4", "Tables and columns expected by the deployed code."],
+                        ["Database", "5", "Tables and columns expected by the deployed code, including incident batch deduplication."],
                     ],
                 ),
                 h2("Historical Health Rather Than A Snapshot"),
@@ -1579,14 +1655,14 @@ await db.execute_transaction(statements, retry_safe=True)
                     "gateway latency, a measured database probe, internal database health, per-operation query timing, command errors, task state, "
                     "and provider latency. Provider samples make it possible to distinguish a slow external level API from a slow database or Discord connection."
                 ),
-                source_code("Persistent runtime and provider samples", "cogs/Operations.py", 270, 325),
+                source_function("Persistent runtime and provider samples", "cogs/Operations.py", "collect_health_sample"),
                 p(
                     "Error logging follows the same principle. The message text is normalized and hashed into a fingerprint. Repeated failures update "
                     "one incident with an occurrence count and latest correlation ID instead of behaving like unrelated errors. Permission drift is "
                     "stored similarly, including when a previously missing permission is resolved."
                 ),
                 h2("Retention, Restore Drills, And Monthly Impact"),
-                source_code("Allowlisted retention and restore drill entry", "cogs/Operations.py", 361, 391),
+                source_function("Allowlisted retention", "cogs/Operations.py", "run_retention"),
                 source_code("Non-destructive SQLite restore drill", "services/backups.py", 22, 82),
                 p(
                     "Retention is allowlisted, not arbitrary SQL supplied by a command. Only operational history tables can be trimmed, each with a "
@@ -1594,7 +1670,7 @@ await db.execute_transaction(statements, retry_safe=True)
                     "drill creates a temporary backup, opens it read-only, runs PRAGMA integrity_check, verifies core tables, stores the result, and then "
                     "deletes the temporary directory without replacing production data."
                 ),
-                source_code("Idempotent monthly impact delivery", "cogs/Operations.py", 393, 442),
+                source_function("Idempotent monthly impact delivery excerpt", "cogs/Operations.py", "generate_monthly_report"),
                 diagram(
                     "Monthly Impact Report Lifecycle",
                     [
@@ -1626,10 +1702,175 @@ await db.execute_transaction(statements, retry_safe=True)
                     "checks its outbox worker and request cog, compares schema versions, and inventories slash commands. This is an in-process release check, "
                     "not a full staging environment. It catches incomplete deployments and startup wiring mistakes while the dashboard can still explain them."
                 ),
-                source_code("Post-deployment smoke checks", "cogs/Operations.py", 502, 545),
+                source_function("Post-deployment smoke checks excerpt", "cogs/Operations.py", "_post_deploy_smoke_test"),
                 callout(
                     "Mental model",
                     "Cogs own Discord workflows. Services own reusable business rules. Utils own infrastructure. Turso owns durable truth. OperationsCog watches the watchers, and the outbox turns important Discord effects into recoverable work.",
+                ),
+            ],
+        ),
+        (
+            "Runtime Isolation And Incident Recovery 3 22 1",
+            [
+                p(
+                    "The September 15 review found an important distinction: putting a native call in a thread does not prove it is "
+                    "safe for an asyncio application. The installed libSQL extension can retain Python's GIL during database work. "
+                    "Our local threaded-query experiment took about 0.402 seconds while a separate heartbeat paused for about 0.411 "
+                    "seconds. This demonstrates interpreter contention, not the exact length or sole cause of the production outage."
+                ),
+                h2("Why Threads Were Not Enough"),
+                p(
+                    "The GIL is Python's interpreter execution lock. asyncio normally cooperates by yielding control at await points. "
+                    "A thread future lets the coroutine yield, but the main interpreter still needs the GIL to resume any Python code. "
+                    "If a Rust extension retains that lock while waiting for a database result, the event loop cannot reliably run "
+                    "heartbeats, interaction responses, watchdogs, or error delivery. CPU cores alone do not solve this ownership problem."
+                ),
+                diagram(
+                    "The Shared Interpreter Failure",
+                    ["async handler awaits thread", "native driver retains GIL", "main interpreter waits", "Discord acknowledgement expires"],
+                    "An await is useful only if the code that must resume can actually acquire interpreter execution time.",
+                ),
+                h2("The Process Boundary"),
+                p(
+                    "A worker process has a separate Python interpreter and its own GIL. IsolatedConnection starts that worker with "
+                    "multiprocessing spawn and gives it the path, remote URL, and token in memory. The parent waits on a pipe inside "
+                    "a thread; that wait does not retain the parent's interpreter lock. Only materialized SQL results cross the pipe. "
+                    "There is one primary worker connection, not a fleet of writers and not a silent switch to disposable local storage."
+                ),
+                source_function("Worker operations and materialized result boundary", "utils/libsql_worker.py", "_worker_main"),
+                source_function("Bounded worker RPC", "utils/libsql_worker.py", "_call"),
+                diagram(
+                    "The Isolated Runtime",
+                    ["Discord interpreter remains responsive", "thread waits on IPC", "worker interpreter runs libSQL", "rows or bounded failure return"],
+                    "A worker can be terminated without killing the Discord event loop. Remote durability still depends on Turso.",
+                ),
+                h2("Deadlines And Cancellation Ownership"),
+                p(
+                    "The queue has a ten-second acquisition deadline. A queue timeout means this caller never started its operation. "
+                    "A worker RPC defaults to twenty seconds, with a shared thirty-second budget for normal work on an existing "
+                    "connection and a longer ninety-second startup budget. Reconnection and safe retries are separate phases; these "
+                    "are bounded phases rather than a promise that every end-to-end command finishes in thirty seconds."
+                ),
+                source_function("Bounded queue ownership", "utils/db.py", "_guard"),
+                source_function("Cancellation retains ownership until the thread finishes", "utils/db.py", "_thread_call"),
+                code(
+                    "Simplified cancellation rule with commentary",
+                    "python",
+                    """async with connection_lock:
+    # shield prevents cancelling the asyncio caller from cancelling the
+    # Future that represents our still-running database thread.
+    running = asyncio.create_task(asyncio.to_thread(worker_call))
+    try:
+        return await asyncio.shield(running)
+    except asyncio.CancelledError:
+        # This line represents a helper that waits despite repeated
+        # cancellation. Another caller must not own the connection yet.
+        await wait_until_thread_finishes(running)
+        raise
+
+# Only after the thread exits may reconnect, close, or another query
+# acquire this lock. Cancelling a Future cannot stop a native thread.""",
+                ),
+                callout(
+                    "Timeout does not mean no write happened",
+                    "A terminated worker may have committed remotely before its reply was lost. Completion is unknown. Never blindly repeat "
+                    "a non-idempotent write; check saved state or use a guarded transaction with a stable idempotency key.",
+                ),
+                p(
+                    "Deadlines use time.monotonic so an operating-system wall-clock correction cannot extend or shorten a timeout. "
+                    "Business timestamps use epoch time for records and Discord timestamps. This distinction is about elapsed versus "
+                    "calendar time; the bot does not depend on a separate atomic-clock service."
+                ),
+                h2("Acknowledge First Validate The Decision Later"),
+                p(
+                    "Discord requires the initial response within three seconds. A modal must be that initial response, so deferring "
+                    "and later opening the same modal is not valid. Review buttons therefore open their modal without querying storage. "
+                    "The final submission checks the configured reviewer roles, source channel, current pending row, and current decision. "
+                    "An immediately opened form does not grant permission or guarantee the level is still pending."
+                ),
+                source_function("Review modal initial response", "cogs/RequestLevels.py", "handle_review_button"),
+                p(
+                    "Persistent views are registered before preflight and login so saved button custom IDs have handlers from the start. "
+                    "Known slash command names also resolve using the interaction's actual guild if the command-ID cache is cold. "
+                    "An invocation does not force a REST command-sync round trip before its initial acknowledgement."
+                ),
+                h2("Error Reporting Must Survive Its Own Storage Failure"),
+                p(
+                    "The old database-first logger could disappear behind the same database stall it was reporting. log_error now "
+                    "redacts and prints immediately, then adds an incident to a bounded memory buffer. Independent workers update a "
+                    "Discord embed and persist counts. Component and modal callbacks have central handlers alongside command/event "
+                    "handlers. A repeated failure updates its occurrence count and last-seen timestamp instead of being silently hidden."
+                ),
+                source_function("Immediate log recording", "utils/errors.py", "log_error"),
+                source_function("Retry-safe incident batches", "utils/errors.py", "_persist_loop"),
+                diagram(
+                    "Independent Evidence Paths",
+                    ["redacted error", "immediate deployment stdout", "memory occurrence and Discord update", "retry-safe Turso batch"],
+                    "The Discord and database paths are independent workers. Database failure does not prevent a notification attempt.",
+                ),
+                p(
+                    "A batch UUID solves a subtle retry bug. Suppose Turso commits an increment, but its reply is lost. Retrying an "
+                    "ordinary increment doubles the count. Schema 5 commits the incident delta and its unique batch ID together; "
+                    "the same batch is ignored on retry. The buffer supports 512 incident groups, not unlimited durable memory. If "
+                    "the process dies before cloud persistence succeeds, pending memory-only counts can be lost. Deployment logs "
+                    "provide separate evidence subject to the host's retention policy."
+                ),
+                h2("The Watchers Must Not Wait For Their Database"),
+                p(
+                    "Operations starts its supervisor, watchdog, health, outbox, maintenance, and smoke work before awaiting persisted "
+                    "bootstrap settings. Bootstrap retries independently. The supervisor dispatches restart and history jobs rather "
+                    "than waiting for database-dependent work itself. A shared per-cog lock prevents initial startup and supervisor "
+                    "repair from starting the same feature concurrently. Missing tasks are repaired; deliberately disabled features remain off."
+                ),
+                source_function("Shared startup and repair ownership", "utils/supervision.py", "start_cog_background"),
+                source_function("Memory-only watchdog heartbeat", "cogs/Operations.py", "_watchdog_loop"),
+                h2("Liveness Is Not Readiness"),
+                table(
+                    ["Signal", "Question", "Failure behavior"],
+                    [
+                        ["/health", "Is the web process alive", "Remains HTTP 200 while diagnostics can still answer"],
+                        ["/ready", "Can the initialized bot perform useful work", "HTTP 503 for stale heartbeat, offline gateway, storage trouble, or stopped critical work"],
+                        ["/api/bot", "What may the public website disclose", "Sanitized ready/responsive state and Degraded or Unavailable status"],
+                        ["Recovery dashboard", "What can we inspect without SQL", "Worker state, queue, active operation, event-loop lag, tasks, and pending incident counts"],
+                    ],
+                ),
+                source_function("Readiness combines independent runtime signals", "utils/keepalive.py", "get_runtime_health"),
+                p(
+                    "The watchdog writes a memory-only heartbeat once a second. The HTTP thread can read it even if the asyncio "
+                    "loop stalls, and readiness fails when the heartbeat is fifteen seconds old. The full dashboard build has a "
+                    "five-second shielded deadline; a memory-only fallback appears while a cached build may finish in the background. "
+                    "Neither a health poll nor a Discord reconnect is treated as a new process start for service uptime."
+                ),
+                h2("Recovering Discord Effects And Stale Evidence"),
+                p(
+                    "The review transaction now queues a disabled-button edit alongside the decision and result notifications. If "
+                    "the immediate edit fails, the durable outbox still repairs that original card. Abandoned processing claims "
+                    "recover during runtime after two minutes. Successful sends have in-process receipts if their database "
+                    "confirmation fails, and deterministic enforced nonces reduce recent duplicate Discord sends after a crash. "
+                    "Discord nonce deduplication has a limited window; this is not an unlimited exactly-once guarantee."
+                ),
+                p(
+                    "Pending validation refreshes run in small batches. External lookups happen outside the review lock, then the "
+                    "handler reloads the row and checks pending status and level ID before a compare-and-set JSON update. This "
+                    "prevents stale provider results overwriting an edit or reopening buttons after review. Missing Discord "
+                    "messages remain a repair condition rather than a reason to recreate cards on every loop. A Boomlings 403 "
+                    "remains denied upstream access; another provider's positive evidence is retained."
+                ),
+                source_function("Safe validation refresh against concurrent review", "cogs/RequestLevels.py", "_refresh_review_validation"),
+                callout(
+                    "Do not confuse Discord delivery denial with a bot callback",
+                    "If Clyde refuses a user's DM, the bot receives no event to fix or log. Check mutual-server membership, privacy, blocks, "
+                    "and Discord screening separately. Runtime repair cannot bypass a message that Discord never delivered.",
+                ),
+                h2("How We Verified The Boundary"),
+                p(
+                    "The regression suite exercises the real installed native driver in an isolated process, a hard worker "
+                    "deadline, cancellation while another caller waits, a locked primary with a readable snapshot, uncertain "
+                    "incident commits, repeated Discord logs during a stalled database, cold command IDs, early saved views, "
+                    "a failed original review edit, post-send receipt failure, readiness degradation, and refresh/review races. "
+                    "These tests validate mechanisms locally. Render deployment and real Discord smoke checks still establish "
+                    "whether the current production configuration is healthy. The detailed evidence and changed-file inventory "
+                    "live in docs/INCIDENT_DIAGNOSIS_2026-09-15.md."
                 ),
             ],
         ),
@@ -1774,6 +2015,7 @@ def add_callout(doc: Document, title: str, text: str) -> None:
     tbl = doc.add_table(rows=1, cols=1)
     tbl.autofit = False
     set_table_widths(tbl, [6.5])
+    keep_row_together(tbl.rows[0])
     cell = tbl.cell(0, 0)
     set_cell_shading(cell, CALLOUT_FILL)
     cell.text = ""
@@ -1806,12 +2048,16 @@ def add_manual_table(doc: Document, headers: list[str], rows: list[list[str]]) -
     else:
         widths = [usable / len(headers)] * len(headers)
     set_table_widths(tbl, widths)
+    keep_row_together(tbl.rows[0])
+    header_repeat = OxmlElement("w:tblHeader")
+    tbl.rows[0]._tr.get_or_add_trPr().append(header_repeat)
     for idx, header in enumerate(headers):
         cell = tbl.rows[0].cells[idx]
         set_cell_shading(cell, TABLE_FILL)
         set_cell_text(cell, header, bold=True, color=DARK_BLUE)
     for row_values in rows:
         row = tbl.add_row()
+        keep_row_together(row)
         for idx, value in enumerate(row_values):
             set_cell_text(row.cells[idx], value)
     doc.add_paragraph()
@@ -1819,6 +2065,7 @@ def add_manual_table(doc: Document, headers: list[str], rows: list[list[str]]) -
 
 def add_manual_diagram(doc: Document, title: str, steps: list[str], note: str = "") -> None:
     add_para(doc, title, bold=True)
+    doc.paragraphs[-1].paragraph_format.keep_with_next = True
     tbl = doc.add_table(rows=1, cols=max(1, len(steps)))
     tbl.autofit = False
     width = 6.5 / max(1, len(steps))
@@ -1835,6 +2082,7 @@ def add_manual_diagram(doc: Document, title: str, steps: list[str], note: str = 
 
 def add_code_block(doc: Document, title: str, language: str, text: str) -> None:
     raw_lines = str(text or "").splitlines() or [""]
+    highlighted = code_spans(text, language)
     chunk_size = 34
     chunks = [
         raw_lines[index : index + chunk_size]
@@ -1847,6 +2095,7 @@ def add_code_block(doc: Document, title: str, language: str, text: str) -> None:
             else f"{title} - part {chunk_index} of {len(chunks)}"
         )
         add_para(doc, chunk_title, bold=True)
+        doc.paragraphs[-1].paragraph_format.keep_with_next = True
         tbl = doc.add_table(rows=1, cols=1)
         tbl.autofit = False
         set_table_widths(tbl, [6.5])
@@ -1857,10 +2106,15 @@ def add_code_block(doc: Document, title: str, language: str, text: str) -> None:
         para = cell.paragraphs[0]
         para.paragraph_format.space_after = Pt(0)
         para.paragraph_format.line_spacing = 1.0
-        run = para.add_run("\n".join(chunk))
-        run.font.name = "Courier New"
-        run.font.size = Pt(7.0)
-        run.font.color.rgb = INK
+        start = (chunk_index - 1) * chunk_size
+        for line_index, spans in enumerate(highlighted[start:start + len(chunk)]):
+            if line_index:
+                para.add_run("\n")
+            for text_span, color in spans:
+                run = para.add_run(text_span)
+                run.font.name = "Courier New"
+                run.font.size = Pt(7.0)
+                run.font.color.rgb = RGBColor.from_string(color)
         if language:
             para2 = cell.add_paragraph()
             para2.paragraph_format.space_after = Pt(0)
@@ -1979,13 +2233,13 @@ def build_docx() -> None:
                     run.font.size = Pt(10.5)
                     run.font.color.rgb = INK
             elif kind == "numbered":
-                for item in block[1]:
-                    para = doc.add_paragraph(style="List Number")
+                for number, item in enumerate(block[1], start=1):
+                    para = doc.add_paragraph()
                     para.paragraph_format.left_indent = Inches(0.375)
                     para.paragraph_format.first_line_indent = Inches(-0.188)
                     para.paragraph_format.space_after = Pt(4)
                     para.paragraph_format.line_spacing = 1.25
-                    run = para.add_run(item)
+                    run = para.add_run(f"{number}. {item}")
                     run.font.name = "Calibri"
                     run.font.size = Pt(10.5)
                     run.font.color.rgb = INK
@@ -2287,18 +2541,23 @@ def _pdf_diagram(styles, title: str, steps: list[str], note: str = ""):
 
 def _pdf_code_block(styles, title: str, language: str, text: str):
     raw_lines = str(text or "").splitlines() or [""]
+    highlighted = code_spans(text, language)
     story = []
-    chunk_size = 46
+    chunk_size = 34
     chunks = [raw_lines[idx: idx + chunk_size] for idx in range(0, len(raw_lines), chunk_size)]
     for chunk_idx, chunk in enumerate(chunks, start=1):
         chunk_title = title if len(chunks) == 1 else f"{title} - part {chunk_idx}"
-        escaped_lines = [_pdf_safe(line) for line in chunk]
+        start = (chunk_idx - 1) * chunk_size
+        escaped_lines = [
+            "".join(f'<font color="#{color}">{_pdf_safe(span).replace(" ", "&nbsp;")}</font>' for span, color in spans)
+            for spans in highlighted[start:start + len(chunk)]
+        ]
         code_text = "<br/>".join(escaped_lines)
         data = [
             [Paragraph(_pdf_safe(chunk_title), styles["code_title"])],
             [Paragraph(code_text, styles["code"])],
         ]
-        tbl = Table(data, colWidths=[6.25 * inch])
+        tbl = Table(data, colWidths=[6.25 * inch], splitByRow=0)
         tbl.setStyle(
             TableStyle(
                 [

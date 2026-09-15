@@ -14,6 +14,7 @@ from utils.keepalive import (
     set_keepalive_status,
     set_public_bot_metrics,
     set_public_release_data,
+    set_runtime_heartbeat,
 )
 from utils.releases import (
     ReleaseValidationError,
@@ -146,6 +147,7 @@ def test_release_validation_normalizes_versions_and_changes(tmp_path):
 
 def test_public_status_payload_is_sanitized_and_versioned():
     set_keepalive_status("online", "Logged in with an internal account name")
+    set_runtime_heartbeat(lag_ms=0, tasks={}, database={"connected": True}, incidents=[])
     set_public_bot_metrics(
         bot_name="Avenue Guard",
         avatar_url="https://cdn.example/avatar.png",

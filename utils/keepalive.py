@@ -36,6 +36,43 @@ _public_metrics = {
     "updated_ts": _process_started_ts,
 }
 _public_releases: list[dict] = []
+_runtime_heartbeat = 0.0
+_runtime_health: dict = {}
+
+
+def set_runtime_heartbeat(*, lag_ms: float, tasks: dict, database: dict, incidents: list) -> None:
+    global _runtime_heartbeat
+    with _status_lock:
+        _runtime_heartbeat = time.monotonic()
+        _runtime_health.update({
+            "event_loop_lag_ms": round(max(0.0, lag_ms), 2),
+            "tasks": dict(tasks),
+            "database": {key: database.get(key) for key in (
+                "connected", "uses_remote", "isolated_worker", "worker_alive", "waiting_operations",
+                "active_operation", "active_operation_seconds", "queue_timeouts",
+                "primary_write_degraded", "last_operation_error_ts",
+            )},
+            "incident_count": len(incidents),
+            "incident_occurrences": sum(int(item.get("count", 0)) for item in incidents),
+            "unpersisted_occurrences": sum(int(item.get("pending_persistence", 0)) for item in incidents),
+        })
+
+
+def get_runtime_health() -> dict:
+    with _status_lock:
+        heartbeat = _runtime_heartbeat
+        health = dict(_runtime_health)
+        state = str(_status.get("state") or "")
+    age = time.monotonic() - heartbeat if heartbeat else None
+    responsive = bool(heartbeat and age is not None and age < 15)
+    database = health.get("database", {})
+    database_ok = (database.get("connected") is not False and (not database.get("uses_remote") or database.get("worker_alive") is True)
+                   and not database.get("primary_write_degraded"))
+    auxiliary = {"operations.smoke", "operations.bootstrap", "operations.restarts", "operations.timeline"}
+    tasks_ok = not any(str(value).startswith(("failed", "stopped", "missing"))
+                       for name, value in health.get("tasks", {}).items() if name not in auxiliary)
+    return {**health, "heartbeat_age_seconds": round(age, 2) if age is not None else None,
+            "responsive": responsive, "ready": state == "online" and responsive and database_ok and tasks_ok}
 
 
 def set_keepalive_status(
@@ -153,6 +190,8 @@ def get_public_bot_payload() -> dict:
         current_release = dict(_public_releases[0]) if _public_releases else None
 
     state = str(status.get("state") or "unknown")
+    runtime = get_runtime_health()
+    stalled = state == "online" and runtime["heartbeat_age_seconds"] is not None and not runtime["responsive"]
     online_since_ts = int(status.get("online_since_ts") or 0)
     service_uptime_seconds = max(0, now - _process_started_ts)
     discord_connection_uptime_seconds = (
@@ -166,8 +205,10 @@ def get_public_bot_payload() -> dict:
         "bot_name": str(metrics.get("bot_name") or "Avenue Guard"),
         "avatar_url": str(metrics.get("avatar_url") or ""),
         "state": state,
-        "status": _public_state_label(state),
-        "online": state == "online",
+        "status": "Unavailable" if stalled else ("Degraded" if state == "online" and not runtime["ready"] else _public_state_label(state)),
+        "online": state == "online" and not stalled,
+        "ready": runtime["ready"],
+        "responsive": runtime["responsive"],
         "version": (
             str(current_release.get("version") or "")
             if current_release
@@ -225,7 +266,8 @@ def _response_for_path(raw_path: str) -> tuple[bytes, str, str, bool]:
         return body, "application/json; charset=utf-8", "public, max-age=30", True
 
     status = get_keepalive_status()
-    if path in {"/status", "/health"}:
+    if path in {"/status", "/health", "/ready"}:
+        status["runtime"] = get_runtime_health()
         body = json.dumps(status, separators=(",", ":")).encode("utf-8")
         content_type = "application/json; charset=utf-8"
     else:
@@ -249,7 +291,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
         cache_control: str,
         public_api: bool,
     ) -> None:
-        self.send_response(200)
+        path = urlsplit(self.path).path.rstrip("/")
+        self.send_response(503 if path == "/ready" and not get_runtime_health()["ready"] else 200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", cache_control)
@@ -309,6 +352,7 @@ async def _handle(request: web.Request) -> web.Response:
         content_type=content_type.split(";", 1)[0],
         charset="utf-8",
         headers=headers,
+        status=503 if request.path.rstrip("/") == "/ready" and not get_runtime_health()["ready"] else 200,
     )
 
 async def start_keepalive() -> None:
@@ -321,6 +365,7 @@ async def start_keepalive() -> None:
     app.router.add_route("*", "/", _handle)
     app.router.add_route("*", "/health", _handle)
     app.router.add_route("*", "/status", _handle)
+    app.router.add_route("*", "/ready", _handle)
     app.router.add_route("*", "/api/bot", _handle)
     app.router.add_route("*", "/api/releases", _handle)
     runner = web.AppRunner(app)

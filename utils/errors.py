@@ -1,17 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import hashlib
 import re
 import time
 import traceback
+from uuid import uuid4
 import discord
 
 from utils.mentions import no_mentions
 from utils.workflows import clear_workflow_context, current_correlation_id
-
-_ERROR_DEDUPE_SECONDS = 300
-_recent_error_logs: dict[str, float] = {}
 
 
 def _redact_secrets(message: str) -> str:
@@ -76,27 +75,154 @@ def _dedupe_key(message: str) -> str:
     return text[:600]
 
 
-async def _persist_incident(bot: discord.Client, message: str) -> tuple[str, int]:
-    normalized = _dedupe_key(message)
-    fingerprint = hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()[:24]
-    now = int(time.time())
-    category = str(message or "Bot error").splitlines()[0][:120]
-    correlation = current_correlation_id()
-    try:
-        await bot.db.execute(
-            "INSERT INTO error_incidents(fingerprint,category,status,first_seen_ts,last_seen_ts,occurrence_count,last_message,last_correlation_id) "
-            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET status='open',last_seen_ts=excluded.last_seen_ts,"
-            "occurrence_count=error_incidents.occurrence_count+1,last_message=excluded.last_message,"
-            "last_correlation_id=excluded.last_correlation_id,resolved_ts=NULL",
-            (fingerprint, category, "open", now, now, 1, message[:3600], correlation or None),
-        )
-        row = await bot.db.fetchone(
-            "SELECT occurrence_count FROM error_incidents WHERE fingerprint=?",
-            (fingerprint,),
-        )
-        return fingerprint, int(row["occurrence_count"] or 1) if row else 1
-    except Exception:
-        return fingerprint, 1
+class ErrorReporter:
+    """Independent Discord delivery and persistence; neither blocks the caller."""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.entries: dict[str, dict] = {}
+        self._delivery_event = asyncio.Event()
+        self._persistence_event = asyncio.Event()
+        self._tasks: list[asyncio.Task] = []
+        self.delivery_interval = 5.0
+        self.delivery_timeout = 15.0
+        self.persistence_retry_seconds = 10.0
+        self._closed = False
+
+    def record(self, message: str) -> None:
+        if self._closed:
+            return
+        fingerprint = hashlib.sha256(_dedupe_key(message).encode("utf-8", errors="replace")).hexdigest()[:24]
+        now = int(time.time())
+        if fingerprint not in self.entries:
+            if len(self.entries) >= 512:
+                removable = [key for key, value in self.entries.items() if not value["pending"]]
+                if removable:
+                    self.entries.pop(removable[0])
+                else:
+                    print("[Avenue Guard error] Incident buffer full; full error remains in deployment logs", flush=True)
+                    return
+            self.entries[fingerprint] = {
+                "first_ts": now, "last_ts": now, "count": 0, "pending": 0,
+                "dirty": True, "message_id": 0, "last_delivery": 0.0,
+            }
+        entry = self.entries[fingerprint]
+        entry.update(message=message, category=message.splitlines()[0][:120], last_ts=now,
+                     correlation=current_correlation_id(), dirty=True)
+        entry["count"] += 1
+        entry["pending"] += 1
+        self._delivery_event.set()
+        self._persistence_event.set()
+        if not self._tasks or any(task.done() for task in self._tasks):
+            factories = (self._deliver_loop, self._persist_loop)
+            previous = self._tasks
+            self._tasks = [
+                previous[index] if index < len(previous) and not previous[index].done()
+                else asyncio.create_task(factory(), name=f"avenue-guard:error-{index}")
+                for index, factory in enumerate(factories)
+            ]
+
+    def snapshot(self) -> list[dict]:
+        return [
+            {"fingerprint": key, "category": entry["category"], "count": entry["count"],
+             "last_seen_ts": entry["last_ts"], "pending_persistence": entry["pending"]}
+            for key, entry in self.entries.items()
+        ]
+
+    async def close(self) -> None:
+        self._closed = True
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def _deliver_loop(self):
+        while True:
+            await self._delivery_event.wait()
+            self._delivery_event.clear()
+            dirty = [(key, entry) for key, entry in self.entries.items() if entry["dirty"]]
+            for key, entry in dirty:
+                if time.monotonic() - entry["last_delivery"] < self.delivery_interval:
+                    continue
+                try:
+                    config = getattr(self.bot, "config", None)
+                    channel_id = config.get_int("channels", "global_error_log_channel_id") if config else 0
+                    if not channel_id:
+                        entry["dirty"] = False
+                        continue
+                    channel = self.bot.get_channel(channel_id)
+                    if channel is None:
+                        channel = await asyncio.wait_for(self.bot.fetch_channel(channel_id), self.delivery_timeout)
+                    count = entry["count"]
+                    message = entry["message"].replace("```", "` ` `")[:3600]
+                    embed = discord.Embed(title="Bot Error", description=f"```py\n{message}\n```",
+                                          color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
+                    embed.add_field(name="Incident", value=f"`{key}`", inline=True)
+                    embed.add_field(name="Occurrences", value=str(count), inline=True)
+                    embed.add_field(name="Last Seen", value=f"<t:{entry['last_ts']}:R>", inline=True)
+                    if entry.get("correlation"):
+                        embed.add_field(name="Workflow", value=f"`{entry['correlation']}`", inline=False)
+                    if entry["pending"]:
+                        embed.set_footer(text="Avenue Guard error log • persistence pending")
+                    else:
+                        embed.set_footer(text="Avenue Guard error log")
+                    previous = None
+                    if entry["message_id"]:
+                        try:
+                            previous = await asyncio.wait_for(channel.fetch_message(entry["message_id"]), self.delivery_timeout)
+                        except discord.NotFound:
+                            pass
+                    if previous is not None:
+                        await asyncio.wait_for(previous.edit(embed=embed, allowed_mentions=no_mentions()), self.delivery_timeout)
+                    else:
+                        sent = await asyncio.wait_for(channel.send(embed=embed, allowed_mentions=no_mentions()), self.delivery_timeout)
+                        entry["message_id"] = int(sent.id)
+                        self._persistence_event.set()
+                    entry["last_delivery"] = time.monotonic()
+                    entry["dirty"] = entry["count"] != count
+                except Exception as exc:
+                    entry["last_delivery"] = time.monotonic()
+                    print(f"[Avenue Guard error] Discord incident delivery failed: {_redact_secrets(str(exc))}", flush=True)
+            if any(entry["dirty"] for entry in self.entries.values()):
+                await asyncio.sleep(self.delivery_interval)
+                self._delivery_event.set()
+
+    async def _persist_loop(self):
+        while True:
+            await self._persistence_event.wait()
+            self._persistence_event.clear()
+            for key, entry in list(self.entries.items()):
+                delta = entry["pending"]
+                try:
+                    if delta:
+                        batch_id, delta = entry.setdefault("batch", (uuid4().hex, delta))
+                        await self.bot.db.execute_transaction([
+                            (
+                                "INSERT INTO error_incidents(fingerprint,category,status,first_seen_ts,last_seen_ts,occurrence_count,last_message,last_correlation_id,log_message_id) "
+                                "SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM error_incident_batches WHERE batch_id=?) "
+                                "ON CONFLICT(fingerprint) DO UPDATE SET status='open',last_seen_ts=excluded.last_seen_ts,"
+                                "occurrence_count=error_incidents.occurrence_count+excluded.occurrence_count,last_message=excluded.last_message,"
+                                "last_correlation_id=excluded.last_correlation_id,log_message_id=COALESCE(excluded.log_message_id,error_incidents.log_message_id),resolved_ts=NULL",
+                                (key, entry["category"], "open", entry["first_ts"], entry["last_ts"], delta,
+                                 entry["message"], entry.get("correlation") or None, entry["message_id"] or None, batch_id),
+                            ),
+                            ("INSERT OR IGNORE INTO error_incident_batches(batch_id,fingerprint,created_ts) VALUES(?,?,?)",
+                             (batch_id, key, int(time.time()))),
+                        ], retry_safe=True)
+                        entry["pending"] -= delta
+                        entry.pop("batch", None)
+                        row = await self.bot.db.fetchone("SELECT occurrence_count,log_message_id FROM error_incidents WHERE fingerprint=?", (key,))
+                        if row:
+                            entry["count"] = int(row["occurrence_count"]) + entry["pending"]
+                            entry["message_id"] = entry["message_id"] or int(row["log_message_id"] or 0)
+                            entry["dirty"] = True
+                            self._delivery_event.set()
+                    elif entry["message_id"]:
+                        await self.bot.db.execute("UPDATE error_incidents SET log_message_id=? WHERE fingerprint=?", (entry["message_id"], key))
+                except Exception as exc:
+                    print(f"[Avenue Guard error] Incident persistence deferred: {_compact_error_message(_redact_secrets(str(exc)), 300)}", flush=True)
+            if any(entry["pending"] for entry in self.entries.values()):
+                await asyncio.sleep(self.persistence_retry_seconds)
+                self._persistence_event.set()
 
 
 def _unwrap_command_error(error: Exception) -> Exception:
@@ -130,85 +256,28 @@ def _command_error_record(ctx: discord.ApplicationContext, error: Exception) -> 
 
 async def log_error(bot: discord.Client, message: str) -> None:
     message = _compact_error_message(_redact_secrets(message))
-    fingerprint, occurrence_count = await _persist_incident(bot, message)
+    print(f"[Avenue Guard error] {message}", flush=True)
+    reporter = getattr(bot, "_error_reporter", None)
+    if reporter is None:
+        reporter = bot._error_reporter = ErrorReporter(bot)
+    reporter.record(message)
+
+
+async def _notify_interaction_failure(interaction: discord.Interaction, error: Exception) -> None:
+    root = _unwrap_command_error(error)
+    if int(getattr(root, "code", 0) or 0) == 10062:
+        return
+    if "Database busy" in str(root) or "Turso worker" in str(root):
+        message = "Storage is temporarily unavailable. Please retry in a moment; check the current status before repeating a submission."
+    else:
+        message = "Something went wrong. Please try again; staff have been notified."
     try:
-        print(f"[Avenue Guard error] {message}", flush=True)
+        if interaction.response.is_done():
+            await asyncio.wait_for(interaction.followup.send(message, ephemeral=True, allowed_mentions=no_mentions()), timeout=5)
+        else:
+            await asyncio.wait_for(interaction.response.send_message(message, ephemeral=True, allowed_mentions=no_mentions()), timeout=5)
     except Exception:
         pass
-    try:
-        cfg = getattr(bot, "config", None)
-        if cfg is None:
-            return
-        ch_id = cfg.get_int("channels", "global_error_log_channel_id")
-        if not ch_id:
-            return
-        channel = bot.get_channel(ch_id)
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(ch_id)
-            except Exception:
-                return
-        message = _compact_error_message(message, limit=3800)
-        now = time.monotonic()
-        stale_keys = [old_key for old_key, old_ts in _recent_error_logs.items() if now - old_ts >= _ERROR_DEDUPE_SECONDS]
-        for old_key in stale_keys[:100]:
-            _recent_error_logs.pop(old_key, None)
-        key = _dedupe_key(message)
-        last_sent = _recent_error_logs.get(key, 0)
-        if now - last_sent < _ERROR_DEDUPE_SECONDS:
-            return
-        _recent_error_logs[key] = now
-        while len(_recent_error_logs) > 1000:
-            oldest_key = min(_recent_error_logs, key=_recent_error_logs.get)
-            _recent_error_logs.pop(oldest_key, None)
-        safe_message = message.replace("```", "` ` `")
-        embed = discord.Embed(
-            title="Bot Error",
-            description=f"```py\n{safe_message}\n```",
-            color=discord.Color.red(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="Incident", value=f"`{fingerprint}`", inline=True)
-        embed.add_field(name="Occurrences", value=str(occurrence_count), inline=True)
-        correlation = current_correlation_id()
-        if correlation:
-            embed.add_field(name="Workflow", value=f"`{correlation}`", inline=False)
-        embed.set_footer(text="Avenue Guard error log")
-        try:
-            sent = await channel.send(embed=embed, allowed_mentions=no_mentions())
-            try:
-                await bot.db.execute(
-                    "UPDATE error_incidents SET log_message_id=? WHERE fingerprint=?",
-                    (int(sent.id), fingerprint),
-                )
-            except Exception:
-                pass
-        except Exception as send_error:
-            if len(message) > 1800:
-                message = message[:1800] + "\n...truncated..."
-            try:
-                await channel.send(
-                    f"```py\n{message.replace('```', '` ` `')}\n```",
-                    allowed_mentions=no_mentions(),
-                )
-            except Exception:
-                try:
-                    print(
-                        f"[Avenue Guard error] Discord error-log delivery failed: "
-                        f"{type(send_error).__name__}: {send_error}",
-                        flush=True,
-                    )
-                except Exception:
-                    pass
-    except Exception as logging_error:
-        try:
-            print(
-                f"[Avenue Guard error] Error logger failed: "
-                f"{type(logging_error).__name__}: {logging_error}",
-                flush=True,
-            )
-        except Exception:
-            pass
 
 def setup_global_error_handlers(bot: discord.Client) -> None:
     @bot.event
@@ -220,15 +289,25 @@ def setup_global_error_handlers(bot: discord.Client) -> None:
             bot,
             f"Command error in /{record['command']} [{record['category']}]: {repr(error)}\n{error_trace}",
         )
-        if record["category"] == "interaction_timeout":
-            clear_workflow_context()
-            return
-        try:
-            await ctx.respond("Something went wrong while running that command.", ephemeral=True)
-        except Exception:
-            pass
-        finally:
-            clear_workflow_context()
+        if record["category"] != "interaction_timeout":
+            await _notify_interaction_failure(ctx.interaction, error)
+        clear_workflow_context()
+
+    @bot.event
+    async def on_view_error(error: Exception, item, interaction: discord.Interaction):
+        label = str(getattr(item, "custom_id", None) or getattr(item, "label", None) or "component")
+        bot._last_component_error = {"ts": int(time.time()), "component": label, "category": type(error).__name__}
+        await log_error(bot, f"Component error [{label}]: {error!r}\n" + "".join(traceback.format_exception(type(error), error, error.__traceback__)))
+        await _notify_interaction_failure(interaction, error)
+        clear_workflow_context()
+
+    @bot.event
+    async def on_modal_error(error: Exception, interaction: discord.Interaction):
+        custom_id = str((interaction.data or {}).get("custom_id") or "modal")
+        bot._last_component_error = {"ts": int(time.time()), "component": custom_id, "category": type(error).__name__}
+        await log_error(bot, f"Modal error [{custom_id}]: {error!r}\n" + "".join(traceback.format_exception(type(error), error, error.__traceback__)))
+        await _notify_interaction_failure(interaction, error)
+        clear_workflow_context()
 
     @bot.event
     async def on_error(event_method: str, *args, **kwargs):

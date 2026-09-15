@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import hashlib
 import time
 from typing import Any
 
@@ -31,6 +32,7 @@ class DiscordOutbox:
         self.bot = bot
         self.max_attempts = max(1, min(20, int(max_attempts)))
         self._worker_lock = asyncio.Lock()
+        self._delivery_receipts: dict[int, int] = {}
 
     async def enqueue(
         self,
@@ -75,7 +77,7 @@ class DiscordOutbox:
         )
         return int(row["id"] or 0) if row else 0
 
-    async def recover_stale(self, *, stale_seconds: int = 300) -> int:
+    async def recover_stale(self, *, stale_seconds: int = 120) -> int:
         cutoff = int(time.time()) - max(30, int(stale_seconds))
         return await self.bot.db.execute_affected(
             "UPDATE discord_outbox SET status='pending',next_attempt_ts=?,updated_ts=?,last_error='worker interrupted before completion' "
@@ -88,6 +90,17 @@ class DiscordOutbox:
         if self._worker_lock.locked():
             return result
         async with self._worker_lock:
+            if self._delivery_receipts:
+                receipt_ids = list(self._delivery_receipts)
+                for start in range(0, len(receipt_ids), 100):
+                    chunk = receipt_ids[start:start + 100]
+                    placeholders = ",".join("?" for _ in chunk)  # Only placeholders are interpolated; IDs remain bound.
+                    confirmed = await self.bot.db.fetchall(
+                        f"SELECT id FROM discord_outbox WHERE id IN ({placeholders}) AND status IN ('delivered','dead')",  # nosec B608
+                        tuple(chunk),
+                    )
+                    for receipt in confirmed:
+                        self._delivery_receipts.pop(int(receipt["id"]), None)
             now = int(time.time())
             rows = await self.bot.db.fetchall(
                 "SELECT * FROM discord_outbox WHERE status IN ('pending','failed') AND next_attempt_ts<=? "
@@ -119,7 +132,11 @@ class DiscordOutbox:
             return "retried"
         attempts = int(claimed["attempts"] or 1)
         try:
-            delivered_message_id = await self._deliver(claimed)
+            if outbox_id in self._delivery_receipts:
+                delivered_message_id = self._delivery_receipts[outbox_id]
+            else:
+                delivered_message_id = await asyncio.wait_for(self._deliver(claimed), timeout=45)
+                self._delivery_receipts[outbox_id] = int(delivered_message_id or 0)
         except Exception as exc:
             terminal = self._terminal_failure(exc) or attempts >= self.max_attempts
             target = "dead" if terminal else "pending"
@@ -160,6 +177,7 @@ class DiscordOutbox:
                 outbox_id,
             ),
         )
+        self._delivery_receipts.pop(outbox_id, None)
         await record_workflow_event(
             self.bot.db,
             workflow_type="discord_outbox",
@@ -220,17 +238,20 @@ class DiscordOutbox:
         content = str(payload.get("content") or "")[:2000] or None
         embed = self._embed(payload)
         mentions = self._mentions(payload)
+        nonce = hashlib.sha256(str(row["idempotency_key"]).encode()).hexdigest()[:24]
 
         if action == "send_channel":
             channel = await self._channel(channel_id)
             sent = await channel.send(
-                content=content, embed=embed, allowed_mentions=mentions
+                content=content, embed=embed, allowed_mentions=mentions,
+                nonce=nonce, enforce_nonce=True,
             )
             return int(getattr(sent, "id", 0) or 0)
         if action == "send_dm":
             user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
             sent = await user.send(
-                content=content, embed=embed, allowed_mentions=no_mentions()
+                content=content, embed=embed, allowed_mentions=no_mentions(),
+                nonce=nonce, enforce_nonce=True,
             )
             return int(getattr(sent, "id", 0) or 0)
         if action in {"edit_message", "delete_message"}:
@@ -244,8 +265,12 @@ class DiscordOutbox:
             if action == "delete_message":
                 await message.delete()
             else:
+                options = {}
+                if payload.get("request_review_disabled"):
+                    from utils.views import LevelRequestReviewView
+                    options["view"] = LevelRequestReviewView(disabled=True)
                 await message.edit(
-                    content=content, embed=embed, allowed_mentions=mentions
+                    content=content, embed=embed, allowed_mentions=mentions, **options
                 )
             return message_id
 

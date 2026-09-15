@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 import json
 import os
 import re
@@ -18,6 +18,11 @@ from utils.config_schema import (
     EMBED_SCHEMA_VERSION,
     RUNTIME_SCHEMA_VERSION,
 )
+from utils.libsql_worker import IsolatedConnection
+
+
+class DatabaseBusyError(RuntimeError):
+    """Storage is busy; no operation was started for this caller."""
 
 try:
     import libsql
@@ -131,6 +136,7 @@ def _is_recoverable_remote_error(exc: Exception) -> bool:
         "service unavailable",
         "connection reset",
         "timed out",
+        "turso worker",
         "file is not a database",
         "sqlite_notadb",
         "database disk image is malformed",
@@ -284,6 +290,52 @@ class Database:
         self._last_replica_rebuild_ts = 0
         self._last_replica_rebuild_reason = ""
         self._query_metrics: dict[str, dict[str, float | int]] = {}
+        self._waiting_operations = 0
+        self._active_operation = ""
+        self._active_operation_since = 0.0
+        self._queue_timeouts = 0
+        self._queue_timeout_seconds = 10.0
+        self._primary_write_degraded = False
+        self._last_operation_error_ts = 0
+
+    @asynccontextmanager
+    async def _guard(self):
+        self._waiting_operations += 1
+        try:
+            try:
+                await asyncio.wait_for(self._lock.acquire(), self._queue_timeout_seconds)
+            except asyncio.TimeoutError as exc:
+                self._queue_timeouts += 1
+                raise DatabaseBusyError("Database busy; this operation was not started, please retry") from exc
+        finally:
+            self._waiting_operations -= 1
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    async def _thread_call(self, function, *args, budget: float = 30):
+        def invoke():
+            if isinstance(self._conn, IsolatedConnection):
+                self._conn.set_deadline(budget)
+            return function(*args)
+
+        task = asyncio.create_task(asyncio.to_thread(invoke))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Cancelling to_thread does not stop its thread. Retain the lock
+            # until it has exited so a second caller cannot race the connection.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if task.done() and not task.cancelled():
+                task.exception()
+            raise
 
     def _record_query_timing(self, operation: str, elapsed_ms: float, *, failed: bool) -> None:
         key = str(operation or "database")[:40]
@@ -403,7 +455,7 @@ class Database:
                     "TURSO_AUTH_TOKEN looks like a Turso platform/API token, not a database auth token. "
                     "Create a database token with `turso db tokens create <database-name>` and use that value instead."
                 )
-            conn = libsql.connect(str(self.path), sync_url=self.remote_url, auth_token=self.auth_token)
+            conn = IsolatedConnection(str(self.path), sync_url=self.remote_url, auth_token=self.auth_token)
         else:
             conn = sqlite3.connect(str(self.path), check_same_thread=False)
             conn.row_factory = sqlite3.Row
@@ -502,13 +554,18 @@ class Database:
 
         for attempt in range(attempts):
             started = time.perf_counter()
-            async with self._lock:
+            async with self._guard():
                 assert self._conn is not None
-
+                self._active_operation = operation_name
+                self._active_operation_since = time.monotonic()
                 try:
-                    if attempt_pending_sync:
-                        await asyncio.to_thread(self._try_pending_remote_sync_sync)
-                    result = await asyncio.to_thread(operation)
+                    def run():
+                        if attempt_pending_sync:
+                            self._try_pending_remote_sync_sync()
+                        return operation()
+                    result = await self._thread_call(run)
+                    if operation_name in {"execute", "execute_affected", "insert", "transaction", "executemany", "next_ticket_id"}:
+                        self._primary_write_degraded = False
                     self._record_query_timing(
                         operation_name,
                         (time.perf_counter() - started) * 1000,
@@ -522,14 +579,32 @@ class Database:
                         failed=True,
                     )
                     last_error = exc
+                    self._last_operation_error_ts = int(time.time())
                     should_recover = self.uses_remote and _is_recoverable_remote_error(exc)
+                    if self.uses_remote and operation_name in {"execute", "execute_affected", "insert", "transaction", "executemany", "next_ticket_id"}:
+                        if should_recover or any(marker in str(exc).casefold() for marker in ("unauthorized", "forbidden", "401", "403", "read-only", "readonly")):
+                            self._primary_write_degraded = True
                     if should_recover:
-                        if _is_replica_corruption_error(exc):
-                            await asyncio.to_thread(self._rebuild_remote_replica_sync, exc)
-                        else:
-                            await asyncio.to_thread(self._reopen_connection_sync)
+                        try:
+                            if _is_replica_corruption_error(exc):
+                                await self._thread_call(self._rebuild_remote_replica_sync, exc)
+                            else:
+                                await self._thread_call(self._reopen_connection_sync)
+                        except Exception as recovery_error:
+                            self._ready = False
+                            self._last_remote_sync_error = f"Reconnect failed: {recovery_error}"[:1000]
+                            self._last_remote_sync_error_ts = int(time.time())
+                            raise exc from recovery_error
+                    else:
+                        try:
+                            await self._thread_call(self._conn.rollback)
+                        except Exception:
+                            pass
                     if not should_recover or attempt >= attempts - 1:
                         raise
+                finally:
+                    self._active_operation = ""
+                    self._active_operation_since = 0.0
 
             await asyncio.sleep(0.35 * (attempt + 1))
 
@@ -538,7 +613,9 @@ class Database:
         return None
 
     async def connect(self) -> None:
-        async with self._lock:
+        if self._conn is not None and self._ready:
+            return
+        async with self._guard():
             if self._conn is not None and self._ready:
                 return
 
@@ -563,21 +640,21 @@ class Database:
                 self._remote_reconnect_required = False
                 self._replica_rebuild_required = False
 
-            await asyncio.to_thread(_connect_and_migrate)
+            await self._thread_call(_connect_and_migrate, budget=90)
             self._ready = True
 
     async def close(self) -> None:
-        async with self._lock:
+        async with self._guard():
             if self._conn is None:
                 return
 
-            await asyncio.to_thread(self._close_connection_sync)
+            await self._thread_call(self._close_connection_sync)
 
     async def backup_to(self, target_path: str | Path) -> int:
         await self.connect()
         target = Path(target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        async with self._lock:
+        async with self._guard():
             assert self._conn is not None
 
             def _backup() -> int:
@@ -618,12 +695,12 @@ class Database:
                 return int(target.stat().st_size)
 
             try:
-                return await asyncio.to_thread(_backup)
+                return await self._thread_call(_backup)
             except Exception as exc:
                 if not self.uses_remote or not _is_replica_corruption_error(exc):
                     raise
-                await asyncio.to_thread(self._rebuild_remote_replica_sync, exc)
-                return await asyncio.to_thread(_backup)
+                await self._thread_call(self._rebuild_remote_replica_sync, exc)
+                return await self._thread_call(_backup)
 
     async def restore_from(self, source_path: str | Path) -> int:
         """Replace the live SQLite file with a validated backup and migrate it.
@@ -641,7 +718,7 @@ class Database:
                 "For Turso/libSQL, restore through Turso backups/import tooling so the remote primary stays consistent."
             )
 
-        async with self._lock:
+        async with self._guard():
             def _unlink_sidecars(base: Path) -> None:
                 for suffix in ("-wal", "-shm", "-journal"):
                     try:
@@ -715,9 +792,23 @@ class Database:
                         _connect_current()
                     raise
 
-            return await asyncio.to_thread(_restore)
+            return await self._thread_call(_restore)
 
     def _migrate_sync(self) -> None:
+        try:
+            versions = dict(self._conn.execute("SELECT component,schema_version FROM schema_metadata").fetchall())
+            expected = {
+                "database": DATABASE_SCHEMA_VERSION,
+                "config": CONFIG_SCHEMA_VERSION,
+                "runtime_settings": RUNTIME_SCHEMA_VERSION,
+                "embed_templates": EMBED_SCHEMA_VERSION,
+            }
+            if versions == expected:
+                tables = {row[0] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                if {"tickets", "ticket_transcripts", "activity_counts", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
+                    return
+        except Exception:
+            pass
         assert self._conn is not None
         stmts = [
             """CREATE TABLE IF NOT EXISTS activity_counts(
@@ -1138,6 +1229,11 @@ class Database:
                 last_correlation_id TEXT,
                 log_message_id INTEGER,
                 resolved_ts INTEGER
+            );""",
+            """CREATE TABLE IF NOT EXISTS error_incident_batches(
+                batch_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                created_ts INTEGER NOT NULL
             );""",
             """CREATE TABLE IF NOT EXISTS health_metrics(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1688,6 +1784,7 @@ class Database:
 
     def health_snapshot(self) -> dict[str, Any]:
         return {
+            "connected": self._conn is not None and self._ready,
             "uses_remote": self.uses_remote,
             "remote_dirty": self._remote_dirty,
             "replica_refresh_pending": self._remote_dirty,
@@ -1699,6 +1796,14 @@ class Database:
             "last_replica_rebuild_ts": self._last_replica_rebuild_ts,
             "last_replica_rebuild_reason": self._last_replica_rebuild_reason,
             "query_timing": self.query_timing_snapshot(),
+            "isolated_worker": isinstance(self._conn, IsolatedConnection),
+            "worker_alive": self._conn.alive if isinstance(self._conn, IsolatedConnection) else None,
+            "waiting_operations": self._waiting_operations,
+            "active_operation": self._active_operation,
+            "active_operation_seconds": round(time.monotonic() - self._active_operation_since, 2) if self._active_operation_since else 0,
+            "queue_timeouts": self._queue_timeouts,
+            "primary_write_degraded": self._primary_write_degraded,
+            "last_operation_error_ts": self._last_operation_error_ts,
         }
 
     async def sync_remote(self) -> bool:
@@ -1751,18 +1856,28 @@ class Database:
         local replica already contains the newest application state.
         """
 
-        def _run():
-            assert self._conn is not None
-            cur = self._execute_sync(sql, params)
-            row = cur.fetchone()
-            if row is None and self.uses_remote:
-                legacy_params = _legacy_where_params(sql, params)
-                if legacy_params is not None and legacy_params != tuple(params):
-                    cur = self._conn.execute(sql, self._adapt_params(legacy_params))
-                    row = cur.fetchone()
-            return _normalize_row(cur, row)
+        if not self._ready:
+            return None
 
-        return await self._run_locked_with_retry(_run, attempt_pending_sync=False, operation_name="fetchone_local")
+        def read_snapshot():
+            with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=0.2)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                row = connection.execute(sql, tuple(params)).fetchone()
+                if row is None and self.uses_remote:
+                    legacy = _legacy_where_params(sql, params)
+                    if legacy is not None and legacy != tuple(params):
+                        row = connection.execute(sql, legacy).fetchone()
+                return row
+
+        started = time.perf_counter()
+        try:
+            row = await asyncio.wait_for(asyncio.to_thread(read_snapshot), timeout=0.75)
+        except Exception:
+            self._record_query_timing("fetchone_local", (time.perf_counter() - started) * 1000, failed=True)
+            raise
+        self._record_query_timing("fetchone_local", (time.perf_counter() - started) * 1000, failed=False)
+        return row
 
     async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[Any]:
         def _run():

@@ -131,7 +131,8 @@ def test_disagreement_keeps_request_reviewable_and_surfaces_warning():
     assert result["requires_showcase"] is True
     notice = validation_notice(result)
     assert "disagreed" in notice
-    assert "Refreshes <t:200:R>" in notice
+    assert "Snapshot expired" in notice
+    assert "Refreshes" not in notice
 
 
 @pytest.mark.asyncio

@@ -45,6 +45,7 @@ from utils.releases import (
 )
 from utils.timeutils import now_madrid, week_start_sunday
 from utils.errors import log_error
+from utils.keepalive import get_runtime_health
 
 DEFAULT_REQUEST_REVIEWER_ROLE_IDS = [785212232786640966, 1430214323720163498]
 SQLITE_RESTORE_EXTENSIONS = {".sqlite3", ".sqlite", ".db", ".db3"}
@@ -129,7 +130,7 @@ class AdminDashboardView(discord.ui.View):
             await interaction.followup.send("You don't have permission to use this.", ephemeral=True)
             return
         self.page = page
-        embed = await self.cog._admin_dashboard_embed(interaction.guild, page)
+        embed = await self.cog._safe_admin_dashboard_embed(interaction.guild, page)
         await interaction.message.edit(embed=embed, view=self)
 
     @discord.ui.button(label="Overview", style=discord.ButtonStyle.primary)
@@ -189,7 +190,7 @@ class AdminDashboardView(discord.ui.View):
         except Exception as exc:
             await log_error(self.cog.bot, f"Dashboard action {action} failed: {exc!r}")
             detail = f"Action failed: {type(exc).__name__}. Check the incident page."
-        embed = await self.cog._admin_dashboard_embed(interaction.guild, self.page)
+        embed = await self.cog._safe_admin_dashboard_embed(interaction.guild, self.page)
         await interaction.message.edit(embed=embed, view=self)
         await interaction.followup.send(detail, ephemeral=True)
 
@@ -215,6 +216,11 @@ class AdminDashboardView(discord.ui.View):
 
 
 class CommandsCog(commands.Cog):
+    def cog_unload(self):
+        for task in getattr(self, "_dashboard_builds", {}).values():
+            if not task.done():
+                task.cancel()
+
     def __init__(self, bot: discord.Bot):
         self.bot = bot
         cfg = bot.config
@@ -2384,6 +2390,16 @@ class CommandsCog(commands.Cog):
             if hasattr(self.bot.db, "health_snapshot")
             else {}
         )
+        component_error = getattr(self.bot, "_last_component_error", None)
+        if component_error and int(time.time()) - int(component_error.get("ts", 0)) < 3600:
+            issues.append(f"recent component failure: `{component_error.get('component', 'button')}` ({component_error.get('category', 'error')})")
+            repairs.append("Check the component traceback in the global error log")
+        if db_health.get("isolated_worker") and not db_health.get("worker_alive"):
+            issues.append("database worker is unavailable")
+            repairs.append("Check deployment logs for Turso credentials, connectivity, or worker deadlines")
+        if db_health.get("primary_write_degraded"):
+            issues.append("Turso writes are failing even if local reads still work")
+            repairs.append("Check the latest storage error, database availability, and token write permissions")
         if bool(db_health.get("replica_rebuild_required")):
             issues.append("database replica: local cache is waiting to be rebuilt")
             repairs.append("Run `/resync`; restart only if the replica cannot rebuild automatically")
@@ -2566,6 +2582,10 @@ class CommandsCog(commands.Cog):
                     f"Seen **{int(incident['occurrence_count'] or 0)}** time(s) | "
                     f"first <t:{int(incident['first_seen_ts'])}:R> | last <t:{int(incident['last_seen_ts'])}:R>"
                 )
+                reporter = getattr(self.bot, "_error_reporter", None)
+                pending = next((item["pending_persistence"] for item in reporter.snapshot() if item["fingerprint"] == incident["fingerprint"]), 0) if reporter else 0
+                if pending:
+                    value += f"\n**{pending}** additional occurrence(s) awaiting persistence"
                 if correlation:
                     value += f"\nWorkflow: `{correlation}`"
                 embed.add_field(
@@ -2727,8 +2747,43 @@ class CommandsCog(commands.Cog):
         await self._defer(ctx, ephemeral=True)
         if not await self._is_admin_ctx(ctx):
             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
-        embed = await self._admin_dashboard_embed(ctx.guild, "overview")
+        embed = await self._safe_admin_dashboard_embed(ctx.guild, "overview")
         await self._send(ctx, embed=embed, view=AdminDashboardView(self, ctx.user.id), ephemeral=True)
+
+    async def _safe_admin_dashboard_embed(self, guild, page="overview"):
+        builds = getattr(self, "_dashboard_builds", None)
+        if builds is None:
+            builds = self._dashboard_builds = {}
+        key = (guild.id, page)
+        task = builds.get(key)
+        if task is None or task.done():
+            task = builds[key] = asyncio.create_task(self._admin_dashboard_embed(guild, page))
+            task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        except Exception as exc:
+            await log_error(self.bot, f"Admin dashboard using memory-only fallback: {type(exc).__name__}: {exc}")
+            health = get_runtime_health()
+            database = self.bot.db.health_snapshot()
+            operations = self.bot.get_cog("OperationsCog")
+            reporter = getattr(self.bot, "_error_reporter", None)
+            incidents = reporter.snapshot() if reporter else []
+            embed = discord.Embed(title="Admin Dashboard - Recovery", color=discord.Color.orange(), timestamp=now_madrid(),
+                                  description="Full diagnostics could not finish. This live recovery view does not depend on database queries.")
+            embed.add_field(name="Storage", value=(
+                f"Worker alive: **{database.get('worker_alive')}**\n"
+                f"Primary writes degraded: **{database.get('primary_write_degraded', False)}**\n"
+                f"Active: `{database.get('active_operation') or 'none'}` ({database.get('active_operation_seconds', 0)}s)\n"
+                f"Waiting: **{database.get('waiting_operations', 0)}** | queue timeouts: **{database.get('queue_timeouts', 0)}**"), inline=False)
+            embed.add_field(name="Runtime", value=f"Responsive: **{health['responsive']}** | event loop lag: **{health.get('event_loop_lag_ms', 0)} ms**", inline=False)
+            if operations:
+                embed.add_field(name="Tasks", value="\n".join(f"`{name}`: {state}" for name, state in operations.task_snapshot().items())[:1024] or "No task data", inline=False)
+            if incidents:
+                embed.add_field(name="Recent Incidents", value="\n".join(
+                    f"{str(item['category'])[:100]}: **{item['count']}** occurrence(s), **{item['pending_persistence']}** awaiting persistence"
+                    for item in incidents[-5:])[:1024], inline=False)
+            embed.set_footer(text="Recovery controls remain available; check deployment logs for storage failures")
+            return embed
 
     # --- /bot diagnostics ---
 

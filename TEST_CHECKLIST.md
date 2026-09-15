@@ -522,6 +522,28 @@
 
 ---
 
+## Runtime isolation and incident recovery
+
+1. Run `PYTHON_BIN=.venv/bin/python ./scripts/quality_check.sh` before deployment.
+   - Expected: native worker, queue, cancellation, incident retry, command-ID, button, readiness, and review race tests pass.
+2. Restart with the existing Turso URL and a valid database token; press a saved review button before command sync finishes.
+   - Expected: a modal or Other panel opens immediately; authoritative pending/permission checks happen when submitting the decision.
+3. In a test deployment, temporarily interrupt Turso access, then run `/bot dashboard` and trigger two identical component errors.
+   - Expected: an orange recovery dashboard appears; deployment logs show both errors and the Discord incident count increases even if persistence is pending.
+   - Expected: restored access persists the buffered counts once, without replaying an uncertain non-idempotent request write.
+4. Check `/health`, `/ready`, and `/api/bot` during healthy operation and a storage/loop failure.
+   - Expected: liveness remains HTTP 200; readiness changes to 503 and the public status becomes Degraded or Unavailable. Process uptime does not reset because a health check ran.
+5. Review a test request while its original Discord embed edit fails, then restore Discord access.
+   - Expected: the decision remains saved, its queued edit disables all buttons, and a repeated review is denied.
+6. Interrupt receipt persistence after Discord accepts an outbox message, then allow stale-claim recovery.
+   - Expected: the same process retries its saved receipt instead of sending another message. Recent Discord nonces reduce duplicate sends after an immediate restart; do not assume deduplication lasts indefinitely.
+7. Leave an unreviewed level with expired validation evidence.
+   - Expected: the small refresh batch updates its snapshot and the same embed; a concurrent review/edit is not overwritten. Boomlings 403 remains a degraded provider, not a fatal error when another provider finds the level.
+8. Stop or remove an expected background task in a test deployment; keep icon rotation disabled.
+   - Expected: the supervisor repairs the missing task, does not enable icon rotation, and a completed smoke test is not shown as stopped.
+9. Test a DM from an account that can and cannot message the bot.
+   - Expected: accepted DMs reach the support flow. Clyde delivery denial is a Discord-side restriction; no bot event or error log exists for an undelivered message.
+
 ## 25) Public bot status and recent releases
 **Setup:** deploy the bot update first, keep `release_updates.owner_user_ids` set to the owner, and deploy the website files containing `bot.html` and `bot.js`.
 

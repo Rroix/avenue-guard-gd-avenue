@@ -93,6 +93,10 @@ Some of the reliability methods behind Avenue Guard include:
 13. **Durable Discord delivery**: important result messages, DMs, edits, deletions, and role changes can be queued with an idempotency key and retried without creating duplicate queue records.
 14. **Historical health and recovery drills**: database latency, provider latency, gateway health, permission drift, incidents, and backup restore checks are kept as trends instead of one-time snapshots.
 
+The Turso integration also separates the native database driver from the Discord process. That matters because a slow native call can otherwise hold Python's execution lock and freeze unrelated commands. Bounded worker calls and database queue waits keep failures contained, while the supervisor and a live recovery dashboard remain useful during storage trouble. Error notifications do not wait for the database, and repeated incidents display an updated count instead of silently disappearing.
+
+The status service distinguishes a running process from a ready bot: `/health` answers whether the web service is alive, while `/ready` checks the Discord connection, recent runtime heartbeat, storage, and expected background tasks. Important deliveries use persistent queue keys, recent-send deduplication, and saved receipts to reduce repeated messages. These safeguards support recovery; they cannot guarantee a third-party service never fails or that an unpersisted event survives a process loss.
+
 ## Impact Reports
 
 Avenue Guard through multiple analytics also generates a combined community impact report, which we may make public soon if requested so members can learn more about what our bot detects and can interact with.

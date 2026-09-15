@@ -430,6 +430,7 @@ class RequestLevelsCog(commands.Cog):
         self._validation_provider_locks: dict[str, asyncio.Lock] = {}
         self._validation_provider_last_call: dict[str, float] = {}
         self._validation_provider_stats: dict[str, dict[str, float | int]] = {}
+        self._validation_refresh_task: Optional[asyncio.Task] = None
         self._background_tasks: set[asyncio.Task] = set()
 
         guild_ids = [self.allowed_guild_id] if self.allowed_guild_id else None
@@ -575,6 +576,8 @@ class RequestLevelsCog(commands.Cog):
             self._close_task.cancel()
         if self._scheduled_open_task:
             self._scheduled_open_task.cancel()
+        if self._validation_refresh_task:
+            self._validation_refresh_task.cancel()
         for task in tuple(self._background_tasks):
             task.cancel()
         try:
@@ -587,6 +590,10 @@ class RequestLevelsCog(commands.Cog):
 
     async def close_resources(self) -> None:
         """Close reusable HTTP resources before Pycord tears down the loop."""
+        refresh = self._validation_refresh_task
+        if refresh is not None and refresh is not asyncio.current_task() and not refresh.done():
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
         inflight = [
             task for task in self._validation_inflight.values() if not task.done()
         ]
@@ -604,7 +611,8 @@ class RequestLevelsCog(commands.Cog):
     async def start_background(self):
         close_running = self._close_task is not None and not self._close_task.done()
         scheduled_running = self._scheduled_open_task is not None and not self._scheduled_open_task.done()
-        if self._started and close_running and scheduled_running:
+        refresh_running = self._validation_refresh_task is not None and not self._validation_refresh_task.done()
+        if self._started and close_running and scheduled_running and refresh_running:
             return
         await self.bot.db.connect()
         try:
@@ -618,7 +626,36 @@ class RequestLevelsCog(commands.Cog):
             self._close_task = asyncio.create_task(self._auto_close_loop())
         if not scheduled_running:
             self._scheduled_open_task = asyncio.create_task(self._scheduled_open_loop())
+        if not refresh_running:
+            self._validation_refresh_task = asyncio.create_task(self._pending_validation_refresh_loop(), name="avenue-guard:validation-refresh")
         self._started = True
+
+    async def _pending_validation_refresh_loop(self):
+        await asyncio.sleep(60)
+        while not self.bot.is_closed():
+            try:
+                if self._level_validation_enabled():
+                    await self.refresh_expired_pending_validations(limit=2)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await log_error(self.bot, f"Pending validation refresh failed: {exc!r}")
+            await asyncio.sleep(60)
+
+    async def refresh_expired_pending_validations(self, *, limit: int = 2) -> int:
+        refreshed = 0
+        now = int(time_module.time())
+        for kind, table in (("wave", "level_request_submissions"), ("weekly", "weekly_request_reviews")):
+            rows = await self.bot.db.fetchall(
+                f"SELECT * FROM {table} WHERE status='pending' AND request_message_id IS NOT NULL "  # nosec B608
+                "AND CASE WHEN json_valid(data_json) THEN COALESCE(CAST(json_extract(data_json,'$.level_validation_refresh_ts') AS INTEGER),0) ELSE 0 END<=? "
+                "ORDER BY created_ts ASC LIMIT ?", (now, max(1, min(5, limit))),
+            )
+            for row in rows:
+                guild = self.bot.get_guild(int(row["guild_id"]))
+                if guild is not None and await self._refresh_review_validation(guild, kind, row):
+                    refreshed += 1
+        return refreshed
 
     def on_config_reload(self) -> None:
         enabled = self._level_validation_providers()
@@ -3605,36 +3642,59 @@ class RequestLevelsCog(commands.Cog):
         if action == "recheck":
             await interaction.response.defer(ephemeral=True)
             return await self._recheck_review_validation(interaction, interaction.message.id)
-        _, row = await self._review_target_by_message_local(interaction.guild.id, interaction.message.id)
-        if not row:
-            return await interaction.response.send_message("Request not found.", ephemeral=True)
-        if str(row["status"]) != "pending":
-            return await interaction.response.send_message("This request has already been reviewed.", ephemeral=True)
-
+        # The modal itself is the acknowledgement. Authoritative existence and
+        # pending-state checks run after submission, never before this deadline.
         if action == "other":
             return await interaction.response.send_message("Choose a result:", view=OtherReasonView(self, interaction.message.id), ephemeral=True)
 
         await interaction.response.send_modal(ReviewModal(self, interaction.message.id, action))
 
     async def _recheck_review_validation(self, interaction: discord.Interaction, message_id: int) -> None:
+        target_kind, row = await self._review_target_by_message(interaction.guild.id, message_id)
+        if row is None:
+            return await self._reply_ephemeral(interaction, "Request not found.")
+        validation = await self._refresh_review_validation(interaction.guild, target_kind, row, message=interaction.message)
+        if not validation:
+            return await self._reply_ephemeral(interaction, "The request was reviewed or edited while validation ran. Its current state was preserved.")
+        correlation = str(self._row_value(row, "correlation_id", "") or "")
+        await record_workflow_event(self.bot.db, workflow_type="level_request", entity_id=str(message_id),
+                                    event="validation_rechecked", correlation_id=correlation,
+                                    guild_id=interaction.guild.id, actor_id=interaction.user.id,
+                                    payload={"exists": validation.get("exists"), "sources": validation.get("source_summary")})
+        await self._reply_ephemeral(interaction, (validation_notice(validation) or "Validation refreshed successfully.")[:1900])
+
+    async def _refresh_review_validation(self, guild, target_kind, row, *, message=None):
+        data = self._safe_json_loads(row["data_json"], {})
+        if not isinstance(data, dict):
+            data = {}
+        level_id = str(data.get("level_id") or self._row_value(row, "level_id", "")).strip()
+        if str(row["status"]) != "pending" or not level_id:
+            return {}
+        validation = await self._lookup_level_validation(level_id, force=True)
+        if not validation:
+            return {}
+        message_id = int(row["request_message_id"])
         async with self._review_lock:
-            target_kind, row = await self._review_target_by_message(interaction.guild.id, message_id)
+            target_kind, row = await self._review_target_by_message(guild.id, message_id)
             if row is None:
-                return await self._reply_ephemeral(interaction, "Request not found.")
+                return {}
             if str(row["status"]) != "pending":
-                return await self._reply_ephemeral(interaction, "This request has already been reviewed.")
+                return {}
             data = self._safe_json_loads(row["data_json"], {})
             if not isinstance(data, dict):
                 data = {}
-            level_id = str(data.get("level_id") or self._row_value(row, "level_id", "")).strip()
-            validation = await self._lookup_level_validation(level_id, force=True)
+            current_level_id = str(data.get("level_id") or self._row_value(row, "level_id", "")).strip()
+            if current_level_id != level_id:
+                return {}
             data = self._apply_level_validation_vars(data, validation)
             data_json = json.dumps(data, separators=(",", ":"))
             table = "weekly_request_reviews" if target_kind == "weekly" else "level_request_submissions"
-            await self.bot.db.execute(
-                f"UPDATE {table} SET data_json=? WHERE guild_id=? AND request_message_id=? AND status='pending'",  # nosec B608
-                (data_json, interaction.guild.id, message_id),
+            changed = await self.bot.db.execute_affected(
+                f"UPDATE {table} SET data_json=? WHERE guild_id=? AND request_message_id=? AND status='pending' AND data_json=?",  # nosec B608
+                (data_json, guild.id, message_id, row["data_json"]),
             )
+            if changed != 1:
+                return {}
             variables = (
                 self._weekly_data_vars(row, data)
                 if target_kind == "weekly"
@@ -3646,25 +3706,16 @@ class RequestLevelsCog(commands.Cog):
                 variables,
                 default_color=self._color_name("pending", "blurple"),
             )
-            await interaction.message.edit(embed=embed, view=LevelRequestReviewView())
-            correlation = str(self._row_value(row, "correlation_id", "") or data.get("correlation_id") or "")
-            await record_workflow_event(
-                self.bot.db,
-                workflow_type="level_request",
-                entity_id=str(message_id),
-                event="validation_rechecked",
-                correlation_id=correlation,
-                guild_id=interaction.guild.id,
-                actor_id=interaction.user.id,
-                payload={
-                    "level_id": level_id,
-                    "exists": validation.get("exists"),
-                    "rated": validation.get("rated"),
-                    "sources": validation.get("source_summary"),
-                },
-            )
-        notice = validation_notice(validation) or "Validation refreshed successfully."
-        await self._reply_ephemeral(interaction, notice[:1900])
+            if message is None:
+                channel = await self._review_target_channel(guild, target_kind, row)
+                if channel is not None:
+                    try:
+                        message = await channel.fetch_message(message_id)
+                    except discord.NotFound:
+                        await log_error(self.bot, f"Pending request message is missing during validation refresh: {message_id}; use request repair")
+            if message is not None:
+                await message.edit(embed=embed, view=LevelRequestReviewView())
+        return validation
 
     async def handle_review_submission(self, interaction: discord.Interaction, message_id: int, result_key: str, review: str):
         await self._finalize_review(interaction, message_id, result_key, review)
@@ -3736,6 +3787,10 @@ class RequestLevelsCog(commands.Cog):
                     variables,
                     default_color=self._color_name(result_key, "red"),
                 )
+                final_embed = self._embed_from_template(
+                    self._cfg("level_reviewed_embed", default={}) or {}, variables,
+                    default_color=self._color_name(result_key, "red"),
+                )
                 REQUEST_REVIEW_STATES.require("pending", "reviewed")
                 update_sql = (
                     "UPDATE weekly_request_reviews SET request_message_id=?, status='reviewed', result=?, "
@@ -3788,7 +3843,8 @@ class RequestLevelsCog(commands.Cog):
                         ),
                     ),
                     (
-                        "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) VALUES(?,?,?,?,?,?,?,?)",
+                        "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) "
+                        "SELECT ?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM workflow_events WHERE correlation_id=? AND entity_id=? AND event='reviewed')",
                         (
                             correlation_id,
                             "level_request",
@@ -3798,9 +3854,18 @@ class RequestLevelsCog(commands.Cog):
                             reviewer_id,
                             json.dumps({"result": result_key, "kind": target_kind}, separators=(",", ":")),
                             reviewed_ts,
+                            correlation_id,
+                            str(message_id),
                         ),
                     ),
                 ]
+                statements.append((
+                    "INSERT OR IGNORE INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (correlation_id, f"request-review-ui:{interaction.guild.id}:{message_id}", "edit_message",
+                     interaction.guild.id, request_channel.id, requester_id, message_id,
+                     json.dumps({"embed": final_embed.to_dict(), "request_review_disabled": True}, separators=(",", ":")),
+                     "pending", 0, reviewed_ts, reviewed_ts, reviewed_ts),
+                ))
                 if notification_mode in {"dm", "both"}:
                     request_link = f"https://discord.com/channels/{interaction.guild.id}/{request_channel.id}/{message_id}"
                     statements.append(
@@ -3831,20 +3896,18 @@ class RequestLevelsCog(commands.Cog):
                         )
                     )
                 await self.bot.db.execute_transaction(statements, retry_safe=True)
+                _, saved = await self._review_target_by_message(interaction.guild.id, message_id)
+                if saved is None or str(saved["result"]) != result_key or int(saved["reviewed_by"] or 0) != reviewer_id:
+                    return await self._reply_ephemeral(interaction, "Another reviewer already completed this request. Their decision was preserved.")
             except Exception as e:
                 await log_error(self.bot, f"Could not save reviewed level request {message_id}: {repr(e)}")
-                return await self._reply_ephemeral(interaction, "I couldn't save the review, so I did not update the request.")
+                return await self._reply_ephemeral(interaction, "Storage did not confirm the review. Check the request's current status before retrying; a delayed completion is possible.")
 
             result_warning = ""
             try:
-                final_embed = self._embed_from_template(
-                    self._cfg("level_reviewed_embed", default={}) or {},
-                    variables,
-                    default_color=self._color_name(result_key, "red"),
-                )
                 await msg.edit(embed=final_embed, view=LevelRequestReviewView(disabled=True))
             except Exception as e:
-                result_warning += " I saved the review, but couldn't update the original request embed."
+                result_warning += " The original embed update is queued for automatic recovery."
                 await log_error(self.bot, f"Could not edit reviewed level request {message_id}: {repr(e)}")
 
             if target_kind == "wave":
@@ -4099,7 +4162,7 @@ class RequestLevelsCog(commands.Cog):
                 )
                 if msg is None:
                     continue
-                if recovered_message or int(channel.id) != int(row["channel_id"] or 0):
+                if recovered_message:
                     await self.bot.db.execute(
                         "UPDATE level_request_submissions SET request_message_id=? "
                         "WHERE guild_id=? AND wave_id=? AND user_id=? AND status='reviewed'",

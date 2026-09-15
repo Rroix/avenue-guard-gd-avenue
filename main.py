@@ -26,6 +26,7 @@ from utils.views import (
 from utils.runtime_config import load_runtime_config_overrides
 from utils.outbox import DiscordOutbox
 from utils.workflows import begin_workflow_context, clear_workflow_context
+from utils.supervision import start_cog_background
 
 DEFAULT_DB_PATH = "data/bot.db"
 TURSO_REPLICA_PATH = "data/turso-replica.db"
@@ -36,6 +37,22 @@ DEFAULT_STARTUP_ERROR_RETRY_SECONDS = 5 * 60
 
 class PersistenceConfigurationError(RuntimeError):
     """Raised when a configured durable database would silently degrade."""
+
+
+class AvenueBot(discord.Bot):
+    async def process_application_commands(self, interaction, auto_sync=None):
+        data = interaction.data or {}
+        if interaction.type in {discord.InteractionType.application_command, discord.InteractionType.auto_complete}:
+            command_id = data.get("id")
+            if command_id not in self._application_commands:
+                for command in self.application_commands + self.pending_application_commands:
+                    guild_ids = command.guild_ids
+                    if command.name == data.get("name") and (not guild_ids or interaction.guild_id in guild_ids):
+                        self._application_commands[command_id] = command
+                        break
+        # A missing ID cache must not trigger a REST command-sync round trip
+        # before an interaction is acknowledged. Known names are resolved above.
+        await super().process_application_commands(interaction, auto_sync=False)
 
 
 def startup_log(message: str) -> None:
@@ -102,7 +119,16 @@ def _run_preflight_database_check(
     loop: asyncio.AbstractEventLoop,
 ) -> None:
     """Connect and migrate storage before Discord login advertises the bot online."""
+    loop.run_until_complete(bot.register_persistent_views())
     loop.run_until_complete(bot.db.connect())
+
+
+async def _gateway_startup_watchdog(bot, *, timeout: float = 300) -> None:
+    await asyncio.sleep(timeout)
+    if not bot.is_closed() and not getattr(bot, "_runtime_initialized", False):
+        set_keepalive_status("startup_error", "Discord runtime initialization exceeded the startup deadline")
+        await log_error(bot, "Discord runtime initialization exceeded the startup deadline; closing this session for a clean retry")
+        await bot.close()
 
 
 async def _repair_legacy_turso_snowflakes(bot: discord.Bot, guild: discord.Guild) -> None:
@@ -173,6 +199,17 @@ async def _close_runtime_storage(bot: discord.Bot) -> None:
             await close_operations()
         except Exception as e:
             startup_log(f"Operations shutdown failed: {type(e).__name__}: {e}")
+    pending_tasks = set()
+    if operations is not None:
+        for _label, cog_name, attribute in operations._external_task_specs():
+            cog = bot.get_cog(cog_name)
+            value = getattr(cog, attribute, None) if cog else None
+            task = value if isinstance(value, asyncio.Task) else getattr(value, "get_task", lambda: None)()
+            if task is not None and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+                pending_tasks.add(task)
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
 
     requests = bot.get_cog("RequestLevelsCog")
     close_request_resources = getattr(requests, "close_resources", None)
@@ -222,6 +259,9 @@ async def _close_runtime_storage(bot: discord.Bot) -> None:
     except Exception as e:
         startup_log(f"Final database replica refresh failed: {type(e).__name__}: {e}")
     finally:
+        reporter = getattr(bot, "_error_reporter", None)
+        if reporter is not None:
+            await reporter.close()
         await bot.db.close()
 
 
@@ -341,8 +381,10 @@ def create_bot() -> discord.Bot:
     ):
         if hasattr(intents, intent_name):
             setattr(intents, intent_name, True)
-    bot = discord.Bot(intents=intents)
+    bot = AvenueBot(intents=intents)
     bot.config_write_lock = asyncio.Lock()
+    bot._runtime_initialization_lock = asyncio.Lock()
+    bot._runtime_initialized = False
 
     bot.config = Config("config.json")
     bot.db_path, bot.db_path_source, bot.db_path_warning, bot.db_remote_url, bot.db_remote_token = resolve_db_path(bot.config)
@@ -382,8 +424,8 @@ def create_bot() -> discord.Bot:
         bot.load_extension("cogs.Background")
         bot.load_extension("cogs.Operations")
 
-    @bot.event
-    async def on_ready():
+    async def initialize_runtime():
+        await bot.register_persistent_views()
         previous_gateway_state = str(
             get_keepalive_status().get("state") or ""
         )
@@ -440,19 +482,19 @@ def create_bot() -> discord.Bot:
 
         # Start background tasks in cogs
         for cog_name in (
+            "OperationsCog",
             "TrackingCog",
             "HelpCog",
             "RequestLevelsCog",
             "ReleaseCog",
             "BackgroundCog",
-            "OperationsCog",
         ):
             cog = bot.get_cog(cog_name)
             start = getattr(cog, "start_background", None)
             if not callable(start):
                 continue
             try:
-                await start()
+                await start_cog_background(bot, cog_name)
             except Exception as e:
                 await log_error(bot, f"{cog_name} background startup failed: {repr(e)}")
 
@@ -482,6 +524,22 @@ def create_bot() -> discord.Bot:
                     f"Public bot status refresh after ready failed: {e!r}",
                 )
         startup_log(f"Logged in as {bot.user} (ID: {bot.user.id})")
+        bot._runtime_initialized = True
+
+    @bot.event
+    async def on_ready():
+        if bot._runtime_initialization_lock.locked():
+            return
+        async with bot._runtime_initialization_lock:
+            if bot._runtime_initialized:
+                await on_resumed()
+                return
+            try:
+                await initialize_runtime()
+            except Exception as exc:
+                set_keepalive_status("startup_error", f"Runtime initialization failed: {type(exc).__name__}")
+                await log_error(bot, f"Runtime initialization failed: {exc!r}\n{traceback.format_exc()}")
+                await bot.close()
 
     @bot.event
     async def on_disconnect():
@@ -538,6 +596,8 @@ def create_bot() -> discord.Bot:
                 await log_error(bot, f"Public bot status refresh after resume failed: {e!r}")
 
     async def register_persistent_views():
+        if getattr(bot, "_persistent_views_registered", False):
+            return
         bot.add_view(TrackingDeclineConfirmView())
         bot.add_view(TicketClosePromptView())
         bot.add_view(HelpMenuView())
@@ -547,6 +607,7 @@ def create_bot() -> discord.Bot:
         bot.add_view(ReleaseApprovalView())
         bot.add_view(LevelRequestButtonView())
         bot.add_view(LevelRequestReviewView())
+        bot._persistent_views_registered = True
 
     bot.register_persistent_views = register_persistent_views
 
@@ -604,8 +665,16 @@ def run_bot_with_startup_backoff(token: str) -> None:
             time.sleep(seconds)
             continue
         set_keepalive_status("discord_login", "Database ready; attempting Discord login")
+        loop.create_task(_gateway_startup_watchdog(bot), name="avenue-guard:gateway-startup-watchdog")
         try:
             bot.run(token)
+            status = get_keepalive_status()
+            if str(status.get("state")) == "startup_error":
+                seconds = _startup_error_retry_seconds()
+                set_keepalive_status("startup_error", str(status.get("detail") or "Runtime initialization failed"),
+                                     retry_after_seconds=seconds, next_retry_ts=int(time.time()) + seconds)
+                time.sleep(seconds)
+                continue
             set_keepalive_status("stopped", "Discord client stopped")
             return
         except discord.LoginFailure:

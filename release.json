@@ -1,18 +1,18 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.22.0",
-  "title": "Durable operations and request insights",
-  "summary": "A platform reliability release that makes Discord deliveries recoverable, supervises background work, expands request review tools, and turns operational history into useful staff and impact reporting.",
+  "version": "3.22.1",
+  "title": "Runtime isolation and resilient recovery",
+  "summary": "Hardens the operations platform so database stalls do not freeze Discord interactions or hide incidents, and repairs reviewed request cards and interrupted deliveries safely.",
   "changes": [
-    "Added a persistent Discord action outbox with idempotent delivery, retries, dead-letter recovery, and saved message IDs",
-    "Added a background-task supervisor, historical health samples, provider latency telemetry, and post-deployment smoke checks",
-    "Added request notification preferences, live queue aging indicators, validation rechecks, wave comparisons, and structured review analytics",
-    "Expanded wave summaries with reviewer throughput and average review time",
-    "Added actionable dashboard controls for task restarts, request repair, delivery retries, permission scans, backups, and restore drills",
-    "Grouped repeated errors into persistent incidents and added workflow correlation IDs across commands, requests, tickets, and support submissions",
-    "Added permission drift scanning across configured channels, ticket categories, logs, summaries, backups, and assignable roles",
-    "Added forecast confidence, anomaly detection, automated monthly impact reports, retention controls, and scheduled restore drills",
-    "Added typed config and embed-template validation plus explicit database, runtime, config, and template schema versions",
-    "Split validation, scheduling, review analytics, diagnostics, backups, and impact forecasting into reusable service modules"
+    "Isolated the native Turso driver in a bounded worker process to protect Discord heartbeats and interactions",
+    "Added bounded database queue waits, cancellation-safe connection ownership, and explicit degraded-write health",
+    "Removed database waits before review modals and restored persistent buttons before Discord login",
+    "Made error delivery independent of storage, added component and modal error handling, and displayed repeated incident counts without double-counting retries",
+    "Added a memory-only recovery dashboard and readiness checks for event-loop, storage, and background-task health",
+    "Hardened startup deadlines, reconnect initialization, missing-task recovery, supervisor independence, and default retention loading",
+    "Added interrupted outbox recovery, delivery receipts, recent-send deduplication, and durable disabling of reviewed request buttons",
+    "Automatically refreshed expired pending level validation snapshots and clarified stale evidence messages",
+    "Fixed reviewed-wave request repair and made deployment smoke-test failures visible during database outages",
+    "Expanded outage regression tests and updated the private architecture manual and incident diagnosis"
   ]
 }
