@@ -128,6 +128,10 @@ class OperationsCog(commands.Cog):
             if name in {"smoke", "bootstrap", "restarts", "timeline"} and task.done() and not task.cancelled() and task.exception() is None:
                 state = "completed"
             snapshot[f"operations.{name}"] = state
+        release = self.bot.get_cog("ReleaseCog")
+        if release is not None:
+            bootstrap = getattr(release, "_bootstrap_task", None)
+            snapshot["release.bootstrap"] = "completed" if getattr(release, "_bootstrap_complete", False) else self._task_state(bootstrap)
         return snapshot
 
     async def _watchdog_loop(self) -> None:
@@ -285,7 +289,8 @@ class OperationsCog(commands.Cog):
                     for label, state in self._task_states.items()
                     if state.startswith(("failed", "stopped", "missing"))
                 ]
-                if failed:
+                initializing = hasattr(self.bot, "_runtime_initialized") and not self.bot._runtime_initialized
+                if failed and not initializing:
                     restart = self._tasks.get("restarts")
                     if restart is None or restart.done():
                         self._tasks["restarts"] = asyncio.create_task(self.restart_stopped_tasks(), name="avenue-guard:restarts")

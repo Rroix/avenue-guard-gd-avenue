@@ -2400,6 +2400,14 @@ class CommandsCog(commands.Cog):
         if db_health.get("primary_write_degraded"):
             issues.append("Turso writes are failing even if local reads still work")
             repairs.append("Check the latest storage error, database availability, and token write permissions")
+        release = self.bot.get_cog("ReleaseCog")
+        if release is not None and hasattr(release, "uptime_persistence_snapshot"):
+            checkpoint = release.uptime_persistence_snapshot()
+            boundary = max(int(checkpoint.get("last_checkpoint_ts", 0)), int(checkpoint.get("startup_boundary_ts", 0)))
+            deferred = not checkpoint.get("initialized", True) or checkpoint.get("pending_intervals", 0)
+            if deferred and boundary and int(time.time()) - boundary >= 120:
+                issues.append("uptime persistence: a checkpoint is over two minutes old and awaiting persistence")
+                repairs.append("Check the active database writer and Turso availability; uptime observations retry automatically")
         if float(db_health.get("active_operation_seconds", 0) or 0) >= 10:
             issues.append(f"database write queue: `{db_health.get('active_operation') or 'maintenance'}` has held the connection for over 10 seconds")
             repairs.append("Replica reads remain available; let the bounded writer finish and check Turso availability if stalls recur")
@@ -2698,11 +2706,15 @@ class CommandsCog(commands.Cog):
             color=discord.Color.green() if db_ok and not issues else discord.Color.orange(),
             timestamp=now_madrid(),
         )
+        release_cog = self.bot.get_cog("ReleaseCog")
+        checkpoint = release_cog.uptime_persistence_snapshot() if release_cog is not None and hasattr(release_cog, "uptime_persistence_snapshot") else {}
+        checkpoint_state = "Pending" if not checkpoint.get("initialized", True) or checkpoint.get("pending_intervals", 0) else "Current"
         embed.add_field(
             name="Core",
             value=(
                 f"Database: **{db_note}**\n"
                 f"Writers waiting: **{db_health.get('waiting_operations', 0)}** | readers: **{db_health.get('read_waiting', 0)}**\n"
+                f"Uptime checkpoint: **{checkpoint_state}**\n"
                 f"Replica rebuilds: **{int(db_health.get('replica_rebuild_count', 0) or 0)}**\n"
                 f"Historical IDs repaired: **{int(snowflake_repair.get('updated', 0) or 0)}**\n"
                 f"Latency: **{round(self.bot.latency * 1000)} ms**\n"
@@ -2782,6 +2794,7 @@ class CommandsCog(commands.Cog):
                 f"Worker alive: **{database.get('worker_alive')}**\n"
                 f"Primary writes degraded: **{database.get('primary_write_degraded', False)}**\n"
                 f"Active: `{database.get('active_operation') or 'none'}` ({database.get('active_operation_seconds', 0)}s)\n"
+                f"Owner: `{str(database.get('active_operation_task') or 'none')[:100]}`\n"
                 f"Writers waiting: **{database.get('waiting_operations', 0)}** | readers: **{database.get('read_waiting', 0)}**\n"
                 f"Queue timeouts: **{database.get('queue_timeouts', 0)}** | background deferrals: **{database.get('background_queue_deferrals', 0)}**"), inline=False)
             embed.add_field(name="Runtime", value=f"Responsive: **{health['responsive']}** | event loop lag: **{health.get('event_loop_lag_ms', 0)} ms**", inline=False)

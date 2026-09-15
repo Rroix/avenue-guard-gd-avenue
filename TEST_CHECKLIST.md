@@ -648,3 +648,26 @@
 13. Validate backup/restore against schema 6 and a matching bot version.
    - Expected: activity receipts remain present; retrying a restored receipt does not increment again.
    - Expected: an incompatible newer schema is rejected instead of being downgraded.
+
+---
+
+## 28) Startup writes and uptime recovery
+**Setup:** staging bot with a recent backup, existing uptime history, and expired GD validation-cache rows. Inject delays with test doubles, not by damaging production storage.
+
+1. Delay a background transaction during initialization.
+   - Expected: the uptime boundary is established before background jobs; request loops start without deleting cache first.
+   - Expected: the supervisor does not launch missing-cog repairs while the main initializer is still starting those cogs.
+2. Make uptime initialization encounter an unstarted busy write.
+   - Expected: setup remains retryable, the original startup boundary is retained, and the release bootstrap retries after 30 seconds without the old fatal-looking setup log.
+3. Delay uptime persistence across a disconnect and resume, then release the writer.
+   - Expected: online/offline transitions are retained in order and committed exactly once, without treating the entire gap as online.
+4. Lose an uptime commit confirmation and retry.
+   - Expected: initialization does not move the restart boundary to retry time; heartbeat guards prevent duplicate counter increments.
+5. Read public status while uptime persistence is pending.
+   - Expected: snapshot reads do not initialize or write the tracker, process uptime does not reset, and the dashboard shows a pending checkpoint; sustained delays appear under Needs Attention.
+6. Keep the writer busy when expired GD cache maintenance runs.
+   - Expected: cleanup backs off for five minutes after its short queue wait, deletes at most 200 expired rows on recovery, preserves fresh rows, and performs no write when the cache has no expired rows.
+7. Check a new busy log and dashboard storage field.
+   - Expected: the active operation label and owning task identify the writer; scoped startup task names are restored after startup finishes or fails.
+8. Cancel setup or shut down while release bootstrap is running.
+   - Expected: bootstrap and status tasks are joined before database closure; cancelled uptime writes retain their pending observations for retry while the process survives.

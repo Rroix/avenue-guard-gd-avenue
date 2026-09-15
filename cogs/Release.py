@@ -12,6 +12,7 @@ import discord
 from discord.ext import commands
 
 from utils.errors import log_error
+from utils.db import DatabaseBusyError
 from utils.keepalive import (
     get_keepalive_status,
     set_public_bot_metrics,
@@ -34,6 +35,7 @@ DEFAULT_BOT_AVATAR_URL = (
     "d268221fd7a7a5529897730d18edd5a0.webp?size=2048"
 )
 UPTIME_HEARTBEAT_SECONDS = 60
+BOOTSTRAP_RETRY_SECONDS = 30
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -66,16 +68,35 @@ class ReleaseCog(commands.Cog):
         self.bot = bot
         self._background_started = False
         self._metrics_task: asyncio.Task | None = None
+        self._bootstrap_task: asyncio.Task | None = None
+        self._bootstrap_complete = False
         self._uptime_lock = asyncio.Lock()
         self._proposal_lock = asyncio.Lock()
         self._decision_lock = asyncio.Lock()
         self._uptime_initialized = False
+        self._uptime_start_ts: int | None = None
+        self._uptime_last_row: dict | None = None
+        self._uptime_pending: list[tuple[int, bool]] = []
         self._last_member_count = 0
         self._last_member_fetch_attempt = 0.0
 
     def cog_unload(self) -> None:
-        if self._metrics_task is not None:
-            self._metrics_task.cancel()
+        for task in (self._metrics_task, self._bootstrap_task):
+            if task is not None:
+                task.cancel()
+
+    async def close_resources(self) -> None:
+        tasks = [task for task in (self._metrics_task, self._bootstrap_task)
+                 if task is not None and task is not asyncio.current_task() and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def uptime_persistence_snapshot(self) -> dict:
+        return {"initialized": self._uptime_initialized, "pending_intervals": len(self._uptime_pending),
+                "last_checkpoint_ts": int(_row_value(self._uptime_last_row, "last_heartbeat_ts", 0) or 0),
+                "startup_boundary_ts": self._uptime_start_ts or 0}
 
     def _enabled(self) -> bool:
         return bool(self.bot.config.get("release_updates", "enabled", default=True))
@@ -493,34 +514,64 @@ class ReleaseCog(commands.Cog):
         }
 
     async def _initialize_uptime_tracker(self) -> None:
+        if self._uptime_start_ts is None:
+            self._uptime_start_ts = int(time.time())
         if self._uptime_initialized:
             return
         async with self._uptime_lock:
             if self._uptime_initialized:
                 return
-            now = int(time.time())
-            row = await self.bot.db.fetchone(
-                "SELECT * FROM bot_uptime_tracker WHERE id=1"
-            )
-            if row is None:
-                await self.bot.db.execute(
+            boundary = self._uptime_start_ts
+            await self._read_uptime_row()
+            # Fix the startup boundary once. Retrying an uncertain commit must
+            # neither count the restart gap twice nor advance it to retry time.
+            await self.bot.db.execute_transaction([
+                (
                     "INSERT INTO bot_uptime_tracker("
                     "id,tracking_started_ts,last_heartbeat_ts,observed_seconds,online_seconds"
-                    ") VALUES(1,?,?,0,0)",
-                    (now, now),
-                )
-            else:
-                last_heartbeat_ts = int(
-                    _row_value(row, "last_heartbeat_ts", now) or now
-                )
-                offline_gap = max(0, now - last_heartbeat_ts)
-                await self.bot.db.execute(
+                    ") VALUES(1,?,?,0,0) ON CONFLICT(id) DO NOTHING",
+                    (boundary, boundary),
+                ),
+                (
                     "UPDATE bot_uptime_tracker SET "
-                    "observed_seconds=observed_seconds+?,last_heartbeat_ts=? "
-                    "WHERE id=1",
-                    (offline_gap, now),
-                )
+                    "observed_seconds=observed_seconds+?-last_heartbeat_ts,last_heartbeat_ts=? "
+                    "WHERE id=1 AND last_heartbeat_ts<?",
+                    (boundary, boundary, boundary),
+                ),
+            ], retry_safe=True, queue_timeout=0.5, operation_label="uptime.initialize")
             self._uptime_initialized = True
+            await self._read_uptime_row()
+
+    async def _read_uptime_row(self):
+        if not self.bot.db._ready:
+            raise DatabaseBusyError("Uptime snapshot deferred; replica initialization is incomplete")
+        row = await self.bot.db.fetchone_local("SELECT * FROM bot_uptime_tracker WHERE id=1")
+        self._uptime_last_row = dict(row) if row is not None else None
+        return row
+
+    def _queue_uptime_observation(self, timestamp: int, online: bool) -> None:
+        if self._uptime_pending and self._uptime_pending[-1][1] == online:
+            previous, _state = self._uptime_pending[-1]
+            self._uptime_pending[-1] = (max(previous, timestamp), online)
+        else:
+            self._uptime_pending.append((timestamp, online))
+
+    def _live_uptime_snapshot(self, *, now: int, online: bool):
+        if self._uptime_last_row is None:
+            return {"percentage": None, "tracking_started_ts": 0, "observed_seconds": 0, "online_seconds": 0}
+        row = dict(self._uptime_last_row)
+        heartbeat = int(row["last_heartbeat_ts"])
+        boundary = self._uptime_start_ts or heartbeat
+        if heartbeat < boundary:
+            row["observed_seconds"] += boundary - heartbeat
+            heartbeat = boundary
+        for timestamp, was_online in self._uptime_pending:
+            elapsed = max(0, timestamp - heartbeat)
+            row["observed_seconds"] += elapsed
+            row["online_seconds"] += elapsed if was_online else 0
+            heartbeat = max(heartbeat, timestamp)
+        row["last_heartbeat_ts"] = heartbeat
+        return self._uptime_snapshot_from_row(row, now=now, online=online)
 
     async def record_uptime_sample(
         self,
@@ -528,41 +579,40 @@ class ReleaseCog(commands.Cog):
         online: bool,
         force: bool = False,
     ) -> dict[str, int | float | None]:
-        await self._initialize_uptime_tracker()
-        async with self._uptime_lock:
-            now = int(time.time())
-            row = await self.bot.db.fetchone(
-                "SELECT * FROM bot_uptime_tracker WHERE id=1"
-            )
-            if row is None:
-                self._uptime_initialized = False
-                return {
-                    "percentage": None,
-                    "tracking_started_ts": 0,
-                    "observed_seconds": 0,
-                    "online_seconds": 0,
-                }
-
-            last_heartbeat_ts = int(
-                _row_value(row, "last_heartbeat_ts", now) or now
-            )
-            elapsed = max(0, now - last_heartbeat_ts)
-            if force or elapsed >= UPTIME_HEARTBEAT_SECONDS:
-                await self.bot.db.execute(
-                    "UPDATE bot_uptime_tracker SET "
-                    "observed_seconds=observed_seconds+?,"
-                    "online_seconds=online_seconds+?,"
-                    "last_heartbeat_ts=? WHERE id=1",
-                    (elapsed, elapsed if online else 0, now),
-                )
-                row = await self.bot.db.fetchone(
-                    "SELECT * FROM bot_uptime_tracker WHERE id=1"
-                )
-            return self._uptime_snapshot_from_row(
-                row,
-                now=now,
-                online=online,
-            )
+        now = int(time.time())
+        heartbeat = int(_row_value(self._uptime_last_row, "last_heartbeat_ts", now) or now)
+        if force or not self._uptime_initialized or self._uptime_pending or now - heartbeat >= UPTIME_HEARTBEAT_SECONDS:
+            # Record transitions before the first await so a busy primary does
+            # not erase the online/offline boundary when a later sample arrives.
+            self._queue_uptime_observation(now, online)
+        try:
+            await self._initialize_uptime_tracker()
+            async with self._uptime_lock:
+                row = await self._read_uptime_row()
+                if row is None:
+                    self._uptime_initialized = False
+                    return self._live_uptime_snapshot(now=now, online=online)
+                confirmed = int(row["last_heartbeat_ts"])
+                self._uptime_pending = [(timestamp, state) for timestamp, state in self._uptime_pending if timestamp > confirmed]
+                observations = self._uptime_pending[:32]
+                if observations:
+                    await self.bot.db.execute_transaction([
+                        (
+                            "UPDATE bot_uptime_tracker SET observed_seconds=observed_seconds+?-last_heartbeat_ts,"
+                            "online_seconds=online_seconds+CASE WHEN ? THEN ?-last_heartbeat_ts ELSE 0 END,"
+                            "last_heartbeat_ts=? WHERE id=1 AND last_heartbeat_ts<?",
+                            (timestamp, int(was_online), timestamp, timestamp, timestamp),
+                        ) for timestamp, was_online in observations
+                    ], retry_safe=True, queue_timeout=0.5, operation_label="uptime.checkpoint")
+                    row = await self._read_uptime_row()
+                    if row is not None:
+                        confirmed = int(row["last_heartbeat_ts"])
+                        self._uptime_pending = [(timestamp, state) for timestamp, state in self._uptime_pending if timestamp > confirmed]
+        except DatabaseBusyError:
+            # An unstarted short queue wait is a deferral, not a fatal setup
+            # error. The metrics loop retries; preview includes buffered states.
+            pass
+        return self._live_uptime_snapshot(now=now, online=online)
 
     async def record_uptime_transition(self, *, was_online: bool) -> None:
         await self.record_uptime_sample(online=was_online, force=True)
@@ -572,17 +622,11 @@ class ReleaseCog(commands.Cog):
         *,
         online: bool,
     ) -> dict[str, int | float | None]:
-        await self._initialize_uptime_tracker()
-        async with self._uptime_lock:
-            now = int(time.time())
-            row = await self.bot.db.fetchone(
-                "SELECT * FROM bot_uptime_tracker WHERE id=1"
-            )
-            return self._uptime_snapshot_from_row(
-                row,
-                now=now,
-                online=online,
-            )
+        try:
+            await self._read_uptime_row()
+        except DatabaseBusyError:
+            pass
+        return self._live_uptime_snapshot(now=int(time.time()), online=online)
 
     async def _allowed_guild_metrics(self) -> tuple[int, int]:
         guilds = list(getattr(self.bot, "guilds", []) or [])
@@ -687,6 +731,7 @@ class ReleaseCog(commands.Cog):
         refresh_count = 0
         while not self.bot.is_closed():
             await asyncio.sleep(30)
+            self._start_bootstrap()
             try:
                 await self.refresh_public_metrics()
                 refresh_count += 1
@@ -699,31 +744,32 @@ class ReleaseCog(commands.Cog):
 
     async def start_background(self) -> None:
         metrics_running = self._metrics_task is not None and not self._metrics_task.done()
-        if self._background_started and metrics_running:
-            return
-        first_start = not self._background_started
         self._background_started = True
-        if first_start:
-            try:
-                await self._initialize_uptime_tracker()
-            except Exception as exc:
-                await log_error(self.bot, f"Initial uptime tracker setup failed: {exc!r}")
+        if not metrics_running:
+            self._metrics_task = asyncio.create_task(self._metrics_loop(), name="avenue-guard-public-status")
+        self._start_bootstrap()
+
+    def _start_bootstrap(self) -> None:
+        if not self._bootstrap_complete and (self._bootstrap_task is None or self._bootstrap_task.done()):
+            self._bootstrap_task = asyncio.create_task(self._bootstrap_loop(), name="avenue-guard:release-bootstrap")
+
+    async def _bootstrap_loop(self) -> None:
+        while not self.bot.is_closed():
             try:
                 await self.refresh_public_release_cache()
-            except Exception as exc:
-                await log_error(self.bot, f"Initial public release cache load failed: {exc!r}")
-            try:
-                await self.refresh_public_metrics()
-            except Exception as exc:
-                await log_error(self.bot, f"Initial public bot status refresh failed: {exc!r}")
-            try:
+                await self._initialize_uptime_tracker()
+                await self.refresh_public_metrics(record_availability=False)
                 await self._ensure_manifest_proposal()
+                self._bootstrap_complete = True
+                return
+            except asyncio.CancelledError:
+                raise
+            except DatabaseBusyError:
+                # Recover automatically instead of abandoning one-time setup.
+                print("[Avenue Guard startup] Release/uptime setup deferred; retrying after the active writer", flush=True)
             except Exception as exc:
-                await log_error(self.bot, f"Initial release manifest check failed: {exc!r}")
-        self._metrics_task = asyncio.create_task(
-            self._metrics_loop(),
-            name="avenue-guard-public-status",
-        )
+                await log_error(self.bot, f"Release/uptime bootstrap deferred: {exc!r}")
+            await asyncio.sleep(BOOTSTRAP_RETRY_SECONDS)
 
     async def release_overview(self) -> dict[str, Any]:
         approved = await self.bot.db.fetchone(

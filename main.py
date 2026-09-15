@@ -222,6 +222,12 @@ async def _close_runtime_storage(bot: discord.Bot) -> None:
             )
 
     release = bot.get_cog("ReleaseCog")
+    close_release = getattr(release, "close_resources", None)
+    if callable(close_release):
+        try:
+            await close_release()
+        except Exception as e:
+            startup_log(f"Release/status tasks shutdown failed: {type(e).__name__}: {e}")
     record_uptime = getattr(release, "record_uptime_transition", None)
     if callable(record_uptime):
         try:
@@ -480,6 +486,16 @@ def create_bot() -> discord.Bot:
         except Exception:
             pass
 
+        # Establish the uptime boundary before background writers and their
+        # supervisor compete for storage. Busy writes remain buffered for retry.
+        release_cog = bot.get_cog("ReleaseCog")
+        record_uptime = getattr(release_cog, "record_uptime_transition", None)
+        if previous_gateway_state != "online" and callable(record_uptime):
+            try:
+                await record_uptime(was_online=False)
+            except Exception as e:
+                await log_error(bot, f"Uptime boundary setup deferred before background startup: {e!r}")
+
         # Start background tasks in cogs
         for cog_name in (
             "OperationsCog",
@@ -503,16 +519,11 @@ def create_bot() -> discord.Bot:
             await bot.register_persistent_views()
             bot._persistent_views_registered = True
 
-        release_cog = bot.get_cog("ReleaseCog")
-        record_uptime = getattr(release_cog, "record_uptime_transition", None)
-        if previous_gateway_state != "online" and callable(record_uptime):
+        if callable(record_uptime):
             try:
                 await record_uptime(was_online=False)
             except Exception as e:
-                await log_error(
-                    bot,
-                    f"Uptime transition record before ready failed: {e!r}",
-                )
+                await log_error(bot, f"Uptime boundary after background startup deferred: {e!r}")
         set_keepalive_status("online", f"Logged in as {bot.user}")
         refresh_metrics = getattr(release_cog, "refresh_public_metrics", None)
         if callable(refresh_metrics):

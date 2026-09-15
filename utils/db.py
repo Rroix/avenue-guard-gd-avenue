@@ -294,6 +294,7 @@ class Database:
         self._waiting_operations = 0
         self._active_operation = ""
         self._active_operation_since = 0.0
+        self._active_operation_task = ""
         self._queue_timeouts = 0
         self._queue_timeout_seconds = 10.0
         self._primary_write_degraded = False
@@ -318,7 +319,8 @@ class Database:
                 else:
                     self._background_queue_deferrals += 1
                 holder = self._active_operation or "connection/maintenance"
-                raise DatabaseBusyError(f"Database busy; {operation} was not started, please retry (holder={holder}, waiting={self._waiting_operations})") from exc
+                owner = self._active_operation_task or "unknown"
+                raise DatabaseBusyError(f"Database busy; {operation} was not started, please retry (holder={holder}, task={owner}, waiting={self._waiting_operations})") from exc
         finally:
             self._waiting_operations -= 1
         try:
@@ -560,6 +562,7 @@ class Database:
         attempt_pending_sync: bool = True,
         operation_name: str = "database",
         queue_timeout: float | None = None,
+        operation_label: str | None = None,
     ) -> Any:
         await self.connect()
         attempts = 3 if self.uses_remote and retry_operation else 1
@@ -567,10 +570,12 @@ class Database:
 
         for attempt in range(attempts):
             started = time.perf_counter()
-            async with self._guard(queue_timeout, operation_name):
+            async with self._guard(queue_timeout, operation_label or operation_name):
                 assert self._conn is not None
-                self._active_operation = operation_name
+                self._active_operation = operation_label or operation_name
                 self._active_operation_since = time.monotonic()
+                task = asyncio.current_task()
+                self._active_operation_task = task.get_name() if task is not None else "unknown"
                 try:
                     def run():
                         if attempt_pending_sync:
@@ -618,6 +623,7 @@ class Database:
                 finally:
                     self._active_operation = ""
                     self._active_operation_since = 0.0
+                    self._active_operation_task = ""
 
             await asyncio.sleep(0.35 * (attempt + 1))
 
@@ -1637,6 +1643,7 @@ class Database:
         *,
         retry_safe: bool = False,
         queue_timeout: float | None = None,
+        operation_label: str | None = None,
     ) -> None:
         """Commit several statements atomically on the local/remote replica."""
         items = [(sql, tuple(params)) for sql, params in statements]
@@ -1657,7 +1664,7 @@ class Database:
                     pass
                 raise
 
-        await self._run_locked_with_retry(_run, retry_operation=retry_safe, operation_name="transaction", queue_timeout=queue_timeout)
+        await self._run_locked_with_retry(_run, retry_operation=retry_safe, operation_name="transaction", queue_timeout=queue_timeout, operation_label=operation_label)
 
     async def apply_activity_batch(self, batch_id: str, counts: Sequence[tuple], last_seen: Sequence[tuple]) -> None:
         """Commit counters, cooldowns and a retry receipt together in few RPCs."""
@@ -1683,7 +1690,7 @@ class Database:
                 tuple(value for row in last_seen for value in row) + (batch_id,),
             ))
         statements.append(("INSERT OR IGNORE INTO activity_flush_batches(batch_id,created_ts) VALUES(?,?)", (batch_id, int(time.time()))))
-        await self.execute_transaction(statements, retry_safe=True, queue_timeout=0.5)
+        await self.execute_transaction(statements, retry_safe=True, queue_timeout=0.5, operation_label="tracking.activity")
 
     async def set_runtime_setting(self, key: str, value: Any) -> None:
         payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
@@ -1858,6 +1865,7 @@ class Database:
             "worker_alive": self._conn.alive if isinstance(self._conn, IsolatedConnection) else None,
             "waiting_operations": self._waiting_operations,
             "active_operation": self._active_operation,
+            "active_operation_task": self._active_operation_task,
             "active_operation_seconds": round(time.monotonic() - self._active_operation_since, 2) if self._active_operation_since else 0,
             "queue_timeouts": self._queue_timeouts,
             "primary_write_degraded": self._primary_write_degraded,

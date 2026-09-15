@@ -20,6 +20,7 @@ from services.request_validation import validate_level_id_shape, validate_showca
 from utils.checks import basic_color, is_admin_or_owner, is_mod, member_has_any_role
 from utils.discord_refs import fetch_persisted_channel, fetch_persisted_message
 from utils.errors import log_error
+from utils.db import DatabaseBusyError
 from utils.gd_validation import combine_level_validation, fetch_boomlings_level, fetch_gdbrowser_level, validation_notice
 from utils.mentions import no_mentions, user_and_role_mentions
 from utils.timeutils import TZ, now_madrid
@@ -434,6 +435,7 @@ class RequestLevelsCog(commands.Cog):
         self._validation_refresh_task: Optional[asyncio.Task] = None
         self._validation_refresh_retry_after: dict[tuple[str, int], float] = {}
         self._validation_refresh_receipts: dict[tuple[str, int], Any] = {}
+        self._next_validation_cleanup = 0.0
         self._validation_card_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task] = set()
 
@@ -619,17 +621,10 @@ class RequestLevelsCog(commands.Cog):
         if self._started and close_running and scheduled_running and refresh_running:
             return
         await self.bot.db.connect()
-        try:
-            await self.bot.db.execute(
-                "DELETE FROM gd_level_validation_cache WHERE expires_ts<?",
-                (int(time_module.time()),),
-            )
-        except Exception as e:
-            await log_error(self.bot, f"GD validation cache startup cleanup failed: {repr(e)}")
         if not close_running:
-            self._close_task = asyncio.create_task(self._auto_close_loop())
+            self._close_task = asyncio.create_task(self._auto_close_loop(), name="avenue-guard:request-auto-close")
         if not scheduled_running:
-            self._scheduled_open_task = asyncio.create_task(self._scheduled_open_loop())
+            self._scheduled_open_task = asyncio.create_task(self._scheduled_open_loop(), name="avenue-guard:request-scheduled-opening")
         if not refresh_running:
             self._validation_refresh_task = asyncio.create_task(self._pending_validation_refresh_loop(), name="avenue-guard:validation-refresh")
         self._started = True
@@ -638,6 +633,7 @@ class RequestLevelsCog(commands.Cog):
         await asyncio.sleep(60)
         while not self.bot.is_closed():
             try:
+                await self._cleanup_expired_validation_cache()
                 if self._level_validation_enabled():
                     await self.refresh_expired_pending_validations(limit=2)
             except asyncio.CancelledError:
@@ -645,6 +641,26 @@ class RequestLevelsCog(commands.Cog):
             except Exception as exc:
                 await log_error(self.bot, f"Pending validation refresh failed: {exc!r}")
             await asyncio.sleep(60)
+
+    async def _cleanup_expired_validation_cache(self) -> None:
+        if time_module.monotonic() < self._next_validation_cleanup:
+            return
+        now = int(time_module.time())
+        try:
+            if not self.bot.db._ready:
+                raise DatabaseBusyError("Validation cache cleanup deferred until the replica is initialized")
+            expired = await self.bot.db.fetchone_local("SELECT 1 FROM gd_level_validation_cache WHERE expires_ts<? LIMIT 1", (now,))
+            if expired is not None:
+                await self.bot.db.execute_transaction([(
+                    "DELETE FROM gd_level_validation_cache WHERE level_id IN "
+                    "(SELECT level_id FROM gd_level_validation_cache WHERE expires_ts<? ORDER BY expires_ts LIMIT 200)", (now,),
+                )], retry_safe=True, queue_timeout=0.25, operation_label="requests.validation_cleanup")
+            self._next_validation_cleanup = time_module.monotonic() + (60 if expired is not None else 3600)
+        except DatabaseBusyError:
+            self._next_validation_cleanup = time_module.monotonic() + 300
+        except Exception as exc:
+            self._next_validation_cleanup = time_module.monotonic() + 300
+            await log_error(self.bot, f"GD validation cache maintenance deferred: {exc!r}")
 
     async def refresh_expired_pending_validations(self, *, limit: int = 2) -> int:
         refreshed = 0

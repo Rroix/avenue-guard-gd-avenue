@@ -1,17 +1,15 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.22.2",
-  "title": "Turso contention and request recovery",
-  "summary": "Keeps replica reads responsive during slow writes, makes activity retries safe against double-counting, and recovers missing request cards without undoing staff reviews.",
+  "version": "3.22.3",
+  "title": "Startup writes and uptime recovery",
+  "summary": "Makes uptime setup retry safely under database contention and moves expired validation-cache cleanup out of the request startup path.",
   "changes": [
-    "Separated remote replica reads from the primary write queue so slow Turso writes do not block tracking, tickets, or diagnostics",
-    "Batched activity counters and cooldowns atomically with persistent retry receipts to prevent partial updates and double-counting",
-    "Drained activity before ranking and shutdown, and postponed weekly winner selection while that week's activity is unconfirmed",
-    "Removed idle outbox writes and made historical health sampling yield to interactive database work",
-    "Coalesced ticket-cache startup loads and backed off failed retries instead of retrying on every message",
-    "Recovered legacy request-message IDs and automatically recreated confirmed missing pending cards with deduplicated sends",
-    "Queued validation-card edits durably and guarded delivery against already reviewed or subsequently edited requests",
-    "Exposed slow write queues in the dashboard and readiness status, clarified busy errors, and prevented failed schema probes from triggering unnecessary migrations",
-    "Added contention, uncertain-commit, cancellation, backup, and request-recovery regression tests and deployment documentation"
+    "Established the uptime startup boundary before background writers and prevented supervisor repairs from racing initial cog startup",
+    "Started release/status tasks independently of one-time setup and added automatic bootstrap retries",
+    "Made uptime checkpoints timestamp-guarded and retry-safe while retaining delayed online/offline transitions",
+    "Kept public uptime snapshots read-only and showed pending persistence in the admin dashboard",
+    "Moved expired GD validation-cache deletion into bounded read-first maintenance with short queue waits and backoff",
+    "Added transaction labels and owning-task names to database busy diagnostics",
+    "Joined release bootstrap/status tasks during shutdown and added 19 startup-recovery regression cases"
   ]
 }
