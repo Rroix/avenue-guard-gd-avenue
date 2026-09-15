@@ -88,7 +88,7 @@ def test_all_registered_slash_commands_serialize_with_descriptions(tmp_path, mon
 
         names = {name for name, _ in leaves}
         assert len(bot.pending_application_commands) == 17
-        assert len(names) == 44
+        assert len(names) == 45
         assert {
             "bot release",
             "bot releases",

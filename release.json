@@ -1,15 +1,16 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.22.3",
-  "title": "Startup writes and uptime recovery",
-  "summary": "Makes uptime setup retry safely under database contention and moves expired validation-cache cleanup out of the request startup path.",
+  "version": "3.23.0",
+  "title": "Private historical request audit",
+  "summary": "Adds a disableable owner-only historical backfill and research report without changing live requests or prioritization",
   "changes": [
-    "Established the uptime startup boundary before background writers and prevented supervisor repairs from racing initial cog startup",
-    "Started release/status tasks independently of one-time setup and added automatic bootstrap retries",
-    "Made uptime checkpoints timestamp-guarded and retry-safe while retaining delayed online/offline transitions",
-    "Kept public uptime snapshots read-only and showed pending persistence in the admin dashboard",
-    "Moved expired GD validation-cache deletion into bounded read-first maintenance with short queue waits and backoff",
-    "Added transaction labels and owning-task names to database busy diagnostics",
-    "Joined release bootstrap/status tasks during shutdown and added 19 startup-recovery regression cases"
+    "Added owner-only historical audit start, status, report and cancellation with durable restart recovery and worker leases",
+    "Added isolated schema-7 history captures, current level/account snapshots and prestige evidence storage",
+    "Reused GD sessions, provider throttles and circuits for deduplicated current level and Creator Points lookups",
+    "Preserved unknown CP/rating and missing or conflicting prestige instead of guessing values",
+    "Added partial CSV enrichment with exact provenance and conservative wave/date matching",
+    "Added private CSV, JSON and Markdown coverage, rating-outcome, CP, repeated-level and waiting diagnostics",
+    "Kept candidate formulas analysis-only and all live reviews, waves, embeds and allocations unchanged",
+    "Added historical-audit regression tests and an owner runbook; extended quality checks to services"
   ]
 }

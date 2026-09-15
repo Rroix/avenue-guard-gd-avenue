@@ -164,6 +164,7 @@ class OperationsCog(commands.Cog):
             ("requests.auto_close", "RequestLevelsCog", "_close_task"),
             ("requests.scheduled", "RequestLevelsCog", "_scheduled_open_task"),
             ("requests.validation", "RequestLevelsCog", "_validation_refresh_task"),
+            ("history.audit", "HistoricalAuditCog", "_audit_task"),
             ("release.metrics", "ReleaseCog", "_metrics_task"),
             ("background.daily", "BackgroundCog", "daily_report"),
             ("background.snapshot", "BackgroundCog", "update_snapshot"),

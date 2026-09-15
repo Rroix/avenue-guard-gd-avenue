@@ -76,6 +76,14 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Posts one live summary embed per closed wave in `level_requests.level_requested`, including requested, reviewed, sent, not sent, percentages, remaining reviews, reviewer stats, average review time, and comparison with the previous wave.
 - Stores request state, request button message ID, wave count, submitted users, and submitted level IDs in SQLite so restarts do not wipe the wave.
 
+### Private Historical Request Audit
+
+An isolated, owner-only research tool captures historical live-wave requests and enriches them with current GD level metadata and current uploader Creator Points. It preserves one row per request, deduplicates external lookups, records unknowns and failures, and can optionally match an exported prestige CSV without guessing missing labels. Jobs and snapshots persist in Turso/SQLite and resume after restarts.
+
+Use `/requests historical_audit` with `start`, `status`, `report`, or `cancel`. The feature is disabled by default; explicitly enable `historical_audit.enabled` in `config.json`. Reports are delivered only by owner DM or ephemeral response as CSV, JSON and Markdown files. Current-rating cross-tabs are observational, not evidence that Avenue caused ratings.
+
+Candidate f/g/h components are analysis-only. CP scoring and intermediate prestige exponents are undefined by default, and missing components keep totals null. Waiting is an explicitly labelled observed-wave age proxy, not invented moderator-outreach history. No live review, wave, public embed, allocation or Bayesian behavior changes. Setup, schema, data definitions and limitations are explained in [the private audit guide](docs/HISTORICAL_REQUEST_AUDIT.md).
+
 ### Help Menu And Staff Tickets
 - DMs members a compact help dashboard with active tickets, weekly activity, recent support, and their current-wave level request when one exists.
 - Shows the user's current level as pending, accepted, rejected, or rejected for a specific reason, with a direct link to the review message.
@@ -178,6 +186,7 @@ Command options include Discord-side descriptions for confusing fields such as r
 - `/requests notifications mode:<channel|dm|both|none>` saves how the requester wants final level results delivered.
 - `/requests analytics` shows live queue SLA, review throughput, and rejection-reason analytics to configured reviewers.
 - `/requests history message_id:<optional> user_id:<optional> wave:<optional>` shows the edit audit trail for a live-wave request.
+- `/requests historical_audit action:<start/status/report/cancel>` runs or inspects the owner's isolated historical research job; `run_id`, refresh/force and optional prestige CSV input are supported.
 - `/requests repair` runs request-system recovery and message refresh tasks.
 - `/refresh-request-button` refreshes or recreates the live request button.
 - `/open-requests number:<optional> time:<optional> when:<optional> day:<optional> type:<optional> message:<optional>` opens or schedules a request wave.
@@ -454,7 +463,7 @@ pip install -r requirements-dev.txt
 ./scripts/quality_check.sh
 ```
 
-The current suite contains 219 passing tests. It checks migrations from an empty database, transaction rollback, concurrent ticket IDs, outbox idempotency and recovery, state-machine transitions, typed config validation, restore drills, forecasting, request SLA and wave comparison helpers, GD validation, request schedules and edit windows, cold-cache tracking ranks, runtime configuration persistence, URL and regex safety, daily-summary durability, lint, dependency vulnerabilities, and common security mistakes. Runtime resilience tests exercise a real isolated libSQL process, worker termination, database queue contention, cancellation, storage-independent incident delivery, uncertain-commit deduplication, cold command IDs, early persistent views, readiness, and review/validation races. The Turso contention suite also covers independent readers behind a busy writer, atomic counter receipts and backup survival, single-flight/partial cache loading, background deferral, safe missing-card recovery, and stale queued edits. Startup-write tests cover delayed uptime initialization, reconnect interval preservation, uncertain commits, cancellation, independent bootstrap retries, read-only snapshots, bounded validation-cache maintenance, and named database ownership.
+The automated suite checks migrations from an empty database, transaction rollback, concurrent ticket IDs, outbox idempotency and recovery, state-machine transitions, typed config validation, restore drills, forecasting, request SLA and wave comparison helpers, GD validation, request schedules and edit windows, cold-cache tracking ranks, runtime configuration persistence, URL and regex safety, daily-summary durability, lint, dependency vulnerabilities, and common security mistakes. Runtime resilience tests exercise a real isolated libSQL process, worker termination, database queue contention, cancellation, storage-independent incident delivery, uncertain-commit deduplication, cold command IDs, early persistent views, readiness, and review/validation races. The Turso contention suite also covers independent readers behind a busy writer, atomic counter receipts and backup survival, single-flight/partial cache loading, background deferral, safe missing-card recovery, and stale queued edits. Startup-write tests cover delayed uptime initialization, reconnect interval preservation, uncertain commits, cancellation, independent bootstrap retries, read-only snapshots, bounded validation-cache maintenance, and named database ownership. Historical audit tests cover owner-only acknowledgement, source-row non-mutation, snapshot deduplication/cache/restart behavior, cross-process job leases, profile identity and zero-versus-unknown CP, conservative prestige enrichment/conflicts, nullable candidate components, noncausal reports, private fallback and attachment limits.
 
 Use `TEST_CHECKLIST.md` for the full Discord-side test flow. It covers startup, moderation, live request waves, tracking, help sessions, ticket closure, transcript requests, sticky messages, forum reminders, required-word deletion, and fun commands.
 
@@ -464,4 +473,4 @@ The September 15 runtime incident diagnosis, measured GIL blockage, recovery cha
 
 The schema-6 follow-up, write-queue contention diagnosis, replica-read model, activity receipts, and request-card recovery boundaries are documented in `docs/TURSO_CONTENTION_RECOVERY_2026-09-15.md`.
 
-The subsequent uptime/cache startup errors and their repair are documented in `docs/STARTUP_WRITE_RECOVERY_2026-09-15.md`. Database schema remains 6; no new paid storage or credentials are required.
+The subsequent uptime/cache startup errors and their repair are documented in `docs/STARTUP_WRITE_RECOVERY_2026-09-15.md`. That repair used schema 6. The isolated historical audit now adds schema 7, documented in `docs/HISTORICAL_REQUEST_AUDIT.md`; no new paid storage or credentials are required.

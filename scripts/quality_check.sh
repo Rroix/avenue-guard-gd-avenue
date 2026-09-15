@@ -12,8 +12,8 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 
-"$PYTHON_BIN" -m compileall -q main.py cogs utils scripts tests
-"$PYTHON_BIN" -m ruff check main.py cogs utils scripts tests --select E4,E7,E9,F,B
+"$PYTHON_BIN" -m compileall -q main.py cogs utils services scripts tests
+"$PYTHON_BIN" -m ruff check main.py cogs utils services scripts tests --select E4,E7,E9,F,B
 "$PYTHON_BIN" -W error::DeprecationWarning -W error::ResourceWarning -m pytest -q
-"$PYTHON_BIN" -m bandit -q -r main.py cogs utils scripts -x tests -ll
+"$PYTHON_BIN" -m bandit -q -r main.py cogs utils services scripts -x tests -ll
 "$PYTHON_BIN" -m pip_audit -r requirements.txt --progress-spinner off

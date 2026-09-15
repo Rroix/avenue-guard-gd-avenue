@@ -829,10 +829,14 @@ class Database:
         }
         if versions.get("database", 0) > DATABASE_SCHEMA_VERSION:
             raise RuntimeError("Database schema is newer than this bot; deploy matching code instead of downgrading it")
-        if versions == {**expected, "database": 5}:
+        from utils.historical_audit_schema import AUDIT_SCHEMA, AUDIT_TABLES
+
+        if versions in ({**expected, "database": 5}, {**expected, "database": 6}):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute("CREATE TABLE IF NOT EXISTS activity_flush_batches(batch_id TEXT PRIMARY KEY,created_ts INTEGER NOT NULL)")
+                for stmt in AUDIT_SCHEMA:
+                    self._conn.execute(stmt)
                 self._execute_sync("UPDATE schema_metadata SET schema_version=?,updated_ts=? WHERE component='database'", (DATABASE_SCHEMA_VERSION, int(time.time())))
                 self._commit_and_sync_sync()
             except Exception:
@@ -841,7 +845,7 @@ class Database:
             versions["database"] = DATABASE_SCHEMA_VERSION
         if versions == expected:
             tables = {row[0] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if {"tickets", "ticket_transcripts", "activity_counts", "activity_flush_batches", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
+            if AUDIT_TABLES | {"tickets", "ticket_transcripts", "activity_counts", "activity_flush_batches", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
                 return
         stmts = [
             """CREATE TABLE IF NOT EXISTS activity_counts(
@@ -1497,6 +1501,8 @@ class Database:
                 "ON CONFLICT(component) DO UPDATE SET schema_version=excluded.schema_version,updated_ts=excluded.updated_ts",
                 (component, version, now_ts),
             )
+        for stmt in AUDIT_SCHEMA:
+            self._conn.execute(stmt)
         for stmt in index_stmts:
             self._conn.execute(stmt)
         self._commit_and_sync_sync()

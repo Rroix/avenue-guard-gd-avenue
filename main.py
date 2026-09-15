@@ -425,6 +425,7 @@ def create_bot() -> discord.Bot:
         bot.load_extension("cogs.MessageResponses")
         bot.load_extension("cogs.Sticky")
         bot.load_extension("cogs.RequestLevels")
+        bot.load_extension("cogs.HistoricalAudit")
         bot.load_extension("cogs.Release")
         bot.load_extension("cogs.Commands")
         bot.load_extension("cogs.Background")
@@ -502,6 +503,7 @@ def create_bot() -> discord.Bot:
             "TrackingCog",
             "HelpCog",
             "RequestLevelsCog",
+            "HistoricalAuditCog",
             "ReleaseCog",
             "BackgroundCog",
         ):

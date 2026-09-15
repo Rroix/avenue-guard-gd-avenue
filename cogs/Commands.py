@@ -268,6 +268,7 @@ class CommandsCog(commands.Cog):
         self.requests_group.command(name="repair", description="Repair request system messages")(self.requests_repair)
         self.requests_group.command(name="notifications", description="Choose how request results notify you")(self.requests_notifications)
         self.requests_group.command(name="analytics", description="Show request outcomes and review performance")(self.requests_analytics)
+        self.requests_group.command(name="historical_audit", description="Run or inspect a private historical request audit")(self.requests_historical_audit)
         self.server_icon_group.command(name="status", description="Show server icon rotation status")(self.server_icon_status)
         self.server_icon_group.command(name="mode", description="Set server icon rotation mode")(self.server_icon_mode)
         self.server_icon_group.command(name="add", description="Add a server icon URL")(self.server_icon_add)
@@ -305,6 +306,17 @@ class CommandsCog(commands.Cog):
 
     def _in_allowed_guild(self, ctx: discord.ApplicationContext) -> bool:
         return ctx.guild is not None and ctx.guild.id == self.allowed_guild_id
+
+    async def requests_historical_audit(
+        self, ctx: discord.ApplicationContext,
+        action: discord.Option(str, "Start, inspect, download, or cancel an audit", choices=["start", "status", "report", "cancel"]) = "start",
+        run_id: discord.Option(str, "Audit run ID, omitted to use the latest run", required=False) = "",
+        refresh_external: discord.Option(bool, "Fetch expired/missing GD snapshots; false uses stored snapshots only") = True,
+        force: discord.Option(bool, "Ignore fresh audit snapshots, but still respect provider circuits") = False,
+        sheet_csv: discord.Option(discord.Attachment, "Optional exported prestige CSV, at most 2 MB", required=False) = None,
+        csv_url: discord.Option(str, "Optional public HTTPS CSV URL on a configured allowed host", required=False) = "",
+    ):
+        await self.bot.get_cog("HistoricalAuditCog").command(ctx, action, run_id, refresh_external, force, sheet_csv, csv_url)
 
     async def _defer(self, ctx: discord.ApplicationContext, ephemeral: bool = True) -> None:
         response = getattr(getattr(ctx, "interaction", None), "response", None)

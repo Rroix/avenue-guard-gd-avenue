@@ -32,6 +32,19 @@ def _as_bool(value: Any) -> bool:
     return text in {"1", "true", "yes", "y", "on", "epic", "legendary", "mythic"}
 
 
+def _audit_integer(value: Any) -> int | None:
+    """Protocol integers only; absent/invalid data must not become zero."""
+    text = str(value).strip()
+    return int(text) if text.isascii() and text.isdecimal() else None
+
+
+def _audit_rating(stars, featured, epic) -> bool | None:
+    values = (stars, featured, epic)
+    if any(value is not None and value > 0 for value in values):
+        return True
+    return False if all(value is not None for value in values) else None
+
+
 def _kv_pairs(text: str) -> dict[str, str]:
     parts = str(text or "").split(":")
     return {parts[i]: parts[i + 1] for i in range(0, max(len(parts) - 1, 0), 2)}
@@ -202,6 +215,18 @@ def parse_gdbrowser_level(payload: Any, level_id: str) -> dict[str, Any]:
         "epic": epic,
         "demon": demon,
         "platformer": platformer,
+        "audit_metadata": {
+            "uploader_user_id": _audit_integer(payload.get("playerID")),
+            "uploader_account_id": _audit_integer(payload.get("accountID")),
+            "stars": _audit_integer(payload.get("stars")),
+            "featured": payload.get("featured") if isinstance(payload.get("featured"), bool) else None,
+            "epic": payload.get("epic") if isinstance(payload.get("epic"), bool) else None,
+            "rated": _audit_rating(
+                _audit_integer(payload.get("stars")),
+                int(payload["featured"]) if isinstance(payload.get("featured"), bool) else None,
+                int(payload["epic"]) if isinstance(payload.get("epic"), bool) else None,
+            ),
+        },
     }
 
 
@@ -250,6 +275,17 @@ def parse_boomlings_level(text: str, level_id: str) -> dict[str, Any]:
     if platformer and stars > 0:
         difficulty = f"{difficulty} Platformer" if difficulty != "Unknown" else "Platformer"
 
+    uploader_id = str(selected.get("6") or "")
+    creator_entries = [entry.split(":") for entry in (sections[1] if len(sections) > 1 else "").split("|")]
+    uploader_accounts = {
+        _audit_integer(entry[2]) for entry in creator_entries
+        if len(entry) == 3 and entry[0] == uploader_id
+    }
+    account_id = next(iter(uploader_accounts)) if len(uploader_accounts) == 1 else None
+    audit_stars = _audit_integer(selected.get("18"))
+    audit_feature = _audit_integer(selected.get("19"))
+    audit_epic = _audit_integer(selected.get("42"))
+
     return {
         "provider": "boomlings",
         "ok": True,
@@ -265,6 +301,15 @@ def parse_boomlings_level(text: str, level_id: str) -> dict[str, Any]:
         "epic": epic > 0,
         "demon": demon,
         "platformer": platformer,
+        "audit_metadata": {
+            "uploader_user_id": _audit_integer(uploader_id),
+            "uploader_account_id": account_id,
+            "stars": audit_stars,
+            "featured": audit_feature > 0 if audit_feature is not None else None,
+            "epic": audit_epic > 0 if audit_epic is not None else None,
+            "epic_tier_raw": audit_epic,
+            "rated": _audit_rating(audit_stars, audit_feature, audit_epic),
+        },
     }
 
 
@@ -344,7 +389,11 @@ def combine_level_validation(
 ) -> dict[str, Any]:
     checked_ts = int(checked_ts or time.time())
     expires_ts = int(expires_ts or checked_ts)
-    results = {str(k): dict(v or {}) for k, v in provider_results.items()}
+    # Audit-only metadata must not change live cache payloads or the public
+    # level_validation_json template variable. The audit reads provider results
+    # directly, before this live validation boundary.
+    results = {str(k): {key: value for key, value in dict(v or {}).items() if key != "audit_metadata"}
+               for k, v in provider_results.items()}
     successful = [result for result in results.values() if result.get("ok")]
     existing = [result for result in successful if result.get("exists") is True]
     missing = [result for result in successful if result.get("exists") is False]

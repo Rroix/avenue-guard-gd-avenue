@@ -555,6 +555,18 @@
       "1102884420207255653"
     ]
   },
+  "historical_audit": {
+    "_comment": "Owner-only side-development audit. Disabled by default. No live prioritization. Enable explicitly, then use /requests historical_audit",
+    "enabled": true,
+    "success_cache_seconds": 86400,
+    "failure_cache_seconds": 300,
+    "lookup_interval_seconds": 2,
+    "allow_csv_hosts": ["docs.google.com", "docs.googleusercontent.com"],
+    "parse_review_text": true,
+    "candidate_model_version": "historical-observed-wave-proxy-v1",
+    "prestige_x": {"rate": 0, "feature": null, "epic": null, "legendary": null, "mythic": 5},
+    "cp_formula": {"name": "disabled", "points": {}}
+  },
   "operations": {
     "_comment": "Durable worker supervision, health history, permission checks, monthly reporting, and retention",
     "supervisor_interval_seconds": 60,

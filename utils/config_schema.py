@@ -7,7 +7,7 @@ from typing import Any
 CONFIG_SCHEMA_VERSION = 2
 RUNTIME_SCHEMA_VERSION = 2
 EMBED_SCHEMA_VERSION = 2
-DATABASE_SCHEMA_VERSION = 6
+DATABASE_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -391,4 +391,9 @@ def validate_config(data: Any) -> list[ConfigIssue]:
                             "must be an integer from 1 to 3650",
                         )
                     )
+    from utils.historical_audit import audit_settings
+    try:
+        audit_settings(data)
+    except ValueError as exc:
+        issues.append(ConfigIssue("historical_audit", str(exc)))
     return issues

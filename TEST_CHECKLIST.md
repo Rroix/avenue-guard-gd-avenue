@@ -645,7 +645,7 @@
 12. Hold an active database operation beyond the normal queue threshold, then release it.
    - Expected: the dashboard shows contention and `/ready` reports degraded while the stall is active, without resetting process uptime.
    - Expected: readiness recovers when the operation finishes and other pillars are healthy.
-13. Validate backup/restore against schema 6 and a matching bot version.
+13. Validate backup/restore against the current schema and a matching bot version.
    - Expected: activity receipts remain present; retrying a restored receipt does not increment again.
    - Expected: an incompatible newer schema is rejected instead of being downgraded.
 
@@ -671,3 +671,21 @@
    - Expected: the active operation label and owning task identify the writer; scoped startup task names are restored after startup finishes or fails.
 8. Cancel setup or shut down while release bootstrap is running.
    - Expected: bootstrap and status tasks are joined before database closure; cancelled uptime writes retain their pending observations for retry while the process survives.
+
+---
+
+## 29) Private historical request audit
+**Setup:** staging backup with repeated historical live levels, reviewed/pending rows, and optionally a partial prestige CSV. Start disabled; keep real provider throttles and circuits enabled.
+
+1. Confirm schema 7 contains all seven audit/prestige tables and preserves live source rows. A full backup/restore preserves evidence and progress.
+2. Try `/requests historical_audit` as an ordinary member and an admin outside `impact.allowed_user_ids`. Both receive an ephemeral denial and no job starts.
+3. Enable `historical_audit.enabled`; start as the owner. The interaction acknowledges immediately and returns a run ID. A simultaneous second start is denied.
+4. Inspect `action:status`; distinct level/account counts advance. Zero CP is known zero; HTTP denial, wrong account, malformed/missing CP and identity disagreement remain unknown.
+5. Restart halfway through. The same frozen input and finished items remain; the run resumes without re-fetching completed items or repeating completed preparation writes.
+6. Rerun normally: fresh snapshots are reused. Force ignores freshness only; provider circuits still apply. Failures become retryable after the short TTL.
+7. Upload a partial CSV with a conflicting label and a repeated level lacking wave qualifiers. Missing/ambiguous rows stay null; conflicts preserve both sources and select neither.
+8. Run with `refresh_external:false`. No GD HTTP calls occur; missing snapshots stay unknown and stale data is labelled.
+9. Retrieve `action:report`. Private files contain one row per live historical request; weekly reward requests are excluded. Sent/rejected/other current-rating cross-tabs and CP percentages retain unknowns.
+10. Default disabled g and undefined intermediate exponents leave totals null. Configured candidates use current CP and labelled observed-wave age, not actual historical allocation/outreach.
+11. Close owner DMs while the command is usable: report falls back ephemerally. After restart/expiry use `action:report`. An interrupted automatic DM is not automatically resent.
+12. Compare reviewer callbacks, Send/Reject, waves, public request embeds and allocations before/after. No audit data participates, no Bayesian probability exists and no historical source row is rewritten.
