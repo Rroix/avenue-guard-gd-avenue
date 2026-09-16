@@ -674,6 +674,136 @@ CHAPTERS = [
         ],
     ),
     (
+        "Priority Point System V1",
+        [
+            p(
+                "PPS v1 is Avenue Guard's prospective, deterministic outreach queue. A reviewer still makes the human decision, "
+                "and staff still perform moderator outreach manually. The system records a recommendation tier, resolves the current "
+                "Creator Points of the Geometry Dash uploader, adds evidence-backed waiting, and gives the owner a durable ordering. "
+                "The score is an operational priority, never a probability."
+            ),
+            callout(
+                "The rollout boundary",
+                "The wave present when schema 8 deploys remains legacy forever, including later submissions to that wave. Only a newly "
+                "created wave ID receives pps_v1. Every card and repair path reads the saved row version instead of a global switch.",
+            ),
+            diagram(
+                "Versioned Review Path",
+                [
+                    "new wave gets persisted version",
+                    "submission copies wave version",
+                    "legacy renders Send button",
+                    "pps_v1 renders five-tier select",
+                    "review transaction stores result and tier",
+                    "one durable outreach entry",
+                ],
+                "Weekly reward requests are separate and stay on the legacy controls.",
+            ),
+            h2("Recommendation UI And Meaning"),
+            p(
+                "A PPS review card replaces generic Send with Rate, Feature, Epic, Legendary, and Mythic. Selecting a tier opens the "
+                "optional comment modal immediately so Discord receives an acknowledgement before database or network work. Modal "
+                "submission reloads the authoritative row, verifies permissions and pending status, stores result=sent plus send_type, "
+                "and creates the queue record in the guarded transaction. The user sees Recommended and Added to the outreach queue; "
+                "the bot never claims the level already reached a moderator."
+            ),
+            h2("The Three Components"),
+            table(
+                ["Component", "Definition", "Important safety rule"],
+                [
+                    ["F", "1.8^T - 1, where T comes from the review tier", "Fixed by the original recommendation"],
+                    ["G", "max(0, ln(0.25 / (0.06*C + 0.01)))", "C is uploader CP; unknown is null, never zero"],
+                    ["H", "1.5 * min(W, 4)^1.5", "W increases only after a successful outreach cycle"],
+                    ["P", "F + G + H", "Null while any required component is unknown"],
+                ],
+            ),
+            code(
+                "PPS v1 formula with plain-language commentary",
+                "python",
+                """# The review tier supplies a stable prestige coordinate.
+tier = prestige_x[send_type]
+f = prestige_base ** tier - 1.0
+
+# A failed profile lookup returns None. It is not converted to zero CP.
+g = None if current_cp is None else max(
+    0.0,
+    math.log(0.25 / (0.06 * current_cp + 0.01)),
+)
+
+# Keep the real W for evidence and tie-breaking, but cap its score effect.
+h = 1.5 * min(waiting_cycles, 4) ** 1.5
+
+# An incomplete score remains visibly incomplete.
+priority = None if g is None else f + g + h""",
+            ),
+            source_function(
+                "Actual score-component implementation",
+                "utils/priority_system.py",
+                "score_components",
+            ),
+            h2("Outreach Cycles"),
+            p(
+                "A request wave collects community submissions; an outreach cycle records a real staff round of trying to get "
+                "recommended levels to moderators. Starting a cycle snapshots every currently queued candidate and its F/G/H/P, CP, "
+                "W, and model version. Levels added later do not belong to that snapshot and cannot age from it."
+            ),
+            diagram(
+                "Successful Cycle Aging",
+                [
+                    "snapshot eligible queue",
+                    "record planned/attempted/failed work",
+                    "confirm at least one submitted_to_mod",
+                    "submitted entries move to outcomes",
+                    "eligible unsubmitted entries gain W + 1",
+                    "transaction closes cycle once",
+                ],
+                "A zero-submission cycle is cancelled without increasing W. Repeating completion cannot double-increment it.",
+            ),
+            source_function(
+                "Actual successful-cycle transaction",
+                "services/priority_system.py",
+                "complete_cycle",
+                95,
+            ),
+            h2("Prospective Evidence"),
+            p(
+                "PPS keeps append-only CP and level snapshots, cycle membership, private attempts, confirmed moderator-submission time, "
+                "rating observations, and a fixed 30-day result. This creates the evidence the earlier historical audit could not "
+                "reconstruct. No Bayesian model is calculated in this release."
+            ),
+            source_function(
+                "Bounded maintenance pass",
+                "services/priority_system.py",
+                "maintenance_once",
+                85,
+            ),
+            table(
+                ["Private command", "What it controls"],
+                [
+                    ["/pps dashboard", "Rollout version, queue health, active cycle and outcome totals"],
+                    ["/pps queue", "Ranked complete and CP-pending entries"],
+                    ["/pps level", "Score components, snapshots, cycle membership and private attempts"],
+                    ["/pps cycle", "Start, inspect, complete or cancel a durable cycle"],
+                    ["/pps outreach", "Record an attempt or confirmed moderator submission"],
+                    ["/pps refresh", "Refresh providers or record a reasoned CP override"],
+                    ["/pps stats", "Prospective evidence totals without probabilities"],
+                ],
+            ),
+            h2("Recovery"),
+            p(
+                "Both legacy and PPS persistent views register at startup. Request repair restores controls from the submission's saved "
+                "version, relocks reviewed cards, and can idempotently recreate a missing queue entry only for a reviewed pps_v1 sent "
+                "row with a valid tier. Background maintenance is supervised, works in bounded batches, and preserves unknown provider "
+                "results rather than making them look like negative evidence."
+            ),
+            source_function(
+                "Saved-version view selection",
+                "cogs/RequestLevels.py",
+                "_review_view",
+            ),
+        ],
+    ),
+    (
         "Weekly Activity And Rewards",
         [
             p(
@@ -1008,6 +1138,7 @@ def _source_file_inventory_rows() -> list[list[str]]:
         "cogs/MessageResponses.py",
         "cogs/Mod.py",
         "cogs/Operations.py",
+        "cogs/PrioritySystem.py",
         "cogs/Release.py",
         "cogs/RequestLevels.py",
         "cogs/Sticky.py",
@@ -1015,6 +1146,7 @@ def _source_file_inventory_rows() -> list[list[str]]:
         "services/backups.py",
         "services/diagnostics.py",
         "services/impact.py",
+        "services/priority_system.py",
         "services/request_reviews.py",
         "services/request_scheduling.py",
         "services/request_validation.py",
@@ -1024,6 +1156,8 @@ def _source_file_inventory_rows() -> list[list[str]]:
         "utils/errors.py",
         "utils/gd_validation.py",
         "utils/outbox.py",
+        "utils/priority_system.py",
+        "utils/priority_system_schema.py",
         "utils/server_icons.py",
         "utils/views.py",
         "utils/workflows.py",
@@ -1063,7 +1197,14 @@ def _command_inventory_rows() -> list[list[str]]:
 
 
 def _database_table_rows() -> list[list[str]]:
-    text = (ROOT / "utils/db.py").read_text(encoding="utf-8")
+    text = "\n".join(
+        (ROOT / rel).read_text(encoding="utf-8")
+        for rel in (
+            "utils/db.py",
+            "utils/historical_audit_schema.py",
+            "utils/priority_system_schema.py",
+        )
+    )
     names = sorted(set(re.findall(r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z0-9_]+)", text)))
     purpose = {
         "activity_counts": "Weekly activity totals.",
@@ -1107,6 +1248,12 @@ def _database_table_rows() -> list[list[str]]:
         "user_notification_preferences": "Per-user request result delivery choice.",
         "restore_drills": "Non-destructive backup integrity test history.",
         "monthly_impact_reports": "Monthly report generation and outbox delivery state.",
+        "level_outreach_queue": "PPS scores, source requests, queue state, CP and outcomes.",
+        "level_outreach_cycles": "Owner-managed outreach round lifecycle.",
+        "level_outreach_cycle_entries": "Start-of-cycle candidate and score snapshots.",
+        "level_outreach_attempts": "Private outreach routes, outcomes, targets and notes.",
+        "level_outreach_cp_snapshots": "Append-only current uploader CP evidence.",
+        "level_outreach_level_snapshots": "Append-only current level and rating evidence.",
     }
     return [[name, purpose.get(name, "Persistent workflow state.")] for name in names]
 

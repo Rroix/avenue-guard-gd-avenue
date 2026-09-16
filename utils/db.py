@@ -830,12 +830,38 @@ class Database:
         if versions.get("database", 0) > DATABASE_SCHEMA_VERSION:
             raise RuntimeError("Database schema is newer than this bot; deploy matching code instead of downgrading it")
         from utils.historical_audit_schema import AUDIT_SCHEMA, AUDIT_TABLES
+        from utils.priority_system_schema import PRIORITY_SCHEMA, PRIORITY_TABLES
 
-        if versions in ({**expected, "database": 5}, {**expected, "database": 6}):
+        if versions in (
+            {**expected, "database": 5},
+            {**expected, "database": 6},
+            {**expected, "database": 7},
+        ):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute("CREATE TABLE IF NOT EXISTS activity_flush_batches(batch_id TEXT PRIMARY KEY,created_ts INTEGER NOT NULL)")
                 for stmt in AUDIT_SCHEMA:
+                    self._conn.execute(stmt)
+                self._ensure_column_sync(
+                    "level_request_state",
+                    "review_system_version",
+                    "TEXT NOT NULL DEFAULT 'legacy'",
+                )
+                self._ensure_column_sync(
+                    "level_request_submissions",
+                    "review_system_version",
+                    "TEXT NOT NULL DEFAULT 'legacy'",
+                )
+                self._ensure_column_sync("level_request_submissions", "send_type", "TEXT")
+                self._conn.execute(
+                    "UPDATE level_request_state SET review_system_version='legacy' "
+                    "WHERE review_system_version IS NULL OR review_system_version=''"
+                )
+                self._conn.execute(
+                    "UPDATE level_request_submissions SET review_system_version='legacy' "
+                    "WHERE review_system_version IS NULL OR review_system_version=''"
+                )
+                for stmt in PRIORITY_SCHEMA:
                     self._conn.execute(stmt)
                 self._execute_sync("UPDATE schema_metadata SET schema_version=?,updated_ts=? WHERE component='database'", (DATABASE_SCHEMA_VERSION, int(time.time())))
                 self._commit_and_sync_sync()
@@ -845,7 +871,7 @@ class Database:
             versions["database"] = DATABASE_SCHEMA_VERSION
         if versions == expected:
             tables = {row[0] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if AUDIT_TABLES | {"tickets", "ticket_transcripts", "activity_counts", "activity_flush_batches", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
+            if AUDIT_TABLES | PRIORITY_TABLES | {"tickets", "ticket_transcripts", "activity_counts", "activity_flush_batches", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
                 return
         stmts = [
             """CREATE TABLE IF NOT EXISTS activity_counts(
@@ -1090,7 +1116,8 @@ class Database:
                 closed_ts INTEGER,
                 request_channel_id INTEGER,
                 request_message_id INTEGER,
-                request_type TEXT
+                request_type TEXT,
+                review_system_version TEXT NOT NULL DEFAULT 'legacy'
             );""",
             """CREATE TABLE IF NOT EXISTS level_request_submissions(
                 guild_id INTEGER NOT NULL,
@@ -1105,6 +1132,8 @@ class Database:
                 reviewed_ts INTEGER,
                 created_ts INTEGER NOT NULL,
                 data_json TEXT NOT NULL DEFAULT '{}',
+                review_system_version TEXT NOT NULL DEFAULT 'legacy',
+                send_type TEXT,
                 PRIMARY KEY (guild_id, wave_id, user_id),
                 UNIQUE (guild_id, wave_id, level_id)
             );""",
@@ -1443,6 +1472,11 @@ class Database:
         self._ensure_column_sync("level_request_state", "request_channel_id", "INTEGER")
         self._ensure_column_sync("level_request_state", "request_message_id", "INTEGER")
         self._ensure_column_sync("level_request_state", "request_type", "TEXT")
+        self._ensure_column_sync(
+            "level_request_state",
+            "review_system_version",
+            "TEXT NOT NULL DEFAULT 'legacy'",
+        )
         self._ensure_column_sync("level_request_submissions", "request_message_id", "INTEGER")
         self._ensure_column_sync("level_request_submissions", "result", "TEXT")
         self._ensure_column_sync("level_request_submissions", "review_text", "TEXT")
@@ -1450,6 +1484,20 @@ class Database:
         self._ensure_column_sync("level_request_submissions", "reviewed_ts", "INTEGER")
         self._ensure_column_sync("level_request_submissions", "edit_deadline_ts", "INTEGER")
         self._ensure_column_sync("level_request_submissions", "correlation_id", "TEXT")
+        self._ensure_column_sync(
+            "level_request_submissions",
+            "review_system_version",
+            "TEXT NOT NULL DEFAULT 'legacy'",
+        )
+        self._ensure_column_sync("level_request_submissions", "send_type", "TEXT")
+        self._conn.execute(
+            "UPDATE level_request_state SET review_system_version='legacy' "
+            "WHERE review_system_version IS NULL OR review_system_version=''"
+        )
+        self._conn.execute(
+            "UPDATE level_request_submissions SET review_system_version='legacy' "
+            "WHERE review_system_version IS NULL OR review_system_version=''"
+        )
         self._ensure_column_sync("weekly_request_reviews", "channel_id", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "rank", "INTEGER")
         self._ensure_column_sync("weekly_request_reviews", "result", "TEXT")
@@ -1502,6 +1550,8 @@ class Database:
                 (component, version, now_ts),
             )
         for stmt in AUDIT_SCHEMA:
+            self._conn.execute(stmt)
+        for stmt in PRIORITY_SCHEMA:
             self._conn.execute(stmt)
         for stmt in index_stmts:
             self._conn.execute(stmt)

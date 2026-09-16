@@ -567,6 +567,36 @@
     "prestige_x": {"rate": 0, "feature": null, "epic": null, "legendary": null, "mythic": 5},
     "cp_formula": {"name": "disabled", "points": {}}
   },
+  "priority_system": {
+    "_comment": "PPS v1 applies only when a genuinely new wave is created. Existing state and submissions remain legacy after migration",
+    "new_wave_version": "pps_v1",
+    "model_version": "pps_v1",
+    "prestige_base": 1.8,
+    "prestige_x": {
+      "rate": 0.0,
+      "feature": 1.25,
+      "epic": 2.5,
+      "legendary": 3.75,
+      "mythic": 5.0
+    },
+    "creator_opportunity": {
+      "numerator": 0.25,
+      "slope": 0.06,
+      "offset": 0.01,
+      "zero_from_cp": 4
+    },
+    "waiting": {
+      "multiplier": 1.5,
+      "exponent": 1.5,
+      "score_cap_cycles": 4
+    },
+    "cp_refresh_hours": 24,
+    "level_refresh_hours": 6,
+    "outcome_window_days": 30,
+    "maintenance_interval_seconds": 300,
+    "maintenance_batch_size": 5,
+    "failure_retry_minutes": 15
+  },
   "operations": {
     "_comment": "Durable worker supervision, health history, permission checks, monthly reporting, and retention",
     "supervisor_interval_seconds": 60,

@@ -7,7 +7,7 @@ from typing import Any
 CONFIG_SCHEMA_VERSION = 2
 RUNTIME_SCHEMA_VERSION = 2
 EMBED_SCHEMA_VERSION = 2
-DATABASE_SCHEMA_VERSION = 7
+DATABASE_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -135,6 +135,10 @@ REQUEST_TEMPLATE_VARIABLES = {
     "gd_rated",
     "gd_platformer",
     "reviewer_id",
+    "send_type",
+    "send_type_label",
+    "queue_status",
+    "review_system_version",
 }
 
 REQUEST_BUTTON_VARIABLES = {
@@ -174,6 +178,13 @@ WAVE_SUMMARY_VARIABLES = {
     "wave_comparison",
     "request_delta",
     "sent_rate_delta",
+    "review_system_version",
+    "rate_count",
+    "feature_count",
+    "epic_count",
+    "legendary_count",
+    "mythic_count",
+    "recommendation_breakdown",
 }
 
 WEEKLY_SUBMITTED_VARIABLES = REQUEST_TEMPLATE_VARIABLES | {
@@ -392,8 +403,13 @@ def validate_config(data: Any) -> list[ConfigIssue]:
                         )
                     )
     from utils.historical_audit import audit_settings
+    from utils.priority_system import priority_settings
     try:
         audit_settings(data)
     except ValueError as exc:
         issues.append(ConfigIssue("historical_audit", str(exc)))
+    try:
+        priority_settings(data)
+    except ValueError as exc:
+        issues.append(ConfigIssue("priority_system", str(exc)))
     return issues

@@ -24,6 +24,7 @@ CID_LEVEL_REQUEST_SEND = "level_request_send"
 CID_LEVEL_REQUEST_REJECT = "level_request_reject"
 CID_LEVEL_REQUEST_OTHER = "level_request_other"
 CID_LEVEL_REQUEST_RECHECK = "level_request_recheck"
+CID_LEVEL_REQUEST_PPS_SEND_TYPE = "level_request_pps_send_type_v1"
 
 
 class TranscriptRequestView(discord.ui.View):
@@ -353,3 +354,74 @@ class LevelRequestReviewView(discord.ui.View):
                     allowed_mentions=no_mentions(),
                 )
         return _callback
+
+
+class _LevelRequestPPSSendSelect(discord.ui.Select):
+    def __init__(self, disabled: bool = False):
+        super().__init__(
+            placeholder="Send type...",
+            min_values=1,
+            max_values=1,
+            disabled=disabled,
+            custom_id=CID_LEVEL_REQUEST_PPS_SEND_TYPE,
+            options=[
+                discord.SelectOption(label=label, value=value)
+                for value, label in (
+                    ("rate", "Rate"),
+                    ("feature", "Feature"),
+                    ("epic", "Epic"),
+                    ("legendary", "Legendary"),
+                    ("mythic", "Mythic"),
+                )
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("RequestLevelsCog")
+        if cog:
+            await cog.handle_pps_send_type(interaction, self.values[0])
+        else:
+            await interaction.response.send_message(
+                "Request review controls are temporarily unavailable.",
+                ephemeral=True,
+                allowed_mentions=no_mentions(),
+            )
+
+
+class LevelRequestPPSReviewView(discord.ui.View):
+    def __init__(self, disabled: bool = False):
+        super().__init__(timeout=None)
+        self.add_item(_LevelRequestPPSSendSelect(disabled=disabled))
+        for label, style, custom_id, action in (
+            ("Reject", discord.ButtonStyle.danger, CID_LEVEL_REQUEST_REJECT, "rejected"),
+            ("Other", discord.ButtonStyle.secondary, CID_LEVEL_REQUEST_OTHER, "other"),
+            ("Recheck", discord.ButtonStyle.secondary, CID_LEVEL_REQUEST_RECHECK, "recheck"),
+        ):
+            button = discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=custom_id,
+                disabled=disabled,
+            )
+            button.callback = self._make_callback(action)
+            self.add_item(button)
+
+    def _make_callback(self, action: str):
+        async def _callback(interaction: discord.Interaction):
+            cog = interaction.client.get_cog("RequestLevelsCog")
+            if cog:
+                await cog.handle_review_button(interaction, action)
+            else:
+                await interaction.response.send_message(
+                    "Request review controls are temporarily unavailable.",
+                    ephemeral=True,
+                    allowed_mentions=no_mentions(),
+                )
+
+        return _callback
+
+
+def request_review_view(review_system_version: str, *, disabled: bool = False):
+    if str(review_system_version or "legacy").casefold() == "pps_v1":
+        return LevelRequestPPSReviewView(disabled=disabled)
+    return LevelRequestReviewView(disabled=disabled)

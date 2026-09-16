@@ -58,7 +58,7 @@ The input capture is atomic and happens once. Reviews or edits occurring after c
 
 ## Storage and Migrations
 
-Database schema **7** adds seven tables and one partial unique index. Schema 5/6 upgrades use a small additive migration, not the full legacy migration sequence. Fresh databases and restored older backups also receive the audit tables. Newer schema versions are still rejected instead of downgraded.
+The historical audit was introduced in database schema **7**. The current database schema is **8**, which retains every audit table and adds the separate production PPS tables. Schema 5/6/7 upgrades are additive, and fresh databases or restored older backups receive both table families. Newer schema versions are still rejected instead of downgraded.
 
 | Table | Durable purpose |
 |---|---|
@@ -225,4 +225,4 @@ utils/historical_audit.py
 utils/historical_audit_schema.py
 ```
 
-The pre-existing long/condensed manuals and public website were not regenerated or changed; this private guide is the technical addendum. The release manifest proposes 3.23.0 through the existing owner-approval workflow, rather than publishing an unapproved update.
+The historical audit remains an isolated evidence tool: it never feeds the production PPS queue and never rewrites historical requests. PPS v1 is documented separately in `docs/PRIORITY_POINT_SYSTEM.md`; it starts prospectively with newly created PPS waves only.

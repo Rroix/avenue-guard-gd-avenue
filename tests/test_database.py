@@ -38,6 +38,12 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         "user_notification_preferences",
         "restore_drills",
         "monthly_impact_reports",
+        "level_outreach_queue",
+        "level_outreach_cycles",
+        "level_outreach_cycle_entries",
+        "level_outreach_attempts",
+        "level_outreach_cp_snapshots",
+        "level_outreach_level_snapshots",
     } <= tables
 
     ticket_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(tickets)")}
@@ -60,7 +66,18 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     request_columns = {
         str(row["name"]) for row in await db.fetchall("PRAGMA table_info(level_request_submissions)")
     }
-    assert {"edit_deadline_ts", "correlation_id"} <= request_columns
+    assert {
+        "edit_deadline_ts",
+        "correlation_id",
+        "review_system_version",
+        "send_type",
+    } <= request_columns
+
+    state_columns = {
+        str(row["name"])
+        for row in await db.fetchall("PRAGMA table_info(level_request_state)")
+    }
+    assert "review_system_version" in state_columns
 
     for table in ("tickets", "help_submissions", "weekly_request_reviews", "level_request_scheduled_openings"):
         columns = {str(row["name"]) for row in await db.fetchall(f"PRAGMA table_info({table})")}
@@ -69,7 +86,7 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     schema_rows = await db.fetchall("SELECT component,schema_version FROM schema_metadata")
     schema_versions = {str(row["component"]): int(row["schema_version"]) for row in schema_rows}
     assert schema_versions == {
-        "database": 7,
+        "database": 8,
         "config": 2,
         "runtime_settings": 2,
         "embed_templates": 2,

@@ -237,6 +237,7 @@ class CommandsCog(commands.Cog):
         self.ticket_group = discord.SlashCommandGroup("ticket", "Ticket commands", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         self.forum_group = discord.SlashCommandGroup("forum", "Forum moderation commands", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         self.requests_group = discord.SlashCommandGroup("requests", "Level request staff tools", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
+        self.pps_group = discord.SlashCommandGroup("pps", "Private priority outreach management", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
         self.server_icon_group = discord.SlashCommandGroup("server_icon", "Server icon rotation tools", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
 
         # register commands
@@ -269,6 +270,13 @@ class CommandsCog(commands.Cog):
         self.requests_group.command(name="notifications", description="Choose how request results notify you")(self.requests_notifications)
         self.requests_group.command(name="analytics", description="Show request outcomes and review performance")(self.requests_analytics)
         self.requests_group.command(name="historical_audit", description="Run or inspect a private historical request audit")(self.requests_historical_audit)
+        self.pps_group.command(name="dashboard", description="Show the private PPS queue and worker overview")(self.pps_dashboard)
+        self.pps_group.command(name="queue", description="Browse the ranked outreach queue")(self.pps_queue)
+        self.pps_group.command(name="level", description="Inspect one queue entry and its private evidence")(self.pps_level)
+        self.pps_group.command(name="cycle", description="Start, inspect, complete, or cancel an outreach cycle")(self.pps_cycle)
+        self.pps_group.command(name="outreach", description="Record a private outreach attempt or confirmed submission")(self.pps_outreach)
+        self.pps_group.command(name="refresh", description="Refresh queue metadata or audit a CP override")(self.pps_refresh)
+        self.pps_group.command(name="stats", description="Show prospective PPS evidence totals")(self.pps_stats)
         self.server_icon_group.command(name="status", description="Show server icon rotation status")(self.server_icon_status)
         self.server_icon_group.command(name="mode", description="Set server icon rotation mode")(self.server_icon_mode)
         self.server_icon_group.command(name="add", description="Add a server icon URL")(self.server_icon_add)
@@ -282,6 +290,7 @@ class CommandsCog(commands.Cog):
         bot.add_application_command(self.ticket_group)
         bot.add_application_command(self.forum_group)
         bot.add_application_command(self.requests_group)
+        bot.add_application_command(self.pps_group)
         bot.add_application_command(self.server_icon_group)
 
         @bot.slash_command(name="resync", description="Refresh Turso, config, views, and responses without restart", guild_ids=[self.allowed_guild_id] if self.allowed_guild_id else None)
@@ -317,6 +326,108 @@ class CommandsCog(commands.Cog):
         csv_url: discord.Option(str, "Optional public HTTPS CSV URL on a configured allowed host", required=False) = "",
     ):
         await self.bot.get_cog("HistoricalAuditCog").command(ctx, action, run_id, refresh_external, force, sheet_csv, csv_url)
+
+    async def pps_dashboard(self, ctx: discord.ApplicationContext):
+        await self.bot.get_cog("PrioritySystemCog").dashboard_command(ctx)
+
+    async def pps_queue(
+        self,
+        ctx: discord.ApplicationContext,
+        page: discord.Option(int, "Queue page number", min_value=1, max_value=1000) = 1,
+    ):
+        await self.bot.get_cog("PrioritySystemCog").queue_command(ctx, page)
+
+    async def pps_level(
+        self,
+        ctx: discord.ApplicationContext,
+        level_or_queue: discord.Option(str, "Queue ID or Geometry Dash level ID"),
+    ):
+        await self.bot.get_cog("PrioritySystemCog").level_command(ctx, level_or_queue)
+
+    async def pps_cycle(
+        self,
+        ctx: discord.ApplicationContext,
+        action: discord.Option(
+            str,
+            "Cycle action",
+            choices=["start", "view", "complete", "cancel"],
+        ) = "view",
+        cycle_id: discord.Option(
+            int,
+            "Cycle ID; leave 0 to use the active or latest cycle",
+            min_value=0,
+        ) = 0,
+        notes: discord.Option(
+            str,
+            "Optional private cycle notes",
+            required=False,
+            max_length=2000,
+        ) = "",
+    ):
+        await self.bot.get_cog("PrioritySystemCog").cycle_command(
+            ctx, action, cycle_id, notes
+        )
+
+    async def pps_outreach(
+        self,
+        ctx: discord.ApplicationContext,
+        cycle_id: discord.Option(int, "Active outreach cycle ID", min_value=1),
+        queue_id: discord.Option(int, "Eligible queue entry ID", min_value=1),
+        status: discord.Option(
+            str,
+            "What happened during this outreach attempt",
+            choices=["planned", "attempted", "submitted_to_mod", "failed"],
+        ),
+        route: discord.Option(
+            str,
+            "Private outreach route",
+            choices=["direct", "network", "stream", "event", "other"],
+        ),
+        target_label: discord.Option(
+            str,
+            "Optional private moderator or target label",
+            required=False,
+            max_length=300,
+        ) = "",
+        notes: discord.Option(
+            str,
+            "Optional private attempt notes",
+            required=False,
+            max_length=2000,
+        ) = "",
+    ):
+        await self.bot.get_cog("PrioritySystemCog").outreach_command(
+            ctx, cycle_id, queue_id, status, route, target_label, notes
+        )
+
+    async def pps_refresh(
+        self,
+        ctx: discord.ApplicationContext,
+        queue_id: discord.Option(int, "Queue entry ID", min_value=1),
+        mode: discord.Option(
+            str,
+            "External refresh or audited Creator Point override",
+            choices=["external", "override"],
+        ) = "external",
+        creator_points: discord.Option(
+            int,
+            "Current Creator Points for override mode",
+            min_value=0,
+            max_value=1000000,
+        ) = 0,
+        reason: discord.Option(
+            str,
+            "Required explanation for override mode",
+            required=False,
+            max_length=1000,
+        ) = "",
+    ):
+        await self.bot.get_cog("PrioritySystemCog").refresh_command(
+            ctx, queue_id, mode, creator_points, reason
+        )
+
+    async def pps_stats(self, ctx: discord.ApplicationContext):
+        await self.bot.get_cog("PrioritySystemCog").stats_command(ctx)
 
     async def _defer(self, ctx: discord.ApplicationContext, ephemeral: bool = True) -> None:
         response = getattr(getattr(ctx, "interaction", None), "response", None)
@@ -3872,7 +3983,9 @@ class CommandsCog(commands.Cog):
             ctx.guild,
             ctx.user.id,
             "requests_repair",
-            f"pending_recreated={result.get('pending_messages_recreated', 0)} errors={len(result.get('errors') or [])}",
+            f"pending_recreated={result.get('pending_messages_recreated', 0)} "
+            f"pps_queue_repaired={result.get('pps_queue_entries_repaired', 0)} "
+            f"errors={len(result.get('errors') or [])}",
         )
         embed = discord.Embed(title="Request System Repair", color=discord.Color.green() if not result.get("errors") else discord.Color.orange())
         embed.add_field(name="Request button", value="refreshed" if result.get("request_button_refreshed") else "not refreshed", inline=True)
@@ -3882,6 +3995,7 @@ class CommandsCog(commands.Cog):
         embed.add_field(name="Locked reviewed", value=str(result.get("reviewed_messages_locked", 0)), inline=True)
         embed.add_field(name="Weekly recreated", value=str(result.get("weekly_pending_messages_recreated", 0)), inline=True)
         embed.add_field(name="Weekly locked", value=str(result.get("weekly_reviewed_messages_locked", 0)), inline=True)
+        embed.add_field(name="PPS queue repaired", value=str(result.get("pps_queue_entries_repaired", 0)), inline=True)
         embed.add_field(name="Validation refreshed", value=str(result.get("stale_validations_refreshed", 0)), inline=True)
         embed.add_field(
             name="Wave count",

@@ -63,7 +63,7 @@ The bot is intentionally built around one configured server. Most behavior is co
 - Checks configurable required roles before showing the request form.
 - Supports a first-request rules acknowledgement button that grants the configured clearance role and skips the prompt in future waves.
 - Sends staff review embeds to `level_requests.level_requested`.
-- Configured reviewer roles, admins, and owners can choose `Send`, `Reject`, or `Other`.
+- Existing and weekly review cards retain `Send`, `Reject`, `Other`, and `Recheck`. New PPS waves use a five-tier `Send type` menu plus `Reject`, `Other`, and `Recheck`.
 - Staff can filter pending live-wave and weekly requests with `/requests pending`.
 - Requesters can choose whether final results arrive in the result channel, by DM, in both places, or without an additional notification through `/requests notifications`.
 - Pending queues and request cards show configurable fresh, aging, due-soon, and overdue SLA indicators.
@@ -83,6 +83,16 @@ An isolated, owner-only research tool captures historical live-wave requests and
 Use `/requests historical_audit` with `start`, `status`, `report`, or `cancel`. The feature is disabled by default; explicitly enable `historical_audit.enabled` in `config.json`. Reports are delivered only by owner DM or ephemeral response as CSV, JSON and Markdown files. Current-rating cross-tabs are observational, not evidence that Avenue caused ratings.
 
 Candidate f/g/h components are analysis-only. CP scoring and intermediate prestige exponents are undefined by default, and missing components keep totals null. Waiting is an explicitly labelled observed-wave age proxy, not invented moderator-outreach history. No live review, wave, public embed, allocation or Bayesian behavior changes. Setup, schema, data definitions and limitations are explained in [the private audit guide](docs/HISTORICAL_REQUEST_AUDIT.md).
+
+### Priority Point System
+
+PPS v1 is the production successor to the exploratory audit, but it is deliberately isolated from historical data. The wave that exists when schema 8 deploys remains `legacy`, including requests submitted to that wave after restart. Only the next newly created wave is stamped `pps_v1`; every submission copies that persisted wave version, so repair and restart cannot silently upgrade an old card. Weekly reward requests also remain on the legacy review flow.
+
+On a PPS card, a reviewer recommends exactly one tier: Rate, Feature, Epic, Legendary, or Mythic. The saved high-level result remains `sent` for compatibility, while `send_type` records the recommendation. This means “recommended for outreach,” not “already sent to a moderator.” The review decision, result-delivery outbox actions, and one durable outreach-queue entry are guarded by the same authoritative reviewed row.
+
+The deterministic score is `P = F + G + H`. `F` comes from the recommendation tier, `G` uses the current Creator Points of the GD uploader account, and `H` reflects successful outreach cycles the level waited through. Unknown CP remains null and leaves the total incomplete; it never receives the CP-zero bonus. A supervised background worker refreshes level status and CP in small provider-aware batches, removes newly rated levels from the active queue, and records a fixed 30-day result window after confirmed moderator submission.
+
+The private `/pps` command group lets the configured owner inspect the ranked queue, view evidence for one level, start/view/complete/cancel outreach cycles, record attempts, confirm actual moderator submissions, refresh metadata, apply audited CP overrides, and inspect prospective evidence totals. Attempt target labels and notes remain private. PPS never contacts moderators automatically and does not calculate Bayesian probabilities. The full state machine, equations, schema, recovery behavior, and operator steps are documented in [the private PPS guide](docs/PRIORITY_POINT_SYSTEM.md).
 
 ### Help Menu And Staff Tickets
 - DMs members a compact help dashboard with active tickets, weekly activity, recent support, and their current-wave level request when one exists.

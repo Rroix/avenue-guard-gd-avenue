@@ -23,8 +23,16 @@ from utils.errors import log_error
 from utils.db import DatabaseBusyError
 from utils.gd_validation import combine_level_validation, fetch_boomlings_level, fetch_gdbrowser_level, validation_notice
 from utils.mentions import no_mentions, user_and_role_mentions
+from utils.priority_system import (
+    LEGACY_REVIEW_SYSTEM,
+    PPS_V1_REVIEW_SYSTEM,
+    normalize_send_type,
+    prestige_component,
+    priority_settings,
+    send_type_label,
+)
 from utils.timeutils import TZ, now_madrid
-from utils.views import LevelRequestButtonView, LevelRequestReviewView
+from utils.views import LevelRequestButtonView, LevelRequestReviewView, request_review_view
 from utils.workflows import (
     REQUEST_REVIEW_STATES,
     current_correlation_id,
@@ -163,12 +171,15 @@ class LevelRequestModal(discord.ui.Modal):
 
 
 class ReviewModal(discord.ui.Modal):
-    def __init__(self, cog, message_id: int, result_key: str):
-        title = "Send level" if result_key == "sent" else "Reject level"
+    def __init__(self, cog, message_id: int, result_key: str, send_type: str | None = None):
+        title = f"Recommend: {send_type_label(send_type)}" if send_type else (
+            "Send level" if result_key == "sent" else "Reject level"
+        )
         super().__init__(title=title)
         self.cog = cog
         self.message_id = message_id
         self.result_key = result_key
+        self.send_type = normalize_send_type(send_type)
         self.review = discord.ui.InputText(
             label="Review",
             required=False,
@@ -183,6 +194,7 @@ class ReviewModal(discord.ui.Modal):
             self.message_id,
             self.result_key,
             str(self.review.value or "").strip(),
+            send_type=self.send_type,
         )
 
 
@@ -1708,7 +1720,8 @@ class RequestLevelsCog(commands.Cog):
 
     async def _wave_summary_vars(self, guild_id: int, wave_id: int) -> Dict[str, Any]:
         rows = await self.bot.db.fetchall(
-            "SELECT status, result, reviewed_by, reviewed_ts, created_ts, data_json FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
+            "SELECT status, result, send_type, review_system_version, reviewed_by, reviewed_ts, created_ts, data_json "
+            "FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
             (guild_id, wave_id),
         )
         total = len(rows)
@@ -1722,6 +1735,31 @@ class RequestLevelsCog(commands.Cog):
         not_sent = rejected + other
         pending = max(total - reviewed, 0)
         reviewer_stats = await self._reviewer_stats_lines(rows)
+        review_system_version = next(
+            (
+                self._review_system_version(row)
+                for row in rows
+                if self._review_system_version(row) == PPS_V1_REVIEW_SYSTEM
+            ),
+            LEGACY_REVIEW_SYSTEM,
+        )
+        if not rows:
+            state_version = await self.bot.db.fetchone(
+                "SELECT review_system_version FROM level_request_state WHERE guild_id=? AND wave_id=?",
+                (guild_id, wave_id),
+            )
+            if state_version:
+                review_system_version = self._review_system_version(state_version)
+        send_type_counts = {
+            send_type: sum(
+                1
+                for row in rows
+                if str(row["status"]) == "reviewed"
+                and str(row["result"]) == "sent"
+                and str(row["send_type"] or "") == send_type
+            )
+            for send_type in ("rate", "feature", "epic", "legendary", "mythic")
+        }
         request_type = ""
         for row in rows:
             data = self._safe_json_loads(row["data_json"], {})
@@ -1751,6 +1789,16 @@ class RequestLevelsCog(commands.Cog):
             "sent_percent_reviewed": self._pct(sent, reviewed),
             "not_sent_percent_reviewed": self._pct(not_sent, reviewed),
             "reviewer_stats": reviewer_stats,
+            "review_system_version": review_system_version,
+            "rate_count": send_type_counts["rate"],
+            "feature_count": send_type_counts["feature"],
+            "epic_count": send_type_counts["epic"],
+            "legendary_count": send_type_counts["legendary"],
+            "mythic_count": send_type_counts["mythic"],
+            "recommendation_breakdown": "\n".join(
+                f"{send_type_label(key)}: **{value}**"
+                for key, value in send_type_counts.items()
+            ),
             "summary_color": self._color_name("sent" if pending == 0 else "pending", "blurple"),
         }
         previous_wave = await self.bot.db.fetchone(
@@ -1807,7 +1855,12 @@ class RequestLevelsCog(commands.Cog):
     def _wave_summary_embed(self, variables: Dict[str, Any]) -> discord.Embed:
         template = self._cfg("wave_summary_embed", default={}) or {}
         if isinstance(template, dict) and template:
-            return self._embed_from_template(template, variables, default_color=str(variables.get("summary_color") or "blurple"))
+            embed = self._embed_from_template(
+                template,
+                variables,
+                default_color=str(variables.get("summary_color") or "blurple"),
+            )
+            return self._apply_pps_wave_summary(embed, variables)
 
         embed = discord.Embed(
             title=f"Wave {variables['wave_id']} Summary",
@@ -1840,6 +1893,29 @@ class RequestLevelsCog(commands.Cog):
             inline=False,
         )
         embed.set_footer(text="This updates whenever a request in the wave is reviewed.")
+        return self._apply_pps_wave_summary(embed, variables)
+
+    def _apply_pps_wave_summary(
+        self,
+        embed: discord.Embed,
+        variables: Dict[str, Any],
+    ) -> discord.Embed:
+        if variables.get("review_system_version") != PPS_V1_REVIEW_SYSTEM:
+            return embed
+        for index, field in enumerate(embed.fields):
+            if str(field.name).casefold() == "sent":
+                embed.set_field_at(
+                    index,
+                    name="Recommended",
+                    value=field.value,
+                    inline=field.inline,
+                )
+        if len(embed.fields) < 25:
+            embed.add_field(
+                name="Recommendation tiers",
+                value=str(variables.get("recommendation_breakdown") or "No recommendations yet"),
+                inline=False,
+            )
         return embed
 
     async def update_wave_summary(self, guild: discord.Guild, wave_id: int, create_if_missing: bool = True) -> Optional[discord.Message]:
@@ -1959,6 +2035,70 @@ class RequestLevelsCog(commands.Cog):
             return row[key]
         except Exception:
             return default
+
+    def _review_system_version(self, row, target_kind: str = "wave") -> str:
+        if target_kind == "weekly":
+            return LEGACY_REVIEW_SYSTEM
+        version = str(
+            self._row_value(row, "review_system_version", LEGACY_REVIEW_SYSTEM)
+            or LEGACY_REVIEW_SYSTEM
+        ).casefold()
+        return PPS_V1_REVIEW_SYSTEM if version == PPS_V1_REVIEW_SYSTEM else LEGACY_REVIEW_SYSTEM
+
+    def _review_view(self, row, target_kind: str = "wave", *, disabled: bool = False):
+        return request_review_view(
+            self._review_system_version(row, target_kind),
+            disabled=disabled,
+        )
+
+    def _pps_queue_insert_statement(
+        self,
+        row,
+        *,
+        send_type: str,
+        reviewer_id: int,
+        reviewed_ts: int,
+        correlation_id: str,
+    ) -> tuple[str, tuple[Any, ...]]:
+        settings = priority_settings(self.bot.config.data)
+        tier, prestige = prestige_component(send_type, settings)
+        guild_id = int(self._row_value(row, "guild_id", 0) or 0)
+        message_id = int(self._row_value(row, "request_message_id", 0) or 0)
+        values = (
+            guild_id,
+            int(self._row_value(row, "wave_id", 0) or 0),
+            int(self._row_value(row, "user_id", 0) or 0),
+            message_id,
+            str(self._row_value(row, "level_id", "") or ""),
+            send_type,
+            reviewed_ts,
+            tier,
+            prestige,
+            0,
+            0.0,
+            0,
+            settings.model_version,
+            "queued",
+            correlation_id,
+            reviewed_ts,
+            guild_id,
+            message_id,
+            send_type,
+            reviewer_id,
+            reviewed_ts,
+        )
+        return (
+            "INSERT OR IGNORE INTO level_outreach_queue("
+            "guild_id,wave_id,requester_id,request_message_id,level_id,send_type,"
+            "queued_ts,prestige_t,prestige_component_f,waiting_cycles,waiting_component_h,"
+            "priority_complete,model_version,queue_state,correlation_id,updated_ts) "
+            "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? "
+            "WHERE EXISTS(SELECT 1 FROM level_request_submissions "
+            "WHERE guild_id=? AND request_message_id=? AND status='reviewed' "
+            "AND result='sent' AND send_type=? AND reviewed_by=? AND reviewed_ts=? "
+            "AND review_system_version='pps_v1')",
+            values,
+        )
 
     async def _duplicate_history_warning(
         self,
@@ -2233,10 +2373,25 @@ class RequestLevelsCog(commands.Cog):
             ephemeral=True,
         )
 
-    def _data_vars(self, row, data: Dict[str, Any], result_key: str = "", review: str = "", reviewer_id: int = 0) -> Dict[str, Any]:
+    def _data_vars(
+        self,
+        row,
+        data: Dict[str, Any],
+        result_key: str = "",
+        review: str = "",
+        reviewer_id: int = 0,
+        send_type: str | None = None,
+    ) -> Dict[str, Any]:
         level_showcase = str(data.get("level_showcase") or "").strip() or "Not provided"
         notes = str(data.get("notes") or "").strip() or "No notes provided"
-        result_label = self._result_label(result_key)
+        normalized_send_type = normalize_send_type(
+            send_type or self._row_value(row, "send_type", "")
+        )
+        result_label = (
+            f"Recommended: {send_type_label(normalized_send_type)}"
+            if result_key == "sent" and normalized_send_type
+            else self._result_label(result_key)
+        )
         result_color = self._color_name(result_key, self._color_name("pending", "blurple"))
         requester_id = int(self._row_value(row, "user_id", 0) or 0)
         wave_raw = self._row_value(row, "wave_id", "")
@@ -2297,6 +2452,10 @@ class RequestLevelsCog(commands.Cog):
             "review": review or "No review provided.",
             "reviewer_id": reviewer_id or "",
             "reviewer_mention": f"<@{reviewer_id}>" if reviewer_id else "Unknown",
+            "send_type": normalized_send_type or "",
+            "send_type_label": send_type_label(normalized_send_type) if normalized_send_type else "",
+            "queue_status": "Added to GD Avenue's outreach queue" if normalized_send_type and result_key == "sent" else "",
+            "review_system_version": self._review_system_version(row),
             "pending_color": self._color_name("pending", "blurple"),
             "result_color": result_color,
         }
@@ -2462,11 +2621,24 @@ class RequestLevelsCog(commands.Cog):
                 )
                 close_ts = now_ts + int(close_minutes) * 60 if close_minutes and int(close_minutes) > 0 else None
                 normalized_type = self._normalize_request_type(request_type) or ""
+                review_system_version = priority_settings(
+                    self.bot.config.data
+                ).new_wave_version
                 statements = [
                     (
                         "UPDATE level_request_state SET state=?, wave_id=?, request_limit=?, close_ts=?, "
-                        "submitted_count=0, opened_ts=?, closed_ts=NULL, request_type=? WHERE guild_id=?",
-                        (STATE_OPEN, wave_id, request_limit, close_ts, now_ts, normalized_type or None, guild.id),
+                        "submitted_count=0, opened_ts=?, closed_ts=NULL, request_type=?, "
+                        "review_system_version=? WHERE guild_id=?",
+                        (
+                            STATE_OPEN,
+                            wave_id,
+                            request_limit,
+                            close_ts,
+                            now_ts,
+                            normalized_type or None,
+                            review_system_version,
+                            guild.id,
+                        ),
                     )
                 ]
                 if prior_wave_id:
@@ -2502,6 +2674,7 @@ class RequestLevelsCog(commands.Cog):
                 "request_type": normalized_type,
                 "scheduled_opening_id": int(scheduled_opening_id or 0),
                 "replaced_wave_id": previous_wave_id,
+                "review_system_version": review_system_version,
             },
         )
 
@@ -3207,18 +3380,26 @@ class RequestLevelsCog(commands.Cog):
                 data = self._apply_level_validation_vars(data, level_validation)
                 data_json = json.dumps(data, separators=(",", ":"))
                 created_ts = int(time_module.time())
+                review_system_version = self._review_system_version(row)
 
                 try:
                     await self.bot.db.execute(
-                        "INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,status,created_ts,data_json,correlation_id) VALUES(?,?,?,?,?,?,?,?)",
-                        (interaction.guild.id, wave_id, user_id, normalized_level_id, "pending", created_ts, data_json, correlation_id),
+                        "INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,status,created_ts,data_json,correlation_id,review_system_version) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (interaction.guild.id, wave_id, user_id, normalized_level_id, "pending", created_ts, data_json, correlation_id, review_system_version),
                     )
                 except Exception as e:
                     await log_error(self.bot, f"Could not save level request submission before sending embed: {repr(e)}")
                     return await self._reply_ephemeral(interaction, "I couldn't submit your request right now.")
 
                 try:
-                    temp_row = {"guild_id": interaction.guild.id, "wave_id": wave_id, "user_id": user_id, "created_ts": created_ts}
+                    temp_row = {
+                        "guild_id": interaction.guild.id,
+                        "wave_id": wave_id,
+                        "user_id": user_id,
+                        "created_ts": created_ts,
+                        "review_system_version": review_system_version,
+                    }
                     embed = self._embed_from_template(
                         self._cfg("level_requested_embed", default={}) or {},
                         self._data_vars(temp_row, data),
@@ -3226,7 +3407,7 @@ class RequestLevelsCog(commands.Cog):
                     )
                     msg = await target_channel.send(
                         embed=embed,
-                        view=LevelRequestReviewView(),
+                        view=self._review_view(temp_row),
                         allowed_mentions=no_mentions(),
                     )
                 except Exception as e:
@@ -3284,14 +3465,18 @@ class RequestLevelsCog(commands.Cog):
                         correlation_id=correlation_id,
                         guild_id=interaction.guild.id,
                         actor_id=user_id,
-                        payload={"level_id": normalized_level_id, "message_id": int(msg.id)},
+                        payload={
+                            "level_id": normalized_level_id,
+                            "message_id": int(msg.id),
+                            "review_system_version": review_system_version,
+                        },
                     )
                 except Exception as e:
                     try:
                         await msg.delete()
                     except Exception:
                         try:
-                            await msg.edit(view=LevelRequestReviewView(disabled=True))
+                            await msg.edit(view=self._review_view(temp_row, disabled=True))
                         except Exception:
                             pass
                     try:
@@ -3479,7 +3664,7 @@ class RequestLevelsCog(commands.Cog):
                 try:
                     msg = await target_channel.send(
                         embed=embed,
-                        view=LevelRequestReviewView(),
+                        view=self._review_view(row),
                         allowed_mentions=no_mentions(),
                     )
                     created_replacement = True
@@ -3543,13 +3728,13 @@ class RequestLevelsCog(commands.Cog):
 
             try:
                 if not created_replacement:
-                    await msg.edit(embed=embed, view=LevelRequestReviewView())
+                    await msg.edit(embed=embed, view=self._review_view(row))
             except discord.NotFound:
                 replacement = None
                 try:
                     replacement = await target_channel.send(
                         embed=embed,
-                        view=LevelRequestReviewView(),
+                        view=self._review_view(row),
                         allowed_mentions=no_mentions(),
                     )
                     await self.bot.db.execute(
@@ -3685,6 +3870,31 @@ class RequestLevelsCog(commands.Cog):
 
         await interaction.response.send_modal(ReviewModal(self, interaction.message.id, action))
 
+    async def handle_pps_send_type(
+        self,
+        interaction: discord.Interaction,
+        send_type: str,
+    ) -> None:
+        if interaction.guild is None or interaction.message is None:
+            return await interaction.response.send_message(
+                "Request not found.", ephemeral=True
+            )
+        member = self._cached_interaction_member(interaction)
+        if member is None or not self._has_reviewer_role(member):
+            return await interaction.response.send_message(
+                "Only reviewers can use these controls.", ephemeral=True
+            )
+        normalized = normalize_send_type(send_type)
+        if normalized is None:
+            return await interaction.response.send_message(
+                "That recommendation tier is invalid.", ephemeral=True
+            )
+        # Opening the modal acknowledges the component immediately. The saved row
+        # version and pending state are rechecked authoritatively on submission.
+        await interaction.response.send_modal(
+            ReviewModal(self, interaction.message.id, "sent", send_type=normalized)
+        )
+
     async def _recheck_review_validation(self, interaction: discord.Interaction, message_id: int) -> None:
         target_kind, row = await self._review_target_by_message(interaction.guild.id, message_id)
         if row is None:
@@ -3737,7 +3947,7 @@ class RequestLevelsCog(commands.Cog):
                     embed = self._embed_from_template(self._cfg(template_key, default={}) or {}, variables,
                                                       default_color=self._color_name("pending", "blurple"))
                     nonce = hashlib.sha256(f"review-card:{target_kind}:{guild.id}:{message_id}".encode()).hexdigest()[:24]
-                    message = await asyncio.wait_for(channel.send(embed=embed, view=LevelRequestReviewView(),
+                    message = await asyncio.wait_for(channel.send(embed=embed, view=self._review_view(row, target_kind),
                                                                   allowed_mentions=no_mentions(), nonce=nonce, enforce_nonce=True), timeout=15)
                     self._validation_refresh_receipts[receipt_key] = message
                     recreated = True
@@ -3806,18 +4016,43 @@ class RequestLevelsCog(commands.Cog):
                     self._validation_refresh_receipts.pop(cached_key, None)
             if message is not None:
                 try:
-                    await asyncio.wait_for(message.edit(embed=embed, view=LevelRequestReviewView()), timeout=15)
+                    await asyncio.wait_for(
+                        message.edit(embed=embed, view=self._review_view(row, target_kind)),
+                        timeout=15,
+                    )
                 except Exception as exc:
                     await log_error(self.bot, f"Validation card edit queued for recovery message_id={new_message_id}: {exc!r}")
         return validation
 
-    async def handle_review_submission(self, interaction: discord.Interaction, message_id: int, result_key: str, review: str):
-        await self._finalize_review(interaction, message_id, result_key, review)
+    async def handle_review_submission(
+        self,
+        interaction: discord.Interaction,
+        message_id: int,
+        result_key: str,
+        review: str,
+        *,
+        send_type: str | None = None,
+    ):
+        await self._finalize_review(
+            interaction,
+            message_id,
+            result_key,
+            review,
+            send_type=send_type,
+        )
 
     async def handle_other_reason(self, interaction: discord.Interaction, message_id: int, reason_key: str):
         await self._finalize_review(interaction, message_id, reason_key, "")
 
-    async def _finalize_review(self, interaction: discord.Interaction, message_id: int, result_key: str, review: str):
+    async def _finalize_review(
+        self,
+        interaction: discord.Interaction,
+        message_id: int,
+        result_key: str,
+        review: str,
+        *,
+        send_type: str | None = None,
+    ):
         if interaction.guild is None:
             return await self._reply_ephemeral(interaction, "Wrong server.")
 
@@ -3835,6 +4070,20 @@ class RequestLevelsCog(commands.Cog):
             if str(row["status"]) != "pending":
                 return await self._reply_ephemeral(interaction, "This request has already been reviewed.")
 
+            review_system_version = self._review_system_version(row, target_kind)
+            normalized_send_type = normalize_send_type(send_type)
+            if result_key == "sent" and review_system_version == PPS_V1_REVIEW_SYSTEM:
+                if normalized_send_type is None:
+                    return await self._reply_ephemeral(
+                        interaction,
+                        "Choose Rate, Feature, Epic, Legendary, or Mythic from the Send type menu.",
+                    )
+            elif normalized_send_type is not None:
+                return await self._reply_ephemeral(
+                    interaction,
+                    "This request uses the legacy review workflow and cannot accept a PPS send type.",
+                )
+
             data = self._safe_json_loads(row["data_json"], {})
             if not isinstance(data, dict):
                 data = {}
@@ -3843,7 +4092,14 @@ class RequestLevelsCog(commands.Cog):
             if target_kind == "weekly":
                 variables = self._weekly_data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
             else:
-                variables = self._data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
+                variables = self._data_vars(
+                    row,
+                    data,
+                    result_key=result_key,
+                    review=review,
+                    reviewer_id=reviewer_id,
+                    send_type=normalized_send_type,
+                )
 
             request_channel = await self._review_target_channel(interaction.guild, target_kind, row)
             if request_channel is None:
@@ -3885,6 +4141,39 @@ class RequestLevelsCog(commands.Cog):
                     self._cfg("level_reviewed_embed", default={}) or {}, variables,
                     default_color=self._color_name(result_key, "red"),
                 )
+                if (
+                    target_kind == "wave"
+                    and result_key == "sent"
+                    and review_system_version == PPS_V1_REVIEW_SYSTEM
+                    and normalized_send_type is not None
+                ):
+                    tier_label = send_type_label(normalized_send_type)
+                    result_label = f"Recommended: {tier_label}"
+                    result_embed.title = result_label
+                    result_embed.description = (
+                        f"<@{requester_id}>, **{variables['level_name']}** was accepted "
+                        "into GD Avenue's outreach queue. This is a review recommendation, "
+                        "not confirmation that it has reached a Geometry Dash moderator."
+                    )
+                    result_embed.add_field(
+                        name="Recommendation",
+                        value=tier_label,
+                        inline=True,
+                    )
+                    result_embed.add_field(
+                        name="Queue status",
+                        value="Queued for human outreach",
+                        inline=True,
+                    )
+                    final_embed.title = result_label
+                    final_embed.add_field(
+                        name="Outreach queue",
+                        value=(
+                            f"**{tier_label}** recommendation\n"
+                            "Queued for human outreach; no moderator contact is implied yet."
+                        ),
+                        inline=False,
+                    )
                 REQUEST_REVIEW_STATES.require("pending", "reviewed")
                 update_sql = (
                     "UPDATE weekly_request_reviews SET request_message_id=?, status='reviewed', result=?, "
@@ -3893,8 +4182,21 @@ class RequestLevelsCog(commands.Cog):
                     if target_kind == "weekly"
                     else
                     "UPDATE level_request_submissions SET request_message_id=?, status='reviewed', result=?, "
-                    "review_text=?, reviewed_by=?, reviewed_ts=?, correlation_id=? "
+                    "review_text=?, reviewed_by=?, reviewed_ts=?, correlation_id=?, send_type=? "
                     "WHERE guild_id=? AND request_message_id=? AND status='pending'"
+                )
+                review_table = "weekly_request_reviews" if target_kind == "weekly" else "level_request_submissions"
+                review_guard = (
+                    f"SELECT 1 FROM {review_table} WHERE guild_id=? AND request_message_id=? "  # nosec B608
+                    "AND status='reviewed' AND result=? AND reviewed_by=? AND reviewed_ts=? AND correlation_id=?"
+                )
+                review_guard_params = (
+                    interaction.guild.id,
+                    message_id,
+                    result_key,
+                    reviewer_id,
+                    reviewed_ts,
+                    correlation_id,
                 )
                 statements = [
                     (
@@ -3906,13 +4208,14 @@ class RequestLevelsCog(commands.Cog):
                             reviewer_id,
                             reviewed_ts,
                             correlation_id,
+                            *(() if target_kind == "weekly" else (normalized_send_type,)),
                             interaction.guild.id,
                             message_id,
                         ),
                     ),
                     (
                         "INSERT OR IGNORE INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        f"SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS({review_guard})",  # nosec B608
                         (
                             correlation_id,
                             f"request-result-channel:{interaction.guild.id}:{message_id}",
@@ -3934,11 +4237,13 @@ class RequestLevelsCog(commands.Cog):
                             reviewed_ts,
                             reviewed_ts,
                             reviewed_ts,
+                            *review_guard_params,
                         ),
                     ),
                     (
                         "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) "
-                        "SELECT ?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM workflow_events WHERE correlation_id=? AND entity_id=? AND event='reviewed')",
+                        f"SELECT ?,?,?,?,?,?,?,? WHERE EXISTS({review_guard}) "  # nosec B608
+                        "AND NOT EXISTS(SELECT 1 FROM workflow_events WHERE correlation_id=? AND entity_id=? AND event='reviewed')",
                         (
                             correlation_id,
                             "level_request",
@@ -3946,26 +4251,52 @@ class RequestLevelsCog(commands.Cog):
                             "reviewed",
                             interaction.guild.id,
                             reviewer_id,
-                            json.dumps({"result": result_key, "kind": target_kind}, separators=(",", ":")),
+                            json.dumps(
+                                {
+                                    "result": result_key,
+                                    "kind": target_kind,
+                                    "review_system_version": review_system_version,
+                                    "send_type": normalized_send_type,
+                                },
+                                separators=(",", ":"),
+                            ),
                             reviewed_ts,
+                            *review_guard_params,
                             correlation_id,
                             str(message_id),
                         ),
                     ),
                 ]
                 statements.append((
-                    "INSERT OR IGNORE INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) "
+                    f"SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS({review_guard})",  # nosec B608
                     (correlation_id, f"request-review-ui:{interaction.guild.id}:{message_id}", "edit_message",
                      interaction.guild.id, request_channel.id, requester_id, message_id,
-                     json.dumps({"embed": final_embed.to_dict(), "request_review_disabled": True}, separators=(",", ":")),
-                     "pending", 0, reviewed_ts, reviewed_ts, reviewed_ts),
+                     json.dumps({"embed": final_embed.to_dict(), "request_review_disabled": True,
+                                 "request_review_version": review_system_version}, separators=(",", ":")),
+                     "pending", 0, reviewed_ts, reviewed_ts, reviewed_ts, *review_guard_params),
                 ))
+                if (
+                    target_kind == "wave"
+                    and result_key == "sent"
+                    and review_system_version == PPS_V1_REVIEW_SYSTEM
+                    and normalized_send_type is not None
+                ):
+                    statements.append(
+                        self._pps_queue_insert_statement(
+                            row,
+                            send_type=normalized_send_type,
+                            reviewer_id=reviewer_id,
+                            reviewed_ts=reviewed_ts,
+                            correlation_id=correlation_id,
+                        )
+                    )
                 if notification_mode in {"dm", "both"}:
                     request_link = f"https://discord.com/channels/{interaction.guild.id}/{request_channel.id}/{message_id}"
                     statements.append(
                         (
                             "INSERT OR IGNORE INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) "
-                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            f"SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS({review_guard})",  # nosec B608
                             (
                                 correlation_id,
                                 f"request-result-dm:{interaction.guild.id}:{message_id}",
@@ -3976,7 +4307,10 @@ class RequestLevelsCog(commands.Cog):
                                 message_id,
                                 json.dumps(
                                     {
-                                        "content": f"Your level request was marked **{result_label}**. [Open the review]({request_link})",
+                                        "content": (
+                                            f"Your level request was marked **{result_label}**. "
+                                            f"[Open the review]({request_link})"
+                                        ),
                                         "embed": result_embed.to_dict(),
                                     },
                                     separators=(",", ":"),
@@ -3986,6 +4320,7 @@ class RequestLevelsCog(commands.Cog):
                                 reviewed_ts,
                                 reviewed_ts,
                                 reviewed_ts,
+                                *review_guard_params,
                             ),
                         )
                     )
@@ -3993,13 +4328,25 @@ class RequestLevelsCog(commands.Cog):
                 _, saved = await self._review_target_by_message(interaction.guild.id, message_id)
                 if saved is None or str(saved["result"]) != result_key or int(saved["reviewed_by"] or 0) != reviewer_id:
                     return await self._reply_ephemeral(interaction, "Another reviewer already completed this request. Their decision was preserved.")
+                if (
+                    review_system_version == PPS_V1_REVIEW_SYSTEM
+                    and result_key == "sent"
+                    and str(saved["send_type"] or "") != normalized_send_type
+                ):
+                    return await self._reply_ephemeral(
+                        interaction,
+                        "Storage did not confirm the recommendation tier. The request was left in its authoritative saved state.",
+                    )
             except Exception as e:
                 await log_error(self.bot, f"Could not save reviewed level request {message_id}: {repr(e)}")
                 return await self._reply_ephemeral(interaction, "Storage did not confirm the review. Check the request's current status before retrying; a delayed completion is possible.")
 
             result_warning = ""
             try:
-                await msg.edit(embed=final_embed, view=LevelRequestReviewView(disabled=True))
+                await msg.edit(
+                    embed=final_embed,
+                    view=self._review_view(row, target_kind, disabled=True),
+                )
             except Exception as e:
                 result_warning += " The original embed update is queued for automatic recovery."
                 await log_error(self.bot, f"Could not edit reviewed level request {message_id}: {repr(e)}")
@@ -4028,6 +4375,7 @@ class RequestLevelsCog(commands.Cog):
             "reviewed_messages_locked": 0,
             "weekly_pending_messages_recreated": 0,
             "weekly_reviewed_messages_locked": 0,
+            "pps_queue_entries_repaired": 0,
             "stale_validations_refreshed": 0,
             "validation_cache_pruned": False,
             "state_count_reconciled": False,
@@ -4157,7 +4505,7 @@ class RequestLevelsCog(commands.Cog):
                 if msg is None:
                     new_msg = await target_channel.send(
                         embed=embed,
-                        view=LevelRequestReviewView(),
+                        view=self._review_view(row),
                         allowed_mentions=no_mentions(),
                     )
                     try:
@@ -4180,7 +4528,7 @@ class RequestLevelsCog(commands.Cog):
                             (msg.id, guild.id, int(row["wave_id"]), int(row["user_id"])),
                         )
                     if refreshed_validation or recovered_message:
-                        await msg.edit(embed=embed, view=LevelRequestReviewView())
+                        await msg.edit(embed=embed, view=self._review_view(row))
                         result["pending_messages_refreshed"] += 1
             except Exception as e:
                 result["errors"].append(f"pending message {message_id or 'new'}: {type(e).__name__}")
@@ -4251,6 +4599,13 @@ class RequestLevelsCog(commands.Cog):
         )
         for row in reviewed_rows:
             try:
+                if (
+                    self._review_system_version(row) == PPS_V1_REVIEW_SYSTEM
+                    and str(row["result"] or "") == "sent"
+                ):
+                    priority_cog = self.bot.get_cog("PrioritySystemCog")
+                    if priority_cog is not None and await priority_cog.service.ensure_queue_for_submission(row):
+                        result["pps_queue_entries_repaired"] += 1
                 msg, recovered_message = await fetch_persisted_message(
                     target_channel,
                     int(row["request_message_id"]),
@@ -4261,10 +4616,31 @@ class RequestLevelsCog(commands.Cog):
                 if msg is None:
                     continue
                 if recovered_message:
-                    await self.bot.db.execute(
-                        "UPDATE level_request_submissions SET request_message_id=? "
-                        "WHERE guild_id=? AND wave_id=? AND user_id=? AND status='reviewed'",
-                        (msg.id, guild.id, int(row["wave_id"]), int(row["user_id"])),
+                    await self.bot.db.execute_transaction(
+                        (
+                            (
+                                "UPDATE level_request_submissions SET request_message_id=? "
+                                "WHERE guild_id=? AND wave_id=? AND user_id=? AND status='reviewed'",
+                                (
+                                    msg.id,
+                                    guild.id,
+                                    int(row["wave_id"]),
+                                    int(row["user_id"]),
+                                ),
+                            ),
+                            (
+                                "UPDATE level_outreach_queue SET request_message_id=?,updated_ts=? "
+                                "WHERE guild_id=? AND wave_id=? AND requester_id=?",
+                                (
+                                    msg.id,
+                                    int(time_module.time()),
+                                    guild.id,
+                                    int(row["wave_id"]),
+                                    int(row["user_id"]),
+                                ),
+                            ),
+                        ),
+                        retry_safe=True,
                     )
                 data = self._safe_json_loads(row["data_json"], {})
                 embed = self._embed_from_template(
@@ -4278,7 +4654,22 @@ class RequestLevelsCog(commands.Cog):
                     ),
                     default_color=self._color_name(str(row["result"] or "rejected"), "red"),
                 )
-                await msg.edit(embed=embed, view=LevelRequestReviewView(disabled=True))
+                if (
+                    self._review_system_version(row) == PPS_V1_REVIEW_SYSTEM
+                    and str(row["result"] or "") == "sent"
+                    and normalize_send_type(row["send_type"])
+                ):
+                    tier_label = send_type_label(row["send_type"])
+                    embed.title = f"Recommended: {tier_label}"
+                    embed.add_field(
+                        name="Outreach queue",
+                        value=(
+                            f"**{tier_label}** recommendation\n"
+                            "Queued for human outreach; no moderator contact is implied yet."
+                        ),
+                        inline=False,
+                    )
+                await msg.edit(embed=embed, view=self._review_view(row, disabled=True))
                 result["reviewed_messages_locked"] += 1
             except discord.NotFound:
                 continue

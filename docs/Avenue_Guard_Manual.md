@@ -19,39 +19,40 @@ Generated from the current Avenue Guard codebase and configuration for Rodrigo.
 11. Live Request System
 12. Request Validation And GD Metadata
 13. Review Workflow
-14. Weekly Activity And Rewards
-15. Help, Tickets, And Staff Support
-16. Background Telemetry
-17. Admin Tools And Diagnostics
-18. Impact Reporting
-19. External Services And Dependencies
-20. Failure Recovery
-21. Maintenance And Testing
-22. Appendix: Command Families
-23. Appendix: Data And Evidence
-24. Private Orientation: How To Study The Bot
-25. Source Inventory
-26. Command Surface Inventory
-27. Database Table Inventory
-28. Startup Code Walkthrough
-29. Database Code Walkthrough
-30. Config And Template Engine Walkthrough
-31. Persistent Views Walkthrough
-32. Live Request Code Walkthrough
-33. Validation Code Walkthrough
-34. Request Review Code Walkthrough
-35. Scheduled Openings Walkthrough
-36. Tracking Code Walkthrough
-37. Weekly Request Workflow Walkthrough
-38. Help And Ticket Code Walkthrough
-39. Background Telemetry Code Walkthrough
-40. Forum And Sticky Code Walkthrough
-41. Impact And Backup Code Walkthrough
-42. Server Icon Rotation Code Walkthrough
-43. Durable Operations Platform 3 22
-44. Runtime Isolation And Incident Recovery 3 22 1
-45. Engineering Thinking Behind The Bot
-46. Debugging Notebook
+14. Priority Point System V1
+15. Weekly Activity And Rewards
+16. Help, Tickets, And Staff Support
+17. Background Telemetry
+18. Admin Tools And Diagnostics
+19. Impact Reporting
+20. External Services And Dependencies
+21. Failure Recovery
+22. Maintenance And Testing
+23. Appendix: Command Families
+24. Appendix: Data And Evidence
+25. Private Orientation: How To Study The Bot
+26. Source Inventory
+27. Command Surface Inventory
+28. Database Table Inventory
+29. Startup Code Walkthrough
+30. Database Code Walkthrough
+31. Config And Template Engine Walkthrough
+32. Persistent Views Walkthrough
+33. Live Request Code Walkthrough
+34. Validation Code Walkthrough
+35. Request Review Code Walkthrough
+36. Scheduled Openings Walkthrough
+37. Tracking Code Walkthrough
+38. Weekly Request Workflow Walkthrough
+39. Help And Ticket Code Walkthrough
+40. Background Telemetry Code Walkthrough
+41. Forum And Sticky Code Walkthrough
+42. Impact And Backup Code Walkthrough
+43. Server Icon Rotation Code Walkthrough
+44. Durable Operations Platform 3 22
+45. Runtime Isolation And Incident Recovery 3 22 1
+46. Engineering Thinking Behind The Bot
+47. Debugging Notebook
 
 ## 1. Private Manual Notice
 
@@ -359,7 +360,314 @@ When a wave exists, the bot maintains a summary embed in level_requested. It sho
 
 Review actions are designed to be idempotent from a staff perspective. The bot checks the original request row, verifies that it is still pending, confirms the result channel, edits the original embed, writes the review fields, sends the final notification, and disables buttons. This reduces the chance that two reviewers can accidentally process the same request twice.
 
-## 14. Weekly Activity And Rewards
+## 14. Priority Point System V1
+
+PPS v1 is Avenue Guard's prospective, deterministic outreach queue. A reviewer still makes the human decision, and staff still perform moderator outreach manually. The system records a recommendation tier, resolves the current Creator Points of the Geometry Dash uploader, adds evidence-backed waiting, and gives the owner a durable ordering. The score is an operational priority, never a probability.
+
+> **The rollout boundary:** The wave present when schema 8 deploys remains legacy forever, including later submissions to that wave. Only a newly created wave ID receives pps_v1. Every card and repair path reads the saved row version instead of a global switch.
+
+#### Versioned Review Path
+
+```mermaid
+flowchart LR
+  S1["new wave gets persisted version"]
+  S2["submission copies wave version"]
+  S3["legacy renders Send button"]
+  S4["pps_v1 renders five-tier select"]
+  S5["review transaction stores result and tier"]
+  S6["one durable outreach entry"]
+  S1 --> S2
+  S2 --> S3
+  S3 --> S4
+  S4 --> S5
+  S5 --> S6
+```
+
+> Weekly reward requests are separate and stay on the legacy controls.
+
+### Recommendation UI And Meaning
+
+A PPS review card replaces generic Send with Rate, Feature, Epic, Legendary, and Mythic. Selecting a tier opens the optional comment modal immediately so Discord receives an acknowledgement before database or network work. Modal submission reloads the authoritative row, verifies permissions and pending status, stores result=sent plus send_type, and creates the queue record in the guarded transaction. The user sees Recommended and Added to the outreach queue; the bot never claims the level already reached a moderator.
+
+### The Three Components
+
+| Component | Definition | Important safety rule |
+| --- | --- | --- |
+| F | 1.8^T - 1, where T comes from the review tier | Fixed by the original recommendation |
+| G | max(0, ln(0.25 / (0.06*C + 0.01))) | C is uploader CP; unknown is null, never zero |
+| H | 1.5 * min(W, 4)^1.5 | W increases only after a successful outreach cycle |
+| P | F + G + H | Null while any required component is unknown |
+
+#### PPS v1 formula with plain-language commentary
+
+```python
+# The review tier supplies a stable prestige coordinate.
+tier = prestige_x[send_type]
+f = prestige_base ** tier - 1.0
+
+# A failed profile lookup returns None. It is not converted to zero CP.
+g = None if current_cp is None else max(
+    0.0,
+    math.log(0.25 / (0.06 * current_cp + 0.01)),
+)
+
+# Keep the real W for evidence and tie-breaking, but cap its score effect.
+h = 1.5 * min(waiting_cycles, 4) ** 1.5
+
+# An incomplete score remains visibly incomplete.
+priority = None if g is None else f + g + h
+```
+
+#### Actual score-component implementation (utils/priority_system.py:177-195)
+
+```python
+ 177: def score_components(
+ 178:     send_type: str,
+ 179:     creator_points: int | None,
+ 180:     waiting_cycles: int,
+ 181:     settings: PrioritySettings,
+ 182: ) -> dict[str, Any]:
+ 183:     tier, prestige = prestige_component(send_type, settings)
+ 184:     creator = creator_opportunity_component(creator_points, settings)
+ 185:     waiting = waiting_component(waiting_cycles, settings)
+ 186:     complete = creator is not None
+ 187:     return {
+ 188:         "prestige_t": tier,
+ 189:         "prestige_component_f": prestige,
+ 190:         "creator_component_g": creator,
+ 191:         "waiting_component_h": waiting,
+ 192:         "priority_points": prestige + creator + waiting if complete else None,
+ 193:         "priority_complete": int(complete),
+ 194:         "model_version": settings.model_version,
+ 195:     }
+```
+
+### Outreach Cycles
+
+A request wave collects community submissions; an outreach cycle records a real staff round of trying to get recommended levels to moderators. Starting a cycle snapshots every currently queued candidate and its F/G/H/P, CP, W, and model version. Levels added later do not belong to that snapshot and cannot age from it.
+
+#### Successful Cycle Aging
+
+```mermaid
+flowchart LR
+  S1["snapshot eligible queue"]
+  S2["record planned/attempted/failed work"]
+  S3["confirm at least one submitted_to_mod"]
+  S4["submitted entries move to outcomes"]
+  S5["eligible unsubmitted entries gain W + 1"]
+  S6["transaction closes cycle once"]
+  S1 --> S2
+  S2 --> S3
+  S3 --> S4
+  S4 --> S5
+  S5 --> S6
+```
+
+> A zero-submission cycle is cancelled without increasing W. Repeating completion cannot double-increment it.
+
+#### Actual successful-cycle transaction (services/priority_system.py:348-430)
+
+```python
+ 348:     async def complete_cycle(self, guild_id: int, cycle_id: int, actor_id: int):
+ 349:         async with self._cycle_lock:
+ 350:             cycle = await self.db.fetchone(
+ 351:                 "SELECT * FROM level_outreach_cycles WHERE id=? AND guild_id=?",
+ 352:                 (cycle_id, guild_id),
+ 353:             )
+ 354:             if not cycle:
+ 355:                 raise ValueError("Outreach cycle not found")
+ 356:             if str(cycle["status"]) == "completed":
+ 357:                 return cycle, 0
+ 358:             if str(cycle["status"]) != "active":
+ 359:                 raise ValueError("Only an active outreach cycle can be completed")
+ 360:             entries = await self.db.fetchall(
+ 361:                 "SELECT e.*,q.send_type,q.current_creator_points,q.waiting_cycles,q.queue_state "
+ 362:                 "FROM level_outreach_cycle_entries e JOIN level_outreach_queue q ON q.id=e.queue_id "
+ 363:                 "WHERE e.cycle_id=?",
+ 364:                 (cycle_id,),
+ 365:             )
+ 366:             if not any(int(row["submitted_to_mod"] or 0) == 1 for row in entries):
+ 367:                 raise ValueError("This cycle has no confirmed moderator submission; cancel it as unsuccessful instead")
+ 368:             now = int(time.time())
+ 369:             statements: list[tuple[str, tuple[Any, ...]]] = []
+ 370:             incremented = 0
+ 371:             for row in entries:
+ 372:                 if int(row["submitted_to_mod"] or 0) or int(row["waiting_incremented"] or 0):
+ 373:                     continue
+ 374:                 if str(row["queue_state"]) != "in_cycle":
+ 375:                     continue
+ 376:                 waiting_cycles = int(row["waiting_cycles"] or 0) + 1
+ 377:                 score = score_components(
+ 378:                     str(row["send_type"]),
+ 379:                     row["current_creator_points"],
+ 380:                     waiting_cycles,
+ 381:                     self.settings,
+ 382:                 )
+ 383:                 statements.extend(
+ 384:                     [
+ 385:                         (
+ 386:                             "UPDATE level_outreach_queue SET waiting_cycles=?,waiting_component_h=?,creator_component_g=?,"
+ 387:                             "priority_points=?,priority_complete=?,queue_state='queued',updated_ts=? WHERE id=? AND queue_state='in_cycle' "
+ 388:                             "AND EXISTS(SELECT 1 FROM level_outreach_cycle_entries e JOIN level_outreach_cycles c ON c.id=e.cycle_id "
+ 389:                             "WHERE e.cycle_id=? AND e.queue_id=? AND e.waiting_incremented=0 AND e.submitted_to_mod=0 AND c.status='active')",
+ 390:                             (
+ 391:                                 waiting_cycles,
+ 392:                                 score["waiting_component_h"],
+ 393:                                 score["creator_component_g"],
+ 394:                                 score["priority_points"],
+ 395:                                 score["priority_complete"],
+ 396:                                 now,
+ 397:                                 int(row["queue_id"]),
+ 398:                                 cycle_id,
+ 399:                                 int(row["queue_id"]),
+ 400:                             ),
+ 401:                         ),
+ 402:                         (
+ 403:                             "UPDATE level_outreach_cycle_entries SET waiting_incremented=1 WHERE cycle_id=? AND queue_id=? "
+ 404:                             "AND waiting_incremented=0 AND submitted_to_mod=0 "
+ 405:                             "AND EXISTS(SELECT 1 FROM level_outreach_cycles WHERE id=? AND status='active')",
+ 406:                             (cycle_id, int(row["queue_id"]), cycle_id),
+ 407:                         ),
+ 408:                     ]
+ 409:                 )
+ 410:                 incremented += 1
+ 411:             statements.extend(
+ 412:                 [
+ 413:                     (
+ 414:                         "UPDATE level_outreach_cycles SET status='completed',completed_by=?,completed_ts=?,successful=1 "
+ 415:                         "WHERE id=? AND guild_id=? AND status='active'",
+ 416:                         (actor_id, now, cycle_id, guild_id),
+ 417:                     ),
+ 418:                     (
+ 419:                         "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) "
+ 420:                         "SELECT correlation_id,'priority_system',?,'cycle_completed',?,?,?,? FROM level_outreach_cycles c "
+ 421:                         "WHERE c.id=? AND c.status='completed' AND NOT EXISTS(SELECT 1 FROM workflow_events w WHERE w.correlation_id=c.correlation_id AND w.event='cycle_completed')",
+ 422:                         (f"cycle:{cycle_id}", guild_id, actor_id, json.dumps({"waiting_incremented": incremented}), now, cycle_id),
+ 423:                     ),
+ 424:                 ]
+ 425:             )
+ 426:             await self.db.execute_transaction(statements, retry_safe=True)
+ 427:             saved = await self.db.fetchone(
+ 428:                 "SELECT * FROM level_outreach_cycles WHERE id=?", (cycle_id,)
+ 429:             )
+ 430:             return saved, incremented
+```
+
+### Prospective Evidence
+
+PPS keeps append-only CP and level snapshots, cycle membership, private attempts, confirmed moderator-submission time, rating observations, and a fixed 30-day result. This creates the evidence the earlier historical audit could not reconstruct. No Bayesian model is calculated in this release.
+
+#### Bounded maintenance pass (services/priority_system.py:791-871)
+
+```python
+ 791:     async def maintenance_once(self, guild_id: int) -> dict[str, int]:
+ 792:         now = int(time.time())
+ 793:         settings = self.settings
+ 794:         placeholders = ",".join("?" for _ in PPS_QUEUE_REFRESH_STATES)
+ 795:         rows = await self.db.fetchall(
+ 796:             f"SELECT id FROM level_outreach_queue WHERE guild_id=? AND queue_state IN({placeholders}) "  # nosec B608
+ 797:             "AND (COALESCE(level_refresh_after_ts,0)<=? OR (uploader_account_id IS NOT NULL AND COALESCE(creator_points_refresh_after_ts,0)<=?)) "
+ 798:             "ORDER BY MIN(COALESCE(level_refresh_after_ts,0),COALESCE(creator_points_refresh_after_ts,0)),id LIMIT ?",
+ 799:             (
+ 800:                 guild_id,
+ 801:                 *PPS_QUEUE_REFRESH_STATES,
+ 802:                 now,
+ 803:                 now,
+ 804:                 settings.maintenance_batch_size,
+ 805:             ),
+ 806:         )
+ 807:         refreshed = failed = 0
+ 808:         attempted_refreshes: set[int] = set()
+ 809:         successful_refreshes: set[int] = set()
+ 810:         for item in rows:
+ 811:             queue_id = int(item["id"])
+ 812:             attempted_refreshes.add(queue_id)
+ 813:             try:
+ 814:                 await self.refresh_queue_entry(queue_id)
+ 815:                 successful_refreshes.add(queue_id)
+ 816:                 refreshed += 1
+ 817:             except Exception as exc:
+ 818:                 failed += 1
+ 819:                 await log_error(
+ 820:                     self.bot,
+ 821:                     f"PPS queue refresh deferred queue_id={queue_id}: {type(exc).__name__}: {str(exc)[:300]}",
+ 822:                 )
+ 823:         due = await self.db.fetchall(
+ 824:             "SELECT id,rated_observed_ts,outcome_window_due_ts FROM level_outreach_queue "
+ 825:             "WHERE guild_id=? AND submitted_to_mod_ts IS NOT NULL AND outcome_window_due_ts<=? "
+ 826:             "AND outcome_window_completed_ts IS NULL ORDER BY outcome_window_due_ts LIMIT ?",
+ 827:             (guild_id, now, settings.maintenance_batch_size),
+ 828:         )
+ 829:         completed = 0
+ 830:         for row in due:
+ 831:             queue_id = int(row["id"])
+ 832:             if queue_id in attempted_refreshes and queue_id not in successful_refreshes:
+ 833:                 continue
+ 834:             try:
+ 835:                 if queue_id in successful_refreshes:
+ 836:                     refreshed_row = await self.db.fetchone(
+ 837:                         "SELECT * FROM level_outreach_queue WHERE id=?", (queue_id,)
+ 838:                     )
+ 839:                 else:
+ 840:                     refreshed_row = await self.refresh_queue_entry(
+ 841:                         queue_id, force_level=True
+ 842:                     )
+ 843:                 latest_snapshot = await self.db.fetchone(
+ 844:                     "SELECT lookup_status FROM level_outreach_level_snapshots WHERE queue_id=? ORDER BY checked_ts DESC,id DESC LIMIT 1",
+ 845:                     (queue_id,),
+ 846:                 )
+ 847:                 if (
+ 848:                     not refreshed_row
+ 849:                     or not latest_snapshot
+ 850:                     or str(latest_snapshot["lookup_status"]) != "ok"
+ 851:                 ):
+ 852:                     failed += 1
+ 853:                     continue
+ 854:                 row = refreshed_row
+ 855:             except Exception as exc:
+ 856:                 failed += 1
+ 857:                 await log_error(
+ 858:                     self.bot,
+ 859:                     f"PPS outcome-window refresh deferred queue_id={queue_id}: {type(exc).__name__}: {str(exc)[:300]}",
+ 860:                 )
+ 861:                 continue
+ 862:             rated_within = int(
+ 863:                 row["rated_observed_ts"] is not None
+ 864:                 and int(row["rated_observed_ts"]) <= int(row["outcome_window_due_ts"])
+ 865:             )
+ 866:             completed += await self.db.execute_affected(
+ 867:                 "UPDATE level_outreach_queue SET rated_within_window=?,outcome_window_completed_ts=?,updated_ts=? "
+ 868:                 "WHERE id=? AND outcome_window_completed_ts IS NULL",
+ 869:                 (rated_within, now, now, int(row["id"])),
+ 870:             )
+ 871:         return {"refreshed": refreshed, "failed": failed, "outcomes_completed": completed}
+```
+
+| Private command | What it controls |
+| --- | --- |
+| /pps dashboard | Rollout version, queue health, active cycle and outcome totals |
+| /pps queue | Ranked complete and CP-pending entries |
+| /pps level | Score components, snapshots, cycle membership and private attempts |
+| /pps cycle | Start, inspect, complete or cancel a durable cycle |
+| /pps outreach | Record an attempt or confirmed moderator submission |
+| /pps refresh | Refresh providers or record a reasoned CP override |
+| /pps stats | Prospective evidence totals without probabilities |
+
+### Recovery
+
+Both legacy and PPS persistent views register at startup. Request repair restores controls from the submission's saved version, relocks reviewed cards, and can idempotently recreate a missing queue entry only for a reviewed pps_v1 sent row with a valid tier. Background maintenance is supervised, works in bounded batches, and preserves unknown provider results rather than making them look like negative evidence.
+
+#### Saved-version view selection (cogs/RequestLevels.py:2048-2052)
+
+```python
+2048:     def _review_view(self, row, target_kind: str = "wave", *, disabled: bool = False):
+2049:         return request_review_view(
+2050:             self._review_system_version(row, target_kind),
+2051:             disabled=disabled,
+2052:         )
+```
+
+## 15. Weekly Activity And Rewards
 
 TrackingCog counts eligible member messages by week. It skips excluded channels and roles, uses a cooldown to avoid overcounting rapid-fire messages, buffers writes to reduce SQLite load, and applies anti-farm checks before messages are added to the weekly leaderboard.
 
@@ -373,7 +681,7 @@ Weekly streaks reward members who repeatedly place in the configured top rank ba
 
 Manual force-DM exists for operational exceptions. Admins can send the weekly request DM to a member even if normal tracking would exclude them or the automatic reward is disabled for the week. The result is logged so manual overrides remain visible to future staff.
 
-## 15. Help, Tickets, And Staff Support
+## 16. Help, Tickets, And Staff Support
 
 The DM help system starts from a dashboard. Members can see active ticket status, weekly activity status, current request state, recent help submissions, and cooldowns. The menu hides the option the user is already viewing, cleans up previous screens when possible, and supports Back, Cancel, and Start Over controls.
 
@@ -406,7 +714,7 @@ Tickets use atomic ticket IDs, private channels, status tags, inactivity scans, 
 
 The help system is intentionally private-first. It gives members a place to ask for help without escalating every issue into a public channel, but it still creates staff-visible logs when something becomes an official submission. This balances member comfort with staff accountability.
 
-## 16. Background Telemetry
+## 17. Background Telemetry
 
 BackgroundCog is the bot's measurement layer. It listens for messages, edits, deletes, reactions, joins, leaves, bans, unbans, boosts, voice state changes, command completions, and command errors. These events are accumulated into daily snapshots and persisted in daily_stats.
 
@@ -435,7 +743,7 @@ The bot can rotate its Discord status using placeholders such as members, online
 
 Daily stats are useful but should be read as operational telemetry, not perfect analytics. They depend on bot uptime, enabled intents, cache visibility, and events the bot can observe. That is why impact reports label large totals as tracked events rather than claiming to represent every possible interaction in the community.
 
-## 17. Admin Tools And Diagnostics
+## 18. Admin Tools And Diagnostics
 
 CommandsCog exposes most operator-facing slash commands. It includes tracking commands, ticket commands, forum required-word management, request review filters, request history, request repair, server icon controls, fun commands, and bot diagnostics.
 
@@ -454,7 +762,7 @@ The admin dashboard is a button-driven status view. It gathers system health, re
 
 > **Operator principle:** When a feature can fail because a Discord message, channel, permission, or config value changed, the bot should expose a command that explains or repairs it.
 
-## 18. Impact Reporting
+## 19. Impact Reporting
 
 The owner-only /bot impact command turns the bot's persistent state into a quantifiable impact report. It collects current server size, unique members touched by tracked workflows, tracked interaction events, support/help volume, ticket volume, transcripts, request totals, review rates, weekly reward activity, command usage, voice minutes, anti-farm events, and summary history.
 
@@ -487,7 +795,7 @@ For best evidence, run /bot impact on a recurring cadence such as monthly or bef
 
 > **Example CV wording:** Built and maintained Avenue Guard, a Discord operations bot supporting a multi-thousand-member community, coordinating level request workflows, staff tickets, weekly rewards, help flows, moderation guardrails, and persistent impact reporting.
 
-## 19. External Services And Dependencies
+## 20. External Services And Dependencies
 
 Avenue Guard relies on Discord as its primary platform, py-cord as its Discord framework, aiohttp for asynchronous HTTP, SQLite for persistence, and optional hosted infrastructure for runtime availability. Most data remains local to the bot's database and Discord channels.
 
@@ -497,7 +805,7 @@ The Geometry Dash validation feature uses GDBrowser and the GD/Boomlings endpoin
 
 The bot now exports multiple CSV impact files. That is the safest immediate bridge to Google Sheets because it does not require storing Google credentials in the bot. If a future service account or Google Drive integration is added, the same metrics payload can be uploaded automatically. Until then, the summary, trend, and breakdown CSV files are designed to import cleanly into a spreadsheet.
 
-## 20. Failure Recovery
+## 21. Failure Recovery
 
 Avenue Guard assumes that Discord state can drift. A message can be deleted, a channel can be moved, a role can be missing, a permission can change, a provider can fail, or a database can be older than the current code. Recovery is therefore built into migrations, diagnostics, admin logs, repair commands, and cautious external validation.
 
@@ -514,7 +822,7 @@ Avenue Guard assumes that Discord state can drift. A message can be deleted, a c
 
 In practice, most failures fall into a few categories: config points at a missing channel, the bot lacks a permission, a message was deleted, an external provider failed, a user disabled DMs, or a deploy restarted the process mid-workflow. The bot's current recovery tools are aimed at exactly those categories.
 
-## 21. Maintenance And Testing
+## 22. Maintenance And Testing
 
 The main test guide is TEST_CHECKLIST.md. It is intentionally server-side because many behaviors require Discord state: roles, channels, messages, DMs, buttons, modals, slash command permissions, forum threads, scheduled tasks, and external request validation.
 
@@ -530,7 +838,7 @@ Code-level checks still matter. The project should compile cleanly, config.json 
 6. Run /bot impact periodically and keep the CSV files for trend tracking.
 7. Update this manual when new feature families are added.
 
-## 22. Appendix: Command Families
+## 23. Appendix: Command Families
 
 The bot exposes commands by family so staff can discover tools without memorizing every implementation detail. Command descriptions are kept clean; role restrictions are enforced by code instead of being advertised awkwardly in every description.
 
@@ -548,7 +856,7 @@ The bot exposes commands by family so staff can discover tools without memorizin
 
 Use public commands for member self-service, mod commands for ticket and forum operations, admin commands for stateful or config-affecting actions, and repair/doctor commands whenever Discord state no longer matches the database.
 
-## 23. Appendix: Data And Evidence
+## 24. Appendix: Data And Evidence
 
 Avenue Guard's strongest evidence is the data it already generates. Tickets, transcripts, help submissions, request waves, weekly claims, daily stats, and impact reports can show how much community work the bot has handled. The important thing is to use labels that match what is measured.
 
@@ -563,7 +871,7 @@ Avenue Guard's strongest evidence is the data it already generates. Tickets, tra
 
 For a CV, the safest wording combines a clear build claim with measured impact. For example: Built Avenue Guard, a Discord operations bot for GD Avenue that automates request waves, weekly rewards, tickets, help workflows, moderation guardrails, and analytics, with persistent reports quantifying member reach, support volume, request throughput, and staff review outcomes.
 
-## 24. Private Orientation: How To Study The Bot
+## 25. Private Orientation: How To Study The Bot
 
 This private section is written for you as the builder-owner of Avenue Guard. The goal is not only to know which commands exist. The goal is to understand how a Discord event becomes code, how code turns into stored state, how that state survives a restart, and how the bot repairs visible Discord messages when they drift.
 
@@ -602,37 +910,41 @@ flowchart LR
 
 > **The important pattern:** Avenue Guard is event-driven, but its serious workflows are state-driven. The event starts the logic; the database decides what is true.
 
-## 25. Source Inventory
+## 26. Source Inventory
 
 This chapter is generated from the current source files. It gives you a quick structural map before the deeper walkthroughs. Line counts are not a quality metric by themselves, but they reveal where most of the bot's complexity lives.
 
 | File | Lines | Shape | Discord Hooks |
 | --- | --- | --- | --- |
-| main.py | 730 | 2 classes / 26 functions | 0 listeners / 0 loops |
+| main.py | 755 | 2 classes / 26 functions | 0 listeners / 0 loops |
 | cogs/Background.py | 1397 | 3 classes / 89 functions | 12 listeners / 5 loops |
-| cogs/Commands.py | 4858 | 3 classes / 144 functions | 0 listeners / 0 loops |
-| cogs/Help.py | 4734 | 10 classes / 177 functions | 1 listeners / 0 loops |
+| cogs/Commands.py | 5006 | 3 classes / 152 functions | 0 listeners / 0 loops |
+| cogs/Help.py | 4759 | 10 classes / 178 functions | 1 listeners / 0 loops |
 | cogs/MessageResponses.py | 201 | 1 classes / 9 functions | 1 listeners / 0 loops |
 | cogs/Mod.py | 351 | 1 classes / 11 functions | 3 listeners / 0 loops |
-| cogs/Operations.py | 633 | 1 classes / 26 functions | 0 listeners / 0 loops |
-| cogs/Release.py | 941 | 1 classes / 34 functions | 0 listeners / 0 loops |
-| cogs/RequestLevels.py | 4259 | 9 classes / 170 functions | 0 listeners / 0 loops |
+| cogs/Operations.py | 651 | 1 classes / 26 functions | 0 listeners / 0 loops |
+| cogs/PrioritySystem.py | 557 | 1 classes / 19 functions | 0 listeners / 0 loops |
+| cogs/Release.py | 987 | 1 classes / 41 functions | 0 listeners / 0 loops |
+| cogs/RequestLevels.py | 4748 | 9 classes / 178 functions | 0 listeners / 0 loops |
 | cogs/Sticky.py | 634 | 1 classes / 28 functions | 2 listeners / 0 loops |
-| cogs/Tracking.py | 2379 | 2 classes / 67 functions | 1 listeners / 0 loops |
+| cogs/Tracking.py | 2380 | 2 classes / 68 functions | 1 listeners / 0 loops |
 | services/backups.py | 82 | 0 classes / 2 functions | 0 listeners / 0 loops |
 | services/diagnostics.py | 169 | 1 classes / 2 functions | 0 listeners / 0 loops |
 | services/impact.py | 77 | 1 classes / 2 functions | 0 listeners / 0 loops |
+| services/priority_system.py | 922 | 1 classes / 23 functions | 0 listeners / 0 loops |
 | services/request_reviews.py | 100 | 1 classes / 4 functions | 0 listeners / 0 loops |
 | services/request_scheduling.py | 51 | 1 classes / 4 functions | 0 listeners / 0 loops |
 | services/request_validation.py | 29 | 0 classes / 3 functions | 0 listeners / 0 loops |
 | utils/config.py | 85 | 1 classes / 7 functions | 0 listeners / 0 loops |
-| utils/config_schema.py | 394 | 2 classes / 7 functions | 0 listeners / 0 loops |
-| utils/db.py | 1894 | 3 classes / 74 functions | 0 listeners / 0 loops |
+| utils/config_schema.py | 415 | 2 classes / 7 functions | 0 listeners / 0 loops |
+| utils/db.py | 2057 | 3 classes / 77 functions | 0 listeners / 0 loops |
 | utils/errors.py | 314 | 1 classes / 19 functions | 0 listeners / 0 loops |
-| utils/gd_validation.py | 443 | 0 classes / 17 functions | 0 listeners / 0 loops |
-| utils/outbox.py | 290 | 2 classes / 12 functions | 0 listeners / 0 loops |
+| utils/gd_validation.py | 492 | 0 classes / 19 functions | 0 listeners / 0 loops |
+| utils/outbox.py | 323 | 2 classes / 12 functions | 0 listeners / 0 loops |
+| utils/priority_system.py | 195 | 1 classes / 9 functions | 0 listeners / 0 loops |
+| utils/priority_system_schema.py | 139 | 0 classes / 0 functions | 0 listeners / 0 loops |
 | utils/server_icons.py | 100 | 0 classes / 7 functions | 0 listeners / 0 loops |
-| utils/views.py | 355 | 11 classes / 25 functions | 0 listeners / 0 loops |
+| utils/views.py | 427 | 13 classes / 31 functions | 0 listeners / 0 loops |
 | utils/workflows.py | 116 | 2 classes / 9 functions | 0 listeners / 0 loops |
 
 The largest files are large because they own full workflows, not because they only hold utility helpers. RequestLevels.py owns a state machine with modals, validation, buttons, scheduled openings, review actions, and repairs. Commands.py owns the command surface and cross-system diagnostics. Help.py owns the DM and ticket state machines.
@@ -641,7 +953,7 @@ The largest files are large because they own full workflows, not because they on
 
 When debugging, avoid starting from the biggest file and scrolling randomly. Start from the user action. If it is a slash command, search the command name. If it is a button, search the custom ID in utils/views.py and follow the handler. If it is a background action, search the task loop name or the database table it changes.
 
-## 26. Command Surface Inventory
+## 27. Command Surface Inventory
 
 This table is extracted from command registrations. The bot has direct commands and grouped commands. Some legacy or programmatic commands appear by short name here, while their actual Discord path may include a group such as /bot, /tracking, /ticket, /requests, /forum, or /server_icon.
 
@@ -652,21 +964,28 @@ This table is extracted from command registrations. The bot has direct commands 
 | /backup | cogs/Commands.py | Create a durable database backup |
 | /close | cogs/Commands.py | Close the current ticket channel |
 | /config_check | cogs/Commands.py | Check configured channels and roles |
+| /cycle | cogs/Commands.py | Start, inspect, complete, or cancel an outreach cycle |
 | /dance | cogs/Commands.py | Send a dance GIF |
 | /dashboard | cogs/Commands.py | Open the admin system dashboard |
+| /dashboard | cogs/Commands.py | Show the private PPS queue and worker overview |
 | /disable_reward | cogs/Commands.py | Disable this week's automatic weekly request reward |
 | /doctor | cogs/Commands.py | Run deep bot permission diagnostics |
 | /enable_reward | cogs/Commands.py | Re-enable this week's automatic weekly request reward |
 | /force_dm | cogs/Commands.py | Force-send the weekly request DM to a user |
 | /gambling | cogs/Commands.py | Try your luck in a quick slots game |
 | /health | cogs/Commands.py | Show bot health and live system status |
+| /historical_audit | cogs/Commands.py | Run or inspect a private historical request audit |
 | /history | cogs/Commands.py | Show request edit history |
 | /impact | cogs/Commands.py | Generate a persistent community impact report |
+| /level | cogs/Commands.py | Inspect one queue entry and its private evidence |
 | /me | cogs/Commands.py | Show your activity stats for this week |
 | /mode | cogs/Commands.py | Set server icon rotation mode |
 | /next | cogs/Commands.py | Change to the next configured server icon now |
 | /notifications | cogs/Commands.py | Choose how request results notify you |
+| /outreach | cogs/Commands.py | Record a private outreach attempt or confirmed submission |
 | /pending | cogs/Commands.py | Show and filter pending request reviews |
+| /queue | cogs/Commands.py | Browse the ranked outreach queue |
+| /refresh | cogs/Commands.py | Refresh queue metadata or audit a CP override |
 | /release | cogs/Commands.py | Prepare a version update for private approval |
 | /releases | cogs/Commands.py | Show approved and pending bot releases |
 | /remove | cogs/Commands.py | Remove a server icon URL by number |
@@ -680,6 +999,7 @@ This table is extracted from command registrations. The bot has direct commands 
 | /retention | cogs/Commands.py | View, update, or run data retention |
 | /rock-paper-scissors | cogs/Commands.py | Play Rock Paper Scissors |
 | /set | cogs/Commands.py | Change to a specific configured server icon now |
+| /stats | cogs/Commands.py | Show prospective PPS evidence totals |
 | /status | cogs/Commands.py | Set the current ticket status |
 | /status | cogs/Commands.py | Show server icon rotation status |
 | /storage | cogs/Commands.py | Show database storage and backup status |
@@ -694,13 +1014,14 @@ This table is extracted from command registrations. The bot has direct commands 
 
 > **Descriptions are intentionally clean:** The code enforces permissions. The command descriptions do not need to carry visual labels like admin-only or owner-only.
 
-## 27. Database Table Inventory
+## 28. Database Table Inventory
 
 This table is extracted from utils/db.py. It is one of the most useful quick-reference sections because almost every serious Avenue Guard behavior has a table behind it.
 
 | Table | Purpose |
 | --- | --- |
 | activity_counts | Weekly activity totals. |
+| activity_flush_batches | Persistent workflow state. |
 | activity_last_counted | Per-user cooldown memory for activity counting. |
 | anti_farm_events | Skipped low-effort activity events. |
 | ban_info_requests | Persistent workflow state. |
@@ -718,7 +1039,20 @@ This table is extracted from utils/db.py. It is one of the most useful quick-ref
 | help_cooldowns | Help action rate limits. |
 | help_sessions | Current DM help flow stage. |
 | help_submissions | Appeals, reports, and bot issue records. |
+| historical_audit_creators | Persistent workflow state. |
+| historical_audit_levels | Persistent workflow state. |
+| historical_audit_requests | Persistent workflow state. |
+| historical_audit_runs | Persistent workflow state. |
+| historical_creator_audit_snapshots | Persistent workflow state. |
+| historical_level_audit_snapshots | Persistent workflow state. |
+| historical_prestige_labels | Persistent workflow state. |
 | impact_snapshots | Owner impact report payload history. |
+| level_outreach_attempts | Private outreach routes, outcomes, targets and notes. |
+| level_outreach_cp_snapshots | Append-only current uploader CP evidence. |
+| level_outreach_cycle_entries | Start-of-cycle candidate and score snapshots. |
+| level_outreach_cycles | Owner-managed outreach round lifecycle. |
+| level_outreach_level_snapshots | Append-only current level and rating evidence. |
+| level_outreach_queue | PPS scores, source requests, queue state, CP and outcomes. |
 | level_request_edit_audit | Before/after request edit snapshots. |
 | level_request_scheduled_openings | Future request openings. |
 | level_request_state | Current live request wave state. |
@@ -750,248 +1084,249 @@ This table is extracted from utils/db.py. It is one of the most useful quick-ref
 
 The table names are grouped by feature family. activity_* and weekly_* belong to tracking. ticket_* and help_* belong to support. level_request_* and gd_level_validation_cache belong to live requests. daily_stats, impact_snapshots, and database_backups belong to measurement and durability.
 
-## 28. Startup Code Walkthrough
+## 29. Startup Code Walkthrough
 
 main.py is the bot's entry point. The most important startup choice is that production resolves a writable embedded replica and valid Turso credentials before Discord login. That prevents a briefly online but unusable bot and refuses an accidental fallback to disposable host storage.
 
-#### Database path resolution excerpt (main.py:298-365)
+#### Database path resolution excerpt (main.py:313-380)
 
 ```python
- 298: def resolve_db_path(config: Config) -> tuple[str, str, str, str, str]:
- 299:     warnings: list[str] = []
- 300:     require_remote = bool(config.get("database", "require_remote_when_configured", default=True))
- 301:     allow_local_fallback = os.getenv("ALLOW_LOCAL_DATABASE_FALLBACK", "").strip().casefold() in {
- 302:         "1",
- 303:         "true",
- 304:         "yes",
- 305:         "on",
- 306:     }
- 307:     turso_url = (
- 308:         os.getenv("TURSO_DATABASE_URL", "")
- 309:         or os.getenv("LIBSQL_URL", "")
- 310:         or str(config.get("database", "turso_url", default="") or "")
- 311:     ).strip()
- 312:     turso_token = (os.getenv("TURSO_AUTH_TOKEN", "") or os.getenv("LIBSQL_AUTH_TOKEN", "")).strip()
- 313:     if turso_url:
- 314:         if turso_token:
- 315:             replica_path = (
- 316:                 os.getenv("TURSO_REPLICA_PATH", "").strip()
- 317:                 or str(config.get("database", "turso_replica_path", default="") or "").strip()
- 318:                 or TURSO_REPLICA_PATH
- 319:             )
- 320:             ok, error = _database_path_usable(replica_path)
- 321:             if ok:
- 322:                 return replica_path, "Turso/libSQL embedded replica", "", turso_url, turso_token
- 323:             message = f"Turso replica path is not writable: {replica_path} ({error})"
- 324:             if require_remote and not allow_local_fallback:
- 325:                 raise PersistenceConfigurationError(
- 326:                     f"{message}. Refusing to start on disposable local storage. Fix TURSO_REPLICA_PATH or set "
- 327:                     "ALLOW_LOCAL_DATABASE_FALLBACK=1 for intentional local development."
- 328:                 )
- 329:             warnings.append(f"{message}; falling back to local SQLite")
- 330:         else:
- 331:             message = "A Turso/libSQL database URL is set but TURSO_AUTH_TOKEN is missing"
- 332:             if require_remote and not allow_local_fallback:
- 333:                 raise PersistenceConfigurationError(
- 334:                     f"{message}. Refusing to start on disposable local storage. Add the database token or set "
- 335:                     "ALLOW_LOCAL_DATABASE_FALLBACK=1 for intentional local development."
- 336:                 )
- 337:             warnings.append(f"{message}; falling back to local SQLite")
- 338:
- 339:     env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
- 340:     candidates: list[tuple[str, str, bool]] = []
- 341:     if env_path:
- 342:         candidates.append(("AVENUE_GUARD_DB_PATH", env_path, True))
- 343:     config_path = str(config.get("database", "path", default="") or "").strip()
- 344:     if config_path:
- 345:         candidates.append(("config.json database.path", config_path, False))
- 346:     candidates.append(("Render Persistent Disk auto-detect", RENDER_DISK_DB_PATH, False))
- 347:     candidates.append(("local fallback", DEFAULT_DB_PATH, False))
- 348:
- 349:     for source, path, explicit in candidates:
- 350:         ok, error = _database_path_usable(path)
- 351:         if ok:
- 352:             warning = " | ".join(warnings)
- 353:             if warning:
- 354:                 startup_log(warning)
- 355:             if source == "local fallback":
- 356:                 warning = (
- 357:                     f"{warning} | " if warning else ""
- 358:                 ) + "Using local fallback database; data can be lost if Render clears cache and no Persistent Disk is mounted."
- 359:             return path, source, warning, "", ""
- 360:         message = f"Database path from {source} is not writable: {path} ({error})"
- 361:         if explicit:
- 362:             message += "; falling back so the bot can start"
- 363:         warnings.append(message)
- 364:
- 365:     return DEFAULT_DB_PATH, "local fallback", "All configured database paths failed; using local fallback.", "", ""
+ 313: def resolve_db_path(config: Config) -> tuple[str, str, str, str, str]:
+ 314:     warnings: list[str] = []
+ 315:     require_remote = bool(config.get("database", "require_remote_when_configured", default=True))
+ 316:     allow_local_fallback = os.getenv("ALLOW_LOCAL_DATABASE_FALLBACK", "").strip().casefold() in {
+ 317:         "1",
+ 318:         "true",
+ 319:         "yes",
+ 320:         "on",
+ 321:     }
+ 322:     turso_url = (
+ 323:         os.getenv("TURSO_DATABASE_URL", "")
+ 324:         or os.getenv("LIBSQL_URL", "")
+ 325:         or str(config.get("database", "turso_url", default="") or "")
+ 326:     ).strip()
+ 327:     turso_token = (os.getenv("TURSO_AUTH_TOKEN", "") or os.getenv("LIBSQL_AUTH_TOKEN", "")).strip()
+ 328:     if turso_url:
+ 329:         if turso_token:
+ 330:             replica_path = (
+ 331:                 os.getenv("TURSO_REPLICA_PATH", "").strip()
+ 332:                 or str(config.get("database", "turso_replica_path", default="") or "").strip()
+ 333:                 or TURSO_REPLICA_PATH
+ 334:             )
+ 335:             ok, error = _database_path_usable(replica_path)
+ 336:             if ok:
+ 337:                 return replica_path, "Turso/libSQL embedded replica", "", turso_url, turso_token
+ 338:             message = f"Turso replica path is not writable: {replica_path} ({error})"
+ 339:             if require_remote and not allow_local_fallback:
+ 340:                 raise PersistenceConfigurationError(
+ 341:                     f"{message}. Refusing to start on disposable local storage. Fix TURSO_REPLICA_PATH or set "
+ 342:                     "ALLOW_LOCAL_DATABASE_FALLBACK=1 for intentional local development."
+ 343:                 )
+ 344:             warnings.append(f"{message}; falling back to local SQLite")
+ 345:         else:
+ 346:             message = "A Turso/libSQL database URL is set but TURSO_AUTH_TOKEN is missing"
+ 347:             if require_remote and not allow_local_fallback:
+ 348:                 raise PersistenceConfigurationError(
+ 349:                     f"{message}. Refusing to start on disposable local storage. Add the database token or set "
+ 350:                     "ALLOW_LOCAL_DATABASE_FALLBACK=1 for intentional local development."
+ 351:                 )
+ 352:             warnings.append(f"{message}; falling back to local SQLite")
+ 353:
+ 354:     env_path = os.getenv("AVENUE_GUARD_DB_PATH", "").strip()
+ 355:     candidates: list[tuple[str, str, bool]] = []
+ 356:     if env_path:
+ 357:         candidates.append(("AVENUE_GUARD_DB_PATH", env_path, True))
+ 358:     config_path = str(config.get("database", "path", default="") or "").strip()
+ 359:     if config_path:
+ 360:         candidates.append(("config.json database.path", config_path, False))
+ 361:     candidates.append(("Render Persistent Disk auto-detect", RENDER_DISK_DB_PATH, False))
+ 362:     candidates.append(("local fallback", DEFAULT_DB_PATH, False))
+ 363:
+ 364:     for source, path, explicit in candidates:
+ 365:         ok, error = _database_path_usable(path)
+ 366:         if ok:
+ 367:             warning = " | ".join(warnings)
+ 368:             if warning:
+ 369:                 startup_log(warning)
+ 370:             if source == "local fallback":
+ 371:                 warning = (
+ 372:                     f"{warning} | " if warning else ""
+ 373:                 ) + "Using local fallback database; data can be lost if Render clears cache and no Persistent Disk is mounted."
+ 374:             return path, source, warning, "", ""
+ 375:         message = f"Database path from {source} is not writable: {path} ({error})"
+ 376:         if explicit:
+ 377:             message += "; falling back so the bot can start"
+ 378:         warnings.append(message)
+ 379:
+ 380:     return DEFAULT_DB_PATH, "local fallback", "All configured database paths failed; using local fallback.", "", ""
 ```
 
 When Turso is configured, the resolver requires both a database URL and database-scoped token, verifies the replica path, and refuses silent local fallback in production. Local-only mode still checks environment, config, mounted disk, and development paths with a real write probe before accepting one.
 
-#### Bot creation and outbox wiring excerpt (main.py:367-431)
+#### Bot creation and outbox wiring excerpt (main.py:382-446)
 
 ```python
- 367: def create_bot() -> discord.Bot:
- 368:     intents = discord.Intents.default()
- 369:     for intent_name in (
- 370:         "bans",
- 371:         "dm_messages",
- 372:         "guild_messages",
- 373:         "guild_reactions",
- 374:         "members",
- 375:         "message_content",
- 376:         "messages",
- 377:         "moderation",
- 378:         "presences",
- 379:         "reactions",
- 380:         "voice_states",
- 381:     ):
- 382:         if hasattr(intents, intent_name):
- 383:             setattr(intents, intent_name, True)
- 384:     bot = AvenueBot(intents=intents)
- 385:     bot.config_write_lock = asyncio.Lock()
- 386:     bot._runtime_initialization_lock = asyncio.Lock()
- 387:     bot._runtime_initialized = False
- 388:
- 389:     bot.config = Config("config.json")
- 390:     bot.db_path, bot.db_path_source, bot.db_path_warning, bot.db_remote_url, bot.db_remote_token = resolve_db_path(bot.config)
- 391:     startup_log(f"Using database path: {bot.db_path} ({bot.db_path_source})")
- 392:     bot.db = Database(bot.db_path, remote_url=bot.db_remote_url, auth_token=bot.db_remote_token)
- 393:     bot.outbox = DiscordOutbox(bot)
- 394:     _install_storage_close_hook(bot)
- 395:
- 396:     @bot.check_once
- 397:     async def attach_command_correlation(ctx: discord.ApplicationContext) -> bool:
- 398:         command = getattr(ctx, "command", None)
- 399:         command_name = str(
- 400:             getattr(command, "qualified_name", None)
- 401:             or getattr(command, "name", None)
- 402:             or "command"
- 403:         )
- 404:         ctx.correlation_id = begin_workflow_context(prefix=command_name)
- 405:         return True
- 406:
- 407:     @bot.event
- 408:     async def on_application_command_completion(
- 409:         ctx: discord.ApplicationContext,
- 410:     ) -> None:
- 411:         clear_workflow_context()
- 412:
- 413:     setup_global_error_handlers(bot)
- 414:
- 415:     def _load_cogs():
- 416:         bot.load_extension("cogs.Mod")
- 417:         bot.load_extension("cogs.Tracking")
- 418:         bot.load_extension("cogs.Help")
- 419:         bot.load_extension("cogs.MessageResponses")
- 420:         bot.load_extension("cogs.Sticky")
- 421:         bot.load_extension("cogs.RequestLevels")
- 422:         bot.load_extension("cogs.Release")
- 423:         bot.load_extension("cogs.Commands")
- 424:         bot.load_extension("cogs.Background")
- 425:         bot.load_extension("cogs.Operations")
- 426:
- 427:     async def initialize_runtime():
- 428:         await bot.register_persistent_views()
- 429:         previous_gateway_state = str(
- 430:             get_keepalive_status().get("state") or ""
- 431:         )
+ 382: def create_bot() -> discord.Bot:
+ 383:     intents = discord.Intents.default()
+ 384:     for intent_name in (
+ 385:         "bans",
+ 386:         "dm_messages",
+ 387:         "guild_messages",
+ 388:         "guild_reactions",
+ 389:         "members",
+ 390:         "message_content",
+ 391:         "messages",
+ 392:         "moderation",
+ 393:         "presences",
+ 394:         "reactions",
+ 395:         "voice_states",
+ 396:     ):
+ 397:         if hasattr(intents, intent_name):
+ 398:             setattr(intents, intent_name, True)
+ 399:     bot = AvenueBot(intents=intents)
+ 400:     bot.config_write_lock = asyncio.Lock()
+ 401:     bot._runtime_initialization_lock = asyncio.Lock()
+ 402:     bot._runtime_initialized = False
+ 403:
+ 404:     bot.config = Config("config.json")
+ 405:     bot.db_path, bot.db_path_source, bot.db_path_warning, bot.db_remote_url, bot.db_remote_token = resolve_db_path(bot.config)
+ 406:     startup_log(f"Using database path: {bot.db_path} ({bot.db_path_source})")
+ 407:     bot.db = Database(bot.db_path, remote_url=bot.db_remote_url, auth_token=bot.db_remote_token)
+ 408:     bot.outbox = DiscordOutbox(bot)
+ 409:     _install_storage_close_hook(bot)
+ 410:
+ 411:     @bot.check_once
+ 412:     async def attach_command_correlation(ctx: discord.ApplicationContext) -> bool:
+ 413:         command = getattr(ctx, "command", None)
+ 414:         command_name = str(
+ 415:             getattr(command, "qualified_name", None)
+ 416:             or getattr(command, "name", None)
+ 417:             or "command"
+ 418:         )
+ 419:         ctx.correlation_id = begin_workflow_context(prefix=command_name)
+ 420:         return True
+ 421:
+ 422:     @bot.event
+ 423:     async def on_application_command_completion(
+ 424:         ctx: discord.ApplicationContext,
+ 425:     ) -> None:
+ 426:         clear_workflow_context()
+ 427:
+ 428:     setup_global_error_handlers(bot)
+ 429:
+ 430:     def _load_cogs():
+ 431:         bot.load_extension("cogs.Mod")
+ 432:         bot.load_extension("cogs.Tracking")
+ 433:         bot.load_extension("cogs.Help")
+ 434:         bot.load_extension("cogs.MessageResponses")
+ 435:         bot.load_extension("cogs.Sticky")
+ 436:         bot.load_extension("cogs.RequestLevels")
+ 437:         bot.load_extension("cogs.PrioritySystem")
+ 438:         bot.load_extension("cogs.HistoricalAudit")
+ 439:         bot.load_extension("cogs.Release")
+ 440:         bot.load_extension("cogs.Commands")
+ 441:         bot.load_extension("cogs.Background")
+ 442:         bot.load_extension("cogs.Operations")
+ 443:
+ 444:     async def initialize_runtime():
+ 445:         await bot.register_persistent_views()
+ 446:         previous_gateway_state = str(
 ```
 
 create_bot wires configuration, database, the durable outbox, command correlation, cogs, and on_ready behavior together. Persistent views and preflight migration happen before login; on_ready then validates the guild, repairs legacy IDs, starts cog loops and the operations pillars exactly once. Reconnects do not repeat the whole initialization.
 
-#### Persistent view registration (main.py:598-610)
+#### Persistent view registration (main.py:622-635)
 
 ```python
- 598:     async def register_persistent_views():
- 599:         if getattr(bot, "_persistent_views_registered", False):
- 600:             return
- 601:         bot.add_view(TrackingDeclineConfirmView())
- 602:         bot.add_view(TicketClosePromptView())
- 603:         bot.add_view(HelpMenuView())
- 604:         bot.add_view(FormerMemberHelpView())
- 605:         bot.add_view(BanInfoGiveInfoView())
- 606:         bot.add_view(TranscriptRequestView())
- 607:         bot.add_view(ReleaseApprovalView())
- 608:         bot.add_view(LevelRequestButtonView())
- 609:         bot.add_view(LevelRequestReviewView())
- 610:         bot._persistent_views_registered = True
+ 622:     async def register_persistent_views():
+ 623:         if getattr(bot, "_persistent_views_registered", False):
+ 624:             return
+ 625:         bot.add_view(TrackingDeclineConfirmView())
+ 626:         bot.add_view(TicketClosePromptView())
+ 627:         bot.add_view(HelpMenuView())
+ 628:         bot.add_view(FormerMemberHelpView())
+ 629:         bot.add_view(BanInfoGiveInfoView())
+ 630:         bot.add_view(TranscriptRequestView())
+ 631:         bot.add_view(ReleaseApprovalView())
+ 632:         bot.add_view(LevelRequestButtonView())
+ 633:         bot.add_view(LevelRequestReviewView())
+ 634:         bot.add_view(LevelRequestPPSReviewView())
+ 635:         bot._persistent_views_registered = True
 ```
 
 Persistent view registration is easy to underestimate. Discord button messages can outlive the Python process. Without registering the views again after restart, users could click old buttons and Discord would not know which callback should run.
 
-## 29. Database Code Walkthrough
+## 30. Database Code Walkthrough
 
 The Database wrapper serializes primary access and preserves transaction ownership. Local SQLite calls use threads. Native libSQL calls use a process facade, with a parent thread waiting for IPC. Threads alone are insufficient when an extension retains the GIL; the runtime recovery chapter explains the measured failure and the isolation boundary.
 
-#### Local SQLite and isolated Turso connection (utils/db.py:449-473)
+#### Local SQLite and isolated Turso connection (utils/db.py:463-487)
 
 ```python
- 449:     def _open_connection_sync(self) -> Any:
- 450:         if self.uses_remote:
- 451:             if libsql is None:
- 452:                 raise RuntimeError("TURSO_DATABASE_URL is configured, but the libsql Python package is not installed.")
- 453:             if _looks_like_turso_platform_token(self.auth_token):
- 454:                 raise RuntimeError(
- 455:                     "TURSO_AUTH_TOKEN looks like a Turso platform/API token, not a database auth token. "
- 456:                     "Create a database token with `turso db tokens create <database-name>` and use that value instead."
- 457:                 )
- 458:             conn = IsolatedConnection(str(self.path), sync_url=self.remote_url, auth_token=self.auth_token)
- 459:         else:
- 460:             conn = sqlite3.connect(str(self.path), check_same_thread=False)
- 461:             conn.row_factory = sqlite3.Row
- 462:             conn.execute("PRAGMA journal_mode=WAL;")
- 463:         try:
- 464:             conn.execute("PRAGMA foreign_keys=ON;")
- 465:         except Exception:
- 466:             pass
- 467:         for pragma in ("PRAGMA busy_timeout=5000;", "PRAGMA synchronous=NORMAL;"):
- 468:             try:
- 469:                 conn.execute(pragma)
- 470:             except Exception:
- 471:                 pass
- 472:         conn.commit()
- 473:         return conn
+ 463:     def _open_connection_sync(self) -> Any:
+ 464:         if self.uses_remote:
+ 465:             if libsql is None:
+ 466:                 raise RuntimeError("TURSO_DATABASE_URL is configured, but the libsql Python package is not installed.")
+ 467:             if _looks_like_turso_platform_token(self.auth_token):
+ 468:                 raise RuntimeError(
+ 469:                     "TURSO_AUTH_TOKEN looks like a Turso platform/API token, not a database auth token. "
+ 470:                     "Create a database token with `turso db tokens create <database-name>` and use that value instead."
+ 471:                 )
+ 472:             conn = IsolatedConnection(str(self.path), sync_url=self.remote_url, auth_token=self.auth_token)
+ 473:         else:
+ 474:             conn = sqlite3.connect(str(self.path), check_same_thread=False)
+ 475:             conn.row_factory = sqlite3.Row
+ 476:             conn.execute("PRAGMA journal_mode=WAL;")
+ 477:         try:
+ 478:             conn.execute("PRAGMA foreign_keys=ON;")
+ 479:         except Exception:
+ 480:             pass
+ 481:         for pragma in ("PRAGMA busy_timeout=5000;", "PRAGMA synchronous=NORMAL;"):
+ 482:             try:
+ 483:                 conn.execute(pragma)
+ 484:             except Exception:
+ 485:                 pass
+ 486:         conn.commit()
+ 487:         return conn
 ```
 
 WAL mode helps SQLite handle concurrent readers while writes are happening. The lock still serializes bot-side operations, which prevents two coroutine paths from sharing one cursor incorrectly. This is less glamorous than a bigger database, but it fits a single-server bot well and keeps deployment simple.
 
-#### Atomic ticket sequence (utils/db.py:1537-1561)
+#### Atomic ticket sequence (utils/db.py:1630-1654)
 
 ```python
-1537:     async def next_ticket_id(self, guild_id: int) -> int:
-1538:         def _run():
-1539:             assert self._conn is not None
-1540:             cur = self._execute_sync(
-1541:                 "SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?",
-1542:                 (guild_id,),
-1543:             )
-1544:             row = cur.fetchone()
-1545:             if row is None:
-1546:                 next_id = 1
-1547:                 self._execute_sync(
-1548:                     "INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)",
-1549:                     (guild_id, 2),
-1550:                 )
-1551:                 self._commit_and_sync_sync()
-1552:                 return next_id
-1553:             next_id = int(_row_get(row, "next_ticket_id", index=0, default=1) or 1)
-1554:             self._execute_write_compat_sync(
-1555:                 "UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?",
-1556:                 (next_id + 1, guild_id),
-1557:             )
-1558:             self._commit_and_sync_sync()
-1559:             return next_id
-1560:
-1561:         return await self._run_locked_with_retry(_run, retry_operation=False, operation_name="next_ticket_id")
+1630:     async def next_ticket_id(self, guild_id: int) -> int:
+1631:         def _run():
+1632:             assert self._conn is not None
+1633:             cur = self._execute_sync(
+1634:                 "SELECT next_ticket_id FROM ticket_sequences WHERE guild_id=?",
+1635:                 (guild_id,),
+1636:             )
+1637:             row = cur.fetchone()
+1638:             if row is None:
+1639:                 next_id = 1
+1640:                 self._execute_sync(
+1641:                     "INSERT INTO ticket_sequences(guild_id, next_ticket_id) VALUES(?,?)",
+1642:                     (guild_id, 2),
+1643:                 )
+1644:                 self._commit_and_sync_sync()
+1645:                 return next_id
+1646:             next_id = int(_row_get(row, "next_ticket_id", index=0, default=1) or 1)
+1647:             self._execute_write_compat_sync(
+1648:                 "UPDATE ticket_sequences SET next_ticket_id=? WHERE guild_id=?",
+1649:                 (next_id + 1, guild_id),
+1650:             )
+1651:             self._commit_and_sync_sync()
+1652:             return next_id
+1653:
+1654:         return await self._run_locked_with_retry(_run, retry_operation=False, operation_name="next_ticket_id")
 ```
 
 The ticket ID function is the cleanest example of an atomic counter in this codebase. It reads and increments under the same database lock, commits before returning, and stores the next value by guild. This prevents two tickets opened at nearly the same time from receiving the same visible ticket number.
 
 > **Atomic means indivisible:** In this bot, atomic usually means one protected operation that cannot be interleaved with another coroutine halfway through. The lock plus one database transaction gives that guarantee for counters and state transitions.
 
-## 30. Config And Template Engine Walkthrough
+## 31. Config And Template Engine Walkthrough
 
 config.json is treated as a practical control plane. The Config class is intentionally simple: load JSON, expose typed getters, and save atomically through a temporary file plus os.replace. This matters because a partially-written config file could break startup.
 
@@ -1055,122 +1390,122 @@ config.json is treated as a practical control plane. The Config class is intenti
 
 Many embeds use Python format_map with a SafeDict. If a template references a missing variable, the bot inserts an empty string instead of crashing the workflow. That is why template validation is useful: SafeDict keeps the bot alive, while config checks help you notice mistakes before users see blank fields.
 
-#### Request embed template renderer (cogs/RequestLevels.py:1568-1617)
+#### Request embed template renderer (cogs/RequestLevels.py:1616-1665)
 
 ```python
-1568:     def _embed_from_template(self, template: Dict[str, Any], variables: Dict[str, Any], default_color: str = "blurple") -> discord.Embed:
-1569:         if not isinstance(template, dict):
-1570:             template = {}
-1571:
-1572:         color_text = self._format(template.get("color", default_color), variables) or default_color
-1573:         title = self._format(template.get("title", ""), variables)
-1574:         description = self._format(template.get("description", ""), variables)
-1575:         embed = discord.Embed(
-1576:             title=title[:256] or None,
-1577:             description=description[:4096] or None,
-1578:             color=basic_color(color_text),
-1579:         )
-1580:
-1581:         fields = template.get("fields", []) or []
-1582:         if not isinstance(fields, list):
-1583:             fields = []
-1584:         total_chars = len(str(embed.title or "")) + len(str(embed.description or ""))
-1585:         for field in fields[:25]:
-1586:             if not isinstance(field, dict):
-1587:                 continue
-1588:             name = self._format(field.get("name", ""), variables)
-1589:             value = self._format(field.get("value", ""), variables)
-1590:             if not name or not value:
-1591:                 continue
-1592:             name = name[:256]
-1593:             value = value[:1024]
-1594:             if total_chars + len(name) + len(value) > 5700:
-1595:                 break
-1596:             embed.add_field(name=name, value=value, inline=bool(field.get("inline", False)))
-1597:             total_chars += len(name) + len(value)
-1598:
-1599:         footer = self._format(template.get("footer", ""), variables)
-1600:         if footer:
-1601:             footer = footer[: min(2048, max(0, 5850 - total_chars))]
-1602:             if footer:
-1603:                 embed.set_footer(text=footer)
-1604:                 total_chars += len(footer)
-1605:         thumbnail_url = self._format(template.get("thumbnail_url", ""), variables)
-1606:         if thumbnail_url:
-1607:             embed.set_thumbnail(url=thumbnail_url)
-1608:         image_url = self._format(template.get("image_url", ""), variables)
-1609:         if image_url:
-1610:             embed.set_image(url=image_url)
-1611:         author_name = self._format(template.get("author_name", ""), variables)
-1612:         if author_name:
-1613:             author_name = author_name[: min(256, max(0, 5950 - total_chars))]
-1614:             author_icon = self._format(template.get("author_icon_url", ""), variables)
-1615:             if author_name:
-1616:                 embed.set_author(name=author_name, icon_url=author_icon or None)
-1617:         return embed
+1616:     def _embed_from_template(self, template: Dict[str, Any], variables: Dict[str, Any], default_color: str = "blurple") -> discord.Embed:
+1617:         if not isinstance(template, dict):
+1618:             template = {}
+1619:
+1620:         color_text = self._format(template.get("color", default_color), variables) or default_color
+1621:         title = self._format(template.get("title", ""), variables)
+1622:         description = self._format(template.get("description", ""), variables)
+1623:         embed = discord.Embed(
+1624:             title=title[:256] or None,
+1625:             description=description[:4096] or None,
+1626:             color=basic_color(color_text),
+1627:         )
+1628:
+1629:         fields = template.get("fields", []) or []
+1630:         if not isinstance(fields, list):
+1631:             fields = []
+1632:         total_chars = len(str(embed.title or "")) + len(str(embed.description or ""))
+1633:         for field in fields[:25]:
+1634:             if not isinstance(field, dict):
+1635:                 continue
+1636:             name = self._format(field.get("name", ""), variables)
+1637:             value = self._format(field.get("value", ""), variables)
+1638:             if not name or not value:
+1639:                 continue
+1640:             name = name[:256]
+1641:             value = value[:1024]
+1642:             if total_chars + len(name) + len(value) > 5700:
+1643:                 break
+1644:             embed.add_field(name=name, value=value, inline=bool(field.get("inline", False)))
+1645:             total_chars += len(name) + len(value)
+1646:
+1647:         footer = self._format(template.get("footer", ""), variables)
+1648:         if footer:
+1649:             footer = footer[: min(2048, max(0, 5850 - total_chars))]
+1650:             if footer:
+1651:                 embed.set_footer(text=footer)
+1652:                 total_chars += len(footer)
+1653:         thumbnail_url = self._format(template.get("thumbnail_url", ""), variables)
+1654:         if thumbnail_url:
+1655:             embed.set_thumbnail(url=thumbnail_url)
+1656:         image_url = self._format(template.get("image_url", ""), variables)
+1657:         if image_url:
+1658:             embed.set_image(url=image_url)
+1659:         author_name = self._format(template.get("author_name", ""), variables)
+1660:         if author_name:
+1661:             author_name = author_name[: min(256, max(0, 5950 - total_chars))]
+1662:             author_icon = self._format(template.get("author_icon_url", ""), variables)
+1663:             if author_name:
+1664:                 embed.set_author(name=author_name, icon_url=author_icon or None)
+1665:         return embed
 ```
 
 The embed renderer is shared by live request submissions, reviewed request embeds, result notifications, and wave summaries. It reads fields, footer, images, thumbnails, author info, color, title, and description from config. Workflow logic stays in Python; presentation stays in config.
 
-## 31. Persistent Views Walkthrough
+## 32. Persistent Views Walkthrough
 
 utils/views.py is the component router. It stores stable custom IDs and very small button/select classes. The view should not implement the business rules. It should only receive the click and call the owning cog.
 
-#### Persistent request button router (utils/views.py:307-328)
+#### Persistent request button router (utils/views.py:308-329)
 
 ```python
- 307: class LevelRequestButtonView(discord.ui.View):
- 308:     def __init__(self, label: str = "Request your level!", disabled: bool = False):
- 309:         super().__init__(timeout=None)
- 310:         button = discord.ui.Button(
- 311:             label=label or "Request your level!",
- 312:             style=discord.ButtonStyle.primary,
- 313:             custom_id=CID_LEVEL_REQUEST_BUTTON,
- 314:             disabled=disabled,
- 315:         )
- 316:         button.callback = self.request
- 317:         self.add_item(button)
- 318:
- 319:     async def request(self, interaction: discord.Interaction):
- 320:         cog = interaction.client.get_cog("RequestLevelsCog")
- 321:         if cog:
- 322:             await cog.handle_request_button(interaction)
- 323:         else:
- 324:             await interaction.response.send_message(
- 325:                 "Level requests are temporarily unavailable.",
- 326:                 ephemeral=True,
- 327:                 allowed_mentions=no_mentions(),
- 328:             )
+ 308: class LevelRequestButtonView(discord.ui.View):
+ 309:     def __init__(self, label: str = "Request your level!", disabled: bool = False):
+ 310:         super().__init__(timeout=None)
+ 311:         button = discord.ui.Button(
+ 312:             label=label or "Request your level!",
+ 313:             style=discord.ButtonStyle.primary,
+ 314:             custom_id=CID_LEVEL_REQUEST_BUTTON,
+ 315:             disabled=disabled,
+ 316:         )
+ 317:         button.callback = self.request
+ 318:         self.add_item(button)
+ 319:
+ 320:     async def request(self, interaction: discord.Interaction):
+ 321:         cog = interaction.client.get_cog("RequestLevelsCog")
+ 322:         if cog:
+ 323:             await cog.handle_request_button(interaction)
+ 324:         else:
+ 325:             await interaction.response.send_message(
+ 326:                 "Level requests are temporarily unavailable.",
+ 327:                 ephemeral=True,
+ 328:                 allowed_mentions=no_mentions(),
+ 329:             )
 ```
 
-#### Persistent review button router (utils/views.py:331-355)
+#### Persistent review button router (utils/views.py:332-356)
 
 ```python
- 331: class LevelRequestReviewView(discord.ui.View):
- 332:     def __init__(self, disabled: bool = False):
- 333:         super().__init__(timeout=None)
- 334:         for label, style, custom_id, action in (
- 335:             ("Send", discord.ButtonStyle.success, CID_LEVEL_REQUEST_SEND, "sent"),
- 336:             ("Reject", discord.ButtonStyle.danger, CID_LEVEL_REQUEST_REJECT, "rejected"),
- 337:             ("Other", discord.ButtonStyle.secondary, CID_LEVEL_REQUEST_OTHER, "other"),
- 338:             ("Recheck", discord.ButtonStyle.secondary, CID_LEVEL_REQUEST_RECHECK, "recheck"),
- 339:         ):
- 340:             button = discord.ui.Button(label=label, style=style, custom_id=custom_id, disabled=disabled)
- 341:             button.callback = self._make_callback(action)
- 342:             self.add_item(button)
- 343:
- 344:     def _make_callback(self, action: str):
- 345:         async def _callback(interaction: discord.Interaction):
- 346:             cog = interaction.client.get_cog("RequestLevelsCog")
- 347:             if cog:
- 348:                 await cog.handle_review_button(interaction, action)
- 349:             else:
- 350:                 await interaction.response.send_message(
- 351:                     "Request review controls are temporarily unavailable.",
- 352:                     ephemeral=True,
- 353:                     allowed_mentions=no_mentions(),
- 354:                 )
- 355:         return _callback
+ 332: class LevelRequestReviewView(discord.ui.View):
+ 333:     def __init__(self, disabled: bool = False):
+ 334:         super().__init__(timeout=None)
+ 335:         for label, style, custom_id, action in (
+ 336:             ("Send", discord.ButtonStyle.success, CID_LEVEL_REQUEST_SEND, "sent"),
+ 337:             ("Reject", discord.ButtonStyle.danger, CID_LEVEL_REQUEST_REJECT, "rejected"),
+ 338:             ("Other", discord.ButtonStyle.secondary, CID_LEVEL_REQUEST_OTHER, "other"),
+ 339:             ("Recheck", discord.ButtonStyle.secondary, CID_LEVEL_REQUEST_RECHECK, "recheck"),
+ 340:         ):
+ 341:             button = discord.ui.Button(label=label, style=style, custom_id=custom_id, disabled=disabled)
+ 342:             button.callback = self._make_callback(action)
+ 343:             self.add_item(button)
+ 344:
+ 345:     def _make_callback(self, action: str):
+ 346:         async def _callback(interaction: discord.Interaction):
+ 347:             cog = interaction.client.get_cog("RequestLevelsCog")
+ 348:             if cog:
+ 349:                 await cog.handle_review_button(interaction, action)
+ 350:             else:
+ 351:                 await interaction.response.send_message(
+ 352:                     "Request review controls are temporarily unavailable.",
+ 353:                     ephemeral=True,
+ 354:                     allowed_mentions=no_mentions(),
+ 355:                 )
+ 356:         return _callback
 ```
 
 This is why a request review button can still work after a restart. The custom ID is stable, the view is registered on startup, and the callback asks the live bot instance for RequestLevelsCog. The cog then reloads the real request state from SQLite.
@@ -1192,1500 +1527,1498 @@ flowchart LR
 
 > The button identifies the action; the database identifies the current truth.
 
-## 32. Live Request Code Walkthrough
+## 33. Live Request Code Walkthrough
 
 The request button is deceptively complex. On click, the bot checks whether the user already has a current-wave request. If they do and the edit window is still open, the same button becomes an edit entry point. If not, it checks open/closed state, required roles, banned role, first-time request role logic, and then opens the modal.
 
-#### Request button state gate excerpt (cogs/RequestLevels.py:2936-3005)
+#### Request button state gate excerpt (cogs/RequestLevels.py:3145-3214)
 
 ```python
-2936:     async def handle_request_button(self, interaction: discord.Interaction):
-2937:         if interaction.guild is None:
-2938:             return await interaction.response.send_message("Wrong server.", ephemeral=True)
-2939:
-2940:         # A modal must be the initial response. Replica-only reads avoid waiting
-2941:         # for Turso synchronization before Discord's response deadline.
-2942:         row = await self._get_state_local(interaction.guild.id)
-2943:         if row is None:
-2944:             return await interaction.response.send_message(
-2945:                 "The request system is still initializing. Please try again in a moment.",
-2946:                 ephemeral=True,
-2947:             )
-2948:
-2949:         now_ts = int(time_module.time())
-2950:         close_ts = self._row_value(row, "close_ts", None)
-2951:         timed_out = (
-2952:             str(row["state"]) == STATE_OPEN
-2953:             and close_ts is not None
-2954:             and int(close_ts) <= now_ts
-2955:         )
-2956:
-2957:         request_row = await self._current_user_submission_local(
-2958:             interaction.guild.id,
-2959:             int(row["wave_id"]),
-2960:             interaction.user.id,
-2961:         )
-2962:         if timed_out:
-2963:             self._start_background_task(
-2964:                 self._set_state_closed(interaction.guild, reason="time limit"),
-2965:                 label=f"Timed request close guild_id={interaction.guild.id}",
-2966:             )
-2967:             if request_row and self._can_edit_submission(row, request_row):
-2968:                 return await interaction.response.send_modal(
-2969:                     LevelRequestModal(
-2970:                         self,
-2971:                         interaction.user.id,
-2972:                         edit=True,
-2973:                         initial=self._request_initial_values(request_row),
-2974:                         edit_wave_id=int(request_row["wave_id"]),
-2975:                     )
-2976:                 )
-2977:             return await interaction.response.send_message(
-2978:                 self._message("closed", "Requests are closed :/"),
-2979:                 ephemeral=True,
-2980:             )
-2981:
-2982:         if request_row:
-2983:             if self._can_edit_submission(row, request_row):
-2984:                 return await interaction.response.send_modal(
-2985:                     LevelRequestModal(
-2986:                         self,
-2987:                         interaction.user.id,
-2988:                         edit=True,
-2989:                         initial=self._request_initial_values(request_row),
-2990:                         edit_wave_id=int(request_row["wave_id"]),
-2991:                     )
-2992:                 )
-2993:             if str(request_row["status"]) != "pending":
-2994:                 return await interaction.response.send_message("That request has already been reviewed.", ephemeral=True)
-2995:             if str(row["state"]) != STATE_OPEN:
-2996:                 return await interaction.response.send_message(self._message("edit_window_expired", "Your request can no longer be edited."), ephemeral=True)
-2997:             return await interaction.response.send_message(
-2998:                 self._message("already_submitted", "You already submitted a level during this request wave."),
-2999:                 ephemeral=True,
-3000:             )
-3001:
-3002:         if str(row["state"]) != STATE_OPEN:
-3003:             return await interaction.response.send_message(self._message("closed", "Requests are closed :/"), ephemeral=True)
-3004:
-3005:         member = self._cached_interaction_member(interaction)
+3145:     async def handle_request_button(self, interaction: discord.Interaction):
+3146:         if interaction.guild is None:
+3147:             return await interaction.response.send_message("Wrong server.", ephemeral=True)
+3148:
+3149:         # A modal must be the initial response. Replica-only reads avoid waiting
+3150:         # for Turso synchronization before Discord's response deadline.
+3151:         row = await self._get_state_local(interaction.guild.id)
+3152:         if row is None:
+3153:             return await interaction.response.send_message(
+3154:                 "The request system is still initializing. Please try again in a moment.",
+3155:                 ephemeral=True,
+3156:             )
+3157:
+3158:         now_ts = int(time_module.time())
+3159:         close_ts = self._row_value(row, "close_ts", None)
+3160:         timed_out = (
+3161:             str(row["state"]) == STATE_OPEN
+3162:             and close_ts is not None
+3163:             and int(close_ts) <= now_ts
+3164:         )
+3165:
+3166:         request_row = await self._current_user_submission_local(
+3167:             interaction.guild.id,
+3168:             int(row["wave_id"]),
+3169:             interaction.user.id,
+3170:         )
+3171:         if timed_out:
+3172:             self._start_background_task(
+3173:                 self._set_state_closed(interaction.guild, reason="time limit"),
+3174:                 label=f"Timed request close guild_id={interaction.guild.id}",
+3175:             )
+3176:             if request_row and self._can_edit_submission(row, request_row):
+3177:                 return await interaction.response.send_modal(
+3178:                     LevelRequestModal(
+3179:                         self,
+3180:                         interaction.user.id,
+3181:                         edit=True,
+3182:                         initial=self._request_initial_values(request_row),
+3183:                         edit_wave_id=int(request_row["wave_id"]),
+3184:                     )
+3185:                 )
+3186:             return await interaction.response.send_message(
+3187:                 self._message("closed", "Requests are closed :/"),
+3188:                 ephemeral=True,
+3189:             )
+3190:
+3191:         if request_row:
+3192:             if self._can_edit_submission(row, request_row):
+3193:                 return await interaction.response.send_modal(
+3194:                     LevelRequestModal(
+3195:                         self,
+3196:                         interaction.user.id,
+3197:                         edit=True,
+3198:                         initial=self._request_initial_values(request_row),
+3199:                         edit_wave_id=int(request_row["wave_id"]),
+3200:                     )
+3201:                 )
+3202:             if str(request_row["status"]) != "pending":
+3203:                 return await interaction.response.send_message("That request has already been reviewed.", ephemeral=True)
+3204:             if str(row["state"]) != STATE_OPEN:
+3205:                 return await interaction.response.send_message(self._message("edit_window_expired", "Your request can no longer be edited."), ephemeral=True)
+3206:             return await interaction.response.send_message(
+3207:                 self._message("already_submitted", "You already submitted a level during this request wave."),
+3208:                 ephemeral=True,
+3209:             )
+3210:
+3211:         if str(row["state"]) != STATE_OPEN:
+3212:             return await interaction.response.send_message(self._message("closed", "Requests are closed :/"), ephemeral=True)
+3213:
+3214:         member = self._cached_interaction_member(interaction)
 ```
 
 The submission handler uses a lock because request limits and duplicate checks must be consistent. Imagine a wave with one slot left and two users submit at the same moment. Without the lock, both could pass the count check. With the lock, one complete submission finishes before the next one evaluates the current state.
 
-#### Request form submission excerpt (cogs/RequestLevels.py:3063-3152)
+#### Request form submission excerpt (cogs/RequestLevels.py:3272-3361)
 
 ```python
-3063:     async def handle_request_form(self, interaction: discord.Interaction, data: Dict[str, str]):
-3064:         if interaction.guild is None:
-3065:             return await self._reply_ephemeral(interaction, "Wrong server.")
-3066:         member = await self._resolve_member(interaction.guild, interaction.user)
-3067:         if member is None or not await self._requirements_ok(member):
-3068:             return await self._reply_ephemeral(
-3069:                 interaction,
-3070:                 self._message("no_requirements", "You don't meet the requirements, please read the requesting rules"),
-3071:             )
-3072:         if not data.get("level_id") or not data.get("level_name") or not data.get("creators"):
-3073:             return await self._reply_ephemeral(interaction, "Missing required fields.")
-3074:         validation_errors = self._validate_request_data(data)
-3075:         if validation_errors:
-3076:             return await self._reply_ephemeral(
-3077:                 interaction,
-3078:                 self._message_formatted(
-3079:                     "validation_error",
-3080:                     "Please fix your request before submitting: {errors}",
-3081:                     {"errors": " ".join(validation_errors)},
-3082:                 ),
-3083:             )
-3084:
-3085:         if not interaction.response.is_done():
-3086:             await interaction.response.defer(ephemeral=True)
-3087:
-3088:         external_errors, level_validation = await self._validate_level_external(data, interaction.guild.id, interaction.user.id)
-3089:         if external_errors:
-3090:             return await self._reply_ephemeral(
-3091:                 interaction,
-3092:                 self._message_formatted(
-3093:                     "validation_error",
-3094:                     "Please fix your request before submitting: {errors}",
-3095:                     {"errors": " ".join(external_errors)},
-3096:                 ),
-3097:             )
-3098:
-3099:         refresh_after_close = False
-3100:         closed_before_submit = False
-3101:         closed_by_timer = False
-3102:         async with self._state_lock, self._submit_lock:
-3103:             row = await self._get_state(interaction.guild.id)
-3104:             if str(row["state"]) != STATE_OPEN:
-3105:                 closed_before_submit = True
-3106:             elif row["close_ts"] is not None and int(row["close_ts"]) <= int(time_module.time()):
-3107:                 closed_ts = int(row["close_ts"])
-3108:                 await self.bot.db.execute_transaction(
-3109:                     (
-3110:                         (
-3111:                             "UPDATE level_request_state SET state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
-3112:                             (STATE_CLOSED, closed_ts, interaction.guild.id),
-3113:                         ),
-3114:                         (
-3115:                             "UPDATE level_request_submissions SET edit_deadline_ts=? "
-3116:                             "WHERE guild_id=? AND wave_id=? AND status='pending' AND edit_deadline_ts IS NULL",
-3117:                             (
-3118:                                 closed_ts + self._post_close_edit_seconds(),
-3119:                                 interaction.guild.id,
-3120:                                 int(row["wave_id"]),
-3121:                             ),
-3122:                         ),
-3123:                     ),
-3124:                     retry_safe=True,
-3125:                 )
-3126:                 refresh_after_close = True
-3127:                 closed_by_timer = True
-3128:
-3129:             if not closed_before_submit and not refresh_after_close:
-3130:                 wave_id = int(row["wave_id"])
-3131:                 user_id = interaction.user.id
-3132:                 normalized_level_id = self._normalize_level_id(data["level_id"])
-3133:                 request_type = self._request_type_from_row(row)
-3134:                 type_error = self._request_type_validation_error(request_type, data, level_validation)
-3135:                 if type_error:
-3136:                     return await self._reply_ephemeral(interaction, type_error)
-3137:
-3138:                 existing_user = await self.bot.db.fetchone(
-3139:                     "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
-3140:                     (interaction.guild.id, wave_id, user_id),
-3141:                 )
-3142:                 if existing_user:
-3143:                     return await self._reply_ephemeral(interaction, self._message("already_submitted", "You already submitted a level during this request wave."))
-3144:
-3145:                 existing_level = await self.bot.db.fetchone(
-3146:                     "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND level_id=?",
-3147:                     (interaction.guild.id, wave_id, normalized_level_id),
-3148:                 )
-3149:                 if existing_level:
-3150:                     return await self._reply_ephemeral(interaction, self._message("duplicate_level", "That level ID has already been submitted during this request wave."))
-3151:
-3152:                 target_channel = await self._configured_channel(interaction.guild, "level_requested")
+3272:     async def handle_request_form(self, interaction: discord.Interaction, data: Dict[str, str]):
+3273:         if interaction.guild is None:
+3274:             return await self._reply_ephemeral(interaction, "Wrong server.")
+3275:         member = await self._resolve_member(interaction.guild, interaction.user)
+3276:         if member is None or not await self._requirements_ok(member):
+3277:             return await self._reply_ephemeral(
+3278:                 interaction,
+3279:                 self._message("no_requirements", "You don't meet the requirements, please read the requesting rules"),
+3280:             )
+3281:         if not data.get("level_id") or not data.get("level_name") or not data.get("creators"):
+3282:             return await self._reply_ephemeral(interaction, "Missing required fields.")
+3283:         validation_errors = self._validate_request_data(data)
+3284:         if validation_errors:
+3285:             return await self._reply_ephemeral(
+3286:                 interaction,
+3287:                 self._message_formatted(
+3288:                     "validation_error",
+3289:                     "Please fix your request before submitting: {errors}",
+3290:                     {"errors": " ".join(validation_errors)},
+3291:                 ),
+3292:             )
+3293:
+3294:         if not interaction.response.is_done():
+3295:             await interaction.response.defer(ephemeral=True)
+3296:
+3297:         external_errors, level_validation = await self._validate_level_external(data, interaction.guild.id, interaction.user.id)
+3298:         if external_errors:
+3299:             return await self._reply_ephemeral(
+3300:                 interaction,
+3301:                 self._message_formatted(
+3302:                     "validation_error",
+3303:                     "Please fix your request before submitting: {errors}",
+3304:                     {"errors": " ".join(external_errors)},
+3305:                 ),
+3306:             )
+3307:
+3308:         refresh_after_close = False
+3309:         closed_before_submit = False
+3310:         closed_by_timer = False
+3311:         async with self._state_lock, self._submit_lock:
+3312:             row = await self._get_state(interaction.guild.id)
+3313:             if str(row["state"]) != STATE_OPEN:
+3314:                 closed_before_submit = True
+3315:             elif row["close_ts"] is not None and int(row["close_ts"]) <= int(time_module.time()):
+3316:                 closed_ts = int(row["close_ts"])
+3317:                 await self.bot.db.execute_transaction(
+3318:                     (
+3319:                         (
+3320:                             "UPDATE level_request_state SET state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
+3321:                             (STATE_CLOSED, closed_ts, interaction.guild.id),
+3322:                         ),
+3323:                         (
+3324:                             "UPDATE level_request_submissions SET edit_deadline_ts=? "
+3325:                             "WHERE guild_id=? AND wave_id=? AND status='pending' AND edit_deadline_ts IS NULL",
+3326:                             (
+3327:                                 closed_ts + self._post_close_edit_seconds(),
+3328:                                 interaction.guild.id,
+3329:                                 int(row["wave_id"]),
+3330:                             ),
+3331:                         ),
+3332:                     ),
+3333:                     retry_safe=True,
+3334:                 )
+3335:                 refresh_after_close = True
+3336:                 closed_by_timer = True
+3337:
+3338:             if not closed_before_submit and not refresh_after_close:
+3339:                 wave_id = int(row["wave_id"])
+3340:                 user_id = interaction.user.id
+3341:                 normalized_level_id = self._normalize_level_id(data["level_id"])
+3342:                 request_type = self._request_type_from_row(row)
+3343:                 type_error = self._request_type_validation_error(request_type, data, level_validation)
+3344:                 if type_error:
+3345:                     return await self._reply_ephemeral(interaction, type_error)
+3346:
+3347:                 existing_user = await self.bot.db.fetchone(
+3348:                     "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+3349:                     (interaction.guild.id, wave_id, user_id),
+3350:                 )
+3351:                 if existing_user:
+3352:                     return await self._reply_ephemeral(interaction, self._message("already_submitted", "You already submitted a level during this request wave."))
+3353:
+3354:                 existing_level = await self.bot.db.fetchone(
+3355:                     "SELECT 1 FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND level_id=?",
+3356:                     (interaction.guild.id, wave_id, normalized_level_id),
+3357:                 )
+3358:                 if existing_level:
+3359:                     return await self._reply_ephemeral(interaction, self._message("duplicate_level", "That level ID has already been submitted during this request wave."))
+3360:
+3361:                 target_channel = await self._configured_channel(interaction.guild, "level_requested")
 ```
 
 Notice the order: validate local fields, defer the interaction, validate externally, enter the submit lock, reload current state, check duplicate user and duplicate level ID, send the review embed, store the Discord message ID, then increment the wave count. The request only counts after the staff queue message exists.
 
-#### Request edit audit trail excerpt (cogs/RequestLevels.py:3288-3377)
+#### Request edit audit trail excerpt (cogs/RequestLevels.py:3509-3598)
 
 ```python
-3288:     async def handle_request_edit_form(
-3289:         self,
-3290:         interaction: discord.Interaction,
-3291:         data: Dict[str, str],
-3292:         edit_wave_id: int = 0,
-3293:     ):
-3294:         if interaction.guild is None:
-3295:             return await self._reply_ephemeral(interaction, "Wrong server.")
-3296:         member = await self._resolve_member(interaction.guild, interaction.user)
-3297:         if member is None or not await self._requirements_ok(member):
-3298:             return await self._reply_ephemeral(
-3299:                 interaction,
-3300:                 self._message("no_requirements", "You don't meet the requirements, please read the requesting rules"),
-3301:             )
-3302:         if not data.get("level_id") or not data.get("level_name") or not data.get("creators"):
-3303:             return await self._reply_ephemeral(interaction, "Missing required fields.")
-3304:         validation_errors = self._validate_request_data(data)
-3305:         if validation_errors:
-3306:             return await self._reply_ephemeral(
-3307:                 interaction,
-3308:                 self._message_formatted(
-3309:                     "validation_error",
-3310:                     "Please fix your request before submitting: {errors}",
-3311:                     {"errors": " ".join(validation_errors)},
-3312:                 ),
-3313:             )
-3314:         if not interaction.response.is_done():
-3315:             await interaction.response.defer(ephemeral=True)
-3316:
-3317:         external_errors, level_validation = await self._validate_level_external(data, interaction.guild.id, interaction.user.id)
-3318:         if external_errors:
-3319:             return await self._reply_ephemeral(
-3320:                 interaction,
-3321:                 self._message_formatted(
-3322:                     "validation_error",
-3323:                     "Please fix your request before submitting: {errors}",
-3324:                     {"errors": " ".join(external_errors)},
-3325:                 ),
-3326:             )
-3327:
-3328:         async with self._state_lock, self._submit_lock:
-3329:             state_row = await self._get_state(interaction.guild.id)
-3330:             if (
-3331:                 str(state_row["state"]) == STATE_OPEN
-3332:                 and state_row["close_ts"] is not None
-3333:                 and int(state_row["close_ts"]) <= int(time_module.time())
-3334:             ):
-3335:                 closing_wave_id = int(state_row["wave_id"])
-3336:                 closed_ts = int(state_row["close_ts"])
-3337:                 await self.bot.db.execute_transaction(
-3338:                     (
-3339:                         (
-3340:                             "UPDATE level_request_state SET state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
-3341:                             (STATE_CLOSED, closed_ts, interaction.guild.id),
-3342:                         ),
-3343:                         (
-3344:                             "UPDATE level_request_submissions SET edit_deadline_ts=? "
-3345:                             "WHERE guild_id=? AND wave_id=? AND status='pending' AND edit_deadline_ts IS NULL",
-3346:                             (
-3347:                                 closed_ts + self._post_close_edit_seconds(),
-3348:                                 interaction.guild.id,
-3349:                                 closing_wave_id,
-3350:                             ),
-3351:                         ),
-3352:                     ),
-3353:                     retry_safe=True,
-3354:                 )
-3355:                 self._start_background_task(
-3356:                     self._refresh_closed_wave(interaction.guild, closing_wave_id),
-3357:                     label=f"Closed-wave refresh wave_id={closing_wave_id}",
-3358:                 )
-3359:                 state_row = await self._get_state(interaction.guild.id)
-3360:             wave_id = int(edit_wave_id or state_row["wave_id"])
-3361:             row = await self.bot.db.fetchone(
-3362:                 "SELECT * FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
-3363:                 (interaction.guild.id, wave_id, interaction.user.id),
-3364:             )
-3365:             if not row:
-3366:                 return await self._reply_ephemeral(interaction, "That request could not be found.")
-3367:             if str(row["status"]) != "pending":
-3368:                 return await self._reply_ephemeral(interaction, "That request has already been reviewed.")
-3369:             if not self._can_edit_submission(state_row, row):
-3370:                 return await self._reply_ephemeral(interaction, self._message("edit_window_expired", "Your request can no longer be edited."))
-3371:
-3372:             old_data_json = row["data_json"] or "{}"
-3373:             old_data = self._safe_json_loads(old_data_json, {})
-3374:             normalized_level_id = self._normalize_level_id(data["level_id"])
-3375:             if wave_id == int(state_row["wave_id"]):
-3376:                 request_type = self._request_type_from_row(state_row)
-3377:             else:
+3509:     async def handle_request_edit_form(
+3510:         self,
+3511:         interaction: discord.Interaction,
+3512:         data: Dict[str, str],
+3513:         edit_wave_id: int = 0,
+3514:     ):
+3515:         if interaction.guild is None:
+3516:             return await self._reply_ephemeral(interaction, "Wrong server.")
+3517:         member = await self._resolve_member(interaction.guild, interaction.user)
+3518:         if member is None or not await self._requirements_ok(member):
+3519:             return await self._reply_ephemeral(
+3520:                 interaction,
+3521:                 self._message("no_requirements", "You don't meet the requirements, please read the requesting rules"),
+3522:             )
+3523:         if not data.get("level_id") or not data.get("level_name") or not data.get("creators"):
+3524:             return await self._reply_ephemeral(interaction, "Missing required fields.")
+3525:         validation_errors = self._validate_request_data(data)
+3526:         if validation_errors:
+3527:             return await self._reply_ephemeral(
+3528:                 interaction,
+3529:                 self._message_formatted(
+3530:                     "validation_error",
+3531:                     "Please fix your request before submitting: {errors}",
+3532:                     {"errors": " ".join(validation_errors)},
+3533:                 ),
+3534:             )
+3535:         if not interaction.response.is_done():
+3536:             await interaction.response.defer(ephemeral=True)
+3537:
+3538:         external_errors, level_validation = await self._validate_level_external(data, interaction.guild.id, interaction.user.id)
+3539:         if external_errors:
+3540:             return await self._reply_ephemeral(
+3541:                 interaction,
+3542:                 self._message_formatted(
+3543:                     "validation_error",
+3544:                     "Please fix your request before submitting: {errors}",
+3545:                     {"errors": " ".join(external_errors)},
+3546:                 ),
+3547:             )
+3548:
+3549:         async with self._state_lock, self._submit_lock:
+3550:             state_row = await self._get_state(interaction.guild.id)
+3551:             if (
+3552:                 str(state_row["state"]) == STATE_OPEN
+3553:                 and state_row["close_ts"] is not None
+3554:                 and int(state_row["close_ts"]) <= int(time_module.time())
+3555:             ):
+3556:                 closing_wave_id = int(state_row["wave_id"])
+3557:                 closed_ts = int(state_row["close_ts"])
+3558:                 await self.bot.db.execute_transaction(
+3559:                     (
+3560:                         (
+3561:                             "UPDATE level_request_state SET state=?, close_ts=NULL, closed_ts=? WHERE guild_id=?",
+3562:                             (STATE_CLOSED, closed_ts, interaction.guild.id),
+3563:                         ),
+3564:                         (
+3565:                             "UPDATE level_request_submissions SET edit_deadline_ts=? "
+3566:                             "WHERE guild_id=? AND wave_id=? AND status='pending' AND edit_deadline_ts IS NULL",
+3567:                             (
+3568:                                 closed_ts + self._post_close_edit_seconds(),
+3569:                                 interaction.guild.id,
+3570:                                 closing_wave_id,
+3571:                             ),
+3572:                         ),
+3573:                     ),
+3574:                     retry_safe=True,
+3575:                 )
+3576:                 self._start_background_task(
+3577:                     self._refresh_closed_wave(interaction.guild, closing_wave_id),
+3578:                     label=f"Closed-wave refresh wave_id={closing_wave_id}",
+3579:                 )
+3580:                 state_row = await self._get_state(interaction.guild.id)
+3581:             wave_id = int(edit_wave_id or state_row["wave_id"])
+3582:             row = await self.bot.db.fetchone(
+3583:                 "SELECT * FROM level_request_submissions WHERE guild_id=? AND wave_id=? AND user_id=?",
+3584:                 (interaction.guild.id, wave_id, interaction.user.id),
+3585:             )
+3586:             if not row:
+3587:                 return await self._reply_ephemeral(interaction, "That request could not be found.")
+3588:             if str(row["status"]) != "pending":
+3589:                 return await self._reply_ephemeral(interaction, "That request has already been reviewed.")
+3590:             if not self._can_edit_submission(state_row, row):
+3591:                 return await self._reply_ephemeral(interaction, self._message("edit_window_expired", "Your request can no longer be edited."))
+3592:
+3593:             old_data_json = row["data_json"] or "{}"
+3594:             old_data = self._safe_json_loads(old_data_json, {})
+3595:             normalized_level_id = self._normalize_level_id(data["level_id"])
+3596:             if wave_id == int(state_row["wave_id"]):
+3597:                 request_type = self._request_type_from_row(state_row)
+3598:             else:
 ```
 
 The edit path writes both the new data and an audit record. That lets reviewers know the request changed and lets you inspect what changed later. The audit table stores old and new JSON snapshots because request form data is template-driven and may gain fields over time.
 
-## 33. Validation Code Walkthrough
+## 34. Validation Code Walkthrough
 
 Validation is split into two files. utils/gd_validation.py knows how to parse provider responses and combine them. RequestLevelsCog decides when to call validation, cache it, rate-limit it, and turn the result into user-facing errors or reviewer warnings.
 
-#### Provider result combiner excerpt (utils/gd_validation.py:339-408)
+#### Provider result combiner excerpt (utils/gd_validation.py:384-453)
 
 ```python
- 339: def combine_level_validation(
- 340:     level_id: str,
- 341:     provider_results: dict[str, dict[str, Any]],
- 342:     checked_ts: int | None = None,
- 343:     expires_ts: int | None = None,
- 344: ) -> dict[str, Any]:
- 345:     checked_ts = int(checked_ts or time.time())
- 346:     expires_ts = int(expires_ts or checked_ts)
- 347:     results = {str(k): dict(v or {}) for k, v in provider_results.items()}
- 348:     successful = [result for result in results.values() if result.get("ok")]
- 349:     existing = [result for result in successful if result.get("exists") is True]
- 350:     missing = [result for result in successful if result.get("exists") is False]
- 351:     failed = [result for result in results.values() if not result.get("ok")]
- 352:     disagreement = bool(existing and missing)
- 353:     all_requested_succeeded = bool(results) and not failed
- 354:
- 355:     if existing:
- 356:         exists: bool | None = True
- 357:     elif missing and all_requested_succeeded:
- 358:         exists = False
- 359:     else:
- 360:         exists = None
- 361:
- 362:     missing_confident = exists is False and all_requested_succeeded and bool(missing)
- 363:     rated = any(bool(result.get("rated")) for result in existing)
- 364:     requires_showcase = any(bool(result.get("demon")) or bool(result.get("platformer")) for result in existing)
- 365:     chosen = existing[0] if existing else {}
- 366:
- 367:     warnings: list[str] = []
- 368:     if disagreement:
- 369:         warnings.append("GDBrowser and the GD API disagreed. Please check this level manually.")
- 370:     elif exists is None and missing:
- 371:         warnings.append("This level doesn't seem to exist, but one validation source failed, so it was not auto-blocked.")
- 372:     elif exists is None:
- 373:         warnings.append("Level validation could not run right now. Please check this level manually.")
- 374:     elif exists is False and not missing_confident:
- 375:         warnings.append("This level doesn't seem to exist, but validation was not confident enough to block it.")
- 376:     if rated:
- 377:         warnings.append("This level seems to have been rated already.")
- 378:     if requires_showcase:
- 379:         warnings.append("This level appears to be a demon or platformer; a showcase is required.")
- 380:
- 381:     sources = []
- 382:     for provider, result in sorted(results.items()):
- 383:         if result.get("ok") and result.get("exists") is True:
- 384:             status = "found"
- 385:         elif result.get("ok") and result.get("exists") is False:
- 386:             status = "missing"
- 387:         else:
- 388:             kind = str(
- 389:                 result.get("circuit_reason")
- 390:                 or result.get("failure_kind")
- 391:                 or ""
- 392:             ).replace("_", " ")
- 393:             detail = kind or str(result.get("error") or "unknown")
- 394:             status = f"unavailable ({detail})"
- 395:         sources.append(f"{provider}: {status}")
- 396:
- 397:     return {
- 398:         "level_id": str(level_id),
- 399:         "checked_ts": checked_ts,
- 400:         "expires_ts": expires_ts,
- 401:         "providers": results,
- 402:         "exists": exists,
- 403:         "missing_confident": missing_confident,
- 404:         "rated": rated,
- 405:         "requires_showcase": requires_showcase,
- 406:         "warnings": warnings,
- 407:         "provider_disagreement": disagreement,
- 408:         "level_name": str(chosen.get("name") or ""),
+ 384: def combine_level_validation(
+ 385:     level_id: str,
+ 386:     provider_results: dict[str, dict[str, Any]],
+ 387:     checked_ts: int | None = None,
+ 388:     expires_ts: int | None = None,
+ 389: ) -> dict[str, Any]:
+ 390:     checked_ts = int(checked_ts or time.time())
+ 391:     expires_ts = int(expires_ts or checked_ts)
+ 392:     # Audit-only metadata must not change live cache payloads or the public
+ 393:     # level_validation_json template variable. The audit reads provider results
+ 394:     # directly, before this live validation boundary.
+ 395:     results = {str(k): {key: value for key, value in dict(v or {}).items() if key != "audit_metadata"}
+ 396:                for k, v in provider_results.items()}
+ 397:     successful = [result for result in results.values() if result.get("ok")]
+ 398:     existing = [result for result in successful if result.get("exists") is True]
+ 399:     missing = [result for result in successful if result.get("exists") is False]
+ 400:     failed = [result for result in results.values() if not result.get("ok")]
+ 401:     disagreement = bool(existing and missing)
+ 402:     all_requested_succeeded = bool(results) and not failed
+ 403:
+ 404:     if existing:
+ 405:         exists: bool | None = True
+ 406:     elif missing and all_requested_succeeded:
+ 407:         exists = False
+ 408:     else:
+ 409:         exists = None
+ 410:
+ 411:     missing_confident = exists is False and all_requested_succeeded and bool(missing)
+ 412:     rated = any(bool(result.get("rated")) for result in existing)
+ 413:     requires_showcase = any(bool(result.get("demon")) or bool(result.get("platformer")) for result in existing)
+ 414:     chosen = existing[0] if existing else {}
+ 415:
+ 416:     warnings: list[str] = []
+ 417:     if disagreement:
+ 418:         warnings.append("GDBrowser and the GD API disagreed. Please check this level manually.")
+ 419:     elif exists is None and missing:
+ 420:         warnings.append("This level doesn't seem to exist, but one validation source failed, so it was not auto-blocked.")
+ 421:     elif exists is None:
+ 422:         warnings.append("Level validation could not run right now. Please check this level manually.")
+ 423:     elif exists is False and not missing_confident:
+ 424:         warnings.append("This level doesn't seem to exist, but validation was not confident enough to block it.")
+ 425:     if rated:
+ 426:         warnings.append("This level seems to have been rated already.")
+ 427:     if requires_showcase:
+ 428:         warnings.append("This level appears to be a demon or platformer; a showcase is required.")
+ 429:
+ 430:     sources = []
+ 431:     for provider, result in sorted(results.items()):
+ 432:         if result.get("ok") and result.get("exists") is True:
+ 433:             status = "found"
+ 434:         elif result.get("ok") and result.get("exists") is False:
+ 435:             status = "missing"
+ 436:         else:
+ 437:             kind = str(
+ 438:                 result.get("circuit_reason")
+ 439:                 or result.get("failure_kind")
+ 440:                 or ""
+ 441:             ).replace("_", " ")
+ 442:             detail = kind or str(result.get("error") or "unknown")
+ 443:             status = f"unavailable ({detail})"
+ 444:         sources.append(f"{provider}: {status}")
+ 445:
+ 446:     return {
+ 447:         "level_id": str(level_id),
+ 448:         "checked_ts": checked_ts,
+ 449:         "expires_ts": expires_ts,
+ 450:         "providers": results,
+ 451:         "exists": exists,
+ 452:         "missing_confident": missing_confident,
+ 453:         "rated": rated,
 ```
 
 The combiner does not pretend providers are always perfect. It tracks existing results, missing results, failed providers, disagreement, rating status, and whether a showcase appears required. This is why the bot can block confidently missing IDs but only warn when a provider failed or disagreed.
 
-#### Cached provider lookup excerpt (cogs/RequestLevels.py:1346-1415)
+#### Cached provider lookup excerpt (cogs/RequestLevels.py:1394-1463)
 
 ```python
-1346:     async def _lookup_level_validation(self, level_id: str, force: bool = False) -> Dict[str, Any]:
-1347:         level_id = self._clean_level_id(level_id)
-1348:         if not self._level_validation_enabled() or not level_id:
-1349:             return {}
-1350:
-1351:         now_ts = int(time_module.time())
-1352:         if not force:
-1353:             cached = await self._cached_level_validation(level_id)
-1354:             if cached:
-1355:                 return cached
-1356:
-1357:             existing = self._validation_inflight.get(level_id)
-1358:             if existing is not None and not existing.done():
-1359:                 return await asyncio.shield(existing)
-1360:
-1361:             task = asyncio.create_task(self._lookup_level_validation(level_id, force=True))
-1362:             self._validation_inflight[level_id] = task
-1363:             try:
-1364:                 return await asyncio.shield(task)
-1365:             finally:
-1366:                 if self._validation_inflight.get(level_id) is task:
-1367:                     self._validation_inflight.pop(level_id, None)
-1368:
-1369:         providers = self._level_validation_providers()
-1370:         results: dict[str, dict[str, Any]] = {}
-1371:         ready_providers: list[str] = []
-1372:         for provider in ("gdbrowser", "boomlings"):
-1373:             if not providers.get(provider):
-1374:                 continue
-1375:             if self._provider_circuit_open(provider):
-1376:                 results[provider] = self._provider_circuit_result(provider)
-1377:             else:
-1378:                 ready_providers.append(provider)
-1379:
-1380:         if not ready_providers and not results:
-1381:             return {}
-1382:
-1383:         tasks = []
-1384:         if ready_providers:
-1385:             session = await self._get_level_validation_session()
-1386:             tasks = [
-1387:                 (provider, self._fetch_validation_provider(provider, session, level_id))
-1388:                 for provider in ready_providers
-1389:             ]
-1390:
-1391:         fetched = await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
-1392:         for (provider, _), result in zip(tasks, fetched, strict=True):
-1393:             if isinstance(result, Exception):
-1394:                 results[provider] = {"provider": provider, "ok": False, "exists": None, "error": type(result).__name__}
-1395:                 self._record_provider_validation_result(provider, results[provider])
-1396:             elif isinstance(result, dict):
-1397:                 results[provider] = result
-1398:             else:
-1399:                 results[provider] = {"provider": provider, "ok": False, "exists": None, "error": "Unexpected result"}
-1400:                 self._record_provider_validation_result(provider, results[provider])
-1401:
-1402:         successful_provider = any(result.get("ok") for result in results.values())
-1403:         cache_seconds = (
-1404:             self._level_validation_cache_seconds()
-1405:             if successful_provider
-1406:             else self._level_validation_failure_cache_seconds()
-1407:         )
-1408:         expires_ts = now_ts + cache_seconds
-1409:         combined = combine_level_validation(level_id, results, checked_ts=now_ts, expires_ts=expires_ts)
-1410:         try:
-1411:             await self.bot.db.execute(
-1412:                 "INSERT INTO gd_level_validation_cache(level_id,checked_ts,expires_ts,data_json) VALUES(?,?,?,?) "
-1413:                 "ON CONFLICT(level_id) DO UPDATE SET checked_ts=excluded.checked_ts, expires_ts=excluded.expires_ts, data_json=excluded.data_json",
-1414:                 (level_id, now_ts, expires_ts, json.dumps(combined, separators=(",", ":"))),
-1415:             )
+1394:     async def _lookup_level_validation(self, level_id: str, force: bool = False) -> Dict[str, Any]:
+1395:         level_id = self._clean_level_id(level_id)
+1396:         if not self._level_validation_enabled() or not level_id:
+1397:             return {}
+1398:
+1399:         now_ts = int(time_module.time())
+1400:         if not force:
+1401:             cached = await self._cached_level_validation(level_id)
+1402:             if cached:
+1403:                 return cached
+1404:
+1405:             existing = self._validation_inflight.get(level_id)
+1406:             if existing is not None and not existing.done():
+1407:                 return await asyncio.shield(existing)
+1408:
+1409:             task = asyncio.create_task(self._lookup_level_validation(level_id, force=True))
+1410:             self._validation_inflight[level_id] = task
+1411:             try:
+1412:                 return await asyncio.shield(task)
+1413:             finally:
+1414:                 if self._validation_inflight.get(level_id) is task:
+1415:                     self._validation_inflight.pop(level_id, None)
+1416:
+1417:         providers = self._level_validation_providers()
+1418:         results: dict[str, dict[str, Any]] = {}
+1419:         ready_providers: list[str] = []
+1420:         for provider in ("gdbrowser", "boomlings"):
+1421:             if not providers.get(provider):
+1422:                 continue
+1423:             if self._provider_circuit_open(provider):
+1424:                 results[provider] = self._provider_circuit_result(provider)
+1425:             else:
+1426:                 ready_providers.append(provider)
+1427:
+1428:         if not ready_providers and not results:
+1429:             return {}
+1430:
+1431:         tasks = []
+1432:         if ready_providers:
+1433:             session = await self._get_level_validation_session()
+1434:             tasks = [
+1435:                 (provider, self._fetch_validation_provider(provider, session, level_id))
+1436:                 for provider in ready_providers
+1437:             ]
+1438:
+1439:         fetched = await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
+1440:         for (provider, _), result in zip(tasks, fetched, strict=True):
+1441:             if isinstance(result, Exception):
+1442:                 results[provider] = {"provider": provider, "ok": False, "exists": None, "error": type(result).__name__}
+1443:                 self._record_provider_validation_result(provider, results[provider])
+1444:             elif isinstance(result, dict):
+1445:                 results[provider] = result
+1446:             else:
+1447:                 results[provider] = {"provider": provider, "ok": False, "exists": None, "error": "Unexpected result"}
+1448:                 self._record_provider_validation_result(provider, results[provider])
+1449:
+1450:         successful_provider = any(result.get("ok") for result in results.values())
+1451:         cache_seconds = (
+1452:             self._level_validation_cache_seconds()
+1453:             if successful_provider
+1454:             else self._level_validation_failure_cache_seconds()
+1455:         )
+1456:         expires_ts = now_ts + cache_seconds
+1457:         combined = combine_level_validation(level_id, results, checked_ts=now_ts, expires_ts=expires_ts)
+1458:         try:
+1459:             await self.bot.db.execute(
+1460:                 "INSERT INTO gd_level_validation_cache(level_id,checked_ts,expires_ts,data_json) VALUES(?,?,?,?) "
+1461:                 "ON CONFLICT(level_id) DO UPDATE SET checked_ts=excluded.checked_ts, expires_ts=excluded.expires_ts, data_json=excluded.data_json",
+1462:                 (level_id, now_ts, expires_ts, json.dumps(combined, separators=(",", ":"))),
+1463:             )
 ```
 
-#### External validation policy (cogs/RequestLevels.py:1502-1529)
+#### External validation policy (cogs/RequestLevels.py:1550-1577)
 
 ```python
-1502:     async def _validate_level_external(self, data: Dict[str, str], guild_id: int = 0, user_id: int = 0) -> tuple[list[str], Dict[str, Any]]:
-1503:         if not self._level_validation_enabled():
-1504:             return [], {}
-1505:         level_id = self._clean_level_id(data.get("level_id"))
-1506:         if not re.fullmatch(r"\d{7,9}", level_id):
-1507:             return [], {}
-1508:         cached = await self._cached_level_validation(level_id)
-1509:         if not cached and guild_id and user_id and level_id not in self._validation_inflight:
-1510:             rate_limited = self._level_validation_rate_limit_message(guild_id, user_id)
-1511:             if rate_limited:
-1512:                 return [rate_limited], {}
-1513:
-1514:         validation = cached or await self._lookup_level_validation(level_id)
-1515:         errors: list[str] = []
-1516:         auto_reject = bool(self._level_validation_cfg().get("auto_reject_missing", True))
-1517:         if validation.get("missing_confident") and auto_reject:
-1518:             errors.append(self._level_validation_message("missing", "That level ID does not seem to exist. Please check the ID and try again."))
-1519:
-1520:         showcase = str(data.get("level_showcase") or "").strip()
-1521:         if validation.get("requires_showcase") and not self._valid_url(showcase):
-1522:             errors.append(
-1523:                 self._level_validation_message(
-1524:                     "showcase_required",
-1525:                     "This level appears to be a demon or platformer, so a showcase URL is required.",
-1526:                 )
-1527:             )
-1528:
-1529:         return errors, validation
+1550:     async def _validate_level_external(self, data: Dict[str, str], guild_id: int = 0, user_id: int = 0) -> tuple[list[str], Dict[str, Any]]:
+1551:         if not self._level_validation_enabled():
+1552:             return [], {}
+1553:         level_id = self._clean_level_id(data.get("level_id"))
+1554:         if not re.fullmatch(r"\d{7,9}", level_id):
+1555:             return [], {}
+1556:         cached = await self._cached_level_validation(level_id)
+1557:         if not cached and guild_id and user_id and level_id not in self._validation_inflight:
+1558:             rate_limited = self._level_validation_rate_limit_message(guild_id, user_id)
+1559:             if rate_limited:
+1560:                 return [rate_limited], {}
+1561:
+1562:         validation = cached or await self._lookup_level_validation(level_id)
+1563:         errors: list[str] = []
+1564:         auto_reject = bool(self._level_validation_cfg().get("auto_reject_missing", True))
+1565:         if validation.get("missing_confident") and auto_reject:
+1566:             errors.append(self._level_validation_message("missing", "That level ID does not seem to exist. Please check the ID and try again."))
+1567:
+1568:         showcase = str(data.get("level_showcase") or "").strip()
+1569:         if validation.get("requires_showcase") and not self._valid_url(showcase):
+1570:             errors.append(
+1571:                 self._level_validation_message(
+1572:                     "showcase_required",
+1573:                     "This level appears to be a demon or platformer, so a showcase URL is required.",
+1574:                 )
+1575:             )
+1576:
+1577:         return errors, validation
 ```
 
 The cache is important for both speed and kindness to external services. The circuit breaker is a practical resilience feature: if one provider fails repeatedly, the bot temporarily stops using it instead of letting every submission wait on a broken service.
 
-## 34. Request Review Code Walkthrough
+## 35. Request Review Code Walkthrough
 
 Review actions are shared between live wave requests and weekly request submissions. The handler first figures out whether the clicked message belongs to level_request_submissions or weekly_request_reviews, then applies the same result logic.
 
-#### Immediate review button routing (cogs/RequestLevels.py:3636-3650)
+#### Immediate review button routing (cogs/RequestLevels.py:3857-3871)
 
 ```python
-3636:     async def handle_review_button(self, interaction: discord.Interaction, action: str):
-3637:         if interaction.guild is None or interaction.message is None:
-3638:             return await interaction.response.send_message("Request not found.", ephemeral=True)
-3639:         member = self._cached_interaction_member(interaction)
-3640:         if member is None or not self._has_reviewer_role(member):
-3641:             return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
-3642:         if action == "recheck":
-3643:             await interaction.response.defer(ephemeral=True)
-3644:             return await self._recheck_review_validation(interaction, interaction.message.id)
-3645:         # The modal itself is the acknowledgement. Authoritative existence and
-3646:         # pending-state checks run after submission, never before this deadline.
-3647:         if action == "other":
-3648:             return await interaction.response.send_message("Choose a result:", view=OtherReasonView(self, interaction.message.id), ephemeral=True)
-3649:
-3650:         await interaction.response.send_modal(ReviewModal(self, interaction.message.id, action))
+3857:     async def handle_review_button(self, interaction: discord.Interaction, action: str):
+3858:         if interaction.guild is None or interaction.message is None:
+3859:             return await interaction.response.send_message("Request not found.", ephemeral=True)
+3860:         member = self._cached_interaction_member(interaction)
+3861:         if member is None or not self._has_reviewer_role(member):
+3862:             return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
+3863:         if action == "recheck":
+3864:             await interaction.response.defer(ephemeral=True)
+3865:             return await self._recheck_review_validation(interaction, interaction.message.id)
+3866:         # The modal itself is the acknowledgement. Authoritative existence and
+3867:         # pending-state checks run after submission, never before this deadline.
+3868:         if action == "other":
+3869:             return await interaction.response.send_message("Choose a result:", view=OtherReasonView(self, interaction.message.id), ephemeral=True)
+3870:
+3871:         await interaction.response.send_modal(ReviewModal(self, interaction.message.id, action))
 ```
 
-#### Final review transaction excerpt (cogs/RequestLevels.py:3726-3815)
+#### Final review transaction excerpt (cogs/RequestLevels.py:4047-4136)
 
 ```python
-3726:     async def _finalize_review(self, interaction: discord.Interaction, message_id: int, result_key: str, review: str):
-3727:         if interaction.guild is None:
-3728:             return await self._reply_ephemeral(interaction, "Wrong server.")
-3729:
-3730:         if not interaction.response.is_done():
-3731:             await interaction.response.defer(ephemeral=True)
-3732:
-3733:         member = self._cached_interaction_member(interaction)
-3734:         if member is None or not self._has_reviewer_role(member):
-3735:             return await self._reply_ephemeral(interaction, "Only reviewers can use these controls.")
-3736:
-3737:         async with self._review_lock:
-3738:             target_kind, row = await self._review_target_by_message(interaction.guild.id, message_id)
-3739:             if not row:
-3740:                 return await self._reply_ephemeral(interaction, "Request not found.")
-3741:             if str(row["status"]) != "pending":
-3742:                 return await self._reply_ephemeral(interaction, "This request has already been reviewed.")
-3743:
-3744:             data = self._safe_json_loads(row["data_json"], {})
-3745:             if not isinstance(data, dict):
-3746:                 data = {}
-3747:             reviewer_id = interaction.user.id
-3748:             result_label = self._result_label(result_key)
-3749:             if target_kind == "weekly":
-3750:                 variables = self._weekly_data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
-3751:             else:
-3752:                 variables = self._data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
-3753:
-3754:             request_channel = await self._review_target_channel(interaction.guild, target_kind, row)
-3755:             if request_channel is None:
-3756:                 return await self._reply_ephemeral(interaction, "I couldn't find the original request channel, so I did not mark it reviewed.")
-3757:             msg = interaction.message
-3758:             if msg is None or int(msg.id) != int(message_id):
-3759:                 try:
-3760:                     msg = await request_channel.fetch_message(message_id)
-3761:                 except Exception as e:
-3762:                     await log_error(self.bot, f"Could not fetch reviewed level request {message_id}: {repr(e)}")
-3763:                     return await self._reply_ephemeral(interaction, "I couldn't find the original request message, so I did not mark it reviewed.")
-3764:
-3765:             result_channel_id = self._status_channel_id(result_key)
-3766:             if not result_channel_id:
-3767:                 return await self._reply_ephemeral(interaction, "I couldn't find the result channel, so I did not mark it reviewed.")
-3768:
-3769:             reviewed_ts = int(time_module.time())
-3770:             requester_id = int(self._row_value(row, "user_id", 0) or 0)
-3771:             preference_row = await self.bot.db.fetchone(
-3772:                 "SELECT request_result_mode FROM user_notification_preferences WHERE guild_id=? AND user_id=?",
-3773:                 (interaction.guild.id, requester_id),
-3774:             )
-3775:             default_mode = self._cfg("default_result_notification", default="channel")
-3776:             notification_mode = normalize_notification_mode(
-3777:                 preference_row["request_result_mode"] if preference_row else default_mode
-3778:             )
-3779:             correlation_id = str(
-3780:                 self._row_value(row, "correlation_id", "")
-3781:                 or data.get("correlation_id")
-3782:                 or new_correlation_id("review")
-3783:             )
-3784:             try:
-3785:                 result_embed = self._embed_from_template(
-3786:                     self._cfg(self._result_template_key(result_key), default={}) or {},
-3787:                     variables,
-3788:                     default_color=self._color_name(result_key, "red"),
-3789:                 )
-3790:                 final_embed = self._embed_from_template(
-3791:                     self._cfg("level_reviewed_embed", default={}) or {}, variables,
-3792:                     default_color=self._color_name(result_key, "red"),
-3793:                 )
-3794:                 REQUEST_REVIEW_STATES.require("pending", "reviewed")
-3795:                 update_sql = (
-3796:                     "UPDATE weekly_request_reviews SET request_message_id=?, status='reviewed', result=?, "
-3797:                     "review_text=?, reviewed_by=?, reviewed_ts=?, correlation_id=? "
-3798:                     "WHERE guild_id=? AND request_message_id=? AND status='pending'"
-3799:                     if target_kind == "weekly"
-3800:                     else
-3801:                     "UPDATE level_request_submissions SET request_message_id=?, status='reviewed', result=?, "
-3802:                     "review_text=?, reviewed_by=?, reviewed_ts=?, correlation_id=? "
-3803:                     "WHERE guild_id=? AND request_message_id=? AND status='pending'"
-3804:                 )
-3805:                 statements = [
-3806:                     (
-3807:                         update_sql,
-3808:                         (
-3809:                             message_id,
-3810:                             result_key,
-3811:                             review,
-3812:                             reviewer_id,
-3813:                             reviewed_ts,
-3814:                             correlation_id,
-3815:                             interaction.guild.id,
+4047:     async def _finalize_review(
+4048:         self,
+4049:         interaction: discord.Interaction,
+4050:         message_id: int,
+4051:         result_key: str,
+4052:         review: str,
+4053:         *,
+4054:         send_type: str | None = None,
+4055:     ):
+4056:         if interaction.guild is None:
+4057:             return await self._reply_ephemeral(interaction, "Wrong server.")
+4058:
+4059:         if not interaction.response.is_done():
+4060:             await interaction.response.defer(ephemeral=True)
+4061:
+4062:         member = self._cached_interaction_member(interaction)
+4063:         if member is None or not self._has_reviewer_role(member):
+4064:             return await self._reply_ephemeral(interaction, "Only reviewers can use these controls.")
+4065:
+4066:         async with self._review_lock:
+4067:             target_kind, row = await self._review_target_by_message(interaction.guild.id, message_id)
+4068:             if not row:
+4069:                 return await self._reply_ephemeral(interaction, "Request not found.")
+4070:             if str(row["status"]) != "pending":
+4071:                 return await self._reply_ephemeral(interaction, "This request has already been reviewed.")
+4072:
+4073:             review_system_version = self._review_system_version(row, target_kind)
+4074:             normalized_send_type = normalize_send_type(send_type)
+4075:             if result_key == "sent" and review_system_version == PPS_V1_REVIEW_SYSTEM:
+4076:                 if normalized_send_type is None:
+4077:                     return await self._reply_ephemeral(
+4078:                         interaction,
+4079:                         "Choose Rate, Feature, Epic, Legendary, or Mythic from the Send type menu.",
+4080:                     )
+4081:             elif normalized_send_type is not None:
+4082:                 return await self._reply_ephemeral(
+4083:                     interaction,
+4084:                     "This request uses the legacy review workflow and cannot accept a PPS send type.",
+4085:                 )
+4086:
+4087:             data = self._safe_json_loads(row["data_json"], {})
+4088:             if not isinstance(data, dict):
+4089:                 data = {}
+4090:             reviewer_id = interaction.user.id
+4091:             result_label = self._result_label(result_key)
+4092:             if target_kind == "weekly":
+4093:                 variables = self._weekly_data_vars(row, data, result_key=result_key, review=review, reviewer_id=reviewer_id)
+4094:             else:
+4095:                 variables = self._data_vars(
+4096:                     row,
+4097:                     data,
+4098:                     result_key=result_key,
+4099:                     review=review,
+4100:                     reviewer_id=reviewer_id,
+4101:                     send_type=normalized_send_type,
+4102:                 )
+4103:
+4104:             request_channel = await self._review_target_channel(interaction.guild, target_kind, row)
+4105:             if request_channel is None:
+4106:                 return await self._reply_ephemeral(interaction, "I couldn't find the original request channel, so I did not mark it reviewed.")
+4107:             msg = interaction.message
+4108:             if msg is None or int(msg.id) != int(message_id):
+4109:                 try:
+4110:                     msg = await request_channel.fetch_message(message_id)
+4111:                 except Exception as e:
+4112:                     await log_error(self.bot, f"Could not fetch reviewed level request {message_id}: {repr(e)}")
+4113:                     return await self._reply_ephemeral(interaction, "I couldn't find the original request message, so I did not mark it reviewed.")
+4114:
+4115:             result_channel_id = self._status_channel_id(result_key)
+4116:             if not result_channel_id:
+4117:                 return await self._reply_ephemeral(interaction, "I couldn't find the result channel, so I did not mark it reviewed.")
+4118:
+4119:             reviewed_ts = int(time_module.time())
+4120:             requester_id = int(self._row_value(row, "user_id", 0) or 0)
+4121:             preference_row = await self.bot.db.fetchone(
+4122:                 "SELECT request_result_mode FROM user_notification_preferences WHERE guild_id=? AND user_id=?",
+4123:                 (interaction.guild.id, requester_id),
+4124:             )
+4125:             default_mode = self._cfg("default_result_notification", default="channel")
+4126:             notification_mode = normalize_notification_mode(
+4127:                 preference_row["request_result_mode"] if preference_row else default_mode
+4128:             )
+4129:             correlation_id = str(
+4130:                 self._row_value(row, "correlation_id", "")
+4131:                 or data.get("correlation_id")
+4132:                 or new_correlation_id("review")
+4133:             )
+4134:             try:
+4135:                 result_embed = self._embed_from_template(
+4136:                     self._cfg(self._result_template_key(result_key), default={}) or {},
 ```
 
 The review lock has the same purpose as the submit lock: one reviewer should win the state transition. The database status must still be pending when the review is saved. After that, the original buttons are disabled so Discord's visible UI matches the stored result.
 
-#### Wave summary variables and reviewer stats (cogs/RequestLevels.py:1673-1739)
+#### Wave summary variables and reviewer stats (cogs/RequestLevels.py:1721-1790)
 
 ```python
-1673:     async def _wave_summary_vars(self, guild_id: int, wave_id: int) -> Dict[str, Any]:
-1674:         rows = await self.bot.db.fetchall(
-1675:             "SELECT status, result, reviewed_by, reviewed_ts, created_ts, data_json FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
-1676:             (guild_id, wave_id),
-1677:         )
-1678:         total = len(rows)
-1679:         reviewed = sum(1 for row in rows if str(row["status"]) == "reviewed")
-1680:         sent = sum(1 for row in rows if str(row["status"]) == "reviewed" and str(row["result"]) == "sent")
-1681:         rejected = sum(1 for row in rows if str(row["status"]) == "reviewed" and str(row["result"]) == "rejected")
-1682:         level_doesnt_exist = sum(1 for row in rows if str(row["result"]) == "level_doesnt_exist")
-1683:         stolen_level = sum(1 for row in rows if str(row["result"]) == "stolen_level")
-1684:         already_rated = sum(1 for row in rows if str(row["result"]) == "already_rated")
-1685:         other = level_doesnt_exist + stolen_level + already_rated
-1686:         not_sent = rejected + other
-1687:         pending = max(total - reviewed, 0)
-1688:         reviewer_stats = await self._reviewer_stats_lines(rows)
-1689:         request_type = ""
-1690:         for row in rows:
-1691:             data = self._safe_json_loads(row["data_json"], {})
-1692:             if isinstance(data, dict):
-1693:                 request_type = str(data.get("request_type") or "")
-1694:                 if request_type:
-1695:                     break
-1696:         variables = {
-1697:             "wave_id": wave_id,
-1698:             "request_type": request_type,
-1699:             "request_type_label": self._request_type_label(request_type),
-1700:             "total_requests": total,
-1701:             "reviewed_count": reviewed,
-1702:             "sent_count": sent,
-1703:             "not_sent_count": not_sent,
-1704:             "rejected_count": rejected,
-1705:             "other_count": other,
-1706:             "level_doesnt_exist_count": level_doesnt_exist,
-1707:             "stolen_level_count": stolen_level,
-1708:             "already_rated_count": already_rated,
-1709:             "pending_count": pending,
-1710:             "left_to_review": pending,
-1711:             "reviewed_percent": self._pct(reviewed, total),
-1712:             "pending_percent": self._pct(pending, total),
-1713:             "sent_percent": self._pct(sent, total),
-1714:             "not_sent_percent": self._pct(not_sent, total),
-1715:             "sent_percent_reviewed": self._pct(sent, reviewed),
-1716:             "not_sent_percent_reviewed": self._pct(not_sent, reviewed),
-1717:             "reviewer_stats": reviewer_stats,
-1718:             "summary_color": self._color_name("sent" if pending == 0 else "pending", "blurple"),
-1719:         }
-1720:         previous_wave = await self.bot.db.fetchone(
-1721:             "SELECT MAX(wave_id) AS wave_id FROM level_request_submissions WHERE guild_id=? AND wave_id<?",
-1722:             (guild_id, wave_id),
-1723:         )
-1724:         previous: Optional[Dict[str, Any]] = None
-1725:         previous_wave_id = int(previous_wave["wave_id"] or 0) if previous_wave else 0
-1726:         if previous_wave_id:
-1727:             previous_rows = await self.bot.db.fetchall(
-1728:                 "SELECT status,result FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
-1729:                 (guild_id, previous_wave_id),
-1730:             )
-1731:             previous_reviewed = sum(1 for item in previous_rows if str(item["status"]) == "reviewed")
-1732:             previous = {
-1733:                 "wave_id": previous_wave_id,
-1734:                 "total_requests": len(previous_rows),
-1735:                 "reviewed_count": previous_reviewed,
-1736:                 "sent_count": sum(1 for item in previous_rows if str(item["result"]) == "sent"),
-1737:             }
-1738:         variables.update(compare_waves(variables, previous))
-1739:         return variables
+1721:     async def _wave_summary_vars(self, guild_id: int, wave_id: int) -> Dict[str, Any]:
+1722:         rows = await self.bot.db.fetchall(
+1723:             "SELECT status, result, send_type, review_system_version, reviewed_by, reviewed_ts, created_ts, data_json "
+1724:             "FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
+1725:             (guild_id, wave_id),
+1726:         )
+1727:         total = len(rows)
+1728:         reviewed = sum(1 for row in rows if str(row["status"]) == "reviewed")
+1729:         sent = sum(1 for row in rows if str(row["status"]) == "reviewed" and str(row["result"]) == "sent")
+1730:         rejected = sum(1 for row in rows if str(row["status"]) == "reviewed" and str(row["result"]) == "rejected")
+1731:         level_doesnt_exist = sum(1 for row in rows if str(row["result"]) == "level_doesnt_exist")
+1732:         stolen_level = sum(1 for row in rows if str(row["result"]) == "stolen_level")
+1733:         already_rated = sum(1 for row in rows if str(row["result"]) == "already_rated")
+1734:         other = level_doesnt_exist + stolen_level + already_rated
+1735:         not_sent = rejected + other
+1736:         pending = max(total - reviewed, 0)
+1737:         reviewer_stats = await self._reviewer_stats_lines(rows)
+1738:         review_system_version = next(
+1739:             (
+1740:                 self._review_system_version(row)
+1741:                 for row in rows
+1742:                 if self._review_system_version(row) == PPS_V1_REVIEW_SYSTEM
+1743:             ),
+1744:             LEGACY_REVIEW_SYSTEM,
+1745:         )
+1746:         if not rows:
+1747:             state_version = await self.bot.db.fetchone(
+1748:                 "SELECT review_system_version FROM level_request_state WHERE guild_id=? AND wave_id=?",
+1749:                 (guild_id, wave_id),
+1750:             )
+1751:             if state_version:
+1752:                 review_system_version = self._review_system_version(state_version)
+1753:         send_type_counts = {
+1754:             send_type: sum(
+1755:                 1
+1756:                 for row in rows
+1757:                 if str(row["status"]) == "reviewed"
+1758:                 and str(row["result"]) == "sent"
+1759:                 and str(row["send_type"] or "") == send_type
+1760:             )
+1761:             for send_type in ("rate", "feature", "epic", "legendary", "mythic")
+1762:         }
+1763:         request_type = ""
+1764:         for row in rows:
+1765:             data = self._safe_json_loads(row["data_json"], {})
+1766:             if isinstance(data, dict):
+1767:                 request_type = str(data.get("request_type") or "")
+1768:                 if request_type:
+1769:                     break
+1770:         variables = {
+1771:             "wave_id": wave_id,
+1772:             "request_type": request_type,
+1773:             "request_type_label": self._request_type_label(request_type),
+1774:             "total_requests": total,
+1775:             "reviewed_count": reviewed,
+1776:             "sent_count": sent,
+1777:             "not_sent_count": not_sent,
+1778:             "rejected_count": rejected,
+1779:             "other_count": other,
+1780:             "level_doesnt_exist_count": level_doesnt_exist,
+1781:             "stolen_level_count": stolen_level,
+1782:             "already_rated_count": already_rated,
+1783:             "pending_count": pending,
+1784:             "left_to_review": pending,
+1785:             "reviewed_percent": self._pct(reviewed, total),
+1786:             "pending_percent": self._pct(pending, total),
+1787:             "sent_percent": self._pct(sent, total),
+1788:             "not_sent_percent": self._pct(not_sent, total),
+1789:             "sent_percent_reviewed": self._pct(sent, reviewed),
+1790:             "not_sent_percent_reviewed": self._pct(not_sent, reviewed),
 ```
 
 The summary is generated from the database, not from memory. That means it can be rebuilt later and it stays correct even if the bot restarts between reviews.
 
-## 35. Scheduled Openings Walkthrough
+## 36. Scheduled Openings Walkthrough
 
 Scheduled request openings are stored as rows, not just sleeping tasks. This is deliberate. If the bot restarts, a sleeping task disappears, but the row in level_request_scheduled_openings remains. The scheduler loop can pick it up again when the bot is ready.
 
-#### Scheduling command excerpt (cogs/RequestLevels.py:2702-2771)
+#### Scheduling command excerpt (cogs/RequestLevels.py:2911-2980)
 
 ```python
-2702:     async def open_requests(
-2703:         self,
-2704:         ctx: discord.ApplicationContext,
-2705:         number: int = 0,
-2706:         time: int = 0,
-2707:         when: str = "",
-2708:         day: int = 0,
-2709:         request_type: str = "",
-2710:         open_message: str = "",
-2711:     ):
-2712:         if not self._in_allowed_guild(ctx):
-2713:             return await ctx.respond("Wrong server.", ephemeral=True)
-2714:         await self._defer_command(ctx)
-2715:         member = await self._resolve_member(ctx.guild, ctx.user)
-2716:         if member is None or not self._is_admin(member):
-2717:             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
-2718:
-2719:         request_limit = int(number) if number and int(number) > 0 else None
-2720:         close_minutes = int(time) if time and int(time) > 0 else None
-2721:         if int(number or 0) < 0 or int(number or 0) > 10000:
-2722:             return await ctx.respond("Request limit must be between 0 and 10,000.", ephemeral=True)
-2723:         if int(time or 0) < 0 or int(time or 0) > 43200:
-2724:             return await ctx.respond("Close timer must be between 0 and 43,200 minutes (30 days).", ephemeral=True)
-2725:         normalized_type = self._normalize_request_type(request_type)
-2726:         if normalized_type is None:
-2727:             return await ctx.respond(f"Unknown request type. Use one of: {self._request_type_help()}, or leave it blank.", ephemeral=True)
-2728:         type_label = self._request_type_label(normalized_type)
-2729:         cleaned_open_message = self._clean_open_message(open_message)
-2730:
-2731:         if str(when or "").strip():
-2732:             open_ts, error = self._parse_scheduled_open_ts(when, day)
-2733:             if open_ts is None:
-2734:                 return await ctx.respond(error or "I couldn't parse that opening time.", ephemeral=True)
-2735:             await self.bot.db.execute(
-2736:                 "INSERT INTO level_request_scheduled_openings(guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,status,request_type,open_message,correlation_id) "
-2737:                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
-2738:                 (
-2739:                     ctx.guild.id,
-2740:                     request_limit,
-2741:                     close_minutes,
-2742:                     open_ts,
-2743:                     ctx.user.id,
-2744:                     int(time_module.time()),
-2745:                     "pending",
-2746:                     normalized_type or None,
-2747:                     cleaned_open_message,
-2748:                     new_correlation_id("scheduled"),
-2749:                 ),
-2750:             )
-2751:             details = [f"Request opening scheduled for <t:{open_ts}:F> (<t:{open_ts}:R>)."]
-2752:             if normalized_type:
-2753:                 details.append(f"Type: **{type_label}**.")
-2754:             details.append("Announcement: **custom**." if cleaned_open_message else "Announcement: **default role ping**.")
-2755:             if request_limit:
-2756:                 details.append(f"Limit: **{request_limit}** successful requests.")
-2757:             if close_minutes:
-2758:                 details.append(f"Requests will close after **{close_minutes}** minutes unless the limit is reached first.")
-2759:             details.append("Use `/pending-openings` to edit, delete, or open it early.")
-2760:             await self._log_request_admin_action(
-2761:                 ctx.guild,
-2762:                 ctx.user.id,
-2763:                 "scheduled_opening_created",
-2764:                 f"open_ts={open_ts} limit={request_limit} close_minutes={close_minutes} request_type={normalized_type or 'any'} announcement={'custom' if cleaned_open_message else 'default'}",
-2765:             )
-2766:             return await ctx.respond(" ".join(details), ephemeral=True)
-2767:
-2768:         try:
-2769:             wave_id, close_ts = await self._open_requests_now(
-2770:                 ctx.guild,
-2771:                 request_limit,
+2911:     async def open_requests(
+2912:         self,
+2913:         ctx: discord.ApplicationContext,
+2914:         number: int = 0,
+2915:         time: int = 0,
+2916:         when: str = "",
+2917:         day: int = 0,
+2918:         request_type: str = "",
+2919:         open_message: str = "",
+2920:     ):
+2921:         if not self._in_allowed_guild(ctx):
+2922:             return await ctx.respond("Wrong server.", ephemeral=True)
+2923:         await self._defer_command(ctx)
+2924:         member = await self._resolve_member(ctx.guild, ctx.user)
+2925:         if member is None or not self._is_admin(member):
+2926:             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+2927:
+2928:         request_limit = int(number) if number and int(number) > 0 else None
+2929:         close_minutes = int(time) if time and int(time) > 0 else None
+2930:         if int(number or 0) < 0 or int(number or 0) > 10000:
+2931:             return await ctx.respond("Request limit must be between 0 and 10,000.", ephemeral=True)
+2932:         if int(time or 0) < 0 or int(time or 0) > 43200:
+2933:             return await ctx.respond("Close timer must be between 0 and 43,200 minutes (30 days).", ephemeral=True)
+2934:         normalized_type = self._normalize_request_type(request_type)
+2935:         if normalized_type is None:
+2936:             return await ctx.respond(f"Unknown request type. Use one of: {self._request_type_help()}, or leave it blank.", ephemeral=True)
+2937:         type_label = self._request_type_label(normalized_type)
+2938:         cleaned_open_message = self._clean_open_message(open_message)
+2939:
+2940:         if str(when or "").strip():
+2941:             open_ts, error = self._parse_scheduled_open_ts(when, day)
+2942:             if open_ts is None:
+2943:                 return await ctx.respond(error or "I couldn't parse that opening time.", ephemeral=True)
+2944:             await self.bot.db.execute(
+2945:                 "INSERT INTO level_request_scheduled_openings(guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,status,request_type,open_message,correlation_id) "
+2946:                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
+2947:                 (
+2948:                     ctx.guild.id,
+2949:                     request_limit,
+2950:                     close_minutes,
+2951:                     open_ts,
+2952:                     ctx.user.id,
+2953:                     int(time_module.time()),
+2954:                     "pending",
+2955:                     normalized_type or None,
+2956:                     cleaned_open_message,
+2957:                     new_correlation_id("scheduled"),
+2958:                 ),
+2959:             )
+2960:             details = [f"Request opening scheduled for <t:{open_ts}:F> (<t:{open_ts}:R>)."]
+2961:             if normalized_type:
+2962:                 details.append(f"Type: **{type_label}**.")
+2963:             details.append("Announcement: **custom**." if cleaned_open_message else "Announcement: **default role ping**.")
+2964:             if request_limit:
+2965:                 details.append(f"Limit: **{request_limit}** successful requests.")
+2966:             if close_minutes:
+2967:                 details.append(f"Requests will close after **{close_minutes}** minutes unless the limit is reached first.")
+2968:             details.append("Use `/pending-openings` to edit, delete, or open it early.")
+2969:             await self._log_request_admin_action(
+2970:                 ctx.guild,
+2971:                 ctx.user.id,
+2972:                 "scheduled_opening_created",
+2973:                 f"open_ts={open_ts} limit={request_limit} close_minutes={close_minutes} request_type={normalized_type or 'any'} announcement={'custom' if cleaned_open_message else 'default'}",
+2974:             )
+2975:             return await ctx.respond(" ".join(details), ephemeral=True)
+2976:
+2977:         try:
+2978:             wave_id, close_ts = await self._open_requests_now(
+2979:                 ctx.guild,
+2980:                 request_limit,
 ```
 
-#### Pending opening edit/list excerpt (cogs/RequestLevels.py:2797-2866)
+#### Pending opening edit/list excerpt (cogs/RequestLevels.py:3006-3075)
 
 ```python
-2797:     async def pending_openings(
-2798:         self,
-2799:         ctx: discord.ApplicationContext,
-2800:         action: str = "list",
-2801:         opening_id: int = 0,
-2802:         number: int = -1,
-2803:         time: int = -1,
-2804:         when: str = "",
-2805:         day: int = 0,
-2806:         request_type: str = "",
-2807:         open_message: str = "",
-2808:     ):
-2809:         if not self._in_allowed_guild(ctx):
-2810:             return await ctx.respond("Wrong server.", ephemeral=True)
-2811:         await self._defer_command(ctx)
-2812:         member = await self._resolve_member(ctx.guild, ctx.user)
-2813:         if member is None or not self._is_admin(member):
-2814:             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
-2815:
-2816:         action = str(action or "list").strip().casefold()
-2817:         if action in {"delete", "remove", "cancel"}:
-2818:             if not opening_id:
-2819:                 return await ctx.respond("Please provide the scheduled opening ID to delete.", ephemeral=True)
-2820:             async with self._scheduled_lock:
-2821:                 existing = await self.get_scheduled_opening(ctx.guild.id, opening_id)
-2822:                 if existing is None:
-2823:                     return await ctx.respond("I couldn't find a pending opening with that ID.", ephemeral=True)
-2824:                 await self.bot.db.execute(
-2825:                     "UPDATE level_request_scheduled_openings SET status='deleted' WHERE guild_id=? AND id=? AND status='pending'",
-2826:                     (ctx.guild.id, opening_id),
-2827:                 )
-2828:             await self._log_request_admin_action(ctx.guild, ctx.user.id, "scheduled_opening_deleted", f"opening_id={opening_id}")
-2829:             return await ctx.respond(f"Deleted scheduled opening **#{opening_id}** if it was still pending.", ephemeral=True)
-2830:
-2831:         if action in {"edit", "update"}:
-2832:             if not opening_id:
-2833:                 return await ctx.respond("Please provide the scheduled opening ID to edit.", ephemeral=True)
-2834:             row = await self.bot.db.fetchone(
-2835:                 "SELECT * FROM level_request_scheduled_openings WHERE guild_id=? AND id=? AND status='pending'",
-2836:                 (ctx.guild.id, opening_id),
-2837:             )
-2838:             if not row:
-2839:                 return await ctx.respond("I couldn't find a pending opening with that ID.", ephemeral=True)
-2840:
-2841:             new_limit = row["request_limit"]
-2842:             new_close = row["close_minutes"]
-2843:             new_open_ts = int(row["open_ts"])
-2844:             new_type = row["request_type"] if "request_type" in row.keys() else None
-2845:             new_message = self._row_value(row, "open_message", None)
-2846:             if number < -1 or time < -1:
-2847:                 return await ctx.respond("Use -1 to keep a value, 0 to clear it, or a positive number.", ephemeral=True)
-2848:             if number > 10000:
-2849:                 return await ctx.respond("Request limit cannot be greater than 10,000.", ephemeral=True)
-2850:             if time > 43200:
-2851:                 return await ctx.respond("Close timer cannot be greater than 43,200 minutes (30 days).", ephemeral=True)
-2852:             if number >= 0:
-2853:                 new_limit = int(number) if int(number) > 0 else None
-2854:             if time >= 0:
-2855:                 new_close = int(time) if int(time) > 0 else None
-2856:             if str(request_type or "").strip():
-2857:                 parsed_type = self._normalize_request_type(request_type)
-2858:                 if parsed_type is None:
-2859:                     return await ctx.respond(
-2860:                         f"Unknown request type. Use one of: {self._request_type_help()}, or use `any` to clear it.",
-2861:                         ephemeral=True,
-2862:                     )
-2863:                 new_type = parsed_type or None
-2864:             if str(open_message or "").strip():
-2865:                 new_message = self._clean_open_message(open_message)
-2866:             if str(when or "").strip():
+3006:     async def pending_openings(
+3007:         self,
+3008:         ctx: discord.ApplicationContext,
+3009:         action: str = "list",
+3010:         opening_id: int = 0,
+3011:         number: int = -1,
+3012:         time: int = -1,
+3013:         when: str = "",
+3014:         day: int = 0,
+3015:         request_type: str = "",
+3016:         open_message: str = "",
+3017:     ):
+3018:         if not self._in_allowed_guild(ctx):
+3019:             return await ctx.respond("Wrong server.", ephemeral=True)
+3020:         await self._defer_command(ctx)
+3021:         member = await self._resolve_member(ctx.guild, ctx.user)
+3022:         if member is None or not self._is_admin(member):
+3023:             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+3024:
+3025:         action = str(action or "list").strip().casefold()
+3026:         if action in {"delete", "remove", "cancel"}:
+3027:             if not opening_id:
+3028:                 return await ctx.respond("Please provide the scheduled opening ID to delete.", ephemeral=True)
+3029:             async with self._scheduled_lock:
+3030:                 existing = await self.get_scheduled_opening(ctx.guild.id, opening_id)
+3031:                 if existing is None:
+3032:                     return await ctx.respond("I couldn't find a pending opening with that ID.", ephemeral=True)
+3033:                 await self.bot.db.execute(
+3034:                     "UPDATE level_request_scheduled_openings SET status='deleted' WHERE guild_id=? AND id=? AND status='pending'",
+3035:                     (ctx.guild.id, opening_id),
+3036:                 )
+3037:             await self._log_request_admin_action(ctx.guild, ctx.user.id, "scheduled_opening_deleted", f"opening_id={opening_id}")
+3038:             return await ctx.respond(f"Deleted scheduled opening **#{opening_id}** if it was still pending.", ephemeral=True)
+3039:
+3040:         if action in {"edit", "update"}:
+3041:             if not opening_id:
+3042:                 return await ctx.respond("Please provide the scheduled opening ID to edit.", ephemeral=True)
+3043:             row = await self.bot.db.fetchone(
+3044:                 "SELECT * FROM level_request_scheduled_openings WHERE guild_id=? AND id=? AND status='pending'",
+3045:                 (ctx.guild.id, opening_id),
+3046:             )
+3047:             if not row:
+3048:                 return await ctx.respond("I couldn't find a pending opening with that ID.", ephemeral=True)
+3049:
+3050:             new_limit = row["request_limit"]
+3051:             new_close = row["close_minutes"]
+3052:             new_open_ts = int(row["open_ts"])
+3053:             new_type = row["request_type"] if "request_type" in row.keys() else None
+3054:             new_message = self._row_value(row, "open_message", None)
+3055:             if number < -1 or time < -1:
+3056:                 return await ctx.respond("Use -1 to keep a value, 0 to clear it, or a positive number.", ephemeral=True)
+3057:             if number > 10000:
+3058:                 return await ctx.respond("Request limit cannot be greater than 10,000.", ephemeral=True)
+3059:             if time > 43200:
+3060:                 return await ctx.respond("Close timer cannot be greater than 43,200 minutes (30 days).", ephemeral=True)
+3061:             if number >= 0:
+3062:                 new_limit = int(number) if int(number) > 0 else None
+3063:             if time >= 0:
+3064:                 new_close = int(time) if int(time) > 0 else None
+3065:             if str(request_type or "").strip():
+3066:                 parsed_type = self._normalize_request_type(request_type)
+3067:                 if parsed_type is None:
+3068:                     return await ctx.respond(
+3069:                         f"Unknown request type. Use one of: {self._request_type_help()}, or use `any` to clear it.",
+3070:                         ephemeral=True,
+3071:                     )
+3072:                 new_type = parsed_type or None
+3073:             if str(open_message or "").strip():
+3074:                 new_message = self._clean_open_message(open_message)
+3075:             if str(when or "").strip():
 ```
 
 The command accepts immediate openings and scheduled openings through the same entry point. The when/day options create a future row; leaving when empty opens immediately. This keeps the admin interface compact while the stored state remains explicit.
 
 > **Why Discord timestamps are used:** The bot stores Unix timestamps and displays Discord timestamp markup. Discord then renders the time in each viewer's client, which avoids putting a timezone label in the frontend while still keeping scheduling internally consistent.
 
-## 36. Tracking Code Walkthrough
+## 37. Tracking Code Walkthrough
 
 TrackingCog counts activity without writing to SQLite on every message. That would be slow and noisy. Instead, it keeps small in-memory buffers and periodically flushes them with UPSERT statements. If the flush fails, it puts the counts back into the buffer so they can be retried.
 
-#### Message counting gate (cogs/Tracking.py:982-1043)
+#### Message counting gate (cogs/Tracking.py:985-1046)
 
 ```python
- 982:     async def on_message(self, message: discord.Message):
- 983:         if message.author.bot:
- 984:             return
- 985:
- 986:         # DM handling for weekly request process
- 987:         if message.guild is None:
- 988:             await self._handle_dm(message)
- 989:             return
- 990:
- 991:         allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
- 992:         if not ensure_allowed_guild_id(message.guild, allowed_guild_id):
- 993:             return
- 994:
- 995:         # Exclude blacklisted roles
- 996:         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
- 997:         if excluded_role_ids:
- 998:             m = await self._resolve_member(message.guild, message.author)
- 999:             if m and any(r.id in excluded_role_ids for r in m.roles):
-1000:                 return
-1001:
-1002:         # Exclude channels
-1003:         excluded_channels = set(self._cfg_int_list("channels", "excluded_tracking_channel_ids")) | set(
-1004:             self._cfg_int_list("channels", "bot_commands_channel_ids")
-1005:         )
-1006:         review_access_channel_id = self._cfg_int("channels", "review_access_channel_id", 0)
-1007:         if review_access_channel_id:
-1008:             excluded_channels.add(review_access_channel_id)
-1009:         if message.channel.id in excluded_channels:
-1010:             return
-1011:
-1012:         now = int(time.time())
-1013:         if len(self._last_counted_cache) > 20000:
-1014:             oldest = sorted(self._last_counted_cache.items(), key=lambda item: item[1])[:5000]
-1015:             for old_key, _ in oldest:
-1016:                 self._last_counted_cache.pop(old_key, None)
-1017:         anti_farm_reason = await self._anti_farm_reason(message, now)
-1018:         if anti_farm_reason:
-1019:             await self._record_anti_farm_event(message, anti_farm_reason, now)
-1020:             return
-1021:
-1022:         cd = max(0, min(3600, self._cfg_int("tracking", "count_cooldown_seconds", 10)))
-1023:         cache_key = (message.guild.id, message.author.id)
+ 985:     async def on_message(self, message: discord.Message):
+ 986:         if message.author.bot:
+ 987:             return
+ 988:
+ 989:         # DM handling for weekly request process
+ 990:         if message.guild is None:
+ 991:             await self._handle_dm(message)
+ 992:             return
+ 993:
+ 994:         allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
+ 995:         if not ensure_allowed_guild_id(message.guild, allowed_guild_id):
+ 996:             return
+ 997:
+ 998:         # Exclude blacklisted roles
+ 999:         excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
+1000:         if excluded_role_ids:
+1001:             m = await self._resolve_member(message.guild, message.author)
+1002:             if m and any(r.id in excluded_role_ids for r in m.roles):
+1003:                 return
+1004:
+1005:         # Exclude channels
+1006:         excluded_channels = set(self._cfg_int_list("channels", "excluded_tracking_channel_ids")) | set(
+1007:             self._cfg_int_list("channels", "bot_commands_channel_ids")
+1008:         )
+1009:         review_access_channel_id = self._cfg_int("channels", "review_access_channel_id", 0)
+1010:         if review_access_channel_id:
+1011:             excluded_channels.add(review_access_channel_id)
+1012:         if message.channel.id in excluded_channels:
+1013:             return
+1014:
+1015:         now = int(time.time())
+1016:         if len(self._last_counted_cache) > 20000:
+1017:             oldest = sorted(self._last_counted_cache.items(), key=lambda item: item[1])[:5000]
+1018:             for old_key, _ in oldest:
+1019:                 self._last_counted_cache.pop(old_key, None)
+1020:         anti_farm_reason = await self._anti_farm_reason(message, now)
+1021:         if anti_farm_reason:
+1022:             await self._record_anti_farm_event(message, anti_farm_reason, now)
+1023:             return
 1024:
-1025:         last_counted = self._last_counted_cache.get(cache_key)
-1026:         if last_counted is None:
-1027:             row = await self.bot.db.fetchone(
-1028:                 "SELECT last_counted_ts FROM activity_last_counted WHERE guild_id=? AND user_id=?",
-1029:                 (message.guild.id, message.author.id),
-1030:             )
-1031:             last_counted = int(row["last_counted_ts"]) if row else 0
-1032:             self._last_counted_cache[cache_key] = last_counted
-1033:
-1034:         if last_counted and now - int(last_counted) < cd:
-1035:             return
+1025:         cd = max(0, min(3600, self._cfg_int("tracking", "count_cooldown_seconds", 10)))
+1026:         cache_key = (message.guild.id, message.author.id)
+1027:
+1028:         last_counted = self._last_counted_cache.get(cache_key)
+1029:         if last_counted is None:
+1030:             row = await self.bot.db.fetchone(
+1031:                 "SELECT last_counted_ts FROM activity_last_counted WHERE guild_id=? AND user_id=?",
+1032:                 (message.guild.id, message.author.id),
+1033:             )
+1034:             last_counted = int(row["last_counted_ts"]) if row else 0
+1035:             self._last_counted_cache[cache_key] = last_counted
 1036:
-1037:         ws_iso = week_start_sunday(now_madrid()).isoformat()
-1038:         self._last_counted_cache[cache_key] = now
+1037:         if last_counted and now - int(last_counted) < cd:
+1038:             return
 1039:
-1040:         async with self._activity_lock:
-1041:             count_key = (message.guild.id, message.author.id, ws_iso)
-1042:             self._pending_activity_counts[count_key] = self._pending_activity_counts.get(count_key, 0) + 1
-1043:             self._pending_last_counted[cache_key] = now
+1040:         ws_iso = week_start_sunday(now_madrid()).isoformat()
+1041:         self._last_counted_cache[cache_key] = now
+1042:
+1043:         async with self._activity_lock:
+1044:             count_key = (message.guild.id, message.author.id, ws_iso)
+1045:             self._pending_activity_counts[count_key] = self._pending_activity_counts.get(count_key, 0) + 1
+1046:             self._pending_last_counted[cache_key] = now
 ```
 
-#### Buffered activity flush (cogs/Tracking.py:1056-1096)
+#### Buffered activity flush (cogs/Tracking.py:1059-1088)
 
 ```python
-1056:     async def flush_activity_counts(self) -> None:
-1057:         async with self._activity_lock:
-1058:             counts = self._pending_activity_counts
-1059:             last_seen = self._pending_last_counted
-1060:             self._pending_activity_counts = {}
-1061:             self._pending_last_counted = {}
-1062:
-1063:         if not counts and not last_seen:
-1064:             return
-1065:
-1066:         if counts:
-1067:             try:
-1068:                 await self.bot.db.executemany(
-1069:                     "INSERT INTO activity_counts(guild_id,user_id,week_start,count) VALUES(?,?,?,?) "
-1070:                     "ON CONFLICT(guild_id,user_id,week_start) DO UPDATE SET count=count+excluded.count",
-1071:                     [(guild_id, user_id, week_start, amount) for (guild_id, user_id, week_start), amount in counts.items()],
-1072:                 )
-1073:             except Exception as e:
-1074:                 async with self._activity_lock:
-1075:                     for key, amount in counts.items():
-1076:                         self._pending_activity_counts[key] = self._pending_activity_counts.get(key, 0) + amount
-1077:                     for key, ts in last_seen.items():
-1078:                         self._pending_last_counted[key] = max(self._pending_last_counted.get(key, 0), ts)
-1079:                 await self._log_background_error("activity_flush_counts", f"Activity count flush failed: {repr(e)}")
-1080:                 # Do not persist a cooldown timestamp for a message whose
-1081:                 # count did not persist. Otherwise a restart can lose the
-1082:                 # message permanently while still suppressing the next one.
-1083:                 return
-1084:
-1085:         if last_seen:
-1086:             try:
-1087:                 await self.bot.db.executemany(
-1088:                     "INSERT INTO activity_last_counted(guild_id,user_id,last_counted_ts) VALUES(?,?,?) "
-1089:                     "ON CONFLICT(guild_id,user_id) DO UPDATE SET last_counted_ts=excluded.last_counted_ts",
-1090:                     [(guild_id, user_id, ts) for (guild_id, user_id), ts in last_seen.items()],
-1091:                 )
-1092:             except Exception as e:
-1093:                 async with self._activity_lock:
-1094:                     for key, ts in last_seen.items():
-1095:                         self._pending_last_counted[key] = max(self._pending_last_counted.get(key, 0), ts)
-1096:                 await self._log_background_error("activity_flush_last_seen", f"Activity cooldown flush failed: {repr(e)}")
+1059:     async def flush_activity_counts(self, *, drain: bool = False) -> None:
+1060:         if self._activity_flush_lock.locked() and not drain:
+1061:             return
+1062:         async with self._activity_flush_lock:
+1063:             # Keep a failed batch immutable: its receipt may already exist
+1064:             # remotely after an uncertain commit. New activity stays separate.
+1065:             batches = 0
+1066:             while drain or batches < 4:
+1067:                 batches += 1
+1068:                 if self._activity_retry_batch is None:
+1069:                     async with self._activity_lock:
+1070:                         count_keys = list(self._pending_activity_counts)[:50]
+1071:                         counts = [(*key, self._pending_activity_counts.pop(key)) for key in count_keys]
+1072:                         unflushed_users = {(key[0], key[1]) for key in self._pending_activity_counts}
+1073:                         seen_keys = [key for key in self._pending_last_counted if key not in unflushed_users][:50]
+1074:                         last_seen = [(*key, self._pending_last_counted.pop(key)) for key in seen_keys if key in self._pending_last_counted]
+1075:                     if not counts and not last_seen:
+1076:                         return
+1077:                     self._activity_retry_batch = (new_correlation_id("activity"), counts, last_seen)
+1078:                 batch_id, counts, last_seen = self._activity_retry_batch
+1079:                 try:
+1080:                     await self.bot.db.apply_activity_batch(batch_id, counts, last_seen)
+1081:                 except DatabaseBusyError:
+1082:                     return
+1083:                 except Exception as e:
+1084:                     await self._log_background_error("activity_flush_counts", f"Activity batch persistence deferred: {e!r}")
+1085:                     return
+1086:                 self._activity_retry_batch = None
+1087:                 # Let interactive writers acquire the queue between chunks.
+1088:                 await asyncio.sleep(0)
 ```
 
 The ON CONFLICT SQL is doing the increment atomically at database level: if a row already exists for that user and week, count becomes count + excluded.count. That keeps weekly totals correct even though the bot flushes multiple messages together.
 
-#### Weekly job runner (cogs/Tracking.py:1784-1826)
+#### Weekly job runner (cogs/Tracking.py:1796-1844)
 
 ```python
-1784:     async def run_weekly_job(self, week_start_iso: str):
-1785:         allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
-1786:         guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
-1787:         if guild is None:
-1788:             return
-1789:         await self.flush_activity_counts()
-1790:
-1791:         top_limit = max(1, min(500, self._cfg_int("tracking", "top_limit", 20)))
-1792:         winners_to_dm = max(0, min(top_limit, self._cfg_int("tracking", "winners_to_dm", 1)))
-1793:         timeout_h = max(1, min(24 * 30, self._cfg_int("tracking", "dm_timeout_hours", 48)))
-1794:
-1795:         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_start", f"top_limit={top_limit} winners_to_dm={winners_to_dm} timeout_h={timeout_h}")
-1796:
-1797:         ranked: List[int] = []
-1798:         ranked_rows = await self._ranked_rows_for_week(
-1799:             guild,
-1800:             week_start_iso,
-1801:             top_limit,
-1802:             include_unresolved=False,
-1803:         )
-1804:         for r in ranked_rows:
-1805:             uid = int(r["user_id"])
-1806:             ranked.append(uid)
-1807:
-1808:         try:
-1809:             await self._update_weekly_streaks(guild, week_start_iso, ranked)
-1810:         except Exception as e:
-1811:             await self._log_background_error("weekly_streaks", f"Weekly streak update failed: {repr(e)}")
+1796:     async def run_weekly_job(self, week_start_iso: str):
+1797:         allowed_guild_id = self._cfg_int("guild", "allowed_guild_id", 0)
+1798:         guild = self.bot.get_guild(allowed_guild_id) if allowed_guild_id else None
+1799:         if guild is None:
+1800:             return
+1801:         await self.flush_activity_counts(drain=True)
+1802:         async with self._activity_lock:
+1803:             pending = any(key[0] == guild.id and key[2] == week_start_iso for key in self._pending_activity_counts)
+1804:             retry = self._activity_retry_batch
+1805:             pending = pending or bool(retry and any(row[0] == guild.id and row[2] == week_start_iso for row in retry[1]))
+1806:         if pending:
+1807:             raise DatabaseBusyError("Weekly reward postponed until this week's activity batch is confirmed; no winners were selected")
+1808:
+1809:         top_limit = max(1, min(500, self._cfg_int("tracking", "top_limit", 20)))
+1810:         winners_to_dm = max(0, min(top_limit, self._cfg_int("tracking", "winners_to_dm", 1)))
+1811:         timeout_h = max(1, min(24 * 30, self._cfg_int("tracking", "dm_timeout_hours", 48)))
 1812:
-1813:         if await self.weekly_reward_disabled(guild.id, week_start_iso):
-1814:             await self._log_weekly(guild, week_start_iso, 0, "weekly_reward_skipped", "Reward disabled for this tracking week")
-1815:             await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted=0 eligible_ranked={len(ranked)}")
-1816:             return
-1817:
-1818:         contacted = 0
-1819:         for idx, uid in enumerate(ranked, start=1):
-1820:             if contacted >= winners_to_dm:
-1821:                 break
-1822:             ok = await self._contact_user_for_week(guild, week_start_iso, uid, rank=idx, timeout_hours=timeout_h)
-1823:             if ok:
-1824:                 contacted += 1
+1813:         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_start", f"top_limit={top_limit} winners_to_dm={winners_to_dm} timeout_h={timeout_h}")
+1814:
+1815:         ranked: List[int] = []
+1816:         ranked_rows = await self._ranked_rows_for_week(
+1817:             guild,
+1818:             week_start_iso,
+1819:             top_limit,
+1820:             include_unresolved=False,
+1821:         )
+1822:         for r in ranked_rows:
+1823:             uid = int(r["user_id"])
+1824:             ranked.append(uid)
 1825:
-1826:         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted={contacted} eligible_ranked={len(ranked)}")
+1826:         try:
+1827:             await self._update_weekly_streaks(guild, week_start_iso, ranked)
+1828:         except Exception as e:
+1829:             await self._log_background_error("weekly_streaks", f"Weekly streak update failed: {repr(e)}")
+1830:
+1831:         if await self.weekly_reward_disabled(guild.id, week_start_iso):
+1832:             await self._log_weekly(guild, week_start_iso, 0, "weekly_reward_skipped", "Reward disabled for this tracking week")
+1833:             await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted=0 eligible_ranked={len(ranked)}")
+1834:             return
+1835:
+1836:         contacted = 0
+1837:         for idx, uid in enumerate(ranked, start=1):
+1838:             if contacted >= winners_to_dm:
+1839:                 break
+1840:             ok = await self._contact_user_for_week(guild, week_start_iso, uid, rank=idx, timeout_hours=timeout_h)
+1841:             if ok:
+1842:                 contacted += 1
+1843:
+1844:         await self._log_weekly(guild, week_start_iso, 0, "weekly_job_done", f"contacted={contacted} eligible_ranked={len(ranked)}")
 ```
 
 The weekly job flushes pending activity first, ranks users, updates streaks, respects the weekly reward disabled switch, contacts winners, writes the weekly_runs idempotency row, and creates a private recap. The weekly_runs table prevents the same week from being processed repeatedly by the scheduler.
 
-## 37. Weekly Request Workflow Walkthrough
+## 38. Weekly Request Workflow Walkthrough
 
 Weekly request rewards happen in DMs. A winner receives a formatted request prompt, replies with the required fields, and TrackingCog parses the message into the same shape that RequestLevelsCog understands for review embeds.
 
-#### Weekly DM request parser (cogs/Tracking.py:162-223)
+#### Weekly DM request parser (cogs/Tracking.py:165-226)
 
 ```python
- 162:     def _weekly_request_review_data(self, content: str, apply_defaults: bool = True) -> dict[str, str]:
- 163:         aliases = {
- 164:             "name": "level_name",
- 165:             "level name": "level_name",
- 166:             "id": "level_id",
- 167:             "level id": "level_id",
- 168:             "creator": "creators",
- 169:             "creators": "creators",
- 170:             "creator s": "creators",
- 171:             "level showcase": "level_showcase",
- 172:             "showcase": "level_showcase",
- 173:             "video": "level_showcase",
- 174:             "notes": "notes",
- 175:             "note": "notes",
- 176:         }
- 177:         data: dict[str, str] = {"request_content": str(content or "").strip()}
- 178:         current_key: Optional[str] = None
- 179:
- 180:         for raw_line in str(content or "").splitlines():
- 181:             line = raw_line.strip()
- 182:             if line.startswith(">"):
- 183:                 line = line.lstrip("> ").strip()
- 184:             if not line:
- 185:                 continue
- 186:
- 187:             if ":" in line:
- 188:                 raw_key, value = line.split(":", 1)
- 189:                 normalized = re.sub(r"[^a-z0-9]+", " ", raw_key.casefold()).strip()
- 190:                 field_key = aliases.get(normalized)
- 191:                 if field_key:
- 192:                     current_key = field_key
- 193:                     if value.strip() or field_key not in data:
- 194:                         data[field_key] = value.strip()
- 195:                     continue
- 196:
- 197:             if current_key:
- 198:                 previous = str(data.get(current_key) or "").strip()
- 199:                 data[current_key] = f"{previous}\n{line}".strip() if previous else line
- 200:
- 201:         if not data.get("level_id"):
- 202:             match = re.search(r"\b(?:level\s*)?id\s*[:#-]?\s*([0-9]{7,9})\b", str(content or ""), flags=re.I)
- 203:             if match:
- 204:                 data["level_id"] = match.group(1)
- 205:         if not data.get("level_name"):
- 206:             match = re.search(r"\b(?:level\s*)?name\s*[:#-]?\s*(.+)", str(content or ""), flags=re.I)
- 207:             if match:
- 208:                 data["level_name"] = match.group(1).strip()
- 209:         if not data.get("creators"):
- 210:             match = re.search(r"\bcreators?\s*[:#-]?\s*(.+)", str(content or ""), flags=re.I)
- 211:             if match:
- 212:                 data["creators"] = match.group(1).strip()
- 213:
- 214:         if not apply_defaults:
- 215:             return data
+ 165:     def _weekly_request_review_data(self, content: str, apply_defaults: bool = True) -> dict[str, str]:
+ 166:         aliases = {
+ 167:             "name": "level_name",
+ 168:             "level name": "level_name",
+ 169:             "id": "level_id",
+ 170:             "level id": "level_id",
+ 171:             "creator": "creators",
+ 172:             "creators": "creators",
+ 173:             "creator s": "creators",
+ 174:             "level showcase": "level_showcase",
+ 175:             "showcase": "level_showcase",
+ 176:             "video": "level_showcase",
+ 177:             "notes": "notes",
+ 178:             "note": "notes",
+ 179:         }
+ 180:         data: dict[str, str] = {"request_content": str(content or "").strip()}
+ 181:         current_key: Optional[str] = None
+ 182:
+ 183:         for raw_line in str(content or "").splitlines():
+ 184:             line = raw_line.strip()
+ 185:             if line.startswith(">"):
+ 186:                 line = line.lstrip("> ").strip()
+ 187:             if not line:
+ 188:                 continue
+ 189:
+ 190:             if ":" in line:
+ 191:                 raw_key, value = line.split(":", 1)
+ 192:                 normalized = re.sub(r"[^a-z0-9]+", " ", raw_key.casefold()).strip()
+ 193:                 field_key = aliases.get(normalized)
+ 194:                 if field_key:
+ 195:                     current_key = field_key
+ 196:                     if value.strip() or field_key not in data:
+ 197:                         data[field_key] = value.strip()
+ 198:                     continue
+ 199:
+ 200:             if current_key:
+ 201:                 previous = str(data.get(current_key) or "").strip()
+ 202:                 data[current_key] = f"{previous}\n{line}".strip() if previous else line
+ 203:
+ 204:         if not data.get("level_id"):
+ 205:             match = re.search(r"\b(?:level\s*)?id\s*[:#-]?\s*([0-9]{7,9})\b", str(content or ""), flags=re.I)
+ 206:             if match:
+ 207:                 data["level_id"] = match.group(1)
+ 208:         if not data.get("level_name"):
+ 209:             match = re.search(r"\b(?:level\s*)?name\s*[:#-]?\s*(.+)", str(content or ""), flags=re.I)
+ 210:             if match:
+ 211:                 data["level_name"] = match.group(1).strip()
+ 212:         if not data.get("creators"):
+ 213:             match = re.search(r"\bcreators?\s*[:#-]?\s*(.+)", str(content or ""), flags=re.I)
+ 214:             if match:
+ 215:                 data["creators"] = match.group(1).strip()
  216:
- 217:         data["level_id"] = str(data.get("level_id") or "Not provided").strip()
- 218:         data["level_id_normalized"] = data["level_id"].casefold()
- 219:         data["level_name"] = str(data.get("level_name") or "Weekly request").strip()
- 220:         data["creators"] = str(data.get("creators") or "Not provided").strip()
- 221:         data["level_showcase"] = str(data.get("level_showcase") or "Not provided").strip()
- 222:         data["notes"] = str(data.get("notes") or data["request_content"] or "No notes provided").strip()
- 223:         return data
+ 217:         if not apply_defaults:
+ 218:             return data
+ 219:
+ 220:         data["level_id"] = str(data.get("level_id") or "Not provided").strip()
+ 221:         data["level_id_normalized"] = data["level_id"].casefold()
+ 222:         data["level_name"] = str(data.get("level_name") or "Weekly request").strip()
+ 223:         data["creators"] = str(data.get("creators") or "Not provided").strip()
+ 224:         data["level_showcase"] = str(data.get("level_showcase") or "Not provided").strip()
+ 225:         data["notes"] = str(data.get("notes") or data["request_content"] or "No notes provided").strip()
+ 226:         return data
 ```
 
-#### Weekly request recording excerpt (cogs/Tracking.py:1204-1273)
+#### Weekly request recording excerpt (cogs/Tracking.py:1217-1286)
 
 ```python
-1204:     async def _record_request(self, guild: discord.Guild, user_id: int, week_start_iso: str, content: str):
-1205:         active = await self.bot.db.fetchone(
-1206:             "SELECT c.rank AS rank FROM weekly_claims c "
-1207:             "JOIN weekly_sessions s ON s.guild_id=c.guild_id AND s.week_start=c.week_start AND s.user_id=c.user_id "
-1208:             "WHERE c.guild_id=? AND c.week_start=? AND c.user_id=? AND c.status='pending' AND s.active=1",
-1209:             (guild.id, week_start_iso, user_id),
-1210:         )
-1211:         if not active:
-1212:             return
-1213:
-1214:         weekly_channel_id = self._cfg_int("channels", "weekly_request_channel_ID", 0)
-1215:         channel = await self._configured_channel(guild, weekly_channel_id)
-1216:         if channel is None:
-1217:             await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", "reason=weekly_request_channel_missing")
-1218:             await log_error(self.bot, f"Weekly request from user_id={user_id} could not be recorded: weekly_request_channel_ID is missing or invalid.")
-1219:             try:
-1220:                 user = await self._resolve_dm_user(guild, user_id)
-1221:                 await user.send("I couldn't record your request because the staff request channel is not configured correctly. Please contact staff.")
-1222:             except Exception:
-1223:                 pass
-1224:             return
-1225:
-1226:         rank = int(active["rank"]) if active["rank"] is not None else None
-1227:
-1228:         review_data = self._weekly_request_review_data(content)
-1229:         ok, review_data = await self._validate_weekly_request_for_review(guild, user_id, week_start_iso, review_data)
-1230:         if not ok:
-1231:             return
-1232:         created_ts = int(time.time())
-1233:         correlation_id = new_correlation_id("weekly-request")
-1234:         review_data["correlation_id"] = correlation_id
-1235:         variables = {
-1236:             **review_data,
-1237:             "user_id": user_id,
-1238:             "user_mention": f"<@{user_id}>",
-1239:             "requester_id": user_id,
-1240:             "requester_mention": f"<@{user_id}>",
-1241:             "rank": f"#{rank}" if rank else "Unknown",
-1242:             "weekly_rank": f"#{rank}" if rank else "Unknown",
-1243:             "week_start": week_start_iso,
-1244:             "request_content": content,
-1245:             "created_ts": created_ts,
-1246:             "submitted_ts": created_ts,
-1247:             "submitted_ago": f"<t:{created_ts}:R>",
-1248:         }
-1249:         template = self.bot.config.get("level_requests", "weekly_request_submitted_embed", default={}) or {}
-1250:         if isinstance(template, dict) and template:
-1251:             embed = self._embed_from_template(template, variables, "Weekly Request Submitted", "gold")
-1252:         else:
-1253:             embed = discord.Embed(title="Weekly Request Submitted")
-1254:             embed.add_field(name="User", value=f"<@{user_id}> ({user_id})", inline=False)
-1255:             if rank:
-1256:                 embed.add_field(name="Rank", value=f"#{rank}", inline=True)
-1257:             embed.add_field(name="Week start", value=week_start_iso, inline=False)
-1258:             embed.add_field(name="Content", value=content[:1024], inline=False)
-1259:
-1260:         msg = None
-1261:         try:
-1262:             msg = await channel.send(
-1263:                 embed=embed,
-1264:                 view=LevelRequestReviewView(),
-1265:                 allowed_mentions=no_mentions(),
-1266:             )
-1267:         except Exception as e:
-1268:             await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=weekly_request_send_failed error={type(e).__name__}")
-1269:             await log_error(self.bot, f"Weekly request from user_id={user_id} could not be sent to staff channel {channel.id}: {repr(e)}")
-1270:             try:
-1271:                 user = await self._resolve_dm_user(guild, user_id)
-1272:                 await user.send("I couldn't record your request right now because I could not send it to the staff channel. Please contact staff.")
-1273:             except Exception:
+1217:     async def _record_request(self, guild: discord.Guild, user_id: int, week_start_iso: str, content: str):
+1218:         active = await self.bot.db.fetchone(
+1219:             "SELECT c.rank AS rank FROM weekly_claims c "
+1220:             "JOIN weekly_sessions s ON s.guild_id=c.guild_id AND s.week_start=c.week_start AND s.user_id=c.user_id "
+1221:             "WHERE c.guild_id=? AND c.week_start=? AND c.user_id=? AND c.status='pending' AND s.active=1",
+1222:             (guild.id, week_start_iso, user_id),
+1223:         )
+1224:         if not active:
+1225:             return
+1226:
+1227:         weekly_channel_id = self._cfg_int("channels", "weekly_request_channel_ID", 0)
+1228:         channel = await self._configured_channel(guild, weekly_channel_id)
+1229:         if channel is None:
+1230:             await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", "reason=weekly_request_channel_missing")
+1231:             await log_error(self.bot, f"Weekly request from user_id={user_id} could not be recorded: weekly_request_channel_ID is missing or invalid.")
+1232:             try:
+1233:                 user = await self._resolve_dm_user(guild, user_id)
+1234:                 await user.send("I couldn't record your request because the staff request channel is not configured correctly. Please contact staff.")
+1235:             except Exception:
+1236:                 pass
+1237:             return
+1238:
+1239:         rank = int(active["rank"]) if active["rank"] is not None else None
+1240:
+1241:         review_data = self._weekly_request_review_data(content)
+1242:         ok, review_data = await self._validate_weekly_request_for_review(guild, user_id, week_start_iso, review_data)
+1243:         if not ok:
+1244:             return
+1245:         created_ts = int(time.time())
+1246:         correlation_id = new_correlation_id("weekly-request")
+1247:         review_data["correlation_id"] = correlation_id
+1248:         variables = {
+1249:             **review_data,
+1250:             "user_id": user_id,
+1251:             "user_mention": f"<@{user_id}>",
+1252:             "requester_id": user_id,
+1253:             "requester_mention": f"<@{user_id}>",
+1254:             "rank": f"#{rank}" if rank else "Unknown",
+1255:             "weekly_rank": f"#{rank}" if rank else "Unknown",
+1256:             "week_start": week_start_iso,
+1257:             "request_content": content,
+1258:             "created_ts": created_ts,
+1259:             "submitted_ts": created_ts,
+1260:             "submitted_ago": f"<t:{created_ts}:R>",
+1261:         }
+1262:         template = self.bot.config.get("level_requests", "weekly_request_submitted_embed", default={}) or {}
+1263:         if isinstance(template, dict) and template:
+1264:             embed = self._embed_from_template(template, variables, "Weekly Request Submitted", "gold")
+1265:         else:
+1266:             embed = discord.Embed(title="Weekly Request Submitted")
+1267:             embed.add_field(name="User", value=f"<@{user_id}> ({user_id})", inline=False)
+1268:             if rank:
+1269:                 embed.add_field(name="Rank", value=f"#{rank}", inline=True)
+1270:             embed.add_field(name="Week start", value=week_start_iso, inline=False)
+1271:             embed.add_field(name="Content", value=content[:1024], inline=False)
+1272:
+1273:         msg = None
+1274:         try:
+1275:             msg = await channel.send(
+1276:                 embed=embed,
+1277:                 view=LevelRequestReviewView(),
+1278:                 allowed_mentions=no_mentions(),
+1279:             )
+1280:         except Exception as e:
+1281:             await self._log_weekly(guild, week_start_iso, user_id, "request_record_failed", f"reason=weekly_request_send_failed error={type(e).__name__}")
+1282:             await log_error(self.bot, f"Weekly request from user_id={user_id} could not be sent to staff channel {channel.id}: {repr(e)}")
+1283:             try:
+1284:                 user = await self._resolve_dm_user(guild, user_id)
+1285:                 await user.send("I couldn't record your request right now because I could not send it to the staff channel. Please contact staff.")
+1286:             except Exception:
 ```
 
 The important bridge is LevelRequestReviewView. Weekly submissions are not part of a live wave, but they still use the same Send, Reject, and Other buttons. The review row lives in weekly_request_reviews, and RequestLevelsCog's review finalizer handles it.
 
-#### Weekly contact state excerpt (cogs/Tracking.py:1828-1897)
+#### Weekly contact state excerpt (cogs/Tracking.py:1846-1915)
 
 ```python
-1828:     async def _contact_user_for_week(self, guild: discord.Guild, week_start_iso: str, user_id: int, rank: int, timeout_hours: int, force: bool = False) -> bool:
-1829:         if not force and await self.weekly_reward_disabled(guild.id, week_start_iso):
-1830:             await self._log_weekly(guild, week_start_iso, user_id, "skipped_reward_disabled", "")
-1831:             return False
-1832:
-1833:         member = await self._resolve_member(guild, user_id)
-1834:         if member is None or member.bot:
-1835:             await self._log_weekly(guild, week_start_iso, user_id, "no_eligible_member", "reason=member_missing_or_bot")
-1836:             return False
-1837:         if not force:
-1838:             excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
-1839:             if excluded_role_ids and any(role.id in excluded_role_ids for role in member.roles):
-1840:                 await self._log_weekly(guild, week_start_iso, user_id, "no_eligible_member", "reason=excluded_role")
-1841:                 return False
-1842:
-1843:         now_ts = int(time.time())
-1844:         timeout_hours = max(1, int(timeout_hours))
-1845:         expires = now_ts + timeout_hours * 3600
-1846:
-1847:         # Reserve the offer before sending the DM. Concurrent scheduler/force
-1848:         # runs now see `contacting` and cannot send the same offer twice.
-1849:         async with self._weekly_offer_lock:
-1850:             row = await self.bot.db.fetchone(
-1851:                 "SELECT status FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
-1852:                 (guild.id, week_start_iso, user_id),
-1853:             )
-1854:             if row is not None:
-1855:                 await self._log_weekly(
-1856:                     guild,
-1857:                     week_start_iso,
-1858:                     user_id,
-1859:                     "skipped_already_contacted",
-1860:                     f"status={row['status']}",
-1861:                 )
-1862:                 return False
-1863:             await self.bot.db.execute(
-1864:                 "INSERT INTO weekly_claims("
-1865:                 "guild_id,week_start,user_id,rank,status,contacted_ts,offer_expires_ts"
-1866:                 ") VALUES(?,?,?,?,?,?,?)",
-1867:                 (
-1868:                     guild.id,
-1869:                     week_start_iso,
-1870:                     user_id,
-1871:                     rank,
-1872:                     "contacting",
-1873:                     now_ts,
-1874:                     expires,
-1875:                 ),
-1876:             )
-1877:
-1878:         offer_message = None
-1879:         dm_channel = None
-1880:         try:
-1881:             offer_message, dm_channel = await self._send_weekly_offer_message(
-1882:                 member,
-1883:                 timeout_hours=timeout_hours,
-1884:                 expires_ts=expires,
-1885:             )
-1886:         except Exception as e:
-1887:             await self.bot.db.execute(
-1888:                 "UPDATE weekly_claims SET status='dm_closed' "
-1889:                 "WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
-1890:                 (guild.id, week_start_iso, user_id),
-1891:             )
-1892:             await self._log_weekly(guild, week_start_iso, user_id, "dm_failed", type(e).__name__)
-1893:
-1894:             log_ch_id = self._cfg_int("channels", "dm_fail_log_channel_id", 0)
-1895:             log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
-1896:             if log_ch is None and log_ch_id:
-1897:                 try:
+1846:     async def _contact_user_for_week(self, guild: discord.Guild, week_start_iso: str, user_id: int, rank: int, timeout_hours: int, force: bool = False) -> bool:
+1847:         if not force and await self.weekly_reward_disabled(guild.id, week_start_iso):
+1848:             await self._log_weekly(guild, week_start_iso, user_id, "skipped_reward_disabled", "")
+1849:             return False
+1850:
+1851:         member = await self._resolve_member(guild, user_id)
+1852:         if member is None or member.bot:
+1853:             await self._log_weekly(guild, week_start_iso, user_id, "no_eligible_member", "reason=member_missing_or_bot")
+1854:             return False
+1855:         if not force:
+1856:             excluded_role_ids = set(self._cfg_int_list("roles", "excluded_tracking_role_id"))
+1857:             if excluded_role_ids and any(role.id in excluded_role_ids for role in member.roles):
+1858:                 await self._log_weekly(guild, week_start_iso, user_id, "no_eligible_member", "reason=excluded_role")
+1859:                 return False
+1860:
+1861:         now_ts = int(time.time())
+1862:         timeout_hours = max(1, int(timeout_hours))
+1863:         expires = now_ts + timeout_hours * 3600
+1864:
+1865:         # Reserve the offer before sending the DM. Concurrent scheduler/force
+1866:         # runs now see `contacting` and cannot send the same offer twice.
+1867:         async with self._weekly_offer_lock:
+1868:             row = await self.bot.db.fetchone(
+1869:                 "SELECT status FROM weekly_claims WHERE guild_id=? AND week_start=? AND user_id=?",
+1870:                 (guild.id, week_start_iso, user_id),
+1871:             )
+1872:             if row is not None:
+1873:                 await self._log_weekly(
+1874:                     guild,
+1875:                     week_start_iso,
+1876:                     user_id,
+1877:                     "skipped_already_contacted",
+1878:                     f"status={row['status']}",
+1879:                 )
+1880:                 return False
+1881:             await self.bot.db.execute(
+1882:                 "INSERT INTO weekly_claims("
+1883:                 "guild_id,week_start,user_id,rank,status,contacted_ts,offer_expires_ts"
+1884:                 ") VALUES(?,?,?,?,?,?,?)",
+1885:                 (
+1886:                     guild.id,
+1887:                     week_start_iso,
+1888:                     user_id,
+1889:                     rank,
+1890:                     "contacting",
+1891:                     now_ts,
+1892:                     expires,
+1893:                 ),
+1894:             )
+1895:
+1896:         offer_message = None
+1897:         dm_channel = None
+1898:         try:
+1899:             offer_message, dm_channel = await self._send_weekly_offer_message(
+1900:                 member,
+1901:                 timeout_hours=timeout_hours,
+1902:                 expires_ts=expires,
+1903:             )
+1904:         except Exception as e:
+1905:             await self.bot.db.execute(
+1906:                 "UPDATE weekly_claims SET status='dm_closed' "
+1907:                 "WHERE guild_id=? AND week_start=? AND user_id=? AND status='contacting'",
+1908:                 (guild.id, week_start_iso, user_id),
+1909:             )
+1910:             await self._log_weekly(guild, week_start_iso, user_id, "dm_failed", type(e).__name__)
+1911:
+1912:             log_ch_id = self._cfg_int("channels", "dm_fail_log_channel_id", 0)
+1913:             log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
+1914:             if log_ch is None and log_ch_id:
+1915:                 try:
 ```
 
 force_dm is an intentional override path. Normal weekly rewards respect exclusions and the disabled switch; manual force-DM can be used for exceptions and is logged so the override is visible later.
 
-## 38. Help And Ticket Code Walkthrough
+## 39. Help And Ticket Code Walkthrough
 
 HelpCog is a state machine for DMs and ticket channels. The user's current help stage is stored in help_sessions. A typed message or button action reads the stage, updates the session, and sends the next prompt.
 
-#### Help session message router excerpt (cogs/Help.py:2057-2126)
+#### Help session message router excerpt (cogs/Help.py:2082-2151)
 
 ```python
-2057:     async def _handle_help_session_message_locked(self, guild: discord.Guild, message: discord.Message) -> bool:
-2058:         sess = await self._get_help_session(message.author.id, guild.id)
-2059:         if not sess:
-2060:             return False
-2061:
-2062:         stage = sess["stage"]
-2063:         data = sess["data"]
-2064:         content = (message.content or "").strip()
-2065:
-2066:         if content.casefold() in {"cancel", "stop", "never mind", "nevermind"}:
-2067:             await self._clear_help_session(message.author.id, guild.id)
-2068:             await self._send_dm_dashboard(message.channel, guild, message.author.id)
-2069:             return True
-2070:
-2071:         if content.casefold() in {"back", "go back"}:
-2072:             await self._handle_typed_back(guild, message)
-2073:             return True
-2074:
-2075:         if content.casefold() in {"start over", "restart help", "home", "dashboard"}:
-2076:             await self._clear_help_session(message.author.id, guild.id)
-2077:             await self._send_dm_dashboard(message.channel, guild, message.author.id)
-2078:             return True
-2079:
-2080:         if len(content) > self._help_max_submission_chars():
-2081:             await message.channel.send(
-2082:                 f"That message is too long. Please keep it under {self._help_max_submission_chars()} characters.",
-2083:                 view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=True),
-2084:                 allowed_mentions=no_mentions(),
-2085:             )
-2086:             return True
-2087:
-2088:         text_stages = {
-2089:             "appeal_punishment",
-2090:             "appeal_reason",
-2091:             "appeal_behavior",
-2092:             "report_details",
-2093:             "bot_issue_details",
-2094:             "transcript_ticket",
-2095:         }
-2096:         if stage in text_stages and not content:
-2097:             await message.channel.send(
-2098:                 "Please send a written answer before continuing.",
-2099:                 view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=stage != "appeal_punishment"),
-2100:                 allowed_mentions=no_mentions(),
-2101:             )
-2102:             return True
-2103:
-2104:         if stage == "appeal_punishment":
-2105:             data["punishment"] = content
-2106:             self._merge_attachments(data, self._attachment_data(message))
-2107:             await self._start_help_session(message.author.id, guild.id, "appeal_reason", data)
-2108:             embed = self._help_embed(
-2109:                 "Appeal ban" if data.get("appeal_type") == "ban" else "Appeal punishment",
-2110:                 "Why should staff revoke this punishment? Add any context they should consider.",
-2111:                 "gold",
-2112:             )
-2113:             await message.channel.send(
-2114:                 embed=embed,
-2115:                 view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=True),
-2116:                 allowed_mentions=no_mentions(),
-2117:             )
-2118:             return True
-2119:
-2120:         if stage == "appeal_reason":
-2121:             data["reason"] = content
-2122:             self._merge_attachments(data, self._attachment_data(message))
-2123:             await self._start_help_session(message.author.id, guild.id, "appeal_behavior", data)
-2124:             embed = self._help_embed(
-2125:                 "One last question",
-2126:                 "What will change in your behavior if we revoke your punishment?",
+2082:     async def _handle_help_session_message_locked(self, guild: discord.Guild, message: discord.Message) -> bool:
+2083:         sess = await self._get_help_session(message.author.id, guild.id)
+2084:         if not sess:
+2085:             return False
+2086:
+2087:         stage = sess["stage"]
+2088:         data = sess["data"]
+2089:         content = (message.content or "").strip()
+2090:
+2091:         if content.casefold() in {"cancel", "stop", "never mind", "nevermind"}:
+2092:             await self._clear_help_session(message.author.id, guild.id)
+2093:             await self._send_dm_dashboard(message.channel, guild, message.author.id)
+2094:             return True
+2095:
+2096:         if content.casefold() in {"back", "go back"}:
+2097:             await self._handle_typed_back(guild, message)
+2098:             return True
+2099:
+2100:         if content.casefold() in {"start over", "restart help", "home", "dashboard"}:
+2101:             await self._clear_help_session(message.author.id, guild.id)
+2102:             await self._send_dm_dashboard(message.channel, guild, message.author.id)
+2103:             return True
+2104:
+2105:         if len(content) > self._help_max_submission_chars():
+2106:             await message.channel.send(
+2107:                 f"That message is too long. Please keep it under {self._help_max_submission_chars()} characters.",
+2108:                 view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=True),
+2109:                 allowed_mentions=no_mentions(),
+2110:             )
+2111:             return True
+2112:
+2113:         text_stages = {
+2114:             "appeal_punishment",
+2115:             "appeal_reason",
+2116:             "appeal_behavior",
+2117:             "report_details",
+2118:             "bot_issue_details",
+2119:             "transcript_ticket",
+2120:         }
+2121:         if stage in text_stages and not content:
+2122:             await message.channel.send(
+2123:                 "Please send a written answer before continuing.",
+2124:                 view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=stage != "appeal_punishment"),
+2125:                 allowed_mentions=no_mentions(),
+2126:             )
+2127:             return True
+2128:
+2129:         if stage == "appeal_punishment":
+2130:             data["punishment"] = content
+2131:             self._merge_attachments(data, self._attachment_data(message))
+2132:             await self._start_help_session(message.author.id, guild.id, "appeal_reason", data)
+2133:             embed = self._help_embed(
+2134:                 "Appeal ban" if data.get("appeal_type") == "ban" else "Appeal punishment",
+2135:                 "Why should staff revoke this punishment? Add any context they should consider.",
+2136:                 "gold",
+2137:             )
+2138:             await message.channel.send(
+2139:                 embed=embed,
+2140:                 view=HelpSessionControlView(self, message.author.id, guild.id, allow_back=True),
+2141:                 allowed_mentions=no_mentions(),
+2142:             )
+2143:             return True
+2144:
+2145:         if stage == "appeal_reason":
+2146:             data["reason"] = content
+2147:             self._merge_attachments(data, self._attachment_data(message))
+2148:             await self._start_help_session(message.author.id, guild.id, "appeal_behavior", data)
+2149:             embed = self._help_embed(
+2150:                 "One last question",
+2151:                 "What will change in your behavior if we revoke your punishment?",
 ```
 
 The preview step exists to prevent accidental submissions. For appeals, reports, and bot issues, the user can review the embed, edit the last answer, cancel, or submit. The staff log only receives the item after the preview is confirmed.
 
-#### Help submission insert and staff log (cogs/Help.py:2005-2044)
+#### Help submission insert and staff log (cogs/Help.py:2030-2069)
 
 ```python
-2005:     async def _submit_help_submission(self, guild: discord.Guild, user_id: int, kind: str, data: Dict[str, Any]) -> tuple[bool, str, str]:
-2006:         if await self._is_duplicate_help_submission(guild.id, user_id, kind, data):
-2007:             return False, "This looks like a duplicate of a recent submission. Add new details or wait before sending it again.", ""
-2008:         channel = await self._submission_log_channel(guild, kind)
-2009:         if channel is None:
-2010:             await log_error(self.bot, f"{kind} submission failed: configured log channel is missing or invalid.")
-2011:             return False, "I couldn't send this to staff because the log channel is not configured correctly.", ""
-2012:
-2013:         submission_id = await self._insert_help_submission(guild.id, user_id, kind, data)
-2014:         if not submission_id:
-2015:             return False, "I couldn't create a help submission ID. Please try again.", ""
-2016:         code = self._submission_code(kind, submission_id)
-2017:         msg = None
-2018:         try:
-2019:             msg = await channel.send(
-2020:                 embed=self._submission_staff_embed(guild, user_id, kind, submission_id, data),
-2021:                 allowed_mentions=no_mentions(),
-2022:             )
-2023:             await self.bot.db.execute(
-2024:                 "UPDATE help_submissions SET log_channel_id=?, log_message_id=?, updated_ts=? WHERE id=?",
-2025:                 (channel.id, msg.id, int(time.time()), submission_id),
-2026:             )
-2027:         except Exception as e:
-2028:             await log_error(self.bot, f"{kind} submission failed: {repr(e)}")
-2029:             if msg is not None:
-2030:                 try:
-2031:                     await msg.delete()
-2032:                 except Exception:
-2033:                     pass
-2034:             await self.bot.db.execute(
-2035:                 "UPDATE help_submissions SET status='failed', updated_ts=? WHERE id=?",
-2036:                 (int(time.time()), submission_id),
-2037:             )
-2038:             return False, "I created the submission but couldn't send it to staff. Please contact staff directly.", code
-2039:
-2040:         action = {"appeal": "appeal", "report": "report_user", "bot_issue": "bot_issue"}.get(kind)
-2041:         if action:
-2042:             await self._touch_help_cooldown(guild.id, user_id, action)
-2043:         await self._log_help_action(guild, user_id, f"{kind}_submitted", f"id={code}")
-2044:         return True, f"Sent to staff as `{code}`. You can check it later from **My submissions**.", code
+2030:     async def _submit_help_submission(self, guild: discord.Guild, user_id: int, kind: str, data: Dict[str, Any]) -> tuple[bool, str, str]:
+2031:         if await self._is_duplicate_help_submission(guild.id, user_id, kind, data):
+2032:             return False, "This looks like a duplicate of a recent submission. Add new details or wait before sending it again.", ""
+2033:         channel = await self._submission_log_channel(guild, kind)
+2034:         if channel is None:
+2035:             await log_error(self.bot, f"{kind} submission failed: configured log channel is missing or invalid.")
+2036:             return False, "I couldn't send this to staff because the log channel is not configured correctly.", ""
+2037:
+2038:         submission_id = await self._insert_help_submission(guild.id, user_id, kind, data)
+2039:         if not submission_id:
+2040:             return False, "I couldn't create a help submission ID. Please try again.", ""
+2041:         code = self._submission_code(kind, submission_id)
+2042:         msg = None
+2043:         try:
+2044:             msg = await channel.send(
+2045:                 embed=self._submission_staff_embed(guild, user_id, kind, submission_id, data),
+2046:                 allowed_mentions=no_mentions(),
+2047:             )
+2048:             await self.bot.db.execute(
+2049:                 "UPDATE help_submissions SET log_channel_id=?, log_message_id=?, updated_ts=? WHERE id=?",
+2050:                 (channel.id, msg.id, int(time.time()), submission_id),
+2051:             )
+2052:         except Exception as e:
+2053:             await log_error(self.bot, f"{kind} submission failed: {repr(e)}")
+2054:             if msg is not None:
+2055:                 try:
+2056:                     await msg.delete()
+2057:                 except Exception:
+2058:                     pass
+2059:             await self.bot.db.execute(
+2060:                 "UPDATE help_submissions SET status='failed', updated_ts=? WHERE id=?",
+2061:                 (int(time.time()), submission_id),
+2062:             )
+2063:             return False, "I created the submission but couldn't send it to staff. Please contact staff directly.", code
+2064:
+2065:         action = {"appeal": "appeal", "report": "report_user", "bot_issue": "bot_issue"}.get(kind)
+2066:         if action:
+2067:             await self._touch_help_cooldown(guild.id, user_id, action)
+2068:         await self._log_help_action(guild, user_id, f"{kind}_submitted", f"id={code}")
+2069:         return True, f"Sent to staff as `{code}`. You can check it later from **My submissions**.", code
 ```
 
-#### Ticket creation excerpt (cogs/Help.py:4057-4126)
+#### Ticket creation excerpt (cogs/Help.py:4082-4151)
 
 ```python
-4057:     async def _create_staff_ticket_locked(
-4058:         self,
-4059:         interaction: discord.Interaction,
-4060:         guild: discord.Guild,
-4061:         topic_key: str,
-4062:         topic_label: str,
-4063:         *,
-4064:         ping_role_id: Optional[int] = None,
-4065:     ):
-4066:         cfg = self.bot.config
-4067:
-4068:         member = await self._resolve_member(guild, interaction.user.id)
-4069:         if member is None:
-4070:             return await self._respond_interaction(interaction, "You must be in the server to create a ticket", ephemeral=True)
-4071:
-4072:         try:
-4073:             cooldown_h = float(
-4074:                 cfg.get(
-4075:                     "tickets",
-4076:                     "ticket_creation_cooldown_hours",
-4077:                     default=24,
-4078:                 )
-4079:                 or 24
-4080:             )
-4081:             if not 0 <= cooldown_h <= 720:
-4082:                 raise ValueError
-4083:         except (TypeError, ValueError):
-4084:             cooldown_h = 24.0
-4085:         row = await self.bot.db.fetchone(
-4086:             "SELECT last_created_ts FROM ticket_cooldowns WHERE guild_id=? AND user_id=?",
-4087:             (guild.id, member.id),
-4088:         )
-4089:         now = int(time.time())
-4090:         cooldown_seconds = int(cooldown_h * 3600)
-4091:         if row and now - int(row["last_created_ts"]) < cooldown_seconds:
-4092:             remaining = cooldown_seconds - (now - int(row["last_created_ts"]))
-4093:             until_ts = now + remaining
-4094:             return await self._respond_interaction(
-4095:                 interaction,
-4096:                 f"You can create another ticket <t:{until_ts}:R>.",
-4097:                 ephemeral=True,
-4098:             )
-4099:
-4100:         category_id = cfg.get_int("tickets", "ticket_category_id")
-4101:         mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID")
-4102:         if not category_id or not mod_role_id:
-4103:             return await self._respond_interaction(
-4104:                 interaction,
-4105:                 "The ticket system is missing a required channel or role. Please contact an administrator.",
-4106:                 ephemeral=True,
-4107:             )
-4108:
-4109:         category = guild.get_channel(category_id)
-4110:         if not isinstance(category, discord.CategoryChannel):
-4111:             return await self._respond_interaction(interaction, "Ticket category is missing or invalid (please contact staff)", ephemeral=True)
-4112:
-4113:         mod_role = guild.get_role(mod_role_id)
-4114:         if mod_role is None:
-4115:             return await self._respond_interaction(
-4116:                 interaction,
-4117:                 "The configured staff role is missing, so I did not create a private ticket. "
-4118:                 "Please contact an administrator.",
-4119:                 ephemeral=True,
-4120:             )
-4121:         notification_role_id = (
-4122:             int(ping_role_id)
-4123:             if ping_role_id is not None
-4124:             else cfg.get_int("tickets", "staff_ping_role_id", default=0)
-4125:         )
-4126:         notification_role = guild.get_role(notification_role_id) if notification_role_id else None
+4082:     async def _create_staff_ticket_locked(
+4083:         self,
+4084:         interaction: discord.Interaction,
+4085:         guild: discord.Guild,
+4086:         topic_key: str,
+4087:         topic_label: str,
+4088:         *,
+4089:         ping_role_id: Optional[int] = None,
+4090:     ):
+4091:         cfg = self.bot.config
+4092:
+4093:         member = await self._resolve_member(guild, interaction.user.id)
+4094:         if member is None:
+4095:             return await self._respond_interaction(interaction, "You must be in the server to create a ticket", ephemeral=True)
+4096:
+4097:         try:
+4098:             cooldown_h = float(
+4099:                 cfg.get(
+4100:                     "tickets",
+4101:                     "ticket_creation_cooldown_hours",
+4102:                     default=24,
+4103:                 )
+4104:                 or 24
+4105:             )
+4106:             if not 0 <= cooldown_h <= 720:
+4107:                 raise ValueError
+4108:         except (TypeError, ValueError):
+4109:             cooldown_h = 24.0
+4110:         row = await self.bot.db.fetchone(
+4111:             "SELECT last_created_ts FROM ticket_cooldowns WHERE guild_id=? AND user_id=?",
+4112:             (guild.id, member.id),
+4113:         )
+4114:         now = int(time.time())
+4115:         cooldown_seconds = int(cooldown_h * 3600)
+4116:         if row and now - int(row["last_created_ts"]) < cooldown_seconds:
+4117:             remaining = cooldown_seconds - (now - int(row["last_created_ts"]))
+4118:             until_ts = now + remaining
+4119:             return await self._respond_interaction(
+4120:                 interaction,
+4121:                 f"You can create another ticket <t:{until_ts}:R>.",
+4122:                 ephemeral=True,
+4123:             )
+4124:
+4125:         category_id = cfg.get_int("tickets", "ticket_category_id")
+4126:         mod_role_id = cfg.get_int("roles", "MOD_ROLE_ID")
+4127:         if not category_id or not mod_role_id:
+4128:             return await self._respond_interaction(
+4129:                 interaction,
+4130:                 "The ticket system is missing a required channel or role. Please contact an administrator.",
+4131:                 ephemeral=True,
+4132:             )
+4133:
+4134:         category = guild.get_channel(category_id)
+4135:         if not isinstance(category, discord.CategoryChannel):
+4136:             return await self._respond_interaction(interaction, "Ticket category is missing or invalid (please contact staff)", ephemeral=True)
+4137:
+4138:         mod_role = guild.get_role(mod_role_id)
+4139:         if mod_role is None:
+4140:             return await self._respond_interaction(
+4141:                 interaction,
+4142:                 "The configured staff role is missing, so I did not create a private ticket. "
+4143:                 "Please contact an administrator.",
+4144:                 ephemeral=True,
+4145:             )
+4146:         notification_role_id = (
+4147:             int(ping_role_id)
+4148:             if ping_role_id is not None
+4149:             else cfg.get_int("tickets", "staff_ping_role_id", default=0)
+4150:         )
+4151:         notification_role = guild.get_role(notification_role_id) if notification_role_id else None
 ```
 
 Ticket IDs come from the database counter, not from Discord channel IDs. That creates short human labels like T123 while still preserving the real channel ID for lookups, transcript indexing, and closure.
 
-#### Ticket closure safety excerpt (cogs/Help.py:4578-4647)
+#### Ticket closure safety excerpt (cogs/Help.py:4603-4672)
 
 ```python
-4578:     async def _close_ticket_channel_locked(self, guild: discord.Guild, channel_id: int) -> bool:
-4579:         cfg = self.bot.config
-4580:         log_channel_id = cfg.get_int("channels", "general_logging_channel_id")
-4581:         log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
-4582:         if log_channel is None and log_channel_id:
-4583:             try:
-4584:                 log_channel = await guild.fetch_channel(log_channel_id)
-4585:             except Exception:
-4586:                 log_channel = None
-4587:         channel = guild.get_channel(channel_id)
-4588:         if channel is None:
-4589:             try:
-4590:                 channel = await guild.fetch_channel(channel_id)
-4591:             except Exception:
-4592:                 channel = None
-4593:
-4594:         if not isinstance(channel, discord.TextChannel):
-4595:             return False
-4596:
-4597:         row = await self.bot.db.fetchone(
-4598:             "SELECT ticket_id, creator_id, created_ts, status_tag, opening_message_id "
-4599:             "FROM tickets WHERE channel_id=?",
-4600:             (channel_id,),
-4601:         )
-4602:         ticket_id = int(row["ticket_id"]) if row and row["ticket_id"] is not None else None
-4603:         creator_id = int(row["creator_id"]) if row and row["creator_id"] is not None else 0
-4604:         created_ts = int(row["created_ts"]) if row and row["created_ts"] is not None else 0
-4605:         previous_status_tag = str(row["status_tag"] or "waiting_staff") if row else "waiting_staff"
-4606:         if row and creator_id:
-4607:             creator_id = await self._recover_ticket_creator_id(
-4608:                 guild,
-4609:                 channel,
-4610:                 creator_id,
-4611:                 int(row["opening_message_id"] or 0),
-4612:             )
-4613:
-4614:         async def _restore_open_status() -> None:
-4615:             try:
-4616:                 await self.bot.db.execute(
-4617:                     "UPDATE tickets SET status='open', status_tag=?, closed_ts=NULL, closing_prompt_message_id=NULL "
-4618:                     "WHERE channel_id=? AND status<>'closed'",
-4619:                     (previous_status_tag, channel_id),
-4620:                 )
-4621:                 self._active_ticket_channels.add(channel_id)
-4622:                 await self.update_ticket_opening_status(guild, channel_id, previous_status_tag)
-4623:             except Exception as restore_error:
-4624:                 await log_error(self.bot, f"Ticket status restore failed channel_id={channel_id}: {repr(restore_error)}")
-4625:
-4626:         if not isinstance(log_channel, discord.TextChannel):
-4627:             try:
-4628:                 await channel.send("I couldn't close this ticket because the transcript log channel is not configured.")
-4629:             except Exception:
-4630:                 pass
-4631:             return False
-4632:
-4633:         try:
-4634:             try:
-4635:                 await self.bot.db.execute(
-4636:                     "UPDATE tickets SET status_tag='resolved', closed_ts=? WHERE channel_id=?",
-4637:                     (int(time.time()), channel_id),
-4638:                 )
-4639:                 await self.update_ticket_opening_status(guild, channel_id, "resolved")
-4640:             except Exception as status_error:
-4641:                 await log_error(self.bot, f"Ticket resolved status update before transcript failed channel_id={channel_id}: {repr(status_error)}")
-4642:
-4643:             transcript_path = await build_text_transcript(channel)
-4644:             embed = self._staff_log_embed(
-4645:                 guild,
-4646:                 "Ticket Transcript",
-4647:                 f"{channel.mention} was closed and its transcript was saved",
+4603:     async def _close_ticket_channel_locked(self, guild: discord.Guild, channel_id: int) -> bool:
+4604:         cfg = self.bot.config
+4605:         log_channel_id = cfg.get_int("channels", "general_logging_channel_id")
+4606:         log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
+4607:         if log_channel is None and log_channel_id:
+4608:             try:
+4609:                 log_channel = await guild.fetch_channel(log_channel_id)
+4610:             except Exception:
+4611:                 log_channel = None
+4612:         channel = guild.get_channel(channel_id)
+4613:         if channel is None:
+4614:             try:
+4615:                 channel = await guild.fetch_channel(channel_id)
+4616:             except Exception:
+4617:                 channel = None
+4618:
+4619:         if not isinstance(channel, discord.TextChannel):
+4620:             return False
+4621:
+4622:         row = await self.bot.db.fetchone(
+4623:             "SELECT ticket_id, creator_id, created_ts, status_tag, opening_message_id "
+4624:             "FROM tickets WHERE channel_id=?",
+4625:             (channel_id,),
+4626:         )
+4627:         ticket_id = int(row["ticket_id"]) if row and row["ticket_id"] is not None else None
+4628:         creator_id = int(row["creator_id"]) if row and row["creator_id"] is not None else 0
+4629:         created_ts = int(row["created_ts"]) if row and row["created_ts"] is not None else 0
+4630:         previous_status_tag = str(row["status_tag"] or "waiting_staff") if row else "waiting_staff"
+4631:         if row and creator_id:
+4632:             creator_id = await self._recover_ticket_creator_id(
+4633:                 guild,
+4634:                 channel,
+4635:                 creator_id,
+4636:                 int(row["opening_message_id"] or 0),
+4637:             )
+4638:
+4639:         async def _restore_open_status() -> None:
+4640:             try:
+4641:                 await self.bot.db.execute(
+4642:                     "UPDATE tickets SET status='open', status_tag=?, closed_ts=NULL, closing_prompt_message_id=NULL "
+4643:                     "WHERE channel_id=? AND status<>'closed'",
+4644:                     (previous_status_tag, channel_id),
+4645:                 )
+4646:                 self._active_ticket_channels.add(channel_id)
+4647:                 await self.update_ticket_opening_status(guild, channel_id, previous_status_tag)
+4648:             except Exception as restore_error:
+4649:                 await log_error(self.bot, f"Ticket status restore failed channel_id={channel_id}: {repr(restore_error)}")
+4650:
+4651:         if not isinstance(log_channel, discord.TextChannel):
+4652:             try:
+4653:                 await channel.send("I couldn't close this ticket because the transcript log channel is not configured.")
+4654:             except Exception:
+4655:                 pass
+4656:             return False
+4657:
+4658:         try:
+4659:             try:
+4660:                 await self.bot.db.execute(
+4661:                     "UPDATE tickets SET status_tag='resolved', closed_ts=? WHERE channel_id=?",
+4662:                     (int(time.time()), channel_id),
+4663:                 )
+4664:                 await self.update_ticket_opening_status(guild, channel_id, "resolved")
+4665:             except Exception as status_error:
+4666:                 await log_error(self.bot, f"Ticket resolved status update before transcript failed channel_id={channel_id}: {repr(status_error)}")
+4667:
+4668:             transcript_path = await build_text_transcript(channel)
+4669:             embed = self._staff_log_embed(
+4670:                 guild,
+4671:                 "Ticket Transcript",
+4672:                 f"{channel.mention} was closed and its transcript was saved",
 ```
 
 Ticket close is cautious. It marks the ticket resolved, builds a transcript, posts the transcript to the log channel, indexes the transcript, deletes the channel, and prompts satisfaction. If a dangerous middle step fails, it restores the previous status instead of deleting the channel blindly.
 
-## 39. Background Telemetry Code Walkthrough
+## 40. Background Telemetry Code Walkthrough
 
 BackgroundCog turns many Discord events into a daily payload. The dataclass keeps today's counters in memory, while daily_stats stores snapshots so restart and impact reporting do not wipe the day.
 
@@ -2848,7 +3181,7 @@ The rollover logic is subtle because voice time can span midnight. The bot calcu
 
 The summary embed is built from the stored counters plus derived values: net member movement, command success rate, average messages per active member, top channels, top users, and top commands. This is the raw material for later impact reports.
 
-## 40. Forum And Sticky Code Walkthrough
+## 41. Forum And Sticky Code Walkthrough
 
 StickyCog has two different jobs that both involve keeping instructions visible: channel sticky messages and forum first messages. It also enforces the required-word rule for forum threads.
 
@@ -2971,233 +3304,233 @@ StickyCog has two different jobs that both involve keeping instructions visible:
 
 The required-word delete flow is intentionally conservative. If the bot cannot read history, it avoids deletion to prevent false positives. It DMs the thread owner when possible, logs the deletion with author and forum context, unarchives/unlocks if needed, and then deletes the thread.
 
-## 41. Impact And Backup Code Walkthrough
+## 42. Impact And Backup Code Walkthrough
 
 The impact system is a reporting pipeline built on top of the bot's existing persistent tables. It does not invent numbers; it aggregates workflow records the bot already stores.
 
-#### Database backup posting excerpt (cogs/Commands.py:479-548)
+#### Database backup posting excerpt (cogs/Commands.py:602-671)
 
 ```python
- 479:     async def _post_database_backup(self, guild: discord.Guild, reason: str = "manual", requested_by: int = 0) -> discord.Message | None:
- 480:         backup_dir = self._backup_local_dir()
- 481:         backup_dir.mkdir(parents=True, exist_ok=True)
- 482:         ts = int(time.time())
- 483:         slug = now_madrid().strftime("%Y%m%d-%H%M%S")
- 484:         raw_path = backup_dir / f"avenue-guard-db-{slug}.sqlite3"
- 485:         try:
- 486:             size_bytes = await self.bot.db.backup_to(raw_path)
- 487:             await self._validate_restore_database(raw_path)
- 488:             zip_path = await asyncio.to_thread(self._zip_backup_file, raw_path, slug)
- 489:         finally:
- 490:             try:
- 491:                 raw_path.unlink()
- 492:             except FileNotFoundError:
- 493:                 pass
- 494:         await asyncio.to_thread(self._prune_local_backups)
- 495:         channel_id = self._backup_channel_id()
- 496:         channel = guild.get_channel(channel_id) if channel_id else None
- 497:         if channel is None and channel_id:
- 498:             try:
- 499:                 channel = await guild.fetch_channel(channel_id)
- 500:             except Exception:
- 501:                 channel = None
- 502:         if not isinstance(channel, discord.TextChannel):
- 503:             await log_error(self.bot, f"Database backup created locally but backup channel is missing: {zip_path}")
- 504:             return None
- 505:
- 506:         zipped_size = int(zip_path.stat().st_size)
- 507:         storage_note, storage_ok = self._database_storage_note()
- 508:         embed = discord.Embed(
- 509:             title="Database Backup",
- 510:             description="A zipped copy of the bot database is attached.",
- 511:             color=discord.Color.green() if storage_ok else discord.Color.gold(),
- 512:             timestamp=now_madrid(),
- 513:         )
- 514:         embed.add_field(name="Reason", value=str(reason).replace("_", " ").title(), inline=True)
- 515:         embed.add_field(name="Raw Size", value=f"{_fmt_num(size_bytes)} bytes", inline=True)
- 516:         embed.add_field(name="Zip Size", value=f"{_fmt_num(zipped_size)} bytes", inline=True)
- 517:         embed.add_field(name="Storage", value=storage_note[:1024], inline=False)
- 518:         if requested_by:
- 519:             embed.add_field(name="Requested By", value=f"<@{int(requested_by)}>\n`{int(requested_by)}`", inline=True)
- 520:
- 521:         if zipped_size > 24 * 1024 * 1024:
- 522:             await channel.send(
- 523:                 "Database backup was created locally, but the compressed file is too large for a Discord attachment.",
- 524:                 embed=embed,
- 525:                 allowed_mentions=no_mentions(),
- 526:             )
- 527:             await log_error(self.bot, f"Database backup too large for Discord attachment: {zip_path} ({zipped_size} bytes)")
- 528:             return None
- 529:
- 530:         sent = await channel.send(
- 531:             embed=embed,
- 532:             file=discord.File(str(zip_path), filename=zip_path.name),
- 533:             allowed_mentions=no_mentions(),
- 534:         )
- 535:         try:
- 536:             await self.bot.db.execute(
- 537:                 "INSERT OR REPLACE INTO database_backups(guild_id,backup_ts,channel_id,message_id,size_bytes,reason,requested_by,filename) VALUES(?,?,?,?,?,?,?,?)",
- 538:                 (
- 539:                     int(guild.id),
- 540:                     ts,
- 541:                     int(channel.id),
- 542:                     int(sent.id),
- 543:                     int(zipped_size),
- 544:                     str(reason),
- 545:                     int(requested_by or 0),
- 546:                     str(zip_path.name),
- 547:                 ),
- 548:             )
+ 602:     async def _post_database_backup(self, guild: discord.Guild, reason: str = "manual", requested_by: int = 0) -> discord.Message | None:
+ 603:         backup_dir = self._backup_local_dir()
+ 604:         backup_dir.mkdir(parents=True, exist_ok=True)
+ 605:         ts = int(time.time())
+ 606:         slug = now_madrid().strftime("%Y%m%d-%H%M%S")
+ 607:         raw_path = backup_dir / f"avenue-guard-db-{slug}.sqlite3"
+ 608:         try:
+ 609:             size_bytes = await self.bot.db.backup_to(raw_path)
+ 610:             await self._validate_restore_database(raw_path)
+ 611:             zip_path = await asyncio.to_thread(self._zip_backup_file, raw_path, slug)
+ 612:         finally:
+ 613:             try:
+ 614:                 raw_path.unlink()
+ 615:             except FileNotFoundError:
+ 616:                 pass
+ 617:         await asyncio.to_thread(self._prune_local_backups)
+ 618:         channel_id = self._backup_channel_id()
+ 619:         channel = guild.get_channel(channel_id) if channel_id else None
+ 620:         if channel is None and channel_id:
+ 621:             try:
+ 622:                 channel = await guild.fetch_channel(channel_id)
+ 623:             except Exception:
+ 624:                 channel = None
+ 625:         if not isinstance(channel, discord.TextChannel):
+ 626:             await log_error(self.bot, f"Database backup created locally but backup channel is missing: {zip_path}")
+ 627:             return None
+ 628:
+ 629:         zipped_size = int(zip_path.stat().st_size)
+ 630:         storage_note, storage_ok = self._database_storage_note()
+ 631:         embed = discord.Embed(
+ 632:             title="Database Backup",
+ 633:             description="A zipped copy of the bot database is attached.",
+ 634:             color=discord.Color.green() if storage_ok else discord.Color.gold(),
+ 635:             timestamp=now_madrid(),
+ 636:         )
+ 637:         embed.add_field(name="Reason", value=str(reason).replace("_", " ").title(), inline=True)
+ 638:         embed.add_field(name="Raw Size", value=f"{_fmt_num(size_bytes)} bytes", inline=True)
+ 639:         embed.add_field(name="Zip Size", value=f"{_fmt_num(zipped_size)} bytes", inline=True)
+ 640:         embed.add_field(name="Storage", value=storage_note[:1024], inline=False)
+ 641:         if requested_by:
+ 642:             embed.add_field(name="Requested By", value=f"<@{int(requested_by)}>\n`{int(requested_by)}`", inline=True)
+ 643:
+ 644:         if zipped_size > 24 * 1024 * 1024:
+ 645:             await channel.send(
+ 646:                 "Database backup was created locally, but the compressed file is too large for a Discord attachment.",
+ 647:                 embed=embed,
+ 648:                 allowed_mentions=no_mentions(),
+ 649:             )
+ 650:             await log_error(self.bot, f"Database backup too large for Discord attachment: {zip_path} ({zipped_size} bytes)")
+ 651:             return None
+ 652:
+ 653:         sent = await channel.send(
+ 654:             embed=embed,
+ 655:             file=discord.File(str(zip_path), filename=zip_path.name),
+ 656:             allowed_mentions=no_mentions(),
+ 657:         )
+ 658:         try:
+ 659:             await self.bot.db.execute(
+ 660:                 "INSERT OR REPLACE INTO database_backups(guild_id,backup_ts,channel_id,message_id,size_bytes,reason,requested_by,filename) VALUES(?,?,?,?,?,?,?,?)",
+ 661:                 (
+ 662:                     int(guild.id),
+ 663:                     ts,
+ 664:                     int(channel.id),
+ 665:                     int(sent.id),
+ 666:                     int(zipped_size),
+ 667:                     str(reason),
+ 668:                     int(requested_by or 0),
+ 669:                     str(zip_path.name),
+ 670:                 ),
+ 671:             )
 ```
 
-#### Impact metric collection entry (cogs/Commands.py:922-991)
+#### Impact metric collection entry (cogs/Commands.py:1045-1114)
 
 ```python
- 922:     async def _collect_impact_metrics(self, guild: discord.Guild, generated_by_id: int) -> dict:
- 923:         guild_id = int(guild.id)
- 924:         snapshot_ts = int(time.time())
- 925:         daily = await self._impact_daily_totals(guild_id)
- 926:
- 927:         unique_rows = await self.bot.db.fetchall(
- 928:             """
- 929:             SELECT DISTINCT user_id FROM (
- 930:                 SELECT user_id FROM activity_counts WHERE guild_id=?
- 931:                 UNION SELECT user_id FROM weekly_claims WHERE guild_id=?
- 932:                 UNION SELECT user_id FROM weekly_sessions WHERE guild_id=?
- 933:                 UNION SELECT user_id FROM weekly_dm_log WHERE guild_id=?
- 934:                 UNION SELECT user_id FROM weekly_request_reviews WHERE guild_id=?
- 935:                 UNION SELECT creator_id AS user_id FROM tickets WHERE guild_id=?
- 936:                 UNION SELECT user_id FROM help_submissions WHERE guild_id=?
- 937:                 UNION SELECT user_id FROM ban_info_requests WHERE guild_id=?
- 938:                 UNION SELECT requester_id AS user_id FROM transcript_requests WHERE guild_id=?
- 939:                 UNION SELECT user_id FROM level_request_submissions WHERE guild_id=?
- 940:                 UNION SELECT user_id FROM anti_farm_events WHERE guild_id=?
- 941:             ) WHERE user_id IS NOT NULL AND user_id>0
- 942:             """,
- 943:             (guild_id,) * 11,
- 944:         )
- 945:         unique_user_ids = {
- 946:             int(row["user_id"])
- 947:             for row in unique_rows
- 948:             if row["user_id"] is not None and int(row["user_id"]) > 0
- 949:         }
- 950:         unique_user_ids.update(int(user_id) for user_id in daily.get("unique_user_ids", []) if int(user_id) > 0)
- 951:         unique_touched = len(unique_user_ids)
- 952:         activity_messages = await self._impact_scalar(
- 953:             "SELECT COALESCE(SUM(count), 0) AS value FROM activity_counts WHERE guild_id=?",
- 954:             (guild_id,),
- 955:         )
- 956:         active_members = await self._impact_scalar(
- 957:             "SELECT COUNT(DISTINCT user_id) AS value FROM activity_counts WHERE guild_id=?",
- 958:             (guild_id,),
- 959:         )
- 960:         tracked_weeks = await self._impact_scalar(
- 961:             "SELECT COUNT(DISTINCT week_start) AS value FROM activity_counts WHERE guild_id=?",
- 962:             (guild_id,),
- 963:         )
- 964:
- 965:         live_requests = await self._impact_scalar(
- 966:             "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=?",
- 967:             (guild_id,),
- 968:         )
- 969:         live_reviewed = await self._impact_scalar(
- 970:             "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=? AND status='reviewed'",
- 971:             (guild_id,),
- 972:         )
- 973:         live_pending = await self._impact_scalar(
- 974:             "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=? AND status='pending'",
- 975:             (guild_id,),
- 976:         )
- 977:         live_avg_review_hours = await self._impact_float(
- 978:             "SELECT AVG(reviewed_ts - created_ts) / 3600.0 AS value FROM level_request_submissions "
- 979:             "WHERE guild_id=? AND status='reviewed' AND reviewed_ts IS NOT NULL AND reviewed_ts>=created_ts",
- 980:             (guild_id,),
- 981:         )
- 982:         live_waves = await self._impact_scalar(
- 983:             "SELECT COUNT(DISTINCT wave_id) AS value FROM level_request_submissions WHERE guild_id=?",
- 984:             (guild_id,),
- 985:         )
- 986:         request_edits = await self._impact_scalar(
- 987:             "SELECT COUNT(*) AS value FROM level_request_edit_audit WHERE guild_id=?",
- 988:             (guild_id,),
- 989:         )
- 990:         request_level_ids = await self._impact_scalar(
- 991:             "SELECT COUNT(DISTINCT level_id) AS value FROM level_request_submissions WHERE guild_id=?",
+1045:     async def _collect_impact_metrics(self, guild: discord.Guild, generated_by_id: int) -> dict:
+1046:         guild_id = int(guild.id)
+1047:         snapshot_ts = int(time.time())
+1048:         daily = await self._impact_daily_totals(guild_id)
+1049:
+1050:         unique_rows = await self.bot.db.fetchall(
+1051:             """
+1052:             SELECT DISTINCT user_id FROM (
+1053:                 SELECT user_id FROM activity_counts WHERE guild_id=?
+1054:                 UNION SELECT user_id FROM weekly_claims WHERE guild_id=?
+1055:                 UNION SELECT user_id FROM weekly_sessions WHERE guild_id=?
+1056:                 UNION SELECT user_id FROM weekly_dm_log WHERE guild_id=?
+1057:                 UNION SELECT user_id FROM weekly_request_reviews WHERE guild_id=?
+1058:                 UNION SELECT creator_id AS user_id FROM tickets WHERE guild_id=?
+1059:                 UNION SELECT user_id FROM help_submissions WHERE guild_id=?
+1060:                 UNION SELECT user_id FROM ban_info_requests WHERE guild_id=?
+1061:                 UNION SELECT requester_id AS user_id FROM transcript_requests WHERE guild_id=?
+1062:                 UNION SELECT user_id FROM level_request_submissions WHERE guild_id=?
+1063:                 UNION SELECT user_id FROM anti_farm_events WHERE guild_id=?
+1064:             ) WHERE user_id IS NOT NULL AND user_id>0
+1065:             """,
+1066:             (guild_id,) * 11,
+1067:         )
+1068:         unique_user_ids = {
+1069:             int(row["user_id"])
+1070:             for row in unique_rows
+1071:             if row["user_id"] is not None and int(row["user_id"]) > 0
+1072:         }
+1073:         unique_user_ids.update(int(user_id) for user_id in daily.get("unique_user_ids", []) if int(user_id) > 0)
+1074:         unique_touched = len(unique_user_ids)
+1075:         activity_messages = await self._impact_scalar(
+1076:             "SELECT COALESCE(SUM(count), 0) AS value FROM activity_counts WHERE guild_id=?",
+1077:             (guild_id,),
+1078:         )
+1079:         active_members = await self._impact_scalar(
+1080:             "SELECT COUNT(DISTINCT user_id) AS value FROM activity_counts WHERE guild_id=?",
+1081:             (guild_id,),
+1082:         )
+1083:         tracked_weeks = await self._impact_scalar(
+1084:             "SELECT COUNT(DISTINCT week_start) AS value FROM activity_counts WHERE guild_id=?",
+1085:             (guild_id,),
+1086:         )
+1087:
+1088:         live_requests = await self._impact_scalar(
+1089:             "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=?",
+1090:             (guild_id,),
+1091:         )
+1092:         live_reviewed = await self._impact_scalar(
+1093:             "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=? AND status='reviewed'",
+1094:             (guild_id,),
+1095:         )
+1096:         live_pending = await self._impact_scalar(
+1097:             "SELECT COUNT(*) AS value FROM level_request_submissions WHERE guild_id=? AND status='pending'",
+1098:             (guild_id,),
+1099:         )
+1100:         live_avg_review_hours = await self._impact_float(
+1101:             "SELECT AVG(reviewed_ts - created_ts) / 3600.0 AS value FROM level_request_submissions "
+1102:             "WHERE guild_id=? AND status='reviewed' AND reviewed_ts IS NOT NULL AND reviewed_ts>=created_ts",
+1103:             (guild_id,),
+1104:         )
+1105:         live_waves = await self._impact_scalar(
+1106:             "SELECT COUNT(DISTINCT wave_id) AS value FROM level_request_submissions WHERE guild_id=?",
+1107:             (guild_id,),
+1108:         )
+1109:         request_edits = await self._impact_scalar(
+1110:             "SELECT COUNT(*) AS value FROM level_request_edit_audit WHERE guild_id=?",
+1111:             (guild_id,),
+1112:         )
+1113:         request_level_ids = await self._impact_scalar(
+1114:             "SELECT COUNT(DISTINCT level_id) AS value FROM level_request_submissions WHERE guild_id=?",
 ```
 
-#### Impact report persistence (cogs/Commands.py:1530-1599)
+#### Impact report persistence (cogs/Commands.py:1653-1722)
 
 ```python
-1530:     async def bot_impact(self, ctx: discord.ApplicationContext):
-1531:         if not self._in_allowed_guild(ctx):
-1532:             return await ctx.respond("Wrong server.", ephemeral=True)
-1533:
-1534:         await self._defer(ctx, ephemeral=True)
-1535:         if not await self._is_impact_owner_ctx(ctx):
-1536:             return await self._send(ctx, "You don't have permission to use this.", ephemeral=True)
-1537:
-1538:         tracking = self.bot.get_cog("TrackingCog")
-1539:         if tracking is not None:
-1540:             try:
-1541:                 await tracking.flush_activity_counts()
-1542:             except Exception as e:
-1543:                 await log_error(self.bot, f"Impact report activity flush failed: {repr(e)}")
-1544:         background = self.bot.get_cog("BackgroundCog")
-1545:         if background is not None:
-1546:             try:
-1547:                 await background._persist_current_day()
-1548:             except Exception as e:
-1549:                 await log_error(self.bot, f"Impact report daily snapshot flush failed: {repr(e)}")
-1550:         metrics = await self._collect_impact_metrics(ctx.guild, ctx.user.id)
-1551:         embed = self._impact_report_embed(metrics)
-1552:         channel_id = self.bot.config.get_int("impact", "report_channel_id", default=0)
-1553:         if not channel_id:
-1554:             channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
-1555:         channel = ctx.guild.get_channel(channel_id) if channel_id else None
-1556:
-1557:         sent = None
-1558:         if isinstance(channel, discord.TextChannel):
-1559:             try:
-1560:                 sent = await channel.send(
-1561:                     content="Avenue Guard impact report generated. The CSV exports can be imported into Google Sheets.",
-1562:                     embed=embed,
-1563:                     files=self._impact_files(metrics),
-1564:                     allowed_mentions=no_mentions(),
-1565:                 )
-1566:             except Exception as e:
-1567:                 await log_error(self.bot, f"Could not send impact report attachments: {repr(e)}")
-1568:
-1569:         if sent is None:
-1570:             try:
-1571:                 await self._send(
-1572:                     ctx,
-1573:                     "Impact report generated, but no valid report channel was available. Here are the files directly.",
-1574:                     embed=embed,
-1575:                     files=self._impact_files(metrics),
-1576:                     ephemeral=True,
-1577:                 )
-1578:             except Exception as e:
-1579:                 await log_error(self.bot, f"Could not send fallback impact report attachments: {repr(e)}")
-1580:                 await self._send(ctx, "Impact report generated, but I could not attach the files. Check the error log.", embed=embed, ephemeral=True)
-1581:
-1582:         metrics["report"]["report_channel_id"] = int(getattr(getattr(sent, "channel", None), "id", 0) or 0)
-1583:         metrics["report"]["report_message_id"] = int(getattr(sent, "id", 0) or 0)
-1584:         await self.bot.db.execute(
-1585:             "INSERT OR REPLACE INTO impact_snapshots(guild_id,snapshot_ts,report_channel_id,report_message_id,payload_json) VALUES(?,?,?,?,?)",
-1586:             (
-1587:                 int(ctx.guild.id),
-1588:                 int(metrics["report"]["snapshot_ts"]),
-1589:                 int(metrics["report"]["report_channel_id"]),
-1590:                 int(metrics["report"]["report_message_id"]),
-1591:                 json.dumps(metrics, separators=(",", ":")),
-1592:             ),
-1593:         )
-1594:
-1595:         if sent is not None:
-1596:             link = f"https://discord.com/channels/{ctx.guild.id}/{sent.channel.id}/{sent.id}"
-1597:             msg = f"Impact report saved and posted: {link}"
-1598:         else:
-1599:             msg = "Impact report snapshot saved in the database. Configure `impact.report_channel_id` for persistent Discord attachments."
+1653:     async def bot_impact(self, ctx: discord.ApplicationContext):
+1654:         if not self._in_allowed_guild(ctx):
+1655:             return await ctx.respond("Wrong server.", ephemeral=True)
+1656:
+1657:         await self._defer(ctx, ephemeral=True)
+1658:         if not await self._is_impact_owner_ctx(ctx):
+1659:             return await self._send(ctx, "You don't have permission to use this.", ephemeral=True)
+1660:
+1661:         tracking = self.bot.get_cog("TrackingCog")
+1662:         if tracking is not None:
+1663:             try:
+1664:                 await tracking.flush_activity_counts(drain=True)
+1665:             except Exception as e:
+1666:                 await log_error(self.bot, f"Impact report activity flush failed: {repr(e)}")
+1667:         background = self.bot.get_cog("BackgroundCog")
+1668:         if background is not None:
+1669:             try:
+1670:                 await background._persist_current_day()
+1671:             except Exception as e:
+1672:                 await log_error(self.bot, f"Impact report daily snapshot flush failed: {repr(e)}")
+1673:         metrics = await self._collect_impact_metrics(ctx.guild, ctx.user.id)
+1674:         embed = self._impact_report_embed(metrics)
+1675:         channel_id = self.bot.config.get_int("impact", "report_channel_id", default=0)
+1676:         if not channel_id:
+1677:             channel_id = self.bot.config.get_int("channels", "general_logging_channel_id", default=0)
+1678:         channel = ctx.guild.get_channel(channel_id) if channel_id else None
+1679:
+1680:         sent = None
+1681:         if isinstance(channel, discord.TextChannel):
+1682:             try:
+1683:                 sent = await channel.send(
+1684:                     content="Avenue Guard impact report generated. The CSV exports can be imported into Google Sheets.",
+1685:                     embed=embed,
+1686:                     files=self._impact_files(metrics),
+1687:                     allowed_mentions=no_mentions(),
+1688:                 )
+1689:             except Exception as e:
+1690:                 await log_error(self.bot, f"Could not send impact report attachments: {repr(e)}")
+1691:
+1692:         if sent is None:
+1693:             try:
+1694:                 await self._send(
+1695:                     ctx,
+1696:                     "Impact report generated, but no valid report channel was available. Here are the files directly.",
+1697:                     embed=embed,
+1698:                     files=self._impact_files(metrics),
+1699:                     ephemeral=True,
+1700:                 )
+1701:             except Exception as e:
+1702:                 await log_error(self.bot, f"Could not send fallback impact report attachments: {repr(e)}")
+1703:                 await self._send(ctx, "Impact report generated, but I could not attach the files. Check the error log.", embed=embed, ephemeral=True)
+1704:
+1705:         metrics["report"]["report_channel_id"] = int(getattr(getattr(sent, "channel", None), "id", 0) or 0)
+1706:         metrics["report"]["report_message_id"] = int(getattr(sent, "id", 0) or 0)
+1707:         await self.bot.db.execute(
+1708:             "INSERT OR REPLACE INTO impact_snapshots(guild_id,snapshot_ts,report_channel_id,report_message_id,payload_json) VALUES(?,?,?,?,?)",
+1709:             (
+1710:                 int(ctx.guild.id),
+1711:                 int(metrics["report"]["snapshot_ts"]),
+1712:                 int(metrics["report"]["report_channel_id"]),
+1713:                 int(metrics["report"]["report_message_id"]),
+1714:                 json.dumps(metrics, separators=(",", ":")),
+1715:             ),
+1716:         )
+1717:
+1718:         if sent is not None:
+1719:             link = f"https://discord.com/channels/{ctx.guild.id}/{sent.channel.id}/{sent.id}"
+1720:             msg = f"Impact report saved and posted: {link}"
+1721:         else:
+1722:             msg = "Impact report snapshot saved in the database. Configure `impact.report_channel_id` for persistent Discord attachments."
 ```
 
 A backup is a zipped SQLite copy posted to Discord and recorded in database_backups. An impact report is a Markdown/CSV/JSON bundle posted to Discord and recorded in impact_snapshots. The two systems serve different purposes: backup is recovery; impact is evidence and forecasting.
@@ -3219,7 +3552,7 @@ flowchart LR
 
 > The report channel gives you durable evidence files; the database row keeps a bot-side history.
 
-## 42. Server Icon Rotation Code Walkthrough
+## 43. Server Icon Rotation Code Walkthrough
 
 Server icon rotation is a good example of making a visually simple feature reliable. The feature needs config validation, URL cleaning, mode selection, interval enforcement, download checks, state persistence, and commands for manual control.
 
@@ -3282,42 +3615,42 @@ Server icon rotation is a good example of making a visually simple feature relia
 1134:             await log_error(self.bot, f"Server icon rotation skipped: {message}")
 ```
 
-#### Server icon mode command (cogs/Commands.py:2116-2143)
+#### Server icon mode command (cogs/Commands.py:2239-2266)
 
 ```python
-2116:     async def server_icon_mode(
-2117:         self,
-2118:         ctx: discord.ApplicationContext,
-2119:         mode: discord.Option(
-2120:             str,
-2121:             "Rotation mode to use",
-2122:             choices=[
-2123:                 discord.OptionChoice("Random", "random"),
-2124:                 discord.OptionChoice("Linear", "linear"),
-2125:                 discord.OptionChoice("Disabled", "disabled"),
-2126:             ],
-2127:         ),
-2128:     ):
-2129:         if not self._in_allowed_guild(ctx):
-2130:             return await ctx.respond("Wrong server.", ephemeral=True)
-2131:         await self._defer(ctx, ephemeral=True)
-2132:         if not await self._is_admin_ctx(ctx):
-2133:             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
-2134:
-2135:         raw_mode = str(mode or "").strip().casefold()
-2136:         if raw_mode not in VALID_SERVER_ICON_MODES:
-2137:             return await ctx.respond("Mode must be `random`, `linear`, or `disabled`.", ephemeral=True)
-2138:         async with self._server_icon_operation_lock(), self._config_write_lock():
-2139:             cfg = ensure_server_icon_config(self.bot.config)
-2140:             cfg["mode"] = raw_mode
-2141:             if not await self._save_server_icon_config(ctx, "server_icon_mode_updated", f"mode={raw_mode}"):
-2142:                 return
-2143:         await ctx.respond(f"Server icon rotation mode is now `{raw_mode}`.", ephemeral=True)
+2239:     async def server_icon_mode(
+2240:         self,
+2241:         ctx: discord.ApplicationContext,
+2242:         mode: discord.Option(
+2243:             str,
+2244:             "Rotation mode to use",
+2245:             choices=[
+2246:                 discord.OptionChoice("Random", "random"),
+2247:                 discord.OptionChoice("Linear", "linear"),
+2248:                 discord.OptionChoice("Disabled", "disabled"),
+2249:             ],
+2250:         ),
+2251:     ):
+2252:         if not self._in_allowed_guild(ctx):
+2253:             return await ctx.respond("Wrong server.", ephemeral=True)
+2254:         await self._defer(ctx, ephemeral=True)
+2255:         if not await self._is_admin_ctx(ctx):
+2256:             return await ctx.respond("You don't have permission to use this.", ephemeral=True)
+2257:
+2258:         raw_mode = str(mode or "").strip().casefold()
+2259:         if raw_mode not in VALID_SERVER_ICON_MODES:
+2260:             return await ctx.respond("Mode must be `random`, `linear`, or `disabled`.", ephemeral=True)
+2261:         async with self._server_icon_operation_lock(), self._config_write_lock():
+2262:             cfg = ensure_server_icon_config(self.bot.config)
+2263:             cfg["mode"] = raw_mode
+2264:             if not await self._save_server_icon_config(ctx, "server_icon_mode_updated", f"mode={raw_mode}"):
+2265:                 return
+2266:         await ctx.respond(f"Server icon rotation mode is now `{raw_mode}`.", ephemeral=True)
 ```
 
 The current_index and current_url fields prevent linear rotation from getting stuck and help the bot know what it last tried. The interval is normalized to at least five minutes to respect Discord rate limits and avoid accidental rapid icon changes.
 
-## 43. Durable Operations Platform 3 22
+## 44. Durable Operations Platform 3 22
 
 Version 3.22 turns reliability from a collection of local fixes into a shared platform. The request, ticket, tracking, release, summary, and support systems still own their business rules, but background supervision, Discord delivery, workflow tracing, schema validation, health history, retention, and recovery drills now have central owners. This reduces duplicated recovery code and makes failures visible as one connected incident.
 
@@ -3391,85 +3724,85 @@ A direct channel.send followed by a database update has an unavoidable failure w
   78:         return int(row["id"] or 0) if row else 0
 ```
 
-#### Atomic claim, receipts, and delivered state excerpt (utils/outbox.py:115-190)
+#### Atomic claim, receipts, and delivered state excerpt (utils/outbox.py:118-193)
 
 ```python
- 115:     async def _process_row(self, row) -> str:
- 116:         outbox_id = int(row["id"])
- 117:         source = str(row["status"])
- 118:         OUTBOX_STATES.require(source, "processing")
- 119:         now = int(time.time())
- 120:         claimed_count = await self.bot.db.execute_affected(
- 121:             "UPDATE discord_outbox SET status='processing',attempts=attempts+1,updated_ts=? "
- 122:             "WHERE id=? AND status=?",
- 123:             (now, outbox_id, source),
- 124:         )
- 125:         if claimed_count != 1:
- 126:             return "retried"
- 127:         claimed = await self.bot.db.fetchone(
- 128:             "SELECT * FROM discord_outbox WHERE id=? AND status='processing'",
- 129:             (outbox_id,),
- 130:         )
- 131:         if claimed is None:
- 132:             return "retried"
- 133:         attempts = int(claimed["attempts"] or 1)
- 134:         try:
- 135:             if outbox_id in self._delivery_receipts:
- 136:                 delivered_message_id = self._delivery_receipts[outbox_id]
- 137:             else:
- 138:                 delivered_message_id = await asyncio.wait_for(self._deliver(claimed), timeout=45)
- 139:                 self._delivery_receipts[outbox_id] = int(delivered_message_id or 0)
- 140:         except Exception as exc:
- 141:             terminal = self._terminal_failure(exc) or attempts >= self.max_attempts
- 142:             target = "dead" if terminal else "pending"
- 143:             OUTBOX_STATES.require("processing", target)
- 144:             delay = 0 if terminal else min(3600, 5 * (2 ** min(attempts - 1, 9)))
- 145:             await self.bot.db.execute(
- 146:                 "UPDATE discord_outbox SET status=?,next_attempt_ts=?,updated_ts=?,last_error=? WHERE id=?",
- 147:                 (
- 148:                     target,
- 149:                     int(time.time()) + delay,
- 150:                     int(time.time()),
- 151:                     f"{type(exc).__name__}: {exc}"[:1000],
- 152:                     outbox_id,
- 153:                 ),
- 154:             )
- 155:             await record_workflow_event(
- 156:                 self.bot.db,
- 157:                 workflow_type="discord_outbox",
- 158:                 entity_id=str(outbox_id),
- 159:                 event=target,
- 160:                 correlation_id=str(claimed["correlation_id"] or ""),
- 161:                 guild_id=int(claimed["guild_id"] or 0),
- 162:                 payload={
- 163:                     "action": claimed["action_type"],
- 164:                     "attempts": attempts,
- 165:                     "error": str(exc)[:300],
- 166:                 },
- 167:             )
- 168:             return "dead" if terminal else "retried"
- 169:         OUTBOX_STATES.require("processing", "delivered")
- 170:         await self.bot.db.execute(
- 171:             "UPDATE discord_outbox SET status='delivered',delivered_ts=?,updated_ts=?,"
- 172:             "delivered_message_id=?,last_error=NULL WHERE id=?",
- 173:             (
- 174:                 int(time.time()),
- 175:                 int(time.time()),
- 176:                 int(delivered_message_id or 0) or None,
- 177:                 outbox_id,
- 178:             ),
- 179:         )
- 180:         self._delivery_receipts.pop(outbox_id, None)
- 181:         await record_workflow_event(
- 182:             self.bot.db,
- 183:             workflow_type="discord_outbox",
- 184:             entity_id=str(outbox_id),
- 185:             event="delivered",
- 186:             correlation_id=str(claimed["correlation_id"] or ""),
- 187:             guild_id=int(claimed["guild_id"] or 0),
- 188:             payload={"action": claimed["action_type"], "attempts": attempts},
- 189:         )
- 190:         return "delivered"
+ 118:     async def _process_row(self, row) -> str:
+ 119:         outbox_id = int(row["id"])
+ 120:         source = str(row["status"])
+ 121:         OUTBOX_STATES.require(source, "processing")
+ 122:         now = int(time.time())
+ 123:         claimed_count = await self.bot.db.execute_affected(
+ 124:             "UPDATE discord_outbox SET status='processing',attempts=attempts+1,updated_ts=? "
+ 125:             "WHERE id=? AND status=?",
+ 126:             (now, outbox_id, source),
+ 127:         )
+ 128:         if claimed_count != 1:
+ 129:             return "retried"
+ 130:         claimed = await self.bot.db.fetchone(
+ 131:             "SELECT * FROM discord_outbox WHERE id=? AND status='processing'",
+ 132:             (outbox_id,),
+ 133:         )
+ 134:         if claimed is None:
+ 135:             return "retried"
+ 136:         attempts = int(claimed["attempts"] or 1)
+ 137:         try:
+ 138:             if outbox_id in self._delivery_receipts:
+ 139:                 delivered_message_id = self._delivery_receipts[outbox_id]
+ 140:             else:
+ 141:                 delivered_message_id = await asyncio.wait_for(self._deliver(claimed), timeout=45)
+ 142:                 self._delivery_receipts[outbox_id] = int(delivered_message_id or 0)
+ 143:         except Exception as exc:
+ 144:             terminal = self._terminal_failure(exc) or attempts >= self.max_attempts
+ 145:             target = "dead" if terminal else "pending"
+ 146:             OUTBOX_STATES.require("processing", target)
+ 147:             delay = 0 if terminal else min(3600, 5 * (2 ** min(attempts - 1, 9)))
+ 148:             await self.bot.db.execute(
+ 149:                 "UPDATE discord_outbox SET status=?,next_attempt_ts=?,updated_ts=?,last_error=? WHERE id=?",
+ 150:                 (
+ 151:                     target,
+ 152:                     int(time.time()) + delay,
+ 153:                     int(time.time()),
+ 154:                     f"{type(exc).__name__}: {exc}"[:1000],
+ 155:                     outbox_id,
+ 156:                 ),
+ 157:             )
+ 158:             await record_workflow_event(
+ 159:                 self.bot.db,
+ 160:                 workflow_type="discord_outbox",
+ 161:                 entity_id=str(outbox_id),
+ 162:                 event=target,
+ 163:                 correlation_id=str(claimed["correlation_id"] or ""),
+ 164:                 guild_id=int(claimed["guild_id"] or 0),
+ 165:                 payload={
+ 166:                     "action": claimed["action_type"],
+ 167:                     "attempts": attempts,
+ 168:                     "error": str(exc)[:300],
+ 169:                 },
+ 170:             )
+ 171:             return "dead" if terminal else "retried"
+ 172:         OUTBOX_STATES.require("processing", "delivered")
+ 173:         await self.bot.db.execute(
+ 174:             "UPDATE discord_outbox SET status='delivered',delivered_ts=?,updated_ts=?,"
+ 175:             "delivered_message_id=?,last_error=NULL WHERE id=?",
+ 176:             (
+ 177:                 int(time.time()),
+ 178:                 int(time.time()),
+ 179:                 int(delivered_message_id or 0) or None,
+ 180:                 outbox_id,
+ 181:             ),
+ 182:         )
+ 183:         self._delivery_receipts.pop(outbox_id, None)
+ 184:         await record_workflow_event(
+ 185:             self.bot.db,
+ 186:             workflow_type="discord_outbox",
+ 187:             entity_id=str(outbox_id),
+ 188:             event="delivered",
+ 189:             correlation_id=str(claimed["correlation_id"] or ""),
+ 190:             guild_id=int(claimed["guild_id"] or 0),
+ 191:             payload={"action": claimed["action_type"], "attempts": attempts},
+ 192:         )
+ 193:         return "delivered"
 ```
 
 | Outbox State | Meaning | Recovery Rule |
@@ -3500,102 +3833,103 @@ await db.execute_transaction(statements, retry_safe=True)
 
 A task that exists is not necessarily a healthy task. asyncio tasks can finish after an uncaught exception, while the process and slash commands stay online. OperationsCog inventories the expected loops in every cog, recognizes when optional work is deliberately disabled, records state changes, and asks each affected cog to start its work again.
 
-#### Task inventory and restart decision (cogs/Operations.py:207-243)
+#### Task inventory and restart decision (cogs/Operations.py:216-252)
 
 ```python
- 207:     async def restart_stopped_tasks(self, *, force: bool = False) -> dict[str, str]:
- 208:         affected_cogs: set[str] = set()
- 209:         before: dict[str, str] = {}
- 210:         cancelled_tasks: list[asyncio.Task] = []
- 211:         for label, cog_name, attr in self._external_task_specs():
- 212:             cog = self.bot.get_cog(cog_name)
- 213:             if cog is not None and not self._task_expected(label, cog):
- 214:                 before[label] = "disabled"
- 215:                 continue
- 216:             value = getattr(cog, attr, None) if cog else None
- 217:             state = self._task_state(value)
- 218:             before[label] = state
- 219:             if cog is not None and (force or state not in {"running", "unknown"}):
- 220:                 affected_cogs.add(cog_name)
- 221:             if force and value is not None:
- 222:                 cancel = getattr(value, "cancel", None)
- 223:                 if callable(cancel):
- 224:                     cancel()
- 225:                     actual_task = value if isinstance(value, asyncio.Task) else getattr(value, "get_task", lambda: None)()
- 226:                     if actual_task is not None:
- 227:                         cancelled_tasks.append(actual_task)
- 228:         if cancelled_tasks:
- 229:             await asyncio.gather(*cancelled_tasks, return_exceptions=True)
- 230:         if force:
- 231:             await asyncio.sleep(0)
- 232:         for cog_name in sorted(affected_cogs):
- 233:             cog = self.bot.get_cog(cog_name)
- 234:             start = getattr(cog, "start_background", None)
- 235:             if callable(start):
- 236:                 try:
- 237:                     await start_cog_background(self.bot, cog_name)
- 238:                 except Exception as exc:
- 239:                     await log_error(
- 240:                         self.bot,
- 241:                         f"Task supervisor could not restart {cog_name}: {exc!r}",
- 242:                     )
- 243:         return before
+ 216:     async def restart_stopped_tasks(self, *, force: bool = False) -> dict[str, str]:
+ 217:         affected_cogs: set[str] = set()
+ 218:         before: dict[str, str] = {}
+ 219:         cancelled_tasks: list[asyncio.Task] = []
+ 220:         for label, cog_name, attr in self._external_task_specs():
+ 221:             cog = self.bot.get_cog(cog_name)
+ 222:             if cog is not None and not self._task_expected(label, cog):
+ 223:                 before[label] = "disabled"
+ 224:                 continue
+ 225:             value = getattr(cog, attr, None) if cog else None
+ 226:             state = self._task_state(value)
+ 227:             before[label] = state
+ 228:             if cog is not None and (force or state not in {"running", "unknown"}):
+ 229:                 affected_cogs.add(cog_name)
+ 230:             if force and value is not None:
+ 231:                 cancel = getattr(value, "cancel", None)
+ 232:                 if callable(cancel):
+ 233:                     cancel()
+ 234:                     actual_task = value if isinstance(value, asyncio.Task) else getattr(value, "get_task", lambda: None)()
+ 235:                     if actual_task is not None:
+ 236:                         cancelled_tasks.append(actual_task)
+ 237:         if cancelled_tasks:
+ 238:             await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+ 239:         if force:
+ 240:             await asyncio.sleep(0)
+ 241:         for cog_name in sorted(affected_cogs):
+ 242:             cog = self.bot.get_cog(cog_name)
+ 243:             start = getattr(cog, "start_background", None)
+ 244:             if callable(start):
+ 245:                 try:
+ 246:                     await start_cog_background(self.bot, cog_name)
+ 247:                 except Exception as exc:
+ 248:                     await log_error(
+ 249:                         self.bot,
+ 250:                         f"Task supervisor could not restart {cog_name}: {exc!r}",
+ 251:                     )
+ 252:         return before
 ```
 
-#### Independent supervisor and timeline (cogs/Operations.py:264-314)
+#### Independent supervisor and timeline (cogs/Operations.py:273-324)
 
 ```python
- 264:     async def _supervisor_loop(self) -> None:
- 265:         while not self.bot.is_closed():
- 266:             try:
- 267:                 changed: list[tuple[str, str, str]] = []
- 268:                 for label, cog_name, attr in self._external_task_specs():
- 269:                     cog = self.bot.get_cog(cog_name)
- 270:                     if cog is not None and not self._task_expected(label, cog):
- 271:                         state = "disabled"
- 272:                     else:
- 273:                         state = self._task_state(
- 274:                             getattr(cog, attr, None) if cog else None
- 275:                         )
- 276:                     previous = self._task_states.get(label)
- 277:                     self._task_states[label] = state
- 278:                     if previous is not None and state != previous:
- 279:                         changed.append((label, previous, state))
- 280:                 failed = [
- 281:                     label
- 282:                     for label, state in self._task_states.items()
- 283:                     if state.startswith(("failed", "stopped", "missing"))
- 284:                 ]
- 285:                 if failed:
- 286:                     restart = self._tasks.get("restarts")
- 287:                     if restart is None or restart.done():
- 288:                         self._tasks["restarts"] = asyncio.create_task(self.restart_stopped_tasks(), name="avenue-guard:restarts")
- 289:                 internal_factories = {
- 290:                     "outbox": self._outbox_loop,
- 291:                     "health": self._health_loop,
- 292:                     "maintenance": self._maintenance_loop,
- 293:                     "watchdog": self._watchdog_loop,
- 294:                 }
- 295:                 for name, factory in internal_factories.items():
- 296:                     task = self._tasks.get(name)
- 297:                     if task is None or task.done():
- 298:                         if task is not None and not task.cancelled() and task.exception() is not None:
- 299:                             await log_error(self.bot, f"Operations {name} task failed; restarting: {task.exception()!r}")
- 300:                         self._tasks[name] = asyncio.create_task(
- 301:                             factory(),
- 302:                             name=f"avenue-guard:{name}",
- 303:                         )
- 304:                         changed.append((f"operations.{name}", "stopped", "running"))
- 305:                 timeline = self._tasks.get("timeline")
- 306:                 if changed and (timeline is None or timeline.done()):
- 307:                     self._tasks["timeline"] = asyncio.create_task(self._record_task_changes(changed), name="avenue-guard:timeline")
- 308:             except asyncio.CancelledError:
- 309:                 raise
- 310:             except Exception as exc:
- 311:                 await log_error(self.bot, f"Background task supervisor error: {exc!r}")
- 312:             await asyncio.sleep(
- 313:                 operations_settings(self.bot.config.data).supervisor_interval_seconds
- 314:             )
+ 273:     async def _supervisor_loop(self) -> None:
+ 274:         while not self.bot.is_closed():
+ 275:             try:
+ 276:                 changed: list[tuple[str, str, str]] = []
+ 277:                 for label, cog_name, attr in self._external_task_specs():
+ 278:                     cog = self.bot.get_cog(cog_name)
+ 279:                     if cog is not None and not self._task_expected(label, cog):
+ 280:                         state = "disabled"
+ 281:                     else:
+ 282:                         state = self._task_state(
+ 283:                             getattr(cog, attr, None) if cog else None
+ 284:                         )
+ 285:                     previous = self._task_states.get(label)
+ 286:                     self._task_states[label] = state
+ 287:                     if previous is not None and state != previous:
+ 288:                         changed.append((label, previous, state))
+ 289:                 failed = [
+ 290:                     label
+ 291:                     for label, state in self._task_states.items()
+ 292:                     if state.startswith(("failed", "stopped", "missing"))
+ 293:                 ]
+ 294:                 initializing = hasattr(self.bot, "_runtime_initialized") and not self.bot._runtime_initialized
+ 295:                 if failed and not initializing:
+ 296:                     restart = self._tasks.get("restarts")
+ 297:                     if restart is None or restart.done():
+ 298:                         self._tasks["restarts"] = asyncio.create_task(self.restart_stopped_tasks(), name="avenue-guard:restarts")
+ 299:                 internal_factories = {
+ 300:                     "outbox": self._outbox_loop,
+ 301:                     "health": self._health_loop,
+ 302:                     "maintenance": self._maintenance_loop,
+ 303:                     "watchdog": self._watchdog_loop,
+ 304:                 }
+ 305:                 for name, factory in internal_factories.items():
+ 306:                     task = self._tasks.get(name)
+ 307:                     if task is None or task.done():
+ 308:                         if task is not None and not task.cancelled() and task.exception() is not None:
+ 309:                             await log_error(self.bot, f"Operations {name} task failed; restarting: {task.exception()!r}")
+ 310:                         self._tasks[name] = asyncio.create_task(
+ 311:                             factory(),
+ 312:                             name=f"avenue-guard:{name}",
+ 313:                         )
+ 314:                         changed.append((f"operations.{name}", "stopped", "running"))
+ 315:                 timeline = self._tasks.get("timeline")
+ 316:                 if changed and (timeline is None or timeline.done()):
+ 317:                     self._tasks["timeline"] = asyncio.create_task(self._record_task_changes(changed), name="avenue-guard:timeline")
+ 318:             except asyncio.CancelledError:
+ 319:                 raise
+ 320:             except Exception as exc:
+ 321:                 await log_error(self.bot, f"Background task supervisor error: {exc!r}")
+ 322:             await asyncio.sleep(
+ 323:                 operations_settings(self.bot.config.data).supervisor_interval_seconds
+ 324:             )
 ```
 
 > **Important distinction:** Disabled is a valid configured state. Stopped or failed is an operational problem. Treating both as the same would make the supervisor repeatedly start features that the owner intentionally turned off.
@@ -3729,7 +4063,7 @@ The original Config object remains the convenient runtime reader, but config_sch
    7: CONFIG_SCHEMA_VERSION = 2
    8: RUNTIME_SCHEMA_VERSION = 2
    9: EMBED_SCHEMA_VERSION = 2
-  10: DATABASE_SCHEMA_VERSION = 5
+  10: DATABASE_SCHEMA_VERSION = 8
   11:
   12:
   13: @dataclass(frozen=True)
@@ -3842,46 +4176,46 @@ The original Config object remains the convenient runtime reader, but config_sch
  135:     "gd_rated",
  136:     "gd_platformer",
  137:     "reviewer_id",
- 138: }
- 139:
- 140: REQUEST_BUTTON_VARIABLES = {
- 141:     "state",
- 142:     "wave_id",
- 143:     "submitted_count",
- 144:     "request_limit",
- 145:     "close_ts",
- 146:     "request_type",
- 147:     "request_type_label",
- 148:     "request_type_line",
- 149: }
- 150:
- 151: WAVE_SUMMARY_VARIABLES = {
- 152:     "wave_id",
- 153:     "request_type",
- 154:     "request_type_label",
- 155:     "total_requests",
- 156:     "reviewed_count",
- 157:     "sent_count",
- 158:     "not_sent_count",
- 159:     "rejected_count",
- 160:     "other_count",
- 161:     "level_doesnt_exist_count",
- 162:     "stolen_level_count",
- 163:     "already_rated_count",
- 164:     "pending_count",
- 165:     "left_to_review",
- 166:     "reviewed_percent",
- 167:     "pending_percent",
- 168:     "sent_percent",
- 169:     "not_sent_percent",
- 170:     "sent_percent_reviewed",
- 171:     "not_sent_percent_reviewed",
- 172:     "reviewer_stats",
- 173:     "summary_color",
- 174:     "wave_comparison",
- 175:     "request_delta",
- 176:     "sent_rate_delta",
- 177: }
+ 138:     "send_type",
+ 139:     "send_type_label",
+ 140:     "queue_status",
+ 141:     "review_system_version",
+ 142: }
+ 143:
+ 144: REQUEST_BUTTON_VARIABLES = {
+ 145:     "state",
+ 146:     "wave_id",
+ 147:     "submitted_count",
+ 148:     "request_limit",
+ 149:     "close_ts",
+ 150:     "request_type",
+ 151:     "request_type_label",
+ 152:     "request_type_line",
+ 153: }
+ 154:
+ 155: WAVE_SUMMARY_VARIABLES = {
+ 156:     "wave_id",
+ 157:     "request_type",
+ 158:     "request_type_label",
+ 159:     "total_requests",
+ 160:     "reviewed_count",
+ 161:     "sent_count",
+ 162:     "not_sent_count",
+ 163:     "rejected_count",
+ 164:     "other_count",
+ 165:     "level_doesnt_exist_count",
+ 166:     "stolen_level_count",
+ 167:     "already_rated_count",
+ 168:     "pending_count",
+ 169:     "left_to_review",
+ 170:     "reviewed_percent",
+ 171:     "pending_percent",
+ 172:     "sent_percent",
+ 173:     "not_sent_percent",
+ 174:     "sent_percent_reviewed",
+ 175:     "not_sent_percent_reviewed",
+ 176:     "reviewer_stats",
+ 177:     "summary_color",
 ```
 
 | Contract | Current Version | What It Protects |
@@ -3895,96 +4229,104 @@ The original Config object remains the convenient runtime reader, but config_sch
 
 The dashboard still answers what is happening now, but OperationsCog also stores what happened over time. A sample contains gateway latency, a measured database probe, internal database health, per-operation query timing, command errors, task state, and provider latency. Provider samples make it possible to distinguish a slow external level API from a slow database or Discord connection.
 
-#### Persistent runtime and provider samples (cogs/Operations.py:324-379)
+#### Persistent runtime and provider samples (cogs/Operations.py:334-397)
 
 ```python
- 324:     async def collect_health_sample(self) -> dict[str, Any]:
- 325:         started = time.perf_counter()
- 326:         db_ok = True
- 327:         try:
- 328:             await self.bot.db.fetchone("SELECT 1 AS ready")
- 329:         except Exception:
- 330:             db_ok = False
- 331:         db_probe_ms = round((time.perf_counter() - started) * 1000, 2)
- 332:         background = self.bot.get_cog("BackgroundCog")
- 333:         stats = getattr(background, "stats", None)
- 334:         request_cog = self.bot.get_cog("RequestLevelsCog")
- 335:         providers = (
- 336:             request_cog.validation_provider_snapshot()
- 337:             if request_cog is not None
- 338:             and hasattr(request_cog, "validation_provider_snapshot")
- 339:             else {}
- 340:         )
- 341:         payload = {
- 342:             "gateway_latency_ms": round(
- 343:                 float(getattr(self.bot, "latency", 0.0) or 0.0) * 1000, 2
- 344:             ),
- 345:             "db_ok": db_ok,
- 346:             "db_probe_ms": db_probe_ms,
- 347:             "db": self.bot.db.health_snapshot(),
- 348:             "query_timing": self.bot.db.query_timing_snapshot(reset=True),
- 349:             "tasks": self.task_snapshot(),
- 350:             "daily_commands": int(getattr(stats, "commands", 0) or 0),
- 351:             "daily_command_errors": int(getattr(stats, "command_errors", 0) or 0),
- 352:             "providers": providers,
- 353:             "sample_ts": int(time.time()),
- 354:         }
- 355:         guild_id = int(
- 356:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
- 357:         )
- 358:         await self.bot.db.execute(
- 359:             "INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) VALUES(?,?,?,?,?)",
- 360:             (
- 361:                 guild_id,
- 362:                 payload["sample_ts"],
- 363:                 "runtime",
- 364:                 db_probe_ms,
- 365:                 json.dumps(payload, separators=(",", ":")),
- 366:             ),
+ 334:     async def collect_health_sample(self) -> dict[str, Any]:
+ 335:         started = time.perf_counter()
+ 336:         db_ok = True
+ 337:         try:
+ 338:             db_ok = await self.bot.db.fetchone_local("SELECT 1 AS ready") is not None
+ 339:         except Exception:
+ 340:             db_ok = False
+ 341:         db_probe_ms = round((time.perf_counter() - started) * 1000, 2)
+ 342:         background = self.bot.get_cog("BackgroundCog")
+ 343:         stats = getattr(background, "stats", None)
+ 344:         request_cog = self.bot.get_cog("RequestLevelsCog")
+ 345:         providers = (
+ 346:             request_cog.validation_provider_snapshot()
+ 347:             if request_cog is not None
+ 348:             and hasattr(request_cog, "validation_provider_snapshot")
+ 349:             else {}
+ 350:         )
+ 351:         payload = {
+ 352:             "gateway_latency_ms": round(
+ 353:                 float(getattr(self.bot, "latency", 0.0) or 0.0) * 1000, 2
+ 354:             ),
+ 355:             "db_ok": db_ok,
+ 356:             "db_probe_ms": db_probe_ms,
+ 357:             "db": self.bot.db.health_snapshot(),
+ 358:             "query_timing": self.bot.db.query_timing_snapshot(reset=True),
+ 359:             "tasks": self.task_snapshot(),
+ 360:             "daily_commands": int(getattr(stats, "commands", 0) or 0),
+ 361:             "daily_command_errors": int(getattr(stats, "command_errors", 0) or 0),
+ 362:             "providers": providers,
+ 363:             "sample_ts": int(time.time()),
+ 364:         }
+ 365:         guild_id = int(
+ 366:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
  367:         )
- 368:         for provider, provider_payload in providers.items():
- 369:             await self.bot.db.execute(
- 370:                 "INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) VALUES(?,?,?,?,?)",
- 371:                 (
- 372:                     guild_id,
- 373:                     payload["sample_ts"],
- 374:                     f"provider:{provider}",
- 375:                     float(provider_payload.get("average_latency_ms", 0) or 0),
- 376:                     json.dumps(provider_payload, separators=(",", ":")),
- 377:                 ),
- 378:             )
- 379:         return payload
+ 368:         samples = [(
+ 369:                 guild_id,
+ 370:                 payload["sample_ts"],
+ 371:                 "runtime",
+ 372:                 db_probe_ms,
+ 373:                 json.dumps(payload, separators=(",", ":")),
+ 374:             )]
+ 375:         for provider, provider_payload in providers.items():
+ 376:             samples.append((
+ 377:                     guild_id,
+ 378:                     payload["sample_ts"],
+ 379:                     f"provider:{provider}",
+ 380:                     float(provider_payload.get("average_latency_ms", 0) or 0),
+ 381:                     json.dumps(provider_payload, separators=(",", ":")),
+ 382:                 ))
+ 383:         placeholders = ",".join("(?,?,?,?,?)" for _ in samples)
+ 384:         payload["persisted"] = False
+ 385:         self._last_health_sample = payload
+ 386:         try:
+ 387:             await self.bot.db.execute_transaction([(
+ 388:                 f"INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) VALUES {placeholders}",  # nosec B608
+ 389:                 tuple(value for sample in samples for value in sample),
+ 390:             )], queue_timeout=0.25)
+ 391:         except DatabaseBusyError:
+ 392:             self._deferred_health_samples += 1
+ 393:             payload["deferred_samples"] = self._deferred_health_samples
+ 394:             return payload
+ 395:         payload["persisted"] = True
+ 396:         payload["deferred_samples"] = self._deferred_health_samples
+ 397:         return payload
 ```
 
 Error logging follows the same principle. The message text is normalized and hashed into a fingerprint. Repeated failures update one incident with an occurrence count and latest correlation ID instead of behaving like unrelated errors. Permission drift is stored similarly, including when a previously missing permission is resolved.
 
 ### Retention, Restore Drills, And Monthly Impact
 
-#### Allowlisted retention (cogs/Operations.py:415-436)
+#### Allowlisted retention (cogs/Operations.py:433-454)
 
 ```python
- 415:     async def run_retention(self) -> dict[str, int]:
- 416:         settings = operations_settings(self.bot.config.data)
- 417:         now = int(time.time())
- 418:         removed: dict[str, int] = {}
- 419:         for table, days in settings.retention_days.items():
- 420:             target = RETENTION_TARGETS.get(table)
- 421:             if target is None:
- 422:                 continue
- 423:             column, condition = target
- 424:             cutoff = now - int(days) * 86400
- 425:             # Identifiers and predicates come only from RETENTION_TARGETS.
- 426:             removed[table] = await self.bot.db.execute_affected(
- 427:                 f"DELETE FROM {table} WHERE {column}<? {condition}",  # nosec B608
- 428:                 (cutoff,),
- 429:             )
- 430:         await self.bot.db.execute(
- 431:             "UPDATE error_incidents SET status='resolved',resolved_ts=? WHERE status='open' AND last_seen_ts<?",
- 432:             (now, now - 7 * 86400),
- 433:         )
- 434:         self._last_retention_run = now
- 435:         await self._persist_maintenance_timestamps()
- 436:         return removed
+ 433:     async def run_retention(self) -> dict[str, int]:
+ 434:         settings = operations_settings(self.bot.config.data)
+ 435:         now = int(time.time())
+ 436:         removed: dict[str, int] = {}
+ 437:         for table, days in settings.retention_days.items():
+ 438:             target = RETENTION_TARGETS.get(table)
+ 439:             if target is None:
+ 440:                 continue
+ 441:             column, condition = target
+ 442:             cutoff = now - int(days) * 86400
+ 443:             # Identifiers and predicates come only from RETENTION_TARGETS.
+ 444:             removed[table] = await self.bot.db.execute_affected(
+ 445:                 f"DELETE FROM {table} WHERE {column}<? {condition}",  # nosec B608
+ 446:                 (cutoff,),
+ 447:             )
+ 448:         await self.bot.db.execute(
+ 449:             "UPDATE error_incidents SET status='resolved',resolved_ts=? WHERE status='open' AND last_seen_ts<?",
+ 450:             (now, now - 7 * 86400),
+ 451:         )
+ 452:         self._last_retention_run = now
+ 453:         await self._persist_maintenance_timestamps()
+ 454:         return removed
 ```
 
 #### Non-destructive SQLite restore drill (services/backups.py:22-82)
@@ -4055,59 +4397,59 @@ Error logging follows the same principle. The message text is normalized and has
 
 Retention is allowlisted, not arbitrary SQL supplied by a command. Only operational history tables can be trimmed, each with a bounded number of days. Business records such as tickets, requests, reviews, and tracking history are outside that map. A restore drill creates a temporary backup, opens it read-only, runs PRAGMA integrity_check, verifies core tables, stores the result, and then deletes the temporary directory without replacing production data.
 
-#### Idempotent monthly impact delivery excerpt (cogs/Operations.py:448-497)
+#### Idempotent monthly impact delivery excerpt (cogs/Operations.py:466-515)
 
 ```python
- 448:     async def generate_monthly_report(self, *, force: bool = False) -> bool:
- 449:         settings = operations_settings(self.bot.config.data)
- 450:         now = now_madrid()
- 451:         month_key = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
- 452:         guild_id = int(
- 453:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
- 454:         )
- 455:         guild = self.bot.get_guild(guild_id)
- 456:         commands_cog = self.bot.get_cog("CommandsCog")
- 457:         if guild is None or commands_cog is None:
- 458:             return False
- 459:         exists = await self.bot.db.fetchone(
- 460:             "SELECT status FROM monthly_impact_reports WHERE guild_id=? AND month_key=?",
- 461:             (guild_id, month_key),
- 462:         )
- 463:         if exists and not force:
- 464:             return False
- 465:         metrics = await commands_cog._collect_impact_metrics(guild, 0)
- 466:         embed = commands_cog._impact_report_embed(metrics)
- 467:         channel_id = int(
- 468:             settings.monthly_report_channel_id
- 469:             or self.bot.config.get_int("impact", "report_channel_id", default=0)
- 470:             or 0
- 471:         )
- 472:         if not channel_id:
- 473:             return False
- 474:         correlation = new_correlation_id("impact")
- 475:         await self.bot.outbox.enqueue(
- 476:             "send_channel",
- 477:             guild_id=guild_id,
- 478:             channel_id=channel_id,
- 479:             correlation_id=correlation,
- 480:             idempotency_key=f"monthly-impact:{guild_id}:{month_key}",
- 481:             payload={
- 482:                 "content": f"Avenue Guard monthly impact report for {month_key}",
- 483:                 "embed": embed.to_dict(),
- 484:             },
- 485:         )
- 486:         await self.bot.db.execute(
- 487:             "INSERT OR REPLACE INTO monthly_impact_reports(guild_id,month_key,generated_ts,channel_id,payload_json,status) VALUES(?,?,?,?,?,?)",
- 488:             (
- 489:                 guild_id,
- 490:                 month_key,
- 491:                 int(time.time()),
- 492:                 channel_id,
- 493:                 json.dumps(metrics, separators=(",", ":")),
- 494:                 "queued",
- 495:             ),
- 496:         )
- 497:         return True
+ 466:     async def generate_monthly_report(self, *, force: bool = False) -> bool:
+ 467:         settings = operations_settings(self.bot.config.data)
+ 468:         now = now_madrid()
+ 469:         month_key = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+ 470:         guild_id = int(
+ 471:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
+ 472:         )
+ 473:         guild = self.bot.get_guild(guild_id)
+ 474:         commands_cog = self.bot.get_cog("CommandsCog")
+ 475:         if guild is None or commands_cog is None:
+ 476:             return False
+ 477:         exists = await self.bot.db.fetchone(
+ 478:             "SELECT status FROM monthly_impact_reports WHERE guild_id=? AND month_key=?",
+ 479:             (guild_id, month_key),
+ 480:         )
+ 481:         if exists and not force:
+ 482:             return False
+ 483:         metrics = await commands_cog._collect_impact_metrics(guild, 0)
+ 484:         embed = commands_cog._impact_report_embed(metrics)
+ 485:         channel_id = int(
+ 486:             settings.monthly_report_channel_id
+ 487:             or self.bot.config.get_int("impact", "report_channel_id", default=0)
+ 488:             or 0
+ 489:         )
+ 490:         if not channel_id:
+ 491:             return False
+ 492:         correlation = new_correlation_id("impact")
+ 493:         await self.bot.outbox.enqueue(
+ 494:             "send_channel",
+ 495:             guild_id=guild_id,
+ 496:             channel_id=channel_id,
+ 497:             correlation_id=correlation,
+ 498:             idempotency_key=f"monthly-impact:{guild_id}:{month_key}",
+ 499:             payload={
+ 500:                 "content": f"Avenue Guard monthly impact report for {month_key}",
+ 501:                 "embed": embed.to_dict(),
+ 502:             },
+ 503:         )
+ 504:         await self.bot.db.execute(
+ 505:             "INSERT OR REPLACE INTO monthly_impact_reports(guild_id,month_key,generated_ts,channel_id,payload_json,status) VALUES(?,?,?,?,?,?)",
+ 506:             (
+ 507:                 guild_id,
+ 508:                 month_key,
+ 509:                 int(time.time()),
+ 510:                 channel_id,
+ 511:                 json.dumps(metrics, separators=(",", ":")),
+ 512:                 "queued",
+ 513:             ),
+ 514:         )
+ 515:         return True
 ```
 
 #### Monthly Impact Report Lifecycle
@@ -4216,84 +4558,84 @@ The wave summary combines total demand, reviewed and pending work, sent rate, st
 
 After a short configurable delay, the operations layer probes the database, confirms the configured guild, validates typed config, checks its outbox worker and request cog, compares schema versions, and inventories slash commands. This is an in-process release check, not a full staging environment. It catches incomplete deployments and startup wiring mistakes while the dashboard can still explain them.
 
-#### Post-deployment smoke checks excerpt (cogs/Operations.py:559-628)
+#### Post-deployment smoke checks excerpt (cogs/Operations.py:577-646)
 
 ```python
- 559:     async def _post_deploy_smoke_test(self) -> None:
- 560:         delay = operations_settings(self.bot.config.data).smoke_test_delay_seconds
- 561:         if delay:
- 562:             await asyncio.sleep(delay)
- 563:         checks: dict[str, bool] = {}
- 564:         details: dict[str, str] = {}
- 565:         try:
- 566:             checks["database"] = bool(await self.bot.db.fetchone("SELECT 1 AS ready"))
- 567:         except Exception as exc:
- 568:             checks["database"] = False
- 569:             details["database"] = f"{type(exc).__name__}: {exc}"[:300]
- 570:         guild_id = int(
- 571:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
- 572:         )
- 573:         checks["guild"] = self.bot.get_guild(guild_id) is not None
- 574:         checks["config"] = not any(
- 575:             issue.severity == "error" for issue in self.bot.config.validation_issues
- 576:         )
- 577:         outbox_task = self._tasks.get("outbox")
- 578:         checks["outbox"] = outbox_task is not None and not outbox_task.done()
- 579:         checks["request_cog"] = self.bot.get_cog("RequestLevelsCog") is not None
- 580:         try:
- 581:             schema_rows = await self.bot.db.fetchall(
- 582:                 "SELECT component,schema_version FROM schema_metadata"
- 583:             )
- 584:         except Exception as exc:
- 585:             schema_rows = []
- 586:             details["schema_versions"] = f"{type(exc).__name__}: {exc}"[:300]
- 587:         schema_versions = {
- 588:             str(row["component"]): int(row["schema_version"]) for row in schema_rows
- 589:         }
- 590:         expected_schemas = {
- 591:             "database": DATABASE_SCHEMA_VERSION,
- 592:             "config": CONFIG_SCHEMA_VERSION,
- 593:             "runtime_settings": RUNTIME_SCHEMA_VERSION,
- 594:             "embed_templates": EMBED_SCHEMA_VERSION,
- 595:         }
- 596:         checks["schema_versions"] = schema_versions == expected_schemas
- 597:         if not checks["schema_versions"]:
- 598:             details.setdefault("schema_versions", (
- 599:                 f"expected={expected_schemas} actual={schema_versions}"
- 600:             ))
- 601:         command_count = sum(1 for _ in self.bot.walk_application_commands())
- 602:         checks["slash_commands"] = command_count >= 17
- 603:         details["slash_commands"] = str(command_count)
- 604:         status = "passed" if all(checks.values()) else "failed"
- 605:         correlation = new_correlation_id("deployment")
- 606:         self._last_smoke_result = {
- 607:             "status": status,
- 608:             "checks": checks,
- 609:             "details": details,
- 610:             "correlation_id": correlation,
- 611:             "ts": int(time.time()),
- 612:         }
- 613:         try:
- 614:             await record_workflow_event(
- 615:                 self.bot.db,
- 616:                 workflow_type="deployment",
- 617:                 entity_id=str(getattr(self.bot.user, "id", 0) or 0),
- 618:                 event=f"smoke_test_{status}",
- 619:                 correlation_id=correlation,
- 620:                 guild_id=guild_id,
- 621:                 payload={"checks": checks, "details": details},
- 622:             )
- 623:         except Exception as exc:
- 624:             await log_error(self.bot, f"Smoke test history persistence deferred: {exc!r}")
- 625:         if status == "failed":
- 626:             failed = ", ".join(key for key, passed in checks.items() if not passed)
- 627:             await log_error(
- 628:                 self.bot, f"Post-deployment smoke test failed: {failed} [{correlation}]"
+ 577:     async def _post_deploy_smoke_test(self) -> None:
+ 578:         delay = operations_settings(self.bot.config.data).smoke_test_delay_seconds
+ 579:         if delay:
+ 580:             await asyncio.sleep(delay)
+ 581:         checks: dict[str, bool] = {}
+ 582:         details: dict[str, str] = {}
+ 583:         try:
+ 584:             checks["database"] = bool(await self.bot.db.fetchone("SELECT 1 AS ready"))
+ 585:         except Exception as exc:
+ 586:             checks["database"] = False
+ 587:             details["database"] = f"{type(exc).__name__}: {exc}"[:300]
+ 588:         guild_id = int(
+ 589:             self.bot.config.get_int("guild", "allowed_guild_id", default=0) or 0
+ 590:         )
+ 591:         checks["guild"] = self.bot.get_guild(guild_id) is not None
+ 592:         checks["config"] = not any(
+ 593:             issue.severity == "error" for issue in self.bot.config.validation_issues
+ 594:         )
+ 595:         outbox_task = self._tasks.get("outbox")
+ 596:         checks["outbox"] = outbox_task is not None and not outbox_task.done()
+ 597:         checks["request_cog"] = self.bot.get_cog("RequestLevelsCog") is not None
+ 598:         try:
+ 599:             schema_rows = await self.bot.db.fetchall(
+ 600:                 "SELECT component,schema_version FROM schema_metadata"
+ 601:             )
+ 602:         except Exception as exc:
+ 603:             schema_rows = []
+ 604:             details["schema_versions"] = f"{type(exc).__name__}: {exc}"[:300]
+ 605:         schema_versions = {
+ 606:             str(row["component"]): int(row["schema_version"]) for row in schema_rows
+ 607:         }
+ 608:         expected_schemas = {
+ 609:             "database": DATABASE_SCHEMA_VERSION,
+ 610:             "config": CONFIG_SCHEMA_VERSION,
+ 611:             "runtime_settings": RUNTIME_SCHEMA_VERSION,
+ 612:             "embed_templates": EMBED_SCHEMA_VERSION,
+ 613:         }
+ 614:         checks["schema_versions"] = schema_versions == expected_schemas
+ 615:         if not checks["schema_versions"]:
+ 616:             details.setdefault("schema_versions", (
+ 617:                 f"expected={expected_schemas} actual={schema_versions}"
+ 618:             ))
+ 619:         command_count = sum(1 for _ in self.bot.walk_application_commands())
+ 620:         checks["slash_commands"] = command_count >= 17
+ 621:         details["slash_commands"] = str(command_count)
+ 622:         status = "passed" if all(checks.values()) else "failed"
+ 623:         correlation = new_correlation_id("deployment")
+ 624:         self._last_smoke_result = {
+ 625:             "status": status,
+ 626:             "checks": checks,
+ 627:             "details": details,
+ 628:             "correlation_id": correlation,
+ 629:             "ts": int(time.time()),
+ 630:         }
+ 631:         try:
+ 632:             await record_workflow_event(
+ 633:                 self.bot.db,
+ 634:                 workflow_type="deployment",
+ 635:                 entity_id=str(getattr(self.bot.user, "id", 0) or 0),
+ 636:                 event=f"smoke_test_{status}",
+ 637:                 correlation_id=correlation,
+ 638:                 guild_id=guild_id,
+ 639:                 payload={"checks": checks, "details": details},
+ 640:             )
+ 641:         except Exception as exc:
+ 642:             await log_error(self.bot, f"Smoke test history persistence deferred: {exc!r}")
+ 643:         if status == "failed":
+ 644:             failed = ", ".join(key for key, passed in checks.items() if not passed)
+ 645:             await log_error(
+ 646:                 self.bot, f"Post-deployment smoke test failed: {failed} [{correlation}]"
 ```
 
 > **Mental model:** Cogs own Discord workflows. Services own reusable business rules. Utils own infrastructure. Turso owns durable truth. OperationsCog watches the watchers, and the outbox turns important Discord effects into recoverable work.
 
-## 44. Runtime Isolation And Incident Recovery 3 22 1
+## 45. Runtime Isolation And Incident Recovery 3 22 1
 
 The September 15 review found an important distinction: putting a native call in a thread does not prove it is safe for an asyncio application. The installed libSQL extension can retain Python's GIL during database work. Our local threaded-query experiment took about 0.402 seconds while a separate heartbeat paused for about 0.411 seconds. This demonstrates interpreter contention, not the exact length or sole cause of the production outage.
 
@@ -4411,50 +4753,57 @@ flowchart LR
 
 The queue has a ten-second acquisition deadline. A queue timeout means this caller never started its operation. A worker RPC defaults to twenty seconds, with a shared thirty-second budget for normal work on an existing connection and a longer ninety-second startup budget. Reconnection and safe retries are separate phases; these are bounded phases rather than a promise that every end-to-end command finishes in thirty seconds.
 
-#### Bounded queue ownership (utils/db.py:302-315)
+#### Bounded queue ownership (utils/db.py:309-329)
 
 ```python
- 302:     async def _guard(self):
- 303:         self._waiting_operations += 1
- 304:         try:
- 305:             try:
- 306:                 await asyncio.wait_for(self._lock.acquire(), self._queue_timeout_seconds)
- 307:             except asyncio.TimeoutError as exc:
- 308:                 self._queue_timeouts += 1
- 309:                 raise DatabaseBusyError("Database busy; this operation was not started, please retry") from exc
- 310:         finally:
- 311:             self._waiting_operations -= 1
- 312:         try:
- 313:             yield
- 314:         finally:
- 315:             self._lock.release()
+ 309:     async def _guard(self, timeout: float | None = None, operation: str = "database"):
+ 310:         self._waiting_operations += 1
+ 311:         try:
+ 312:             try:
+ 313:                 await asyncio.wait_for(self._lock.acquire(), self._queue_timeout_seconds if timeout is None else timeout)
+ 314:             except asyncio.TimeoutError as exc:
+ 315:                 self._queue_timeouts += 1
+ 316:                 if timeout is None or timeout >= self._queue_timeout_seconds:
+ 317:                     self._last_queue_timeout_ts = int(time.time())
+ 318:                     self._last_queue_timeout_operation = operation
+ 319:                 else:
+ 320:                     self._background_queue_deferrals += 1
+ 321:                 holder = self._active_operation or "connection/maintenance"
+ 322:                 owner = self._active_operation_task or "unknown"
+ 323:                 raise DatabaseBusyError(f"Database busy; {operation} was not started, please retry (holder={holder}, task={owner}, waiting={self._waiting_operations})") from exc
+ 324:         finally:
+ 325:             self._waiting_operations -= 1
+ 326:         try:
+ 327:             yield
+ 328:         finally:
+ 329:             self._lock.release()
 ```
 
-#### Cancellation retains ownership until the thread finishes (utils/db.py:317-338)
+#### Cancellation retains ownership until the thread finishes (utils/db.py:331-352)
 
 ```python
- 317:     async def _thread_call(self, function, *args, budget: float = 30):
- 318:         def invoke():
- 319:             if isinstance(self._conn, IsolatedConnection):
- 320:                 self._conn.set_deadline(budget)
- 321:             return function(*args)
- 322:
- 323:         task = asyncio.create_task(asyncio.to_thread(invoke))
- 324:         try:
- 325:             return await asyncio.shield(task)
- 326:         except asyncio.CancelledError:
- 327:             # Cancelling to_thread does not stop its thread. Retain the lock
- 328:             # until it has exited so a second caller cannot race the connection.
- 329:             while not task.done():
- 330:                 try:
- 331:                     await asyncio.shield(task)
- 332:                 except asyncio.CancelledError:
- 333:                     continue
- 334:                 except Exception:
- 335:                     break
- 336:             if task.done() and not task.cancelled():
- 337:                 task.exception()
- 338:             raise
+ 331:     async def _thread_call(self, function, *args, budget: float = 30):
+ 332:         def invoke():
+ 333:             if isinstance(self._conn, IsolatedConnection):
+ 334:                 self._conn.set_deadline(budget)
+ 335:             return function(*args)
+ 336:
+ 337:         task = asyncio.create_task(asyncio.to_thread(invoke))
+ 338:         try:
+ 339:             return await asyncio.shield(task)
+ 340:         except asyncio.CancelledError:
+ 341:             # Cancelling to_thread does not stop its thread. Retain the lock
+ 342:             # until it has exited so a second caller cannot race the connection.
+ 343:             while not task.done():
+ 344:                 try:
+ 345:                     await asyncio.shield(task)
+ 346:                 except asyncio.CancelledError:
+ 347:                     continue
+ 348:                 except Exception:
+ 349:                     break
+ 350:             if task.done() and not task.cancelled():
+ 351:                 task.exception()
+ 352:             raise
 ```
 
 #### Simplified cancellation rule with commentary
@@ -4484,24 +4833,24 @@ Deadlines use time.monotonic so an operating-system wall-clock correction cannot
 
 Discord requires the initial response within three seconds. A modal must be that initial response, so deferring and later opening the same modal is not valid. Review buttons therefore open their modal without querying storage. The final submission checks the configured reviewer roles, source channel, current pending row, and current decision. An immediately opened form does not grant permission or guarantee the level is still pending.
 
-#### Review modal initial response (cogs/RequestLevels.py:3636-3650)
+#### Review modal initial response (cogs/RequestLevels.py:3857-3871)
 
 ```python
-3636:     async def handle_review_button(self, interaction: discord.Interaction, action: str):
-3637:         if interaction.guild is None or interaction.message is None:
-3638:             return await interaction.response.send_message("Request not found.", ephemeral=True)
-3639:         member = self._cached_interaction_member(interaction)
-3640:         if member is None or not self._has_reviewer_role(member):
-3641:             return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
-3642:         if action == "recheck":
-3643:             await interaction.response.defer(ephemeral=True)
-3644:             return await self._recheck_review_validation(interaction, interaction.message.id)
-3645:         # The modal itself is the acknowledgement. Authoritative existence and
-3646:         # pending-state checks run after submission, never before this deadline.
-3647:         if action == "other":
-3648:             return await interaction.response.send_message("Choose a result:", view=OtherReasonView(self, interaction.message.id), ephemeral=True)
-3649:
-3650:         await interaction.response.send_modal(ReviewModal(self, interaction.message.id, action))
+3857:     async def handle_review_button(self, interaction: discord.Interaction, action: str):
+3858:         if interaction.guild is None or interaction.message is None:
+3859:             return await interaction.response.send_message("Request not found.", ephemeral=True)
+3860:         member = self._cached_interaction_member(interaction)
+3861:         if member is None or not self._has_reviewer_role(member):
+3862:             return await interaction.response.send_message("Only reviewers can use these controls.", ephemeral=True)
+3863:         if action == "recheck":
+3864:             await interaction.response.defer(ephemeral=True)
+3865:             return await self._recheck_review_validation(interaction, interaction.message.id)
+3866:         # The modal itself is the acknowledgement. Authoritative existence and
+3867:         # pending-state checks run after submission, never before this deadline.
+3868:         if action == "other":
+3869:             return await interaction.response.send_message("Choose a result:", view=OtherReasonView(self, interaction.message.id), ephemeral=True)
+3870:
+3871:         await interaction.response.send_modal(ReviewModal(self, interaction.message.id, action))
 ```
 
 Persistent views are registered before preflight and login so saved button custom IDs have handlers from the start. Known slash command names also resolve using the interaction's actual guild if the command-ID cache is cold. An invocation does not force a REST command-sync round trip before its initial acknowledgement.
@@ -4585,7 +4934,7 @@ A batch UUID solves a subtle retry bug. Suppose Turso commits an increment, but 
 
 Operations starts its supervisor, watchdog, health, outbox, maintenance, and smoke work before awaiting persisted bootstrap settings. Bootstrap retries independently. The supervisor dispatches restart and history jobs rather than waiting for database-dependent work itself. A shared per-cog lock prevents initial startup and supervisor repair from starting the same feature concurrently. Missing tasks are repaired; deliberately disabled features remain off.
 
-#### Shared startup and repair ownership (utils/supervision.py:6-16)
+#### Shared startup and repair ownership (utils/supervision.py:6-24)
 
 ```python
    6: async def start_cog_background(bot, cog_name: str) -> None:
@@ -4598,31 +4947,39 @@ Operations starts its supervisor, watchdog, health, outbox, maintenance, and smo
   13:         cog = bot.get_cog(cog_name)
   14:         start = getattr(cog, "start_background", None)
   15:         if callable(start):
-  16:             await start()
+  16:             task = asyncio.current_task()
+  17:             previous_name = task.get_name() if task is not None else ""
+  18:             if task is not None:
+  19:                 task.set_name(f"avenue-guard:startup:{cog_name}")
+  20:             try:
+  21:                 await start()
+  22:             finally:
+  23:                 if task is not None:
+  24:                     task.set_name(previous_name)
 ```
 
-#### Memory-only watchdog heartbeat (cogs/Operations.py:130-148)
+#### Memory-only watchdog heartbeat (cogs/Operations.py:137-155)
 
 ```python
- 130:     async def _watchdog_loop(self) -> None:
- 131:         previous = time.monotonic()
- 132:         while not self.bot.is_closed():
- 133:             now = time.monotonic()
- 134:             lag_ms = max(0.0, (now - previous - 1) * 1000)
- 135:             previous = now
- 136:             reporter = getattr(self.bot, "_error_reporter", None)
- 137:             set_runtime_heartbeat(
- 138:                 lag_ms=lag_ms,
- 139:                 tasks=self.task_snapshot(),
- 140:                 database=self.bot.db.health_snapshot(),
- 141:                 incidents=reporter.snapshot() if reporter else [],
- 142:             )
- 143:             supervisor = self._tasks.get("supervisor")
- 144:             if supervisor is None or supervisor.done():
- 145:                 await self.start_background()
- 146:             if lag_ms >= 2000:
- 147:                 await log_error(self.bot, f"Event loop stalled for {lag_ms / 1000:.1f}s; Discord acknowledgements may have expired")
- 148:             await asyncio.sleep(1)
+ 137:     async def _watchdog_loop(self) -> None:
+ 138:         previous = time.monotonic()
+ 139:         while not self.bot.is_closed():
+ 140:             now = time.monotonic()
+ 141:             lag_ms = max(0.0, (now - previous - 1) * 1000)
+ 142:             previous = now
+ 143:             reporter = getattr(self.bot, "_error_reporter", None)
+ 144:             set_runtime_heartbeat(
+ 145:                 lag_ms=lag_ms,
+ 146:                 tasks=self.task_snapshot(),
+ 147:                 database=self.bot.db.health_snapshot(),
+ 148:                 incidents=reporter.snapshot() if reporter else [],
+ 149:             )
+ 150:             supervisor = self._tasks.get("supervisor")
+ 151:             if supervisor is None or supervisor.done():
+ 152:                 await self.start_background()
+ 153:             if lag_ms >= 2000:
+ 154:                 await log_error(self.bot, f"Event loop stalled for {lag_ms / 1000:.1f}s; Discord acknowledgements may have expired")
+ 155:             await asyncio.sleep(1)
 ```
 
 ### Liveness Is Not Readiness
@@ -4634,24 +4991,24 @@ Operations starts its supervisor, watchdog, health, outbox, maintenance, and smo
 | /api/bot | What may the public website disclose | Sanitized ready/responsive state and Degraded or Unavailable status |
 | Recovery dashboard | What can we inspect without SQL | Worker state, queue, active operation, event-loop lag, tasks, and pending incident counts |
 
-#### Readiness combines independent runtime signals (utils/keepalive.py:61-75)
+#### Readiness combines independent runtime signals (utils/keepalive.py:62-76)
 
 ```python
-  61: def get_runtime_health() -> dict:
-  62:     with _status_lock:
-  63:         heartbeat = _runtime_heartbeat
-  64:         health = dict(_runtime_health)
-  65:         state = str(_status.get("state") or "")
-  66:     age = time.monotonic() - heartbeat if heartbeat else None
-  67:     responsive = bool(heartbeat and age is not None and age < 15)
-  68:     database = health.get("database", {})
-  69:     database_ok = (database.get("connected") is not False and (not database.get("uses_remote") or database.get("worker_alive") is True)
-  70:                    and not database.get("primary_write_degraded"))
-  71:     auxiliary = {"operations.smoke", "operations.bootstrap", "operations.restarts", "operations.timeline"}
-  72:     tasks_ok = not any(str(value).startswith(("failed", "stopped", "missing"))
-  73:                        for name, value in health.get("tasks", {}).items() if name not in auxiliary)
-  74:     return {**health, "heartbeat_age_seconds": round(age, 2) if age is not None else None,
-  75:             "responsive": responsive, "ready": state == "online" and responsive and database_ok and tasks_ok}
+  62: def get_runtime_health() -> dict:
+  63:     with _status_lock:
+  64:         heartbeat = _runtime_heartbeat
+  65:         health = dict(_runtime_health)
+  66:         state = str(_status.get("state") or "")
+  67:     age = time.monotonic() - heartbeat if heartbeat else None
+  68:     responsive = bool(heartbeat and age is not None and age < 15)
+  69:     database = health.get("database", {})
+  70:     database_ok = (database.get("connected") is not False and (not database.get("uses_remote") or database.get("worker_alive") is True)
+  71:                    and not database.get("primary_write_degraded") and not database.get("write_queue_stalled"))
+  72:     auxiliary = {"operations.smoke", "operations.bootstrap", "operations.restarts", "operations.timeline", "release.bootstrap"}
+  73:     tasks_ok = not any(str(value).startswith(("failed", "stopped", "missing"))
+  74:                        for name, value in health.get("tasks", {}).items() if name not in auxiliary)
+  75:     return {**health, "heartbeat_age_seconds": round(age, 2) if age is not None else None,
+  76:             "responsive": responsive, "ready": state == "online" and responsive and database_ok and tasks_ok}
 ```
 
 The watchdog writes a memory-only heartbeat once a second. The HTTP thread can read it even if the asyncio loop stalls, and readiness fails when the heartbeat is fifteen seconds old. The full dashboard build has a five-second shielded deadline; a memory-only fallback appears while a cached build may finish in the background. Neither a health poll nor a Discord reconnect is treated as a new process start for service uptime.
@@ -4662,62 +5019,12 @@ The review transaction now queues a disabled-button edit alongside the decision 
 
 Pending validation refreshes run in small batches. External lookups happen outside the review lock, then the handler reloads the row and checks pending status and level ID before a compare-and-set JSON update. This prevents stale provider results overwriting an edit or reopening buttons after review. Missing Discord messages remain a repair condition rather than a reason to recreate cards on every loop. A Boomlings 403 remains denied upstream access; another provider's positive evidence is retained.
 
-#### Safe validation refresh against concurrent review (cogs/RequestLevels.py:3666-3718)
+#### Safe validation refresh against concurrent review (cogs/RequestLevels.py:3912-3914)
 
 ```python
-3666:     async def _refresh_review_validation(self, guild, target_kind, row, *, message=None):
-3667:         data = self._safe_json_loads(row["data_json"], {})
-3668:         if not isinstance(data, dict):
-3669:             data = {}
-3670:         level_id = str(data.get("level_id") or self._row_value(row, "level_id", "")).strip()
-3671:         if str(row["status"]) != "pending" or not level_id:
-3672:             return {}
-3673:         validation = await self._lookup_level_validation(level_id, force=True)
-3674:         if not validation:
-3675:             return {}
-3676:         message_id = int(row["request_message_id"])
-3677:         async with self._review_lock:
-3678:             target_kind, row = await self._review_target_by_message(guild.id, message_id)
-3679:             if row is None:
-3680:                 return {}
-3681:             if str(row["status"]) != "pending":
-3682:                 return {}
-3683:             data = self._safe_json_loads(row["data_json"], {})
-3684:             if not isinstance(data, dict):
-3685:                 data = {}
-3686:             current_level_id = str(data.get("level_id") or self._row_value(row, "level_id", "")).strip()
-3687:             if current_level_id != level_id:
-3688:                 return {}
-3689:             data = self._apply_level_validation_vars(data, validation)
-3690:             data_json = json.dumps(data, separators=(",", ":"))
-3691:             table = "weekly_request_reviews" if target_kind == "weekly" else "level_request_submissions"
-3692:             changed = await self.bot.db.execute_affected(
-3693:                 f"UPDATE {table} SET data_json=? WHERE guild_id=? AND request_message_id=? AND status='pending' AND data_json=?",  # nosec B608
-3694:                 (data_json, guild.id, message_id, row["data_json"]),
-3695:             )
-3696:             if changed != 1:
-3697:                 return {}
-3698:             variables = (
-3699:                 self._weekly_data_vars(row, data)
-3700:                 if target_kind == "weekly"
-3701:                 else self._data_vars(row, data)
-3702:             )
-3703:             template_key = "weekly_request_submitted_embed" if target_kind == "weekly" else "level_requested_embed"
-3704:             embed = self._embed_from_template(
-3705:                 self._cfg(template_key, default={}) or {},
-3706:                 variables,
-3707:                 default_color=self._color_name("pending", "blurple"),
-3708:             )
-3709:             if message is None:
-3710:                 channel = await self._review_target_channel(guild, target_kind, row)
-3711:                 if channel is not None:
-3712:                     try:
-3713:                         message = await channel.fetch_message(message_id)
-3714:                     except discord.NotFound:
-3715:                         await log_error(self.bot, f"Pending request message is missing during validation refresh: {message_id}; use request repair")
-3716:             if message is not None:
-3717:                 await message.edit(embed=embed, view=LevelRequestReviewView())
-3718:         return validation
+3912:     async def _refresh_review_validation(self, guild, target_kind, row, *, message=None):
+3913:         async with self._validation_card_lock:
+3914:             return await self._refresh_review_card(guild, target_kind, row, message=message)
 ```
 
 > **Do not confuse Discord delivery denial with a bot callback:** If Clyde refuses a user's DM, the bot receives no event to fix or log. Check mutual-server membership, privacy, blocks, and Discord screening separately. Runtime repair cannot bypass a message that Discord never delivered.
@@ -4726,7 +5033,7 @@ Pending validation refreshes run in small batches. External lookups happen outsi
 
 The regression suite exercises the real installed native driver in an isolated process, a hard worker deadline, cancellation while another caller waits, a locked primary with a readable snapshot, uncertain incident commits, repeated Discord logs during a stalled database, cold command IDs, early saved views, a failed original review edit, post-send receipt failure, readiness degradation, and refresh/review races. These tests validate mechanisms locally. Render deployment and real Discord smoke checks still establish whether the current production configuration is healthy. The detailed evidence and changed-file inventory live in docs/INCIDENT_DIAGNOSIS_2026-09-15.md.
 
-## 45. Engineering Thinking Behind The Bot
+## 46. Engineering Thinking Behind The Bot
 
 Avenue Guard's best design choices are about recovering from imperfect reality. Discord is not a database. Messages disappear, permissions change, users close DMs, external APIs fail, and hosted storage can be wiped. The bot works because the important truth lives in SQLite and visible Discord messages are treated as projections that can be refreshed or rebuilt.
 
@@ -4744,7 +5051,7 @@ The bot is not architected as many isolated mini-bots. It is one coherent system
 
 > **How we planned it:** The pattern was usually: identify a manual staff pain, decide what state must survive, store that state, expose a Discord UI, log the outcome, then add a repair or diagnostic path for the ways Discord can drift.
 
-## 46. Debugging Notebook
+## 47. Debugging Notebook
 
 When something breaks, resist the urge to read everything. Use the failure type to choose the shortest path.
 

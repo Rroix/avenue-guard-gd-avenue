@@ -269,16 +269,21 @@ class DiscordOutbox:
                 table = "weekly_request_reviews" if kind == "weekly" else "level_request_submissions"
                 async with cog._review_lock:
                     current = await self.bot.db.fetchone(
-                        f"SELECT 1 FROM {table} WHERE guild_id=? AND request_message_id=? AND status='pending' AND data_json=?",  # nosec B608
+                        f"SELECT * FROM {table} WHERE guild_id=? AND request_message_id=? AND status='pending' AND data_json=?",  # nosec B608
                         (int(row["guild_id"]), message_id, guard["data_json"]),
                     )
                     if current is None:
                         return message_id
-                    from utils.views import LevelRequestReviewView
+                    from utils.views import request_review_view
                     channel = await self._channel(channel_id)
                     message = await asyncio.wait_for(channel.fetch_message(message_id), timeout=15)
+                    review_version = (
+                        "legacy"
+                        if kind == "weekly"
+                        else str(current["review_system_version"] or "legacy")
+                    )
                     await asyncio.wait_for(message.edit(content=content, embed=embed, allowed_mentions=mentions,
-                                                        view=LevelRequestReviewView()), timeout=15)
+                                                        view=request_review_view(review_version)), timeout=15)
                 return message_id
             channel = await self._channel(channel_id)
             try:
@@ -292,8 +297,11 @@ class DiscordOutbox:
             else:
                 options = {}
                 if payload.get("request_review_disabled"):
-                    from utils.views import LevelRequestReviewView
-                    options["view"] = LevelRequestReviewView(disabled=True)
+                    from utils.views import request_review_view
+                    options["view"] = request_review_view(
+                        str(payload.get("request_review_version") or "legacy"),
+                        disabled=True,
+                    )
                 await message.edit(
                     content=content, embed=embed, allowed_mentions=mentions, **options
                 )

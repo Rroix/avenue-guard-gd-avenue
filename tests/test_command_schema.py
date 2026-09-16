@@ -26,7 +26,7 @@ def test_slash_command_schema_stays_constrained_and_readable(monkeypatch):
             for command in (item.to_dict() for item in bot.pending_application_commands)
         }
 
-        assert len(commands) == 17
+        assert len(commands) == 18
         assert all(
             description
             and len(description) <= 100

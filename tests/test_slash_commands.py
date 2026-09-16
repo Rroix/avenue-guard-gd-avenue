@@ -87,8 +87,8 @@ def test_all_registered_slash_commands_serialize_with_descriptions(tmp_path, mon
             leaves.extend(_leaf_command_data(root.to_dict()))
 
         names = {name for name, _ in leaves}
-        assert len(bot.pending_application_commands) == 17
-        assert len(names) == 45
+        assert len(bot.pending_application_commands) == 18
+        assert len(names) == 52
         assert {
             "bot release",
             "bot releases",
@@ -99,6 +99,10 @@ def test_all_registered_slash_commands_serialize_with_descriptions(tmp_path, mon
             "requests notifications",
             "requests analytics",
             "bot retention",
+            "pps dashboard",
+            "pps queue",
+            "pps cycle",
+            "pps outreach",
         } <= names
 
         for name, data in leaves:

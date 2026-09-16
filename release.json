@@ -1,16 +1,16 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.23.0",
-  "title": "Private historical request audit",
-  "summary": "Adds a disableable owner-only historical backfill and research report without changing live requests or prioritization",
+  "version": "3.24.0",
+  "title": "Priority Point System v1",
+  "summary": "Adds prospective recommendation scoring and a durable owner-managed outreach queue while preserving the deployment wave's legacy workflow",
   "changes": [
-    "Added owner-only historical audit start, status, report and cancellation with durable restart recovery and worker leases",
-    "Added isolated schema-7 history captures, current level/account snapshots and prestige evidence storage",
-    "Reused GD sessions, provider throttles and circuits for deduplicated current level and Creator Points lookups",
-    "Preserved unknown CP/rating and missing or conflicting prestige instead of guessing values",
-    "Added partial CSV enrichment with exact provenance and conservative wave/date matching",
-    "Added private CSV, JSON and Markdown coverage, rating-outcome, CP, repeated-level and waiting diagnostics",
-    "Kept candidate formulas analysis-only and all live reviews, waves, embeds and allocations unchanged",
-    "Added historical-audit regression tests and an owner runbook; extended quality checks to services"
+    "Protected the deployment-time wave and all weekly reviews on the unchanged legacy Send, Reject, Other and Recheck controls",
+    "Added a persistent five-tier recommendation menu for only newly created PPS waves",
+    "Implemented deterministic F plus G plus H scoring with current uploader CP and strict unknown-not-zero handling",
+    "Added a durable ranked outreach queue with component snapshots, evidence history and idempotent repair",
+    "Added owner-managed outreach cycles, private attempt records and confirmed moderator-submission tracking",
+    "Added supervised CP, level-status and fixed 30-day outcome maintenance in bounded provider-aware batches",
+    "Added private PPS dashboard, queue, level, cycle, outreach, refresh, override and evidence commands",
+    "Added schema-8 migration, recovery documentation and regression coverage for legacy rollout, formulas, cycles and restart durability"
   ]
 }

@@ -616,7 +616,7 @@
 **Setup:** staging bot, a recent backup, and one pending wave request plus one pending weekly request. Do not inject failures into the production database.
 
 1. Deploy the update with existing valid Turso credentials.
-   - Expected: schema metadata reports database v6, existing records remain, and `activity_flush_batches` exists.
+   - Expected: schema metadata reports database v8, existing records remain, and `activity_flush_batches` exists.
 2. Hold a slow primary write while querying initialized replica state.
    - Expected: ticket/tracking/dashboard reads do not acquire the primary queue; Discord heartbeats continue.
    - Expected: an interactive write that times out reports it was not started, identifies the holder, and can be retried later.
@@ -677,7 +677,7 @@
 ## 29) Private historical request audit
 **Setup:** staging backup with repeated historical live levels, reviewed/pending rows, and optionally a partial prestige CSV. Start disabled; keep real provider throttles and circuits enabled.
 
-1. Confirm schema 7 contains all seven audit/prestige tables and preserves live source rows. A full backup/restore preserves evidence and progress.
+1. Confirm current schema 8 retains all schema-7 audit/prestige tables and preserves live source rows. A full backup/restore preserves evidence and progress.
 2. Try `/requests historical_audit` as an ordinary member and an admin outside `impact.allowed_user_ids`. Both receive an ephemeral denial and no job starts.
 3. Enable `historical_audit.enabled`; start as the owner. The interaction acknowledges immediately and returns a run ID. A simultaneous second start is denied.
 4. Inspect `action:status`; distinct level/account counts advance. Zero CP is known zero; HTTP denial, wrong account, malformed/missing CP and identity disagreement remain unknown.
@@ -689,3 +689,54 @@
 10. Default disabled g and undefined intermediate exponents leave totals null. Configured candidates use current CP and labelled observed-wave age, not actual historical allocation/outreach.
 11. Close owner DMs while the command is usable: report falls back ephemerally. After restart/expiry use `action:report`. An interrupted automatic DM is not automatically resent.
 12. Compare reviewer callbacks, Send/Reject, waves, public request embeds and allocations before/after. No audit data participates, no Bayesian probability exists and no historical source row is rewritten.
+
+---
+
+## 30) Priority Point System v1
+**Setup:** staging backup with an active legacy wave and at least two test accounts. Do not use real moderator target names in test notes.
+
+1. Deploy schema 8 while a wave exists.
+   - Expected: `/pps dashboard` reports the current wave as `legacy` and the next newly created wave as `pps_v1`.
+   - Expected: no historical or current-wave `sent` row is inserted into `level_outreach_queue`.
+2. Submit a new level to that same active wave and run `/requests repair`.
+   - Expected: both old and new cards still show generic Send, Reject, Other and Recheck.
+3. Close the wave and create the next wave, including once through a scheduled opening.
+   - Expected: new submissions copy `pps_v1` and show Send type, Reject, Other and Recheck with no generic Send button.
+4. Choose each tier in staging.
+   - Expected: the select opens the optional review modal immediately; saved machine values are exactly rate, feature, epic, legendary and mythic.
+5. Have two reviewers race one test card.
+   - Expected: one reviewed result, one queue row, one result delivery intent and one disabled-card intent survive.
+6. Reject one PPS card and use an Other reason on another.
+   - Expected: existing result behavior remains, and neither request receives a PPS queue row.
+7. Inspect a new recommendation before provider refresh.
+   - Expected: F and H are stored, CP/G/P are null, and the UI says CP pending rather than CP 0.
+8. Refresh a known CP-0 uploader, then CP 1/2/3/4 test fixtures.
+   - Expected: G is approximately 3.22/1.27/0.65/0.27/0 and P becomes complete.
+9. Force a profile error, malformed response and account mismatch.
+   - Expected: CP remains unknown and no zero-CP bonus is granted; maintenance retries after the configured failure delay.
+10. Compare tier scores.
+   - Expected: F is approximately 0/1.09/3.35/8.06/17.90 from Rate through Mythic.
+11. Start a cycle and inspect it.
+   - Expected: only entries queued at start are snapshotted with F/G/H/P, CP, W and model version; later recommendations are absent.
+12. Record planned, attempted and failed evidence.
+   - Expected: attempts persist with private route/notes, failed alone does not remove the queue entry, and restart preserves the cycle.
+13. Try to complete without a confirmed moderator submission.
+   - Expected: completion is refused; cancellation preserves evidence and increments no W.
+14. Confirm one entry as `submitted_to_mod`, then complete.
+   - Expected: it moves to awaiting outcome and gains no W; other eligible start entries gain exactly one W; late entries gain none.
+15. Complete the same cycle again.
+   - Expected: no W changes a second time.
+16. Repeat successful cycles past W=4.
+   - Expected: raw W continues increasing, H caps at 12, and raw W remains the first complete-score tie-break.
+17. Mark or observe an active level as rated.
+   - Expected: it leaves the ordinary queue as `rated`, while snapshots and source evidence remain.
+18. Confirm a moderator submission and advance a test clock to the configured outcome boundary.
+   - Expected: `rated_within_window` and completion time persist only after a successful fresh level observation; no probability is shown.
+19. Try every `/pps` command as a reviewer/admin who is not in `impact.allowed_user_ids`.
+   - Expected: all management is denied ephemerally. Review controls still work for configured reviewers.
+20. Inspect `/pps level` as the owner.
+   - Expected: private target labels/notes appear only there; requester/result/public embeds never contain them or exact priority scores.
+21. Restart and run `/requests repair`.
+   - Expected: legacy and PPS views restore by saved row version; reviewed controls stay disabled; missing PPS queue rows repair idempotently; legacy rows never enter the queue.
+22. Confirm Operations health.
+   - Expected: `priority.maintenance` is running or restarted by the supervisor, batches stay bounded, and provider failures do not make interactions unavailable.

@@ -21,6 +21,7 @@ from utils.views import (
     TranscriptRequestView,
     ReleaseApprovalView,
     LevelRequestButtonView,
+    LevelRequestPPSReviewView,
     LevelRequestReviewView,
 )
 from utils.runtime_config import load_runtime_config_overrides
@@ -220,6 +221,14 @@ async def _close_runtime_storage(bot: discord.Bot) -> None:
             startup_log(
                 f"Request validation session shutdown failed: {type(e).__name__}: {e}"
             )
+
+    priority = bot.get_cog("PrioritySystemCog")
+    close_priority = getattr(priority, "close_resources", None)
+    if callable(close_priority):
+        try:
+            await close_priority()
+        except Exception as e:
+            startup_log(f"Priority maintenance shutdown failed: {type(e).__name__}: {e}")
 
     release = bot.get_cog("ReleaseCog")
     close_release = getattr(release, "close_resources", None)
@@ -425,6 +434,7 @@ def create_bot() -> discord.Bot:
         bot.load_extension("cogs.MessageResponses")
         bot.load_extension("cogs.Sticky")
         bot.load_extension("cogs.RequestLevels")
+        bot.load_extension("cogs.PrioritySystem")
         bot.load_extension("cogs.HistoricalAudit")
         bot.load_extension("cogs.Release")
         bot.load_extension("cogs.Commands")
@@ -503,6 +513,7 @@ def create_bot() -> discord.Bot:
             "TrackingCog",
             "HelpCog",
             "RequestLevelsCog",
+            "PrioritySystemCog",
             "HistoricalAuditCog",
             "ReleaseCog",
             "BackgroundCog",
@@ -620,6 +631,7 @@ def create_bot() -> discord.Bot:
         bot.add_view(ReleaseApprovalView())
         bot.add_view(LevelRequestButtonView())
         bot.add_view(LevelRequestReviewView())
+        bot.add_view(LevelRequestPPSReviewView())
         bot._persistent_views_registered = True
 
     bot.register_persistent_views = register_persistent_views
