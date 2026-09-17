@@ -10,6 +10,9 @@ import aiohttp
 GDBROWSER_LEVEL_URL = "https://gdbrowser.com/api/level/{level_id}"
 BOOMLINGS_LEVEL_URL = "https://www.boomlings.com/database/getGJLevels21.php"
 GDRATEPLUS_LEVEL_URL = "https://gdrateplus.com/api/levels/{level_id}"
+GDHISTORY_LEVEL_URL = (
+    "https://history.geometrydash.eu/api/v1/level/{level_id}/brief/"
+)
 # Public Geometry Dash protocol value, not an application credential.
 COMMON_SECRET = "Wmfd2893gb7"  # nosec B105
 MAX_PROVIDER_RESPONSE_BYTES = 1_000_000
@@ -296,6 +299,104 @@ def parse_gdrateplus_level(payload: Any, level_id: str) -> dict[str, Any]:
     }
 
 
+def parse_gdhistory_level(payload: Any, level_id: str) -> dict[str, Any]:
+    """Normalize GDHistory's brief snapshot without treating gaps as missing.
+
+    GDHistory is a preservation index, not the authoritative live game API. A
+    matching public, non-deleted row is useful positive evidence. A missing or
+    stale row must remain unknown so it can never cause an automatic rejection.
+    """
+    if not isinstance(payload, dict):
+        return _provider_error(
+            "gdhistory", "Unexpected response", failure_kind="invalid_response"
+        )
+    if payload.get("success") is False:
+        return _provider_error(
+            "gdhistory",
+            "Level is not indexed",
+            failure_kind="not_indexed",
+        )
+
+    returned_id = str(payload.get("online_id") or "").strip()
+    if returned_id != str(level_id).strip():
+        return _provider_error(
+            "gdhistory",
+            "Response level ID did not match the requested ID",
+            failure_kind="invalid_response",
+        )
+    if payload.get("is_public") is not True or payload.get("is_deleted") is True:
+        return _provider_error(
+            "gdhistory",
+            "Snapshot does not confirm a current public level",
+            failure_kind="not_current",
+        )
+
+    name = str(payload.get("cache_level_name") or "").strip()
+    if not name:
+        return _provider_error(
+            "gdhistory",
+            "Snapshot did not include a level name",
+            failure_kind="invalid_response",
+        )
+
+    difficulty_code = _as_int(payload.get("cache_filter_difficulty"), 0)
+    difficulty = {
+        1: "Auto",
+        2: "Easy",
+        3: "Normal",
+        4: "Hard",
+        5: "Harder",
+        6: "Insane",
+        7: "Demon",
+        8: "Easy Demon",
+        9: "Medium Demon",
+        10: "Hard Demon",
+        11: "Insane Demon",
+        12: "Extreme Demon",
+    }.get(difficulty_code, "Unknown")
+    length_code = _as_int(payload.get("cache_length"), -1)
+    length = _length_name(length_code)
+    stars = _as_int(payload.get("cache_stars"), 0)
+    feature_score = _as_int(payload.get("cache_featured"), 0)
+    epic_tier = _as_int(payload.get("cache_epic"), 0)
+    featured = feature_score > 0
+    epic = epic_tier >= 1
+    legendary = epic_tier >= 2
+    mythic = epic_tier >= 3
+    rated = stars > 0 or featured or epic
+
+    return {
+        "provider": "gdhistory",
+        "ok": True,
+        "exists": True,
+        "level_id": returned_id,
+        "name": name,
+        "creator": str(payload.get("cache_username") or ""),
+        "difficulty": difficulty,
+        "length": length,
+        "stars": stars,
+        "rated": rated,
+        "featured": featured,
+        "epic": epic,
+        "legendary": legendary,
+        "mythic": mythic,
+        "demon": difficulty_code >= 7,
+        "platformer": length_code == 5,
+        "snapshot_ts": _audit_integer(payload.get("cache_submitted_timestamp")),
+        "audit_metadata": {
+            "uploader_user_id": _audit_integer(payload.get("cache_user_id")),
+            "uploader_account_id": _audit_integer(payload.get("cache_account_id")),
+            "stars": _audit_integer(payload.get("cache_stars")),
+            "featured": featured,
+            "epic": epic,
+            "epic_tier_raw": _audit_integer(payload.get("cache_epic")),
+            "legendary": legendary,
+            "mythic": mythic,
+            "rated": rated,
+        },
+    }
+
+
 def parse_boomlings_level(text: str, level_id: str) -> dict[str, Any]:
     raw = str(text or "").strip()
     if raw == "-1":
@@ -485,6 +586,45 @@ async def fetch_gdrateplus_level(
         return _provider_error("gdrateplus", type(e).__name__)
 
 
+async def fetch_gdhistory_level(
+    session: aiohttp.ClientSession, level_id: str
+) -> dict[str, Any]:
+    try:
+        headers = {"Accept": "application/json", "User-Agent": "Avenue-Guard/1"}
+        async with session.get(
+            GDHISTORY_LEVEL_URL.format(level_id=level_id), headers=headers
+        ) as resp:
+            text, read_error = await _read_provider_text(resp, "gdhistory")
+            if read_error:
+                return read_error
+            if resp.status == 404:
+                return _provider_error(
+                    "gdhistory",
+                    "Level is not indexed",
+                    failure_kind="not_indexed",
+                )
+            if resp.status >= 400:
+                return _http_error("gdhistory", resp)
+            try:
+                payload = json.loads(text)
+            except (TypeError, ValueError):
+                return _provider_error(
+                    "gdhistory",
+                    "Response was not JSON",
+                    failure_kind="invalid_response",
+                )
+            return parse_gdhistory_level(payload, level_id)
+    except (aiohttp.ClientError, TimeoutError) as e:
+        return _provider_error(
+            "gdhistory",
+            type(e).__name__,
+            failure_kind="network_error",
+            retryable=True,
+        )
+    except Exception as e:
+        return _provider_error("gdhistory", type(e).__name__)
+
+
 def combine_level_validation(
     level_id: str,
     provider_results: dict[str, dict[str, Any]],
@@ -548,6 +688,9 @@ def combine_level_validation(
                 or ""
             ).replace("_", " ")
             detail = kind or str(result.get("error") or "unknown")
+            status_code = _as_int(result.get("status_code"), 0)
+            if status_code:
+                detail = f"{detail}; HTTP {status_code}"
             status = f"unavailable ({detail})"
         sources.append(f"{provider}: {status}")
 

@@ -6,9 +6,11 @@ from utils.gd_validation import (
     combine_level_validation,
     fetch_boomlings_level,
     fetch_gdbrowser_level,
+    fetch_gdhistory_level,
     fetch_gdrateplus_level,
     parse_boomlings_level,
     parse_gdbrowser_level,
+    parse_gdhistory_level,
     parse_gdrateplus_level,
     validation_notice,
 )
@@ -54,6 +56,70 @@ def test_gdbrowser_rejects_a_mismatched_returned_id():
     result = parse_gdbrowser_level({"id": "222222222", "name": "Wrong"}, "111111111")
     assert result["ok"] is False
     assert result["exists"] is None
+
+
+def test_gdhistory_maps_a_current_public_snapshot():
+    result = parse_gdhistory_level(
+        {
+            "online_id": "145676192",
+            "is_public": True,
+            "is_deleted": False,
+            "cache_level_name": "Madeleine",
+            "cache_username": "MinAY",
+            "cache_stars": 9,
+            "cache_filter_difficulty": 6,
+            "cache_length": 4,
+            "cache_featured": 48544,
+            "cache_epic": 3,
+            "cache_user_id": 112127248,
+            "cache_account_id": 10972923,
+        },
+        "145676192",
+    )
+
+    assert result["ok"] is True
+    assert result["exists"] is True
+    assert result["name"] == "Madeleine"
+    assert result["creator"] == "MinAY"
+    assert result["difficulty"] == "Insane"
+    assert result["length"] == "XL"
+    assert result["rated"] is True
+    assert result["featured"] is True
+    assert result["epic"] is True
+    assert result["legendary"] is True
+    assert result["mythic"] is True
+
+
+def test_gdhistory_never_turns_an_unindexed_level_into_missing_evidence():
+    result = parse_gdhistory_level({"success": False}, "999999999")
+
+    assert result["ok"] is False
+    assert result["exists"] is None
+    assert result["failure_kind"] == "not_indexed"
+
+
+def test_gdhistory_requires_an_exact_matching_public_level():
+    mismatch = parse_gdhistory_level(
+        {
+            "online_id": "145676193",
+            "is_public": True,
+            "is_deleted": False,
+            "cache_level_name": "Wrong",
+        },
+        "145676192",
+    )
+    deleted = parse_gdhistory_level(
+        {
+            "online_id": "145676192",
+            "is_public": True,
+            "is_deleted": True,
+            "cache_level_name": "Deleted",
+        },
+        "145676192",
+    )
+
+    assert mismatch["failure_kind"] == "invalid_response"
+    assert deleted["failure_kind"] == "not_current"
 
 
 def test_gdbrowser_rejects_a_success_payload_without_an_id():
@@ -234,3 +300,33 @@ async def test_gdrateplus_fetch_uses_exact_level_endpoint_and_handles_missing():
         "111111111",
     )
     assert missing == {"provider": "gdrateplus", "ok": True, "exists": False}
+
+
+@pytest.mark.asyncio
+async def test_gdhistory_fetch_404_remains_unknown_and_uses_brief_endpoint():
+    session = _FakeSession(_FakeResponse(404, '{"success":false}'))
+
+    result = await fetch_gdhistory_level(session, "999999999")
+
+    assert result["ok"] is False
+    assert result["exists"] is None
+    assert result["failure_kind"] == "not_indexed"
+    assert session.request.url.endswith("/api/v1/level/999999999/brief/")
+
+
+def test_source_summary_includes_provider_http_status():
+    result = combine_level_validation(
+        "111111111",
+        {
+            "boomlings": {
+                "provider": "boomlings",
+                "ok": False,
+                "exists": None,
+                "failure_kind": "access_denied",
+                "status_code": 403,
+            }
+        },
+    )
+
+    assert "upstream" not in result["source_summary"]
+    assert "access denied; HTTP 403" in result["source_summary"]

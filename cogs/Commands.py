@@ -2686,6 +2686,7 @@ class CommandsCog(commands.Cog):
         )
         provider_lines: list[str] = []
         provider_labels = {
+            "gdhistory": "GDHistory",
             "gdrateplus": "GDRate+",
             "boomlings": "GD/Boomlings",
             "gdbrowser": "GDBrowser",
@@ -3617,7 +3618,7 @@ class CommandsCog(commands.Cog):
             enabled_providers = (
                 [
                     name
-                    for name in ("gdrateplus", "boomlings", "gdbrowser")
+                    for name in ("gdhistory", "gdrateplus", "boomlings", "gdbrowser")
                     if bool(providers.get(name))
                 ]
                 if isinstance(providers, dict)
@@ -3653,7 +3654,7 @@ class CommandsCog(commands.Cog):
             if not isinstance(intervals, dict):
                 issues.append("level_requests.level_validation.provider_min_interval_seconds: must be an object")
             else:
-                for provider in ("gdrateplus", "boomlings", "gdbrowser"):
+                for provider in ("gdhistory", "gdrateplus", "boomlings", "gdbrowser"):
                     try:
                         interval = float(intervals.get(provider))
                         if not 0 <= interval <= 10:

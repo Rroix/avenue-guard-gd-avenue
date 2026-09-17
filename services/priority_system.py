@@ -482,7 +482,7 @@ class PrioritySystemService:
         providers = cog._level_validation_providers()
         session = await cog._get_level_validation_session()
         results: dict[str, dict[str, Any]] = {}
-        for provider in ("gdrateplus", "boomlings", "gdbrowser"):
+        for provider in ("gdhistory", "gdrateplus", "boomlings", "gdbrowser"):
             if not providers.get(provider):
                 continue
             try:

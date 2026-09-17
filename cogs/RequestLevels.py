@@ -24,6 +24,7 @@ from utils.gd_validation import (
     combine_level_validation,
     fetch_boomlings_level,
     fetch_gdbrowser_level,
+    fetch_gdhistory_level,
     fetch_gdrateplus_level,
     validation_notice,
 )
@@ -53,7 +54,12 @@ from utils.workflows import (
 
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
-LEVEL_VALIDATION_PROVIDERS = ("gdrateplus", "boomlings", "gdbrowser")
+LEVEL_VALIDATION_PROVIDERS = (
+    "gdhistory",
+    "gdrateplus",
+    "boomlings",
+    "gdbrowser",
+)
 
 OTHER_REASONS = {
     "level_doesnt_exist": "Level doesn't exist",
@@ -1009,6 +1015,7 @@ class RequestLevelsCog(commands.Cog):
         if not isinstance(providers, dict):
             providers = {}
         return {
+            "gdhistory": bool(providers.get("gdhistory", True)),
             "gdrateplus": bool(providers.get("gdrateplus", True)),
             "boomlings": bool(providers.get("boomlings", True)),
             "gdbrowser": bool(providers.get("gdbrowser", False)),
@@ -1225,7 +1232,12 @@ class RequestLevelsCog(commands.Cog):
 
     def _provider_min_interval(self, provider: str) -> float:
         configured = self._level_validation_cfg().get("provider_min_interval_seconds", {})
-        defaults = {"gdrateplus": 0.25, "boomlings": 0.55, "gdbrowser": 0.10}
+        defaults = {
+            "gdhistory": 0.25,
+            "gdrateplus": 0.25,
+            "boomlings": 0.55,
+            "gdbrowser": 0.10,
+        }
         if isinstance(configured, dict):
             raw = configured.get(provider, defaults.get(provider, 0.0))
         else:
@@ -1259,6 +1271,8 @@ class RequestLevelsCog(commands.Cog):
                 request_started = time_module.perf_counter()
                 if provider == "gdbrowser":
                     result = await fetch_gdbrowser_level(session, level_id)
+                elif provider == "gdhistory":
+                    result = await fetch_gdhistory_level(session, level_id)
                 elif provider == "boomlings":
                     result = await fetch_boomlings_level(session, level_id)
                 elif provider == "gdrateplus":
@@ -1338,6 +1352,16 @@ class RequestLevelsCog(commands.Cog):
                 return {}
             cached = self._safe_json_loads(row["data_json"], {})
             if isinstance(cached, dict):
+                cached_providers = cached.get("providers")
+                if not isinstance(cached_providers, dict):
+                    return {}
+                enabled_providers = {
+                    provider
+                    for provider, enabled in self._level_validation_providers().items()
+                    if enabled
+                }
+                if not enabled_providers.issubset(cached_providers):
+                    return {}
                 cached["cache_hit"] = True
                 return cached
         except Exception:

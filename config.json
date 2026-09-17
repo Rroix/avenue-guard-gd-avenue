@@ -287,7 +287,7 @@
     "aging_threshold_hours": [12, 24, 48],
     "default_result_notification": "channel",
     "level_validation": {
-      "_comment": "Checks submitted level IDs through GDRate+ and the direct GD/Boomlings endpoint. GDBrowser remains an optional fallback because its maintainer discourages API dependence and Cloudflare may block hosted bots.",
+      "_comment": "Checks submitted level IDs through GDHistory, GDRate+, and the direct GD/Boomlings endpoint. GDHistory is positive-evidence-only: an unindexed level remains unknown and is never auto-rejected. GDBrowser remains optional because Cloudflare may block hosted bots.",
       "enabled": true,
       "cache_seconds": 1800,
       "failure_cache_seconds": 90,
@@ -300,12 +300,14 @@
       "provider_access_denied_backoff_seconds": 21600,
       "provider_retry_attempts": 2,
       "provider_min_interval_seconds": {
+        "gdhistory": 0.25,
         "gdrateplus": 0.25,
         "gdbrowser": 0.1,
         "boomlings": 0.55
       },
       "auto_reject_missing": true,
       "providers": {
+        "gdhistory": true,
         "gdrateplus": true,
         "gdbrowser": false,
         "boomlings": true

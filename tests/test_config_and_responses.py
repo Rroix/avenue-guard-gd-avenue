@@ -19,11 +19,13 @@ def test_checked_in_config_contains_recovery_and_rate_limit_defaults():
     assert config.get_int("background", "server_icon_rotation", "interval_seconds") == 300
     assert config.get_int("help", "session_timeout_seconds") == 3600
     assert config.get("level_requests", "level_validation", "provider_min_interval_seconds") == {
+        "gdhistory": 0.25,
         "gdrateplus": 0.25,
         "gdbrowser": 0.1,
         "boomlings": 0.55,
     }
     assert config.get("level_requests", "level_validation", "providers") == {
+        "gdhistory": True,
         "gdrateplus": True,
         "gdbrowser": False,
         "boomlings": True,

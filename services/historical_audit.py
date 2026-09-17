@@ -125,7 +125,7 @@ class HistoricalAuditService:
         results = {}
         # Intentionally sequential: an exploratory job never creates a fan-out of
         # concurrent live validation calls. Existing provider locks/circuits apply.
-        for provider in ("gdrateplus", "boomlings", "gdbrowser"):
+        for provider in ("gdhistory", "gdrateplus", "boomlings", "gdbrowser"):
             if providers.get(provider):
                 try:
                     results[provider] = await cog._fetch_validation_provider(provider, session, level_id)

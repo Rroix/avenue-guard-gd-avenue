@@ -1,4 +1,5 @@
 from datetime import datetime
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -101,6 +102,53 @@ def test_unavailable_validation_does_not_claim_level_is_unrated():
     assert data["level_rated"] == "unknown"
     assert data["gd_rated"] == "Unknown"
     assert data["gd_stars"] == "Unknown"
+
+
+@pytest.mark.asyncio
+async def test_validation_cache_is_invalidated_when_an_enabled_provider_is_missing(
+    monkeypatch,
+):
+    cog = make_cog()
+    cog.bot.db = SimpleNamespace(
+        fetchone=AsyncMock(
+            return_value={
+                "expires_ts": 2_000,
+                "data_json": json.dumps(
+                    {
+                        "providers": {
+                            "gdrateplus": {"ok": False},
+                            "boomlings": {"ok": False},
+                        }
+                    }
+                ),
+            }
+        )
+    )
+    monkeypatch.setattr(request_module.time_module, "time", lambda: 1_000)
+
+    assert await cog._cached_level_validation("111111111") == {}
+
+
+@pytest.mark.asyncio
+async def test_validation_cache_accepts_the_current_enabled_provider_set(monkeypatch):
+    cog = make_cog()
+    cached = {
+        "providers": {
+            "gdhistory": {"ok": True, "exists": True},
+            "gdrateplus": {"ok": False},
+            "boomlings": {"ok": False},
+        }
+    }
+    cog.bot.db = SimpleNamespace(
+        fetchone=AsyncMock(
+            return_value={"expires_ts": 2_000, "data_json": json.dumps(cached)}
+        )
+    )
+    monkeypatch.setattr(request_module.time_module, "time", lambda: 1_000)
+
+    result = await cog._cached_level_validation("111111111")
+
+    assert result["cache_hit"] is True
 
 
 def test_access_denied_provider_enters_long_cooldown_immediately(monkeypatch):
