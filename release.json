@@ -1,16 +1,15 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.25.0",
-  "title": "Public Level Recommendations",
-  "summary": "Adds permanent public recommendation pages, exact send-tier artwork and a more resilient Geometry Dash validation path",
+  "version": "3.25.1",
+  "title": "Public Recommendation Clarity",
+  "summary": "Refines public level pages with private rank bands, precise lifecycle semantics and a responsive Geometry Dash presentation",
   "changes": [
-    "Added permanent gdavenue.netlify.app/level/[level-id] recommendation pages with live queue information",
-    "Added LevelThumbs artwork with a clean solid-black fallback when no thumbnail is available",
-    "Cropped the five supplied Rate through Mythic faces exactly and wired configurable Discord application emoji IDs",
-    "Reworked accepted and reviewer embeds with concise outreach wording, reviewer attribution and public level links",
-    "Added GDRate+ as the default hosted fallback and corrected direct Boomlings requests for current Geometry Dash responses",
-    "Disabled GDBrowser by default because hosted Cloudflare access is unreliable and its API is not recommended for dependency",
-    "Removed automatic expired-validation card refreshes while preserving inline request ages and manual Recheck controls",
-    "Added privacy-filtered public level API coverage and full provider, message, restart and responsive-page regression tests"
+    "Replaced public exact queue position and queue size with server-derived Top, High, Standard and Lower priority bands",
+    "Separated public recommendation, outreach and outcome states so Rated is never presented as an outreach status",
+    "Rebuilt the desktop hero around a safe content column while preserving the level image and diagonal GD Avenue composition",
+    "Added relative accessible timestamps, safe uploader display, tier-accent Level ID copying and bottom-of-page sharing",
+    "Added an evidence-aware Geometry Dash-style progress timeline with terminal withdrawn and unavailable states",
+    "Expanded the public API privacy allowlist and removed score, CP, rank, requester, reviewer and private outreach data",
+    "Added API, percentile, lifecycle, responsive layout, copy, share, image fallback and accessibility regression coverage"
   ]
 }

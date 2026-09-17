@@ -740,3 +740,27 @@
    - Expected: legacy and PPS views restore by saved row version; reviewed controls stay disabled; missing PPS queue rows repair idempotently; legacy rows never enter the queue.
 22. Confirm Operations health.
    - Expected: `priority.maintenance` is running or restarted by the supervisor, batches stay bounded, and provider failures do not make interactions unavailable.
+
+## 31) Public Level Recommendation Page
+**Setup:** one active queued level, one in-cycle level, one submitted level, one rated level, and withdrawn/invalid fixtures.
+
+1. Fetch both `/api/level/[id]` and `/api/levels/[id]`.
+   - Expected: payloads match and use schema 2.
+2. Inspect an active queue payload.
+   - Expected: `public_priority_band` is present; exact position, active total, P/F/G/H and CP are absent.
+3. Check boundary fixtures for queue sizes 1, 2, 3, 5, 10 and 100.
+   - Expected: position one is always Top; other positions follow inclusive 10%, 30% and 70% `position / total` boundaries.
+4. Inspect submitted, rated, withdrawn, invalid and unknown fixtures.
+   - Expected: outreach and outcome are separate; Rated appears only as an outcome; inactive levels have no priority band.
+5. Open the public page on small/large mobile, tablet, laptop, 1440p and ultrawide viewports.
+   - Expected: no overflow or diagonal overlap; desktop keeps a safe rectangular content column and mobile uses an image-above/content-below layout.
+6. Inspect relative times from minutes through years.
+   - Expected: visible text is relative while each `<time>` retains exact ISO datetime and an exact-date tooltip/accessibility label.
+7. Click the Level ID and activate it with keyboard focus.
+   - Expected: only the numeric ID is copied, feedback does not shift layout, and focus/hover uses the recommendation accent.
+8. Inspect every lifecycle timeline.
+   - Expected: only evidence-backed stages are complete; withdrawn/invalid end terminally; no private actor, route, target or note appears.
+9. Load a valid and invalid LevelThumbs image.
+   - Expected: valid art covers the image pane; failure leaves an intentional black surface without a broken-image icon.
+10. Use Share with and without Web Share API support.
+    - Expected: native sharing is preferred and permanent-URL copy is the fallback; the action remains below progress content.

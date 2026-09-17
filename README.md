@@ -94,6 +94,8 @@ The deterministic score is `P = F + G + H`. `F` comes from the recommendation ti
 
 The private `/pps` command group lets the configured owner inspect the ranked queue, view evidence for one level, start/view/complete/cancel outreach cycles, record attempts, confirm actual moderator submissions, refresh metadata, apply audited CP overrides, and inspect prospective evidence totals. Attempt target labels and notes remain private. PPS never contacts moderators automatically and does not calculate Bayesian probabilities. The full state machine, equations, schema, recovery behavior, and operator steps are documented in [the private PPS guide](docs/PRIORITY_POINT_SYSTEM.md).
 
+Recommended levels also have a privacy-filtered public page at `gdavenue.netlify.app/level/[level-id]`. The public API separates recommendation, outreach and outcome state, converts private rank into Top/High/Standard/Lower bands, and never exposes exact position, score components, CP, requester/reviewer data or private outreach evidence. Relative times, creator metadata when reliably resolved, and the public progress timeline are presentation-only; they do not modify PPS ordering or state transitions.
+
 ### Help Menu And Staff Tickets
 - DMs members a compact help dashboard with active tickets, weekly activity, recent support, and their current-wave level request when one exists.
 - Shows the user's current level as pending, accepted, rejected, or rejected for a specific reason, with a direct link to the review message.

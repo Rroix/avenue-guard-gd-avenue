@@ -204,34 +204,58 @@ def test_public_level_payload_is_privacy_filtered_and_versioned():
             {
                 "level_id": "111111111",
                 "level_name": "Example",
-                "recommended_ts": 1234,
+                "uploader_name": "Creator",
+                "recommended_at": 1234,
                 "recommendation_type": "legendary",
-                "recommendation_label": "Legendary",
-                "queue_status": "Queued for outreach",
-                "queue_position": 2,
-                "active_queue_total": 8,
+                "public_queue_state": "queued",
+                "public_priority_band": "high_priority",
+                "public_outreach_state": "queued_for_outreach",
+                "public_outcome_state": "unknown",
+                "last_updated_at": 1300,
                 "requester_id": "private",
                 "reviewer_id": "private",
                 "review_text": "private",
                 "priority_points": 99,
+                "prestige_component_f": 10,
+                "creator_component_g": 3,
+                "waiting_component_h": 2,
+                "current_creator_points": 0,
+                "private_target_label": "private",
+                "route_type": "direct",
+                "private_notes": "private",
             }
         ]
     )
 
     payload = get_public_level_payload("111111111")
     assert payload == {
-        "schema_version": 1,
+        "schema_version": 2,
         "level_id": "111111111",
         "level_name": "Example",
-        "recommended_ts": 1234,
+        "uploader_name": "Creator",
         "recommendation_type": "legendary",
-        "recommendation_label": "Legendary",
-        "queue_status": "Queued for outreach",
-        "queue_position": 2,
-        "active_queue_total": 8,
-        "updated_ts": payload["updated_ts"],
+        "public_queue_state": "queued",
+        "public_priority_band": "high_priority",
+        "public_outreach_state": "queued_for_outreach",
+        "public_outcome_state": "unknown",
+        "recommended_at": 1234,
+        "last_updated_at": 1300,
     }
-    assert not {"requester_id", "reviewer_id", "review_text", "priority_points"} & payload.keys()
+    assert not {
+        "queue_position",
+        "active_queue_total",
+        "priority_points",
+        "prestige_component_f",
+        "creator_component_g",
+        "waiting_component_h",
+        "current_creator_points",
+        "requester_id",
+        "reviewer_id",
+        "review_text",
+        "private_target_label",
+        "route_type",
+        "private_notes",
+    } & payload.keys()
 
     body, content_type, cache_control, public_api = _response_for_path(
         "/api/level/111111111?cache=no"
@@ -240,9 +264,59 @@ def test_public_level_payload_is_privacy_filtered_and_versioned():
     assert content_type.startswith("application/json")
     assert cache_control == "public, max-age=30"
     assert public_api is True
+    alias_body, *_ = _response_for_path("/api/levels/111111111")
+    assert json.loads(alias_body) == json.loads(body)
 
     missing, *_ = _response_for_path("/api/level/222222222")
     assert json.loads(missing)["error"] == "level_not_found"
+    set_public_level_data([])
+
+
+def test_public_level_payload_removes_priority_when_not_actively_ranked():
+    set_public_level_data(
+        [
+            {
+                "level_id": "111111112",
+                "level_name": "Rated Example",
+                "recommendation_type": "mythic",
+                "public_queue_state": "rated",
+                "public_priority_band": "top_priority",
+                "public_outreach_state": "outreach_complete",
+                "public_outcome_state": "rated",
+            }
+        ]
+    )
+
+    payload = get_public_level_payload("111111112")
+
+    assert payload["public_priority_band"] is None
+    assert payload["public_outreach_state"] == "outreach_complete"
+    assert payload["public_outcome_state"] == "rated"
+    set_public_level_data([])
+
+
+def test_public_level_payload_preserves_unknown_states():
+    set_public_level_data(
+        [
+            {
+                "level_id": "111111113",
+                "level_name": "Unknown Example",
+                "recommendation_type": "rate",
+                "public_queue_state": "unexpected-private-state",
+                "public_priority_band": "not-a-band",
+                "public_outreach_state": "assume-success",
+                "public_outcome_state": "assume-rated",
+            }
+        ]
+    )
+
+    payload = get_public_level_payload("111111113")
+
+    assert payload["public_queue_state"] == "unknown"
+    assert payload["public_priority_band"] is None
+    assert payload["public_outreach_state"] == "unknown"
+    assert payload["public_outcome_state"] == "unknown"
+    assert "uploader_name" not in payload
     set_public_level_data([])
 
 

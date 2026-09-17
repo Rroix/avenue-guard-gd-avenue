@@ -180,22 +180,79 @@ def set_public_level_data(levels: list[dict]) -> None:
         recommendation_type = str(level.get("recommendation_type") or "").casefold()
         if recommendation_type not in {"rate", "feature", "epic", "legendary", "mythic"}:
             continue
-        safe_levels[level_id] = {
-            "schema_version": 1,
+        public_queue_state = str(
+            level.get("public_queue_state") or "unknown"
+        ).casefold()
+        if public_queue_state not in {
+            "queued",
+            "in_cycle",
+            "awaiting_outcome",
+            "rated",
+            "withdrawn",
+            "invalid",
+            "unknown",
+        }:
+            public_queue_state = "unknown"
+        priority_band = level.get("public_priority_band")
+        if priority_band not in {
+            "top_priority",
+            "high_priority",
+            "standard_priority",
+            "lower_priority",
+        }:
+            priority_band = None
+        if public_queue_state not in {"queued", "in_cycle"}:
+            priority_band = None
+        outreach_state = str(
+            level.get("public_outreach_state") or "unknown"
+        ).casefold()
+        if outreach_state not in {
+            "queued_for_outreach",
+            "outreach_in_progress",
+            "reached_moderator",
+            "outreach_complete",
+            "withdrawn",
+            "level_unavailable",
+            "unknown",
+        }:
+            outreach_state = "unknown"
+        outcome_state = str(
+            level.get("public_outcome_state") or "unknown"
+        ).casefold()
+        if outcome_state not in {
+            "awaiting_outcome",
+            "rated",
+            "not_observed_rated_within_window",
+            "unknown",
+        }:
+            outcome_state = "unknown"
+
+        payload = {
+            "schema_version": 2,
             "level_id": level_id,
             "level_name": str(level.get("level_name") or "Unknown level")[:100],
-            "recommended_ts": max(0, int(level.get("recommended_ts") or 0)),
             "recommendation_type": recommendation_type,
-            "recommendation_label": str(level.get("recommendation_label") or "")[:30],
-            "queue_status": str(level.get("queue_status") or "Queued for outreach")[:80],
-            "queue_position": (
-                max(1, int(level["queue_position"]))
-                if level.get("queue_position") is not None
-                else None
-            ),
-            "active_queue_total": max(0, int(level.get("active_queue_total") or 0)),
-            "updated_ts": max(0, int(level.get("updated_ts") or time.time())),
+            "public_queue_state": public_queue_state,
+            "public_priority_band": priority_band,
+            "public_outreach_state": outreach_state,
+            "public_outcome_state": outcome_state,
         }
+        uploader_name = str(level.get("uploader_name") or "").strip()[:100]
+        if uploader_name:
+            payload["uploader_name"] = uploader_name
+        for key in (
+            "recommended_at",
+            "submitted_to_mod_at",
+            "rated_observed_at",
+            "last_updated_at",
+        ):
+            try:
+                timestamp = int(level.get(key) or 0)
+            except (TypeError, ValueError):
+                timestamp = 0
+            if timestamp > 0:
+                payload[key] = timestamp
+        safe_levels[level_id] = payload
     with _status_lock:
         _public_levels.clear()
         _public_levels.update(safe_levels)

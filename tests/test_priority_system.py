@@ -20,6 +20,8 @@ from utils.priority_system import (
     PPS_SEND_TYPES,
     creator_opportunity_component,
     prestige_component,
+    public_lifecycle_state,
+    public_priority_band,
     priority_settings,
     score_components,
     waiting_component,
@@ -40,6 +42,75 @@ from utils.views import (
 ROOT = Path(__file__).resolve().parents[1]
 GUILD_ID = 717
 OWNER_ID = 11
+
+
+@pytest.mark.parametrize(
+    ("position", "total", "expected"),
+    [
+        (1, 1, "top_priority"),
+        (1, 2, "top_priority"),
+        (2, 2, "lower_priority"),
+        (1, 3, "top_priority"),
+        (2, 3, "standard_priority"),
+        (3, 3, "lower_priority"),
+        (1, 5, "top_priority"),
+        (2, 5, "standard_priority"),
+        (4, 5, "lower_priority"),
+        (5, 5, "lower_priority"),
+        (1, 10, "top_priority"),
+        (3, 10, "high_priority"),
+        (7, 10, "standard_priority"),
+        (8, 10, "lower_priority"),
+        (10, 100, "top_priority"),
+        (30, 100, "high_priority"),
+        (70, 100, "standard_priority"),
+        (71, 100, "lower_priority"),
+    ],
+)
+def test_public_priority_band_boundaries(position, total, expected):
+    assert public_priority_band(position, total) == expected
+
+
+@pytest.mark.parametrize(
+    ("position", "total"),
+    [(None, 10), (1, None), (0, 10), (-1, 10), (11, 10), (1, 0), (True, 1)],
+)
+def test_public_priority_band_rejects_invalid_or_inactive_ranks(position, total):
+    assert public_priority_band(position, total) is None
+
+
+@pytest.mark.parametrize(
+    ("state", "submitted", "rated", "window_result", "completed", "outreach", "outcome"),
+    [
+        ("queued", None, None, None, None, "queued_for_outreach", "unknown"),
+        ("in_cycle", None, None, None, None, "outreach_in_progress", "unknown"),
+        ("awaiting_outcome", 100, None, None, None, "reached_moderator", "awaiting_outcome"),
+        ("awaiting_outcome", 100, None, 0, 200, "reached_moderator", "not_observed_rated_within_window"),
+        ("rated", 100, 150, 1, 200, "outreach_complete", "rated"),
+        ("withdrawn", None, None, None, None, "withdrawn", "unknown"),
+        ("invalid", None, None, None, None, "level_unavailable", "unknown"),
+        ("unexpected", None, None, None, None, "unknown", "unknown"),
+    ],
+)
+def test_public_lifecycle_state_keeps_outreach_and_outcome_separate(
+    state,
+    submitted,
+    rated,
+    window_result,
+    completed,
+    outreach,
+    outcome,
+):
+    result = public_lifecycle_state(
+        state,
+        submitted_to_mod_at=submitted,
+        rated_observed_at=rated,
+        rated_within_window=window_result,
+        outcome_window_completed_at=completed,
+    )
+
+    assert result["public_outreach_state"] == outreach
+    assert result["public_outcome_state"] == outcome
 
 
 class PriorityConfig:
@@ -675,9 +746,12 @@ async def test_public_level_cache_rebuilds_from_durable_queue_without_private_da
         payload = get_public_level_payload("111111111")
         assert payload["level_name"] == "Durable Example"
         assert payload["recommendation_type"] == "mythic"
-        assert payload["queue_position"] == 1
-        assert payload["active_queue_total"] == 1
-        assert payload["queue_status"] == "Queued for outreach"
+        assert payload["public_priority_band"] == "top_priority"
+        assert payload["public_queue_state"] == "queued"
+        assert payload["public_outreach_state"] == "queued_for_outreach"
+        assert payload["public_outcome_state"] == "unknown"
+        assert "queue_position" not in payload
+        assert "active_queue_total" not in payload
         assert "requester_id" not in payload
         assert "reviewed_by" not in payload
         assert "notes" not in payload

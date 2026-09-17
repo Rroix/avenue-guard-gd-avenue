@@ -12,7 +12,11 @@ from services.priority_system import PrioritySystemService
 from utils.errors import log_error
 from utils.mentions import no_mentions
 from utils.keepalive import set_public_level_data
-from utils.priority_system import send_type_label
+from utils.priority_system import (
+    public_lifecycle_state,
+    public_priority_band,
+    send_type_label,
+)
 
 
 class PrioritySystemCog(commands.Cog):
@@ -67,13 +71,6 @@ class PrioritySystemCog(commands.Cog):
             "WHERE q.guild_id=? ORDER BY q.level_id,q.queued_ts DESC,q.id DESC",
             (int(guild_id),),
         )
-        state_labels = {
-            "queued": "Queued for outreach",
-            "in_cycle": "Queued for outreach",
-            "awaiting_outcome": "Outreach submitted",
-            "rated": "Rated",
-            "invalid": "Level unavailable",
-        }
         levels = []
         seen: set[str] = set()
         for row in rows:
@@ -85,17 +82,31 @@ class PrioritySystemCog(commands.Cog):
                 source = json.loads(row["data_json"] or "{}")
             except Exception:
                 source = {}
+            queue_state = str(row["queue_state"] or "")
+            queue_position = active_positions.get(int(row["id"]))
+            lifecycle = public_lifecycle_state(
+                queue_state,
+                submitted_to_mod_at=row["submitted_to_mod_ts"],
+                rated_observed_at=row["rated_observed_ts"],
+                rated_within_window=row["rated_within_window"],
+                outcome_window_completed_at=row["outcome_window_completed_ts"],
+            )
             levels.append(
                 {
                     "level_id": level_id,
                     "level_name": str(row["current_level_name"] or source.get("level_name") or "Unknown level"),
-                    "recommended_ts": int(row["queued_ts"] or 0),
+                    "uploader_name": str(row["uploader_name"] or ""),
+                    "recommended_at": int(row["queued_ts"] or 0),
                     "recommendation_type": str(row["send_type"] or ""),
-                    "recommendation_label": send_type_label(row["send_type"]),
-                    "queue_status": state_labels.get(str(row["queue_state"]), "Outreach status unavailable"),
-                    "queue_position": active_positions.get(int(row["id"])),
-                    "active_queue_total": active_total,
-                    "updated_ts": int(row["updated_ts"] or row["queued_ts"] or 0),
+                    "public_priority_band": public_priority_band(
+                        queue_position, active_total
+                    ),
+                    "submitted_to_mod_at": row["submitted_to_mod_ts"],
+                    "rated_observed_at": row["rated_observed_ts"],
+                    "last_updated_at": int(
+                        row["updated_ts"] or row["queued_ts"] or 0
+                    ),
+                    **lifecycle,
                 }
             )
         set_public_level_data(levels)

@@ -19,6 +19,20 @@ PPS_QUEUE_ACTIVE_STATES = ("queued", "in_cycle")
 PPS_QUEUE_REFRESH_STATES = (*PPS_QUEUE_ACTIVE_STATES, "awaiting_outcome")
 PPS_ROUTE_TYPES = ("direct", "network", "stream", "event", "other")
 PPS_ATTEMPT_STATUSES = ("planned", "attempted", "submitted_to_mod", "failed")
+PUBLIC_PRIORITY_BAND_THRESHOLDS = (
+    (0.10, "top_priority"),
+    (0.30, "high_priority"),
+    (0.70, "standard_priority"),
+    (1.00, "lower_priority"),
+)
+PUBLIC_QUEUE_STATES = {
+    "queued",
+    "in_cycle",
+    "awaiting_outcome",
+    "rated",
+    "withdrawn",
+    "invalid",
+}
 
 
 @dataclass(frozen=True)
@@ -40,6 +54,87 @@ class PrioritySettings:
     maintenance_interval_seconds: int
     maintenance_batch_size: int
     failure_retry_seconds: int
+
+
+def public_priority_band(position: Any, total: Any) -> str | None:
+    """Return a privacy-safe queue band without exposing rank or score.
+
+    The percentile is position / total with inclusive 10%, 30% and 70%
+    boundaries. Position one is always top priority for small queues. Invalid
+    or inactive ranks stay null.
+    """
+    if isinstance(position, bool) or isinstance(total, bool):
+        return None
+    try:
+        normalized_position = int(position)
+        normalized_total = int(total)
+    except (TypeError, ValueError):
+        return None
+    if (
+        normalized_position < 1
+        or normalized_total < 1
+        or normalized_position > normalized_total
+    ):
+        return None
+    if normalized_position == 1:
+        return "top_priority"
+    percentile = normalized_position / normalized_total
+    for threshold, band in PUBLIC_PRIORITY_BAND_THRESHOLDS:
+        if percentile <= threshold:
+            return band
+    return "lower_priority"
+
+
+def public_lifecycle_state(
+    queue_state: Any,
+    *,
+    submitted_to_mod_at: Any = None,
+    rated_observed_at: Any = None,
+    rated_within_window: Any = None,
+    outcome_window_completed_at: Any = None,
+) -> dict[str, str]:
+    """Separate public queue, outreach and outcome concepts conservatively."""
+    state = str(queue_state or "").strip().casefold()
+    public_queue_state = state if state in PUBLIC_QUEUE_STATES else "unknown"
+    submitted = _positive_int_or_none(submitted_to_mod_at)
+    rated_observed = _positive_int_or_none(rated_observed_at)
+    outcome_completed = _positive_int_or_none(outcome_window_completed_at)
+
+    outreach = {
+        "queued": "queued_for_outreach",
+        "in_cycle": "outreach_in_progress",
+        "awaiting_outcome": "reached_moderator" if submitted else "unknown",
+        "rated": "outreach_complete" if submitted else "unknown",
+        "withdrawn": "withdrawn",
+        "invalid": "level_unavailable",
+    }.get(public_queue_state, "unknown")
+
+    if rated_observed or public_queue_state == "rated" or (
+        outcome_completed and rated_within_window in (1, "1", True)
+    ):
+        outcome = "rated"
+    elif submitted and outcome_completed and rated_within_window in (0, "0", False):
+        outcome = "not_observed_rated_within_window"
+    elif submitted:
+        outcome = "awaiting_outcome"
+    else:
+        outcome = "unknown"
+
+    return {
+        "public_queue_state": public_queue_state,
+        "public_outreach_state": outreach,
+        "public_outcome_state": outcome,
+    }
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _number(

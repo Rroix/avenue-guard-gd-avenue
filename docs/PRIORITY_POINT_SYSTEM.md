@@ -313,6 +313,14 @@ Use staging or a controlled request wave where possible.
 13. Restart the bot; confirm queue, active cycle, attempts and both component types still work.
 14. Confirm weekly review cards still use the old Send workflow.
 
-## 14. Explicit Non-Features
+## 14. Public Presentation Boundary
 
-PPS v1 does not implement Bayesian probabilities, AI ranking, public APIs, public exact scores, automated moderator contact, external-moderator DMs, or retroactive historical scoring. Humans make the recommendation and perform outreach; PPS makes ordering and evidence durable and explainable.
+The public level routes are `/api/level/[level-id]` and `/api/levels/[level-id]`. Both return the same schema-2 allowlisted payload. Public data can include the level ID/name, reliably resolved uploader name, recommendation type, recommendation time, sanitized queue/outreach/outcome states, public priority band, confirmed moderator-submission time, observed-rating time and last update time.
+
+Exact queue rank is converted server-side with `public_priority_band(position, total)`. Position one is always `top_priority`; all other active ranks use `position / total`: up to 10% is top, over 10% through 30% is high, over 30% through 70% is standard, and over 70% is lower. Inactive rows have a null band. Exact position, active total, P/F/G/H, CP, requester/reviewer identity, review text, provider diagnostics, routes, targets and private notes never cross the public cache boundary.
+
+Public lifecycle values are derived independently. `Rated` is an outcome, never an outreach status. Missing submission/rating evidence remains unknown, and the website only marks timeline stages supported by persisted timestamps or authoritative queue state.
+
+## 15. Explicit Non-Features
+
+PPS v1 does not implement Bayesian probabilities, AI ranking, public exact scores or ranks, automated moderator contact, external-moderator DMs, or retroactive historical scoring. Humans make the recommendation and perform outreach; PPS makes ordering and evidence durable and explainable.
