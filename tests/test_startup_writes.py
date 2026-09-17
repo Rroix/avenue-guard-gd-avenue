@@ -1,6 +1,5 @@
 import asyncio
 import threading
-import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,7 +7,6 @@ import pytest
 import pytest_asyncio
 
 import cogs.Release as release_module
-import cogs.RequestLevels as request_module
 from cogs.Release import ReleaseCog
 from cogs.RequestLevels import RequestLevelsCog
 from utils.db import Database, DatabaseBusyError
@@ -33,7 +31,6 @@ def release_cog(database):
 def cache_cog(database):
     cog = object.__new__(RequestLevelsCog)
     cog.bot = SimpleNamespace(db=database)
-    cog._next_validation_cleanup = 0
     return cog
 
 
@@ -250,70 +247,26 @@ async def test_cancelled_bootstrap_can_be_restarted_and_shutdown_joins_tasks(db)
 
 
 @pytest.mark.asyncio
-async def test_request_tasks_start_without_any_validation_cleanup_write(db):
+async def test_request_tasks_start_without_an_automatic_validation_refresh_or_write(db):
     cog = cache_cog(db)
     cog._started = False
-    cog._close_task = cog._scheduled_open_task = cog._validation_refresh_task = None
+    cog._close_task = cog._scheduled_open_task = None
     async def stalled():
         await asyncio.Event().wait()
-    cog._auto_close_loop = cog._scheduled_open_loop = cog._pending_validation_refresh_loop = stalled
+    cog._auto_close_loop = cog._scheduled_open_loop = stalled
     db.execute = AsyncMock()
     db.execute_transaction = AsyncMock()
     try:
         await asyncio.wait_for(cog.start_background(), 0.1)
-        assert all(not task.done() for task in (cog._close_task, cog._scheduled_open_task, cog._validation_refresh_task))
+        assert all(not task.done() for task in (cog._close_task, cog._scheduled_open_task))
+        assert not hasattr(cog, "_validation_refresh_task")
         db.execute.assert_not_awaited()
         db.execute_transaction.assert_not_awaited()
     finally:
-        tasks = [cog._close_task, cog._scheduled_open_task, cog._validation_refresh_task]
+        tasks = [cog._close_task, cog._scheduled_open_task]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-
-
-@pytest.mark.asyncio
-async def test_validation_cleanup_is_read_first_and_bounded(db):
-    cog = cache_cog(db)
-    await db.executemany("INSERT INTO gd_level_validation_cache VALUES(?,?,?,?)", [(str(index), 1, 2, '{}') for index in range(201)])
-    await db.execute("INSERT INTO gd_level_validation_cache VALUES('fresh',1,9999999999,'{}')")
-    await cog._cleanup_expired_validation_cache()
-    assert len(await db.fetchall("SELECT * FROM gd_level_validation_cache")) == 2
-    cog._next_validation_cleanup = 0
-    await cog._cleanup_expired_validation_cache()
-    assert [row["level_id"] for row in await db.fetchall("SELECT * FROM gd_level_validation_cache")] == ["fresh"]
-    cog._next_validation_cleanup = 0
-    db.execute_transaction = AsyncMock()
-    await cog._cleanup_expired_validation_cache()
-    db.execute_transaction.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_busy_validation_cleanup_defers_and_recovers_without_error_flood(db, monkeypatch):
-    cog = cache_cog(db)
-    logger = AsyncMock()
-    monkeypatch.setattr(request_module, "log_error", logger)
-    await db.execute("INSERT INTO gd_level_validation_cache VALUES('old',1,2,'{}')")
-    async with db._guard():
-        await asyncio.wait_for(cog._cleanup_expired_validation_cache(), 0.7)
-    logger.assert_not_awaited()
-    assert cog._next_validation_cleanup > time.monotonic()
-    assert len(await db.fetchall("SELECT * FROM gd_level_validation_cache")) == 1
-    cog._next_validation_cleanup = 0
-    await cog._cleanup_expired_validation_cache()
-    assert await db.fetchall("SELECT * FROM gd_level_validation_cache") == []
-
-
-@pytest.mark.asyncio
-async def test_validation_cleanup_reports_real_failure(db, monkeypatch):
-    cog = cache_cog(db)
-    logger = AsyncMock()
-    monkeypatch.setattr(request_module, "log_error", logger)
-    db.fetchone_local = AsyncMock(side_effect=ValueError("Hrana: S3 error"))
-    await cog._cleanup_expired_validation_cache()
-    logger.assert_awaited_once()
-    assert "S3 error" in logger.call_args.args[1]
-
-
 @pytest.mark.asyncio
 async def test_named_transaction_still_updates_write_health_and_names_busy_holder(db):
     entered = threading.Event()

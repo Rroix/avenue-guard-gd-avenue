@@ -415,7 +415,6 @@ async def request_cog(database):
     cog._review_lock = asyncio.Lock()
     cog._validation_card_lock = asyncio.Lock()
     cog._validation_refresh_receipts = {}
-    cog._validation_refresh_retry_after = {}
     cog._review_target_channel = AsyncMock(return_value=channel)
     cog._lookup_level_validation = AsyncMock(return_value={"exists": True, "checked_ts": 10, "expires_ts": 20})
     cog._cfg = lambda *args, **kwargs: {}
@@ -506,14 +505,3 @@ async def test_queued_validation_edit_retries_without_reopening_reviewed_or_over
     assert message.edit.await_count == int(invalidate == "none")
     if invalidate == "none":
         assert all(not child.disabled for child in message.edit.call_args.kwargs["view"].children)
-
-
-@pytest.mark.asyncio
-async def test_validation_backoff_does_not_starve_other_pending_requests(db):
-    cog, _channel, _message = await request_cog(db)
-    await db.execute("INSERT INTO level_request_submissions(guild_id,wave_id,user_id,level_id,request_message_id,data_json,status,created_ts) VALUES(717,1,99,'111111111',777,'{}','pending',2)")
-    cog._validation_refresh_retry_after[("wave", 555)] = time.monotonic() + 600
-    cog._refresh_review_validation = AsyncMock(return_value={"exists": True})
-    assert await cog.refresh_expired_pending_validations(limit=1) == 1
-    row = cog._refresh_review_validation.call_args.args[2]
-    assert row["request_message_id"] == 777

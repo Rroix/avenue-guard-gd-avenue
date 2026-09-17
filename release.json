@@ -1,16 +1,16 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.24.0",
-  "title": "Priority Point System v1",
-  "summary": "Adds prospective recommendation scoring and a durable owner-managed outreach queue while preserving the deployment wave's legacy workflow",
+  "version": "3.25.0",
+  "title": "Public Level Recommendations",
+  "summary": "Adds permanent public recommendation pages, exact send-tier artwork and a more resilient Geometry Dash validation path",
   "changes": [
-    "Protected the deployment-time wave and all weekly reviews on the unchanged legacy Send, Reject, Other and Recheck controls",
-    "Added a persistent five-tier recommendation menu for only newly created PPS waves",
-    "Implemented deterministic F plus G plus H scoring with current uploader CP and strict unknown-not-zero handling",
-    "Added a durable ranked outreach queue with component snapshots, evidence history and idempotent repair",
-    "Added owner-managed outreach cycles, private attempt records and confirmed moderator-submission tracking",
-    "Added supervised CP, level-status and fixed 30-day outcome maintenance in bounded provider-aware batches",
-    "Added private PPS dashboard, queue, level, cycle, outreach, refresh, override and evidence commands",
-    "Added schema-8 migration, recovery documentation and regression coverage for legacy rollout, formulas, cycles and restart durability"
+    "Added permanent gdavenue.netlify.app/level/[level-id] recommendation pages with live queue information",
+    "Added LevelThumbs artwork with a clean solid-black fallback when no thumbnail is available",
+    "Cropped the five supplied Rate through Mythic faces exactly and wired configurable Discord application emoji IDs",
+    "Reworked accepted and reviewer embeds with concise outreach wording, reviewer attribution and public level links",
+    "Added GDRate+ as the default hosted fallback and corrected direct Boomlings requests for current Geometry Dash responses",
+    "Disabled GDBrowser by default because hosted Cloudflare access is unreliable and its API is not recommended for dependency",
+    "Removed automatic expired-validation card refreshes while preserving inline request ages and manual Recheck controls",
+    "Added privacy-filtered public level API coverage and full provider, message, restart and responsive-page regression tests"
   ]
 }

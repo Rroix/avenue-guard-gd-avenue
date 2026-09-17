@@ -19,8 +19,14 @@ def test_checked_in_config_contains_recovery_and_rate_limit_defaults():
     assert config.get_int("background", "server_icon_rotation", "interval_seconds") == 300
     assert config.get_int("help", "session_timeout_seconds") == 3600
     assert config.get("level_requests", "level_validation", "provider_min_interval_seconds") == {
+        "gdrateplus": 0.25,
         "gdbrowser": 0.1,
         "boomlings": 0.55,
+    }
+    assert config.get("level_requests", "level_validation", "providers") == {
+        "gdrateplus": True,
+        "gdbrowser": False,
+        "boomlings": True,
     }
     assert config.get_int("level_requests", "level_validation", "failure_cache_seconds") == 90
     assert config.get_int("level_requests", "level_validation", "provider_retry_attempts") == 2
@@ -31,6 +37,14 @@ def test_checked_in_config_contains_recovery_and_rate_limit_defaults():
     ) == 21600
     assert config.get_int("channels", "dm_fail_log_channel_id") == 1445502925081284729
     assert config.get_int("channels", "transcript_requests_channel_id") == 1455042313855307939
+    assert config.get("priority_system", "send_type_emojis") == {
+        "_comment": "Upload assets/discord-emojis/*.png as application emojis with these names, then paste each emoji ID here",
+        "rate": {"name": "pps_rate", "id": "1550265958688489472"},
+        "feature": {"name": "pps_feature", "id": "1550265953588224102"},
+        "epic": {"name": "pps_epic", "id": "1550265952333996052"},
+        "legendary": {"name": "pps_legendary", "id": "1550265955026993283"},
+        "mythic": {"name": "pps_mythic", "id": "1550265957463621773"},
+    }
 
 
 def test_all_checked_in_embed_templates_fit_discord_structural_limits():

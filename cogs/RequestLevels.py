@@ -20,8 +20,13 @@ from services.request_validation import validate_level_id_shape, validate_showca
 from utils.checks import basic_color, is_admin_or_owner, is_mod, member_has_any_role
 from utils.discord_refs import fetch_persisted_channel, fetch_persisted_message
 from utils.errors import log_error
-from utils.db import DatabaseBusyError
-from utils.gd_validation import combine_level_validation, fetch_boomlings_level, fetch_gdbrowser_level, validation_notice
+from utils.gd_validation import (
+    combine_level_validation,
+    fetch_boomlings_level,
+    fetch_gdbrowser_level,
+    fetch_gdrateplus_level,
+    validation_notice,
+)
 from utils.mentions import no_mentions, user_and_role_mentions
 from utils.priority_system import (
     LEGACY_REVIEW_SYSTEM,
@@ -32,7 +37,12 @@ from utils.priority_system import (
     send_type_label,
 )
 from utils.timeutils import TZ, now_madrid
-from utils.views import LevelRequestButtonView, LevelRequestReviewView, request_review_view
+from utils.views import (
+    LevelRequestButtonView,
+    LevelRequestReviewView,
+    configure_pps_send_type_emojis,
+    request_review_view,
+)
 from utils.workflows import (
     REQUEST_REVIEW_STATES,
     current_correlation_id,
@@ -43,6 +53,7 @@ from utils.workflows import (
 
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
+LEVEL_VALIDATION_PROVIDERS = ("gdrateplus", "boomlings", "gdbrowser")
 
 OTHER_REASONS = {
     "level_doesnt_exist": "Level doesn't exist",
@@ -444,10 +455,7 @@ class RequestLevelsCog(commands.Cog):
         self._validation_provider_locks: dict[str, asyncio.Lock] = {}
         self._validation_provider_last_call: dict[str, float] = {}
         self._validation_provider_stats: dict[str, dict[str, float | int]] = {}
-        self._validation_refresh_task: Optional[asyncio.Task] = None
-        self._validation_refresh_retry_after: dict[tuple[str, int], float] = {}
         self._validation_refresh_receipts: dict[tuple[str, int], Any] = {}
-        self._next_validation_cleanup = 0.0
         self._validation_card_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task] = set()
 
@@ -594,8 +602,6 @@ class RequestLevelsCog(commands.Cog):
             self._close_task.cancel()
         if self._scheduled_open_task:
             self._scheduled_open_task.cancel()
-        if self._validation_refresh_task:
-            self._validation_refresh_task.cancel()
         for task in tuple(self._background_tasks):
             task.cancel()
         try:
@@ -608,10 +614,6 @@ class RequestLevelsCog(commands.Cog):
 
     async def close_resources(self) -> None:
         """Close reusable HTTP resources before Pycord tears down the loop."""
-        refresh = self._validation_refresh_task
-        if refresh is not None and refresh is not asyncio.current_task() and not refresh.done():
-            refresh.cancel()
-            await asyncio.gather(refresh, return_exceptions=True)
         inflight = [
             task for task in self._validation_inflight.values() if not task.done()
         ]
@@ -629,85 +631,21 @@ class RequestLevelsCog(commands.Cog):
     async def start_background(self):
         close_running = self._close_task is not None and not self._close_task.done()
         scheduled_running = self._scheduled_open_task is not None and not self._scheduled_open_task.done()
-        refresh_running = self._validation_refresh_task is not None and not self._validation_refresh_task.done()
-        if self._started and close_running and scheduled_running and refresh_running:
+        if self._started and close_running and scheduled_running:
             return
         await self.bot.db.connect()
         if not close_running:
             self._close_task = asyncio.create_task(self._auto_close_loop(), name="avenue-guard:request-auto-close")
         if not scheduled_running:
             self._scheduled_open_task = asyncio.create_task(self._scheduled_open_loop(), name="avenue-guard:request-scheduled-opening")
-        if not refresh_running:
-            self._validation_refresh_task = asyncio.create_task(self._pending_validation_refresh_loop(), name="avenue-guard:validation-refresh")
         self._started = True
 
-    async def _pending_validation_refresh_loop(self):
-        await asyncio.sleep(60)
-        while not self.bot.is_closed():
-            try:
-                await self._cleanup_expired_validation_cache()
-                if self._level_validation_enabled():
-                    await self.refresh_expired_pending_validations(limit=2)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                await log_error(self.bot, f"Pending validation refresh failed: {exc!r}")
-            await asyncio.sleep(60)
-
-    async def _cleanup_expired_validation_cache(self) -> None:
-        if time_module.monotonic() < self._next_validation_cleanup:
-            return
-        now = int(time_module.time())
-        try:
-            if not self.bot.db._ready:
-                raise DatabaseBusyError("Validation cache cleanup deferred until the replica is initialized")
-            expired = await self.bot.db.fetchone_local("SELECT 1 FROM gd_level_validation_cache WHERE expires_ts<? LIMIT 1", (now,))
-            if expired is not None:
-                await self.bot.db.execute_transaction([(
-                    "DELETE FROM gd_level_validation_cache WHERE level_id IN "
-                    "(SELECT level_id FROM gd_level_validation_cache WHERE expires_ts<? ORDER BY expires_ts LIMIT 200)", (now,),
-                )], retry_safe=True, queue_timeout=0.25, operation_label="requests.validation_cleanup")
-            self._next_validation_cleanup = time_module.monotonic() + (60 if expired is not None else 3600)
-        except DatabaseBusyError:
-            self._next_validation_cleanup = time_module.monotonic() + 300
-        except Exception as exc:
-            self._next_validation_cleanup = time_module.monotonic() + 300
-            await log_error(self.bot, f"GD validation cache maintenance deferred: {exc!r}")
-
-    async def refresh_expired_pending_validations(self, *, limit: int = 2) -> int:
-        refreshed = 0
-        now = int(time_module.time())
-        for kind, table in (("wave", "level_request_submissions"), ("weekly", "weekly_request_reviews")):
-            blocked_ids = [message_id for (key_kind, message_id), retry_ts in self._validation_refresh_retry_after.items()
-                           if key_kind == kind and retry_ts > time_module.monotonic()]
-            excluded = " AND request_message_id NOT IN (" + ",".join("?" for _ in blocked_ids) + ")" if blocked_ids else ""
-            rows = await self.bot.db.fetchall(
-                f"SELECT * FROM {table} WHERE status='pending' AND request_message_id IS NOT NULL "  # nosec B608
-                "AND CASE WHEN json_valid(data_json) THEN COALESCE(CAST(json_extract(data_json,'$.level_validation_refresh_ts') AS INTEGER),0) ELSE 0 END<=? "
-                + excluded + " ORDER BY created_ts ASC LIMIT ?", (now, *blocked_ids, max(1, min(5, limit))),
-            )
-            for row in rows:
-                key = (kind, int(row["request_message_id"]))
-                retries = self._validation_refresh_retry_after
-                if retries.get(key, 0) > time_module.monotonic():
-                    continue
-                guild = self.bot.get_guild(int(row["guild_id"]))
-                if guild is not None:
-                    try:
-                        if await self._refresh_review_validation(guild, kind, row):
-                            refreshed += 1
-                        retries.pop(key, None)
-                    except Exception as exc:
-                        retries[key] = time_module.monotonic() + 600
-                        await log_error(self.bot, f"Pending validation/card recovery deferred for {kind} message_id={key[1]}: {exc!r}")
-        for key, retry_ts in list(self._validation_refresh_retry_after.items()):
-            if retry_ts <= time_module.monotonic():
-                self._validation_refresh_retry_after.pop(key, None)
-        return refreshed
-
     def on_config_reload(self) -> None:
+        configure_pps_send_type_emojis(
+            self.bot.config.get("priority_system", "send_type_emojis", default={})
+        )
         enabled = self._level_validation_providers()
-        for provider in ("gdbrowser", "boomlings"):
+        for provider in LEVEL_VALIDATION_PROVIDERS:
             if enabled.get(provider):
                 continue
             self._validation_provider_failures.pop(provider, None)
@@ -1054,13 +992,26 @@ class RequestLevelsCog(commands.Cog):
             return default
         return str(cfg.get(key) or default)
 
+    def _public_level_url(self, level_id: Any) -> str:
+        base = str(
+            self.bot.config.get(
+                "priority_system",
+                "public_level_base_url",
+                default="https://gdavenue.netlify.app/level",
+            )
+            or "https://gdavenue.netlify.app/level"
+        ).strip().rstrip("/")
+        clean_id = self._clean_level_id(level_id)
+        return f"{base}/{clean_id}" if clean_id else base
+
     def _level_validation_providers(self) -> dict[str, bool]:
         providers = self._level_validation_cfg().get("providers", {})
         if not isinstance(providers, dict):
             providers = {}
         return {
-            "gdbrowser": bool(providers.get("gdbrowser", True)),
+            "gdrateplus": bool(providers.get("gdrateplus", True)),
             "boomlings": bool(providers.get("boomlings", True)),
+            "gdbrowser": bool(providers.get("gdbrowser", False)),
         }
 
     def _level_validation_rate_limit_message(self, guild_id: int, user_id: int) -> str:
@@ -1234,7 +1185,7 @@ class RequestLevelsCog(commands.Cog):
         now_ts = int(time_module.time())
         enabled = self._level_validation_providers()
         snapshot: dict[str, dict[str, Any]] = {}
-        for provider in ("gdbrowser", "boomlings"):
+        for provider in LEVEL_VALIDATION_PROVIDERS:
             open_until = int(self._validation_provider_open_until.get(provider, 0) or 0)
             is_open = bool(enabled.get(provider)) and open_until > now_ts
             last = self._validation_provider_last_result.get(provider, {})
@@ -1274,7 +1225,7 @@ class RequestLevelsCog(commands.Cog):
 
     def _provider_min_interval(self, provider: str) -> float:
         configured = self._level_validation_cfg().get("provider_min_interval_seconds", {})
-        defaults = {"boomlings": 0.55, "gdbrowser": 0.10}
+        defaults = {"gdrateplus": 0.25, "boomlings": 0.55, "gdbrowser": 0.10}
         if isinstance(configured, dict):
             raw = configured.get(provider, defaults.get(provider, 0.0))
         else:
@@ -1310,6 +1261,8 @@ class RequestLevelsCog(commands.Cog):
                     result = await fetch_gdbrowser_level(session, level_id)
                 elif provider == "boomlings":
                     result = await fetch_boomlings_level(session, level_id)
+                elif provider == "gdrateplus":
+                    result = await fetch_gdrateplus_level(session, level_id)
                 else:
                     return {"provider": provider, "ok": False, "exists": None, "error": "Unknown provider"}
                 elapsed_ms = (time_module.perf_counter() - request_started) * 1000
@@ -1417,7 +1370,7 @@ class RequestLevelsCog(commands.Cog):
         providers = self._level_validation_providers()
         results: dict[str, dict[str, Any]] = {}
         ready_providers: list[str] = []
-        for provider in ("gdbrowser", "boomlings"):
+        for provider in LEVEL_VALIDATION_PROVIDERS:
             if not providers.get(provider):
                 continue
             if self._provider_circuit_open(provider):
@@ -1493,16 +1446,32 @@ class RequestLevelsCog(commands.Cog):
         checked_ts = validation.get("checked_ts") or ""
         expires_ts = validation.get("expires_ts") or ""
         exists = validation.get("exists")
-        rated = bool(validation.get("rated"))
+        rated_value = validation.get("rated")
+        rated = rated_value is True
         demon = bool(validation.get("demon"))
         platformer = bool(validation.get("platformer"))
         featured = bool(validation.get("featured"))
         epic = bool(validation.get("epic"))
+        legendary = bool(validation.get("legendary"))
+        mythic = bool(validation.get("mythic"))
         stars_raw = validation.get("stars")
         try:
-            stars_text = f"{int(stars_raw)} stars" if stars_raw is not None and rated else "Unrated"
+            if rated_value is None:
+                stars_text = "Unknown"
+            else:
+                stars_text = (
+                    f"{int(stars_raw)} stars"
+                    if stars_raw is not None and rated
+                    else "Unrated"
+                )
         except Exception:
-            stars_text = "Unrated" if not rated else str(stars_raw or "Unknown")
+            stars_text = (
+                "Unknown"
+                if rated_value is None
+                else "Unrated"
+                if not rated
+                else str(stars_raw or "Unknown")
+            )
         gd_flags = ", ".join(
             flag
             for flag, active in (
@@ -1510,6 +1479,8 @@ class RequestLevelsCog(commands.Cog):
                 ("Platformer", platformer),
                 ("Featured", featured),
                 ("Epic", epic),
+                ("Legendary", legendary),
+                ("Mythic", mythic),
             )
             if active
         ) or "None detected"
@@ -1522,14 +1493,18 @@ class RequestLevelsCog(commands.Cog):
         data["level_validation_checked"] = f"<t:{int(checked_ts)}:R>" if checked_ts else ""
         data["level_validation_refresh"] = f"<t:{int(expires_ts)}:R>" if expires_ts else ""
         data["level_exists"] = "yes" if exists is True else "no" if exists is False else "unknown"
-        data["level_rated"] = "yes" if rated else "no"
+        data["level_rated"] = (
+            "unknown" if rated_value is None else "yes" if rated else "no"
+        )
         data["level_requires_showcase"] = "yes" if validation.get("requires_showcase") else "no"
         data["gd_level_name"] = str(validation.get("level_name") or "Unknown")
         data["gd_creator"] = str(validation.get("creator") or "Unknown")
         data["gd_difficulty"] = str(validation.get("difficulty") or "Unknown")
         data["gd_length"] = str(validation.get("length") or "Unknown")
         data["gd_stars"] = stars_text
-        data["gd_rated"] = "Rated" if rated else "Unrated"
+        data["gd_rated"] = (
+            "Unknown" if rated_value is None else "Rated" if rated else "Unrated"
+        )
         data["gd_demon"] = "Yes" if demon else "No"
         data["gd_platformer"] = "Yes" if platformer else "No"
         data["gd_featured"] = "Yes" if featured else "No"
@@ -3200,7 +3175,7 @@ class RequestLevelsCog(commands.Cog):
                     )
                 )
             if str(request_row["status"]) != "pending":
-                return await interaction.response.send_message("That request has already been reviewed.", ephemeral=True)
+                return await interaction.response.send_message("Your request has already been reviewed.", ephemeral=True)
             if str(row["state"]) != STATE_OPEN:
                 return await interaction.response.send_message(self._message("edit_window_expired", "Your request can no longer be edited."), ephemeral=True)
             return await interaction.response.send_message(
@@ -3586,7 +3561,7 @@ class RequestLevelsCog(commands.Cog):
             if not row:
                 return await self._reply_ephemeral(interaction, "That request could not be found.")
             if str(row["status"]) != "pending":
-                return await self._reply_ephemeral(interaction, "That request has already been reviewed.")
+                return await self._reply_ephemeral(interaction, "Your request has already been reviewed.")
             if not self._can_edit_submission(state_row, row):
                 return await self._reply_ephemeral(interaction, self._message("edit_window_expired", "Your request can no longer be edited."))
 
@@ -4148,12 +4123,14 @@ class RequestLevelsCog(commands.Cog):
                     and normalized_send_type is not None
                 ):
                     tier_label = send_type_label(normalized_send_type)
-                    result_label = f"Recommended: {tier_label}"
-                    result_embed.title = result_label
+                    result_label = f"Recommended for {tier_label}"
+                    level_url = self._public_level_url(variables["level_id"])
+                    result_embed.title = f"Your level was recommended for {tier_label}"
                     result_embed.description = (
-                        f"<@{requester_id}>, **{variables['level_name']}** was accepted "
-                        "into GD Avenue's outreach queue. This is a review recommendation, "
-                        "not confirmation that it has reached a Geometry Dash moderator."
+                        f"<@{requester_id}>, **{variables['level_name']}** has been reviewed "
+                        f"and deemed as **{normalized_send_type}-worthy**. You can check your "
+                        f"level send queue order and other info [here]({level_url}).\n\n"
+                        f"-# Reviewed by <@{reviewer_id}>"
                     )
                     result_embed.add_field(
                         name="Recommendation",
@@ -4162,7 +4139,7 @@ class RequestLevelsCog(commands.Cog):
                     )
                     result_embed.add_field(
                         name="Queue status",
-                        value="Queued for human outreach",
+                        value="Queued for outreach",
                         inline=True,
                     )
                     final_embed.title = result_label
@@ -4170,7 +4147,7 @@ class RequestLevelsCog(commands.Cog):
                         name="Outreach queue",
                         value=(
                             f"**{tier_label}** recommendation\n"
-                            "Queued for human outreach; no moderator contact is implied yet."
+                            f"Queued for outreach\n[View public level page]({level_url})"
                         ),
                         inline=False,
                     )
@@ -4340,6 +4317,22 @@ class RequestLevelsCog(commands.Cog):
             except Exception as e:
                 await log_error(self.bot, f"Could not save reviewed level request {message_id}: {repr(e)}")
                 return await self._reply_ephemeral(interaction, "Storage did not confirm the review. Check the request's current status before retrying; a delayed completion is possible.")
+
+            if (
+                target_kind == "wave"
+                and result_key == "sent"
+                and review_system_version == PPS_V1_REVIEW_SYSTEM
+            ):
+                priority_cog = self.bot.get_cog("PrioritySystemCog")
+                refresh_public = getattr(priority_cog, "refresh_public_level_cache", None)
+                if callable(refresh_public):
+                    try:
+                        await refresh_public()
+                    except Exception as exc:
+                        await log_error(
+                            self.bot,
+                            f"Public level cache refresh deferred for message_id={message_id}: {exc!r}",
+                        )
 
             result_warning = ""
             try:
@@ -4665,7 +4658,8 @@ class RequestLevelsCog(commands.Cog):
                         name="Outreach queue",
                         value=(
                             f"**{tier_label}** recommendation\n"
-                            "Queued for human outreach; no moderator contact is implied yet."
+                            f"Queued for outreach\n"
+                            f"[View public level page]({self._public_level_url(data.get('level_id'))})"
                         ),
                         inline=False,
                     )

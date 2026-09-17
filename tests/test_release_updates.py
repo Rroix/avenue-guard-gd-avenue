@@ -11,8 +11,10 @@ from utils.db import Database
 from utils.keepalive import (
     _response_for_path,
     get_public_bot_payload,
+    get_public_level_payload,
     set_keepalive_status,
     set_public_bot_metrics,
+    set_public_level_data,
     set_public_release_data,
     set_runtime_heartbeat,
 )
@@ -194,6 +196,54 @@ def test_public_status_payload_is_sanitized_and_versioned():
     assert content_type.startswith("application/json")
     assert cache_control == "no-store"
     assert public_api is True
+
+
+def test_public_level_payload_is_privacy_filtered_and_versioned():
+    set_public_level_data(
+        [
+            {
+                "level_id": "111111111",
+                "level_name": "Example",
+                "recommended_ts": 1234,
+                "recommendation_type": "legendary",
+                "recommendation_label": "Legendary",
+                "queue_status": "Queued for outreach",
+                "queue_position": 2,
+                "active_queue_total": 8,
+                "requester_id": "private",
+                "reviewer_id": "private",
+                "review_text": "private",
+                "priority_points": 99,
+            }
+        ]
+    )
+
+    payload = get_public_level_payload("111111111")
+    assert payload == {
+        "schema_version": 1,
+        "level_id": "111111111",
+        "level_name": "Example",
+        "recommended_ts": 1234,
+        "recommendation_type": "legendary",
+        "recommendation_label": "Legendary",
+        "queue_status": "Queued for outreach",
+        "queue_position": 2,
+        "active_queue_total": 8,
+        "updated_ts": payload["updated_ts"],
+    }
+    assert not {"requester_id", "reviewer_id", "review_text", "priority_points"} & payload.keys()
+
+    body, content_type, cache_control, public_api = _response_for_path(
+        "/api/level/111111111?cache=no"
+    )
+    assert json.loads(body)["recommendation_type"] == "legendary"
+    assert content_type.startswith("application/json")
+    assert cache_control == "public, max-age=30"
+    assert public_api is True
+
+    missing, *_ = _response_for_path("/api/level/222222222")
+    assert json.loads(missing)["error"] == "level_not_found"
+    set_public_level_data([])
 
 
 def test_service_uptime_survives_discord_gateway_reconnect(monkeypatch):

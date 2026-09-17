@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import time
 
@@ -10,6 +11,7 @@ from discord.ext import commands
 from services.priority_system import PrioritySystemService
 from utils.errors import log_error
 from utils.mentions import no_mentions
+from utils.keepalive import set_public_level_data
 from utils.priority_system import send_type_label
 
 
@@ -36,6 +38,68 @@ class PrioritySystemCog(commands.Cog):
             self._maintenance_task = asyncio.create_task(
                 self._maintenance_loop(), name="avenue-guard:priority-maintenance"
             )
+        try:
+            await self.refresh_public_level_cache()
+        except Exception as exc:
+            await log_error(self.bot, f"Public level cache startup refresh deferred: {exc!r}")
+
+    async def refresh_public_level_cache(self) -> int:
+        guild_id = self.bot.config.get_int("guild", "allowed_guild_id", default=0)
+        if not guild_id:
+            set_public_level_data([])
+            return 0
+        active_rows = await self.bot.db.fetchall(
+            "SELECT id FROM level_outreach_queue WHERE guild_id=? "
+            "AND queue_state IN('queued','in_cycle') "
+            "ORDER BY CASE WHEN priority_complete=1 THEN 0 ELSE 1 END, "
+            "priority_points DESC,waiting_cycles DESC,queued_ts ASC,id ASC",
+            (int(guild_id),),
+        )
+        active_total = len(active_rows)
+        active_positions = {
+            int(row["id"]): position
+            for position, row in enumerate(active_rows, start=1)
+        }
+        rows = await self.bot.db.fetchall(
+            "SELECT q.*,s.data_json FROM level_outreach_queue q "
+            "LEFT JOIN level_request_submissions s ON s.guild_id=q.guild_id "
+            "AND s.request_message_id=q.request_message_id "
+            "WHERE q.guild_id=? ORDER BY q.level_id,q.queued_ts DESC,q.id DESC",
+            (int(guild_id),),
+        )
+        state_labels = {
+            "queued": "Queued for outreach",
+            "in_cycle": "Queued for outreach",
+            "awaiting_outcome": "Outreach submitted",
+            "rated": "Rated",
+            "invalid": "Level unavailable",
+        }
+        levels = []
+        seen: set[str] = set()
+        for row in rows:
+            level_id = str(row["level_id"] or "")
+            if level_id in seen:
+                continue
+            seen.add(level_id)
+            try:
+                source = json.loads(row["data_json"] or "{}")
+            except Exception:
+                source = {}
+            levels.append(
+                {
+                    "level_id": level_id,
+                    "level_name": str(row["current_level_name"] or source.get("level_name") or "Unknown level"),
+                    "recommended_ts": int(row["queued_ts"] or 0),
+                    "recommendation_type": str(row["send_type"] or ""),
+                    "recommendation_label": send_type_label(row["send_type"]),
+                    "queue_status": state_labels.get(str(row["queue_state"]), "Outreach status unavailable"),
+                    "queue_position": active_positions.get(int(row["id"])),
+                    "active_queue_total": active_total,
+                    "updated_ts": int(row["updated_ts"] or row["queued_ts"] or 0),
+                }
+            )
+        set_public_level_data(levels)
+        return len(levels)
 
     def is_owner(self, user_id: int) -> bool:
         return int(user_id) in self.bot.config.get_int_list(
@@ -329,6 +393,7 @@ class PrioritySystemCog(commands.Cog):
             if action == "start":
                 cycle = await self.service.start_cycle(guild_id, ctx.user.id, notes)
                 entries = await self.service.cycle_entries(int(cycle["id"]))
+                await self.refresh_public_level_cache()
                 await ctx.respond(
                     f"Started outreach cycle **#{int(cycle['id'])}** with **{len(entries)}** start-of-cycle candidates",
                     ephemeral=True,
@@ -354,6 +419,7 @@ class PrioritySystemCog(commands.Cog):
                 saved, incremented = await self.service.complete_cycle(
                     guild_id, cycle_id, ctx.user.id
                 )
+                await self.refresh_public_level_cache()
                 await ctx.respond(
                     f"Completed successful cycle **#{cycle_id}**; **{incremented}** eligible unsubmitted levels gained one waiting cycle",
                     ephemeral=True,
@@ -363,6 +429,7 @@ class PrioritySystemCog(commands.Cog):
                 await self.service.cancel_cycle(
                     guild_id, cycle_id, ctx.user.id, notes
                 )
+                await self.refresh_public_level_cache()
                 await ctx.respond(
                     f"Closed cycle **#{cycle_id}** as unsuccessful without increasing waiting scores",
                     ephemeral=True,
@@ -419,6 +486,7 @@ class PrioritySystemCog(commands.Cog):
                 target_label=target_label,
                 idempotency_key=f"discord:{int(ctx.interaction.id)}",
             )
+            await self.refresh_public_level_cache()
             await ctx.respond(
                 f"Recorded `{attempt['status']}` for queue **#{queue_id}** in cycle **#{cycle_id}**",
                 ephemeral=True,
@@ -456,6 +524,7 @@ class PrioritySystemCog(commands.Cog):
                 row = await self.service.refresh_queue_entry(
                     queue_id, force_level=True, force_cp=True
                 )
+            await self.refresh_public_level_cache()
             await ctx.respond(
                 f"Queue **#{queue_id}** refreshed: CP **{row['current_creator_points'] if row['current_creator_points'] is not None else 'unknown'}**, priority **{self._score(row['priority_points'])}**",
                 ephemeral=True,
@@ -537,6 +606,7 @@ class PrioritySystemCog(commands.Cog):
                     self._last_maintenance = await self.service.maintenance_once(
                         int(guild_id)
                     )
+                    await self.refresh_public_level_cache()
                     if self._last_maintenance.get("failed"):
                         await log_error(
                             self.bot,

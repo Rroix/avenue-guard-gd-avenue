@@ -23,6 +23,7 @@ from utils.views import (
     LevelRequestButtonView,
     LevelRequestPPSReviewView,
     LevelRequestReviewView,
+    configure_pps_send_type_emojis,
 )
 from utils.runtime_config import load_runtime_config_overrides
 from utils.outbox import DiscordOutbox
@@ -402,6 +403,9 @@ def create_bot() -> discord.Bot:
     bot._runtime_initialized = False
 
     bot.config = Config("config.json")
+    configure_pps_send_type_emojis(
+        bot.config.get("priority_system", "send_type_emojis", default={})
+    )
     bot.db_path, bot.db_path_source, bot.db_path_warning, bot.db_remote_url, bot.db_remote_token = resolve_db_path(bot.config)
     startup_log(f"Using database path: {bot.db_path} ({bot.db_path_source})")
     bot.db = Database(bot.db_path, remote_url=bot.db_remote_url, auth_token=bot.db_remote_token)

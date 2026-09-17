@@ -26,6 +26,34 @@ CID_LEVEL_REQUEST_OTHER = "level_request_other"
 CID_LEVEL_REQUEST_RECHECK = "level_request_recheck"
 CID_LEVEL_REQUEST_PPS_SEND_TYPE = "level_request_pps_send_type_v1"
 
+PPS_SEND_TYPE_EMOJI_NAMES = {
+    "rate": "pps_rate",
+    "feature": "pps_feature",
+    "epic": "pps_epic",
+    "legendary": "pps_legendary",
+    "mythic": "pps_mythic",
+}
+_pps_send_type_emojis: dict[str, discord.PartialEmoji] = {}
+
+
+def configure_pps_send_type_emojis(raw_config) -> None:
+    """Load application emoji IDs without making missing IDs a startup error."""
+    _pps_send_type_emojis.clear()
+    config = raw_config if isinstance(raw_config, dict) else {}
+    for send_type, default_name in PPS_SEND_TYPE_EMOJI_NAMES.items():
+        raw = config.get(send_type)
+        if isinstance(raw, dict):
+            name = str(raw.get("name") or default_name).strip() or default_name
+            emoji_id = str(raw.get("id") or "").strip()
+        else:
+            name = default_name
+            emoji_id = str(raw or "").strip()
+        if emoji_id.isascii() and emoji_id.isdecimal() and int(emoji_id) > 0:
+            _pps_send_type_emojis[send_type] = discord.PartialEmoji(
+                name=name,
+                id=int(emoji_id),
+            )
+
 
 class TranscriptRequestView(discord.ui.View):
     def __init__(self):
@@ -365,7 +393,11 @@ class _LevelRequestPPSSendSelect(discord.ui.Select):
             disabled=disabled,
             custom_id=CID_LEVEL_REQUEST_PPS_SEND_TYPE,
             options=[
-                discord.SelectOption(label=label, value=value)
+                discord.SelectOption(
+                    label=label,
+                    value=value,
+                    emoji=_pps_send_type_emojis.get(value),
+                )
                 for value, label in (
                     ("rate", "Rate"),
                     ("feature", "Feature"),

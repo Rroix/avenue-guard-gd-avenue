@@ -15,6 +15,7 @@ from cogs.RequestLevels import ReviewModal
 from services.priority_system import PrioritySystemService
 from utils.config import Config
 from utils.db import Database
+from utils.keepalive import get_public_level_payload, set_public_level_data
 from utils.priority_system import (
     PPS_SEND_TYPES,
     creator_opportunity_component,
@@ -31,6 +32,7 @@ from utils.views import (
     CID_LEVEL_REQUEST_SEND,
     LevelRequestPPSReviewView,
     LevelRequestReviewView,
+    configure_pps_send_type_emojis,
     request_review_view,
 )
 
@@ -203,6 +205,52 @@ async def test_legacy_and_pps_views_have_stable_distinct_send_controls():
     assert type(request_review_view("legacy")) is LevelRequestReviewView
     assert type(request_review_view("pps_v1")) is LevelRequestPPSReviewView
     assert all(child.disabled for child in request_review_view("pps_v1", disabled=True).children)
+
+
+@pytest.mark.asyncio
+async def test_pps_send_menu_uses_configured_application_emoji_ids():
+    configured = {
+        "rate": {"name": "pps_rate", "id": "1550265958688489472"},
+        "feature": {"name": "pps_feature", "id": "1550265953588224102"},
+        "epic": {"name": "pps_epic", "id": "1550265952333996052"},
+        "legendary": {"name": "pps_legendary", "id": "1550265955026993283"},
+        "mythic": {"name": "pps_mythic", "id": "1550265957463621773"},
+    }
+    configure_pps_send_type_emojis(configured)
+    try:
+        view = LevelRequestPPSReviewView()
+        send_select = next(
+            child
+            for child in view.children
+            if child.custom_id == CID_LEVEL_REQUEST_PPS_SEND_TYPE
+        )
+        by_value = {option.value: option for option in send_select.options}
+        for send_type, expected in configured.items():
+            assert by_value[send_type].emoji.id == int(expected["id"])
+            assert by_value[send_type].emoji.name == expected["name"]
+
+        disabled = LevelRequestPPSReviewView(disabled=True)
+        disabled_select = next(
+            child
+            for child in disabled.children
+            if child.custom_id == CID_LEVEL_REQUEST_PPS_SEND_TYPE
+        )
+        assert disabled_select.disabled is True
+        assert all(option.emoji is not None for option in disabled_select.options)
+
+        configure_pps_send_type_emojis(
+            {"rate": {"name": "pps_rate", "id": "invalid"}}
+        )
+        fallback = LevelRequestPPSReviewView()
+        fallback_select = next(
+            child
+            for child in fallback.children
+            if child.custom_id == CID_LEVEL_REQUEST_PPS_SEND_TYPE
+        )
+        fallback_by_value = {option.value: option for option in fallback_select.options}
+        assert fallback_by_value["rate"].emoji is None
+    finally:
+        configure_pps_send_type_emojis({})
 
 
 @pytest.mark.asyncio
@@ -444,6 +492,20 @@ async def test_pps_review_finalization_creates_exactly_one_queue_entry(tmp_path)
     assert queue[0]["priority_points"] is None
     assert queue[0]["priority_complete"] == 0
     assert queue[0]["prestige_component_f"] == pytest.approx(3.35, abs=0.01)
+    outbox_payloads = [
+        json.loads(row["payload_json"])
+        for row in await db.fetchall("SELECT payload_json FROM discord_outbox")
+    ]
+    serialized_payloads = json.dumps(outbox_payloads)
+    assert "Your level was recommended for Epic" in serialized_payloads
+    assert "epic-worthy" in serialized_payloads
+    assert "https://gdavenue.netlify.app/level/123456789" in serialized_payloads
+    reviewed_embed = message.edit.call_args.kwargs["embed"]
+    outreach_field = next(
+        field for field in reviewed_embed.fields if field.name == "Outreach queue"
+    )
+    assert "Queued for outreach" in outreach_field.value
+    assert "no moderator contact" not in outreach_field.value
 
     await cog._finalize_review(
         interaction, 555, "sent", "Duplicate", send_type="mythic"
@@ -573,6 +635,56 @@ async def test_legacy_and_rejected_requests_never_enter_pps_queue(tmp_path):
     assert not await service.ensure_queue_for_submission(rows[1])
     assert not await db.fetchall("SELECT * FROM level_outreach_queue")
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_public_level_cache_rebuilds_from_durable_queue_without_private_data(tmp_path):
+    db = Database(str(tmp_path / "public-level-cache.db"))
+    await db.connect()
+    try:
+        await db.execute(
+            "INSERT INTO level_request_submissions("
+            "guild_id,wave_id,user_id,level_id,request_message_id,status,created_ts,data_json,"
+            "review_system_version,result,reviewed_by,reviewed_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                GUILD_ID,
+                2,
+                33,
+                "111111111",
+                700,
+                "reviewed",
+                100,
+                json.dumps({"level_name": "Durable Example", "notes": "private"}),
+                "pps_v1",
+                "sent",
+                88,
+                200,
+            ),
+        )
+        queue_id = await insert_queue(
+            db,
+            user_id=33,
+            message_id=700,
+            level_id="111111111",
+            send_type="mythic",
+            queued_ts=200,
+        )
+        cog = PrioritySystemCog(make_bot(db))
+
+        assert await cog.refresh_public_level_cache() == 1
+        payload = get_public_level_payload("111111111")
+        assert payload["level_name"] == "Durable Example"
+        assert payload["recommendation_type"] == "mythic"
+        assert payload["queue_position"] == 1
+        assert payload["active_queue_total"] == 1
+        assert payload["queue_status"] == "Queued for outreach"
+        assert "requester_id" not in payload
+        assert "reviewed_by" not in payload
+        assert "notes" not in payload
+        assert queue_id > 0
+    finally:
+        set_public_level_data([])
+        await db.close()
 
 
 @pytest.mark.asyncio

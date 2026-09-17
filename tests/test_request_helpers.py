@@ -84,6 +84,25 @@ def test_level_validation_rate_limit_cache_has_a_hard_ceiling(monkeypatch):
     assert (717, 9999) in cog._validation_attempts
 
 
+def test_unavailable_validation_does_not_claim_level_is_unrated():
+    data = make_cog()._apply_level_validation_vars(
+        {"level_id": "111111111"},
+        {
+            "exists": None,
+            "rated": None,
+            "checked_ts": 100,
+            "expires_ts": 200,
+            "warnings": ["Level validation could not run right now."],
+            "source_summary": "gdrateplus: unavailable (network error)",
+        },
+    )
+
+    assert data["level_exists"] == "unknown"
+    assert data["level_rated"] == "unknown"
+    assert data["gd_rated"] == "Unknown"
+    assert data["gd_stars"] == "Unknown"
+
+
 def test_access_denied_provider_enters_long_cooldown_immediately(monkeypatch):
     cog = make_cog()
     cog._validation_provider_failures = {}

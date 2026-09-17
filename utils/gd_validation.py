@@ -9,6 +9,7 @@ import aiohttp
 
 GDBROWSER_LEVEL_URL = "https://gdbrowser.com/api/level/{level_id}"
 BOOMLINGS_LEVEL_URL = "https://www.boomlings.com/database/getGJLevels21.php"
+GDRATEPLUS_LEVEL_URL = "https://gdrateplus.com/api/levels/{level_id}"
 # Public Geometry Dash protocol value, not an application credential.
 COMMON_SECRET = "Wmfd2893gb7"  # nosec B105
 MAX_PROVIDER_RESPONSE_BYTES = 1_000_000
@@ -230,6 +231,71 @@ def parse_gdbrowser_level(payload: Any, level_id: str) -> dict[str, Any]:
     }
 
 
+def parse_gdrateplus_level(payload: Any, level_id: str) -> dict[str, Any]:
+    """Normalize the documented public GDRate+ level response.
+
+    GDRate+ is a fallback for hosts where Cloudflare blocks both Boomlings and
+    GDBrowser. Only the nested ``level`` object is trusted; community votes and
+    tier predictions are deliberately ignored.
+    """
+    if not isinstance(payload, dict):
+        return _provider_error(
+            "gdrateplus", "Unexpected response", failure_kind="invalid_response"
+        )
+    level = payload.get("level")
+    if not isinstance(level, dict):
+        return _provider_error(
+            "gdrateplus",
+            str(payload.get("error") or "Response did not include level data"),
+            failure_kind="invalid_response",
+        )
+    returned_id = str(level.get("id") or "").strip()
+    if returned_id != str(level_id).strip():
+        return _provider_error(
+            "gdrateplus",
+            "Response level ID did not match the requested ID",
+            failure_kind="invalid_response",
+        )
+
+    difficulty = str(level.get("difficulty") or "Unknown")
+    length = str(level.get("length") or "Unknown")
+    stars = _as_int(level.get("stars"), 0)
+    featured = _as_bool(level.get("featured"))
+    epic = _as_bool(level.get("epic"))
+    legendary = _as_bool(level.get("legendary"))
+    mythic = _as_bool(level.get("mythic"))
+    rated = stars > 0 or featured or epic or legendary or mythic
+    demon = "demon" in difficulty.casefold()
+    platformer = "platformer" in length.casefold() or _as_bool(level.get("platformer"))
+
+    return {
+        "provider": "gdrateplus",
+        "ok": True,
+        "exists": True,
+        "level_id": returned_id,
+        "name": str(level.get("name") or ""),
+        "creator": str(level.get("author") or level.get("creator") or ""),
+        "difficulty": difficulty,
+        "length": length,
+        "stars": stars,
+        "rated": rated,
+        "featured": featured,
+        "epic": epic,
+        "legendary": legendary,
+        "mythic": mythic,
+        "demon": demon,
+        "platformer": platformer,
+        "audit_metadata": {
+            "stars": _audit_integer(level.get("stars")),
+            "featured": featured,
+            "epic": epic,
+            "legendary": legendary,
+            "mythic": mythic,
+            "rated": rated,
+        },
+    }
+
+
 def parse_boomlings_level(text: str, level_id: str) -> dict[str, Any]:
     raw = str(text or "").strip()
     if raw == "-1":
@@ -345,10 +411,13 @@ async def fetch_gdbrowser_level(session: aiohttp.ClientSession, level_id: str) -
 async def fetch_boomlings_level(session: aiohttp.ClientSession, level_id: str) -> dict[str, Any]:
     payload = {
         "gameVersion": "22",
-        "binaryVersion": "45",
+        "binaryVersion": "47",
         "gdw": "0",
         "str": str(level_id),
-        "type": "10",
+        # Type 0 is the normal search mode. The exact-ID parser below prevents
+        # related results from being accepted, while avoiding type 10's false
+        # negatives for valid IDs such as old levels and some nine-digit IDs.
+        "type": "0",
         "page": "0",
         "total": "0",
         "secret": COMMON_SECRET,
@@ -381,6 +450,41 @@ async def fetch_boomlings_level(session: aiohttp.ClientSession, level_id: str) -
         return _provider_error("boomlings", type(e).__name__)
 
 
+async def fetch_gdrateplus_level(
+    session: aiohttp.ClientSession, level_id: str
+) -> dict[str, Any]:
+    try:
+        headers = {"Accept": "application/json", "User-Agent": "Avenue-Guard/1"}
+        async with session.get(
+            GDRATEPLUS_LEVEL_URL.format(level_id=level_id), headers=headers
+        ) as resp:
+            text, read_error = await _read_provider_text(resp, "gdrateplus")
+            if read_error:
+                return read_error
+            if resp.status == 404:
+                return {"provider": "gdrateplus", "ok": True, "exists": False}
+            if resp.status >= 400:
+                return _http_error("gdrateplus", resp)
+            try:
+                payload = json.loads(text)
+            except (TypeError, ValueError):
+                return _provider_error(
+                    "gdrateplus",
+                    "Response was not JSON",
+                    failure_kind="invalid_response",
+                )
+            return parse_gdrateplus_level(payload, level_id)
+    except (aiohttp.ClientError, TimeoutError) as e:
+        return _provider_error(
+            "gdrateplus",
+            type(e).__name__,
+            failure_kind="network_error",
+            retryable=True,
+        )
+    except Exception as e:
+        return _provider_error("gdrateplus", type(e).__name__)
+
+
 def combine_level_validation(
     level_id: str,
     provider_results: dict[str, dict[str, Any]],
@@ -409,20 +513,24 @@ def combine_level_validation(
         exists = None
 
     missing_confident = exists is False and all_requested_succeeded and bool(missing)
-    rated = any(bool(result.get("rated")) for result in existing)
+    rated = (
+        any(bool(result.get("rated")) for result in existing)
+        if existing
+        else None
+    )
     requires_showcase = any(bool(result.get("demon")) or bool(result.get("platformer")) for result in existing)
     chosen = existing[0] if existing else {}
 
     warnings: list[str] = []
     if disagreement:
-        warnings.append("GDBrowser and the GD API disagreed. Please check this level manually.")
+        warnings.append("The enabled validation sources disagreed. Please check this level manually.")
     elif exists is None and missing:
         warnings.append("This level doesn't seem to exist, but one validation source failed, so it was not auto-blocked.")
     elif exists is None:
         warnings.append("Level validation could not run right now. Please check this level manually.")
     elif exists is False and not missing_confident:
         warnings.append("This level doesn't seem to exist, but validation was not confident enough to block it.")
-    if rated:
+    if rated is True:
         warnings.append("This level seems to have been rated already.")
     if requires_showcase:
         warnings.append("This level appears to be a demon or platformer; a showcase is required.")
@@ -461,6 +569,8 @@ def combine_level_validation(
         "length": str(chosen.get("length") or ""),
         "featured": bool(chosen.get("featured")),
         "epic": bool(chosen.get("epic")),
+        "legendary": bool(chosen.get("legendary")),
+        "mythic": bool(chosen.get("mythic")),
         "demon": bool(chosen.get("demon")),
         "platformer": bool(chosen.get("platformer")),
         "source_summary": " | ".join(sources),

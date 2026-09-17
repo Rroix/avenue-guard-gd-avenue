@@ -2685,8 +2685,13 @@ class CommandsCog(commands.Cog):
             else {}
         )
         provider_lines: list[str] = []
+        provider_labels = {
+            "gdrateplus": "GDRate+",
+            "boomlings": "GD/Boomlings",
+            "gdbrowser": "GDBrowser",
+        }
         for provider, details in provider_snapshot.items():
-            label = "GDBrowser" if provider == "gdbrowser" else "GD/Boomlings"
+            label = provider_labels.get(provider, provider.replace("_", " ").title())
             if not details.get("enabled"):
                 state = "disabled"
             elif details.get("circuit_open"):
@@ -3610,12 +3615,18 @@ class CommandsCog(commands.Cog):
         else:
             providers = validation_cfg.get("providers", {}) or {}
             enabled_providers = (
-                [name for name in ("gdbrowser", "boomlings") if bool(providers.get(name))]
+                [
+                    name
+                    for name in ("gdrateplus", "boomlings", "gdbrowser")
+                    if bool(providers.get(name))
+                ]
                 if isinstance(providers, dict)
                 else []
             )
             if bool(validation_cfg.get("enabled", True)) and not enabled_providers:
-                issues.append("level_requests.level_validation.providers: enable gdbrowser, boomlings, or both")
+                issues.append(
+                    "level_requests.level_validation.providers: enable at least one supported provider"
+                )
             else:
                 ok_count += len(enabled_providers)
             numeric_limits = {
@@ -3642,7 +3653,7 @@ class CommandsCog(commands.Cog):
             if not isinstance(intervals, dict):
                 issues.append("level_requests.level_validation.provider_min_interval_seconds: must be an object")
             else:
-                for provider in ("gdbrowser", "boomlings"):
+                for provider in ("gdrateplus", "boomlings", "gdbrowser"):
                     try:
                         interval = float(intervals.get(provider))
                         if not 0 <= interval <= 10:

@@ -287,7 +287,7 @@
     "aging_threshold_hours": [12, 24, 48],
     "default_result_notification": "channel",
     "level_validation": {
-      "_comment": "Checks submitted level IDs through GDBrowser and the direct GD/Boomlings endpoint. Failures degrade safely, access-denied providers cool down automatically, and cached results keep submissions fast.",
+      "_comment": "Checks submitted level IDs through GDRate+ and the direct GD/Boomlings endpoint. GDBrowser remains an optional fallback because its maintainer discourages API dependence and Cloudflare may block hosted bots.",
       "enabled": true,
       "cache_seconds": 1800,
       "failure_cache_seconds": 90,
@@ -300,12 +300,14 @@
       "provider_access_denied_backoff_seconds": 21600,
       "provider_retry_attempts": 2,
       "provider_min_interval_seconds": {
+        "gdrateplus": 0.25,
         "gdbrowser": 0.1,
         "boomlings": 0.55
       },
       "auto_reject_missing": true,
       "providers": {
-        "gdbrowser": true,
+        "gdrateplus": true,
+        "gdbrowser": false,
         "boomlings": true
       },
       "messages": {
@@ -569,6 +571,15 @@
   },
   "priority_system": {
     "_comment": "PPS v1 applies only when a genuinely new wave is created. Existing state and submissions remain legacy after migration",
+    "send_type_emojis": {
+      "_comment": "Upload assets/discord-emojis/*.png as application emojis with these names, then paste each emoji ID here",
+      "rate": {"name": "pps_rate", "id": "1550265958688489472"},
+      "feature": {"name": "pps_feature", "id": "1550265953588224102"},
+      "epic": {"name": "pps_epic", "id": "1550265952333996052"},
+      "legendary": {"name": "pps_legendary", "id": "1550265955026993283"},
+      "mythic": {"name": "pps_mythic", "id": "1550265957463621773"}
+    },
+    "public_level_base_url": "https://gdavenue.netlify.app/level",
     "new_wave_version": "pps_v1",
     "model_version": "pps_v1",
     "prestige_base": 1.8,

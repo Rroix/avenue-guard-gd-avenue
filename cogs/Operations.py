@@ -163,7 +163,6 @@ class OperationsCog(commands.Cog):
             ("help.ticket_scan", "HelpCog", "_ticket_scan_task"),
             ("requests.auto_close", "RequestLevelsCog", "_close_task"),
             ("requests.scheduled", "RequestLevelsCog", "_scheduled_open_task"),
-            ("requests.validation", "RequestLevelsCog", "_validation_refresh_task"),
             ("priority.maintenance", "PrioritySystemCog", "_maintenance_task"),
             ("history.audit", "HistoricalAuditCog", "_audit_task"),
             ("release.metrics", "ReleaseCog", "_metrics_task"),

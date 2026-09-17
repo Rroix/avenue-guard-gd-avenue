@@ -36,6 +36,7 @@ _public_metrics = {
     "updated_ts": _process_started_ts,
 }
 _public_releases: list[dict] = []
+_public_levels: dict[str, dict] = {}
 _runtime_heartbeat = 0.0
 _runtime_health: dict = {}
 
@@ -167,6 +168,46 @@ def set_public_release_data(releases: list[dict]) -> None:
         _public_releases[:] = safe_releases
 
 
+def set_public_level_data(levels: list[dict]) -> None:
+    """Replace the public, privacy-filtered level page cache atomically."""
+    safe_levels: dict[str, dict] = {}
+    for level in levels:
+        if not isinstance(level, dict):
+            continue
+        level_id = str(level.get("level_id") or "").strip()
+        if not (level_id.isascii() and level_id.isdecimal() and 7 <= len(level_id) <= 9):
+            continue
+        recommendation_type = str(level.get("recommendation_type") or "").casefold()
+        if recommendation_type not in {"rate", "feature", "epic", "legendary", "mythic"}:
+            continue
+        safe_levels[level_id] = {
+            "schema_version": 1,
+            "level_id": level_id,
+            "level_name": str(level.get("level_name") or "Unknown level")[:100],
+            "recommended_ts": max(0, int(level.get("recommended_ts") or 0)),
+            "recommendation_type": recommendation_type,
+            "recommendation_label": str(level.get("recommendation_label") or "")[:30],
+            "queue_status": str(level.get("queue_status") or "Queued for outreach")[:80],
+            "queue_position": (
+                max(1, int(level["queue_position"]))
+                if level.get("queue_position") is not None
+                else None
+            ),
+            "active_queue_total": max(0, int(level.get("active_queue_total") or 0)),
+            "updated_ts": max(0, int(level.get("updated_ts") or time.time())),
+        }
+    with _status_lock:
+        _public_levels.clear()
+        _public_levels.update(safe_levels)
+
+
+def get_public_level_payload(level_id: str) -> dict | None:
+    clean_id = str(level_id or "").strip()
+    with _status_lock:
+        payload = _public_levels.get(clean_id)
+        return dict(payload) if payload else None
+
+
 def _public_state_label(state: str) -> str:
     labels = {
         "online": "Operational",
@@ -265,6 +306,18 @@ def _response_for_path(raw_path: str) -> tuple[bytes, str, str, bool]:
             separators=(",", ":"),
         ).encode("utf-8")
         return body, "application/json; charset=utf-8", "public, max-age=30", True
+    level_prefix = next(
+        (prefix for prefix in ("/api/level/", "/api/levels/") if path.startswith(prefix)),
+        "",
+    )
+    if level_prefix:
+        level_id = path[len(level_prefix):]
+        payload = get_public_level_payload(level_id)
+        body = json.dumps(
+            payload or {"schema_version": 1, "error": "level_not_found"},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return body, "application/json; charset=utf-8", "public, max-age=30", True
 
     status = get_keepalive_status()
     if path in {"/status", "/health", "/ready"}:
@@ -293,7 +346,14 @@ class _HealthHandler(BaseHTTPRequestHandler):
         public_api: bool,
     ) -> None:
         path = urlsplit(self.path).path.rstrip("/")
-        self.send_response(503 if path == "/ready" and not get_runtime_health()["ready"] else 200)
+        is_missing_level = path.startswith(("/api/level/", "/api/levels/")) and get_public_level_payload(path.rsplit("/", 1)[-1]) is None
+        self.send_response(
+            404
+            if is_missing_level
+            else 503
+            if path == "/ready" and not get_runtime_health()["ready"]
+            else 200
+        )
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", cache_control)
@@ -348,12 +408,20 @@ async def _handle(request: web.Request) -> web.Response:
     }
     if public_api:
         headers["Access-Control-Allow-Origin"] = "*"
+    path = request.path.rstrip("/")
+    is_missing_level = path.startswith(("/api/level/", "/api/levels/")) and get_public_level_payload(path.rsplit("/", 1)[-1]) is None
     return web.Response(
         body=body,
         content_type=content_type.split(";", 1)[0],
         charset="utf-8",
         headers=headers,
-        status=503 if request.path.rstrip("/") == "/ready" and not get_runtime_health()["ready"] else 200,
+        status=(
+            404
+            if is_missing_level
+            else 503
+            if path == "/ready" and not get_runtime_health()["ready"]
+            else 200
+        ),
     )
 
 async def start_keepalive() -> None:
@@ -369,6 +437,8 @@ async def start_keepalive() -> None:
     app.router.add_route("*", "/ready", _handle)
     app.router.add_route("*", "/api/bot", _handle)
     app.router.add_route("*", "/api/releases", _handle)
+    app.router.add_route("*", "/api/level/{level_id}", _handle)
+    app.router.add_route("*", "/api/levels/{level_id}", _handle)
     runner = web.AppRunner(app)
     await runner.setup()
 

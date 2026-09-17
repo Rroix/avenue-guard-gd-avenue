@@ -6,8 +6,10 @@ from utils.gd_validation import (
     combine_level_validation,
     fetch_boomlings_level,
     fetch_gdbrowser_level,
+    fetch_gdrateplus_level,
     parse_boomlings_level,
     parse_gdbrowser_level,
+    parse_gdrateplus_level,
     validation_notice,
 )
 
@@ -61,6 +63,37 @@ def test_gdbrowser_rejects_a_success_payload_without_an_id():
     assert result["failure_kind"] == "invalid_response"
 
 
+def test_gdrateplus_maps_only_official_level_fields_and_exact_id():
+    payload = {
+        "level": {
+            "id": "111111111",
+            "name": "Example",
+            "author": "Creator",
+            "difficulty": "Extreme Demon",
+            "length": "Long",
+            "stars": 10,
+            "featured": True,
+            "epic": False,
+            "legendary": False,
+            "mythic": False,
+        },
+        "communityTier": {"name": "Mythic"},
+    }
+
+    result = parse_gdrateplus_level(payload, "111111111")
+
+    assert result["ok"] is True
+    assert result["exists"] is True
+    assert result["name"] == "Example"
+    assert result["rated"] is True
+    assert result["featured"] is True
+    assert result["mythic"] is False
+    assert result["demon"] is True
+    mismatch = parse_gdrateplus_level(payload, "222222222")
+    assert mismatch["ok"] is False
+    assert mismatch["failure_kind"] == "invalid_response"
+
+
 def test_boomlings_selects_only_the_exact_level_and_maps_metadata():
     response = (
         "1:111111111:2:Example:6:42:9:50:15:4:17:1:18:10:19:1:42:1:43:6"
@@ -98,6 +131,7 @@ def test_all_requested_sources_must_agree_before_missing_is_confident():
     uncertain = combine_level_validation("111111111", {"gdbrowser": missing, "boomlings": failed})
     assert uncertain["exists"] is None
     assert uncertain["missing_confident"] is False
+    assert uncertain["rated"] is None
 
     confident = combine_level_validation(
         "111111111",
@@ -145,7 +179,8 @@ async def test_boomlings_uses_current_form_headers_and_classifies_access_denial(
     assert result["status_code"] == 403
     assert result["retryable"] is False
     assert session.request.data["gameVersion"] == "22"
-    assert session.request.data["binaryVersion"] == "45"
+    assert session.request.data["binaryVersion"] == "47"
+    assert session.request.data["type"] == "0"
     assert session.request.headers["User-Agent"] == ""
     assert session.request.headers["Cookie"] == "gd=1;"
     assert session.request.headers["Content-Type"] == "application/x-www-form-urlencoded"
@@ -181,3 +216,21 @@ async def test_server_error_body_cannot_be_mistaken_for_a_missing_level():
 
     assert result["ok"] is False
     assert result["failure_kind"] == "upstream_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_gdrateplus_fetch_uses_exact_level_endpoint_and_handles_missing():
+    payload = '{"level":{"id":"111111111","name":"Example","stars":0}}'
+    session = _FakeSession(_FakeResponse(200, payload))
+
+    result = await fetch_gdrateplus_level(session, "111111111")
+
+    assert result["ok"] is True
+    assert result["exists"] is True
+    assert session.request.url.endswith("/api/levels/111111111")
+
+    missing = await fetch_gdrateplus_level(
+        _FakeSession(_FakeResponse(404, '{"error":"not found"}')),
+        "111111111",
+    )
+    assert missing == {"provider": "gdrateplus", "ok": True, "exists": False}
