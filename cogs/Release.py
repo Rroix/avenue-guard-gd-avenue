@@ -12,6 +12,7 @@ import discord
 from discord.ext import commands
 
 from utils.errors import log_error
+from utils.components_v2 import message_component_text
 from utils.db import DatabaseBusyError
 from utils.keepalive import (
     get_keepalive_status,
@@ -252,8 +253,17 @@ class ReleaseCog(commands.Cog):
             )
         return embed
 
-    def _proposal_id_from_interaction(self, interaction: discord.Interaction) -> int:
+    async def _proposal_id_from_interaction(self, interaction: discord.Interaction) -> int:
         message = getattr(interaction, "message", None)
+        message_id = int(getattr(message, "id", 0) or 0)
+        if message_id:
+            row = await self.bot.db.fetchone(
+                "SELECT id FROM bot_releases WHERE approval_message_id=? "
+                "ORDER BY id DESC LIMIT 1",
+                (message_id,),
+            )
+            if row is not None:
+                return int(row["id"])
         for embed in list(getattr(message, "embeds", []) or []):
             for field in list(getattr(embed, "fields", []) or []):
                 if str(getattr(field, "name", "")).casefold() != "proposal id":
@@ -261,6 +271,10 @@ class ReleaseCog(commands.Cog):
                 match = re.search(r"\d+", str(getattr(field, "value", "")))
                 if match:
                     return int(match.group(0))
+        rendered = message_component_text(message)
+        match = re.search(r"\*\*Proposal ID\*\*\s*`?(\d+)`?", rendered, flags=re.I)
+        if match:
+            return int(match.group(1))
         return 0
 
     async def _send_approval_dm(
@@ -823,7 +837,7 @@ class ReleaseCog(commands.Cog):
         *,
         approved: bool,
     ) -> None:
-        proposal_id = self._proposal_id_from_interaction(interaction)
+        proposal_id = await self._proposal_id_from_interaction(interaction)
         row = await self.bot.db.fetchone(
             "SELECT * FROM bot_releases WHERE id=?",
             (proposal_id,),

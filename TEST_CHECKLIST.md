@@ -764,3 +764,29 @@
    - Expected: valid art covers the image pane; failure leaves an intentional black surface without a broken-image icon.
 10. Use Share with and without Web Share API support.
     - Expected: native sharing is preferred and permanent-URL copy is the fallback; the action remains below progress content.
+
+---
+
+## 32) Components V2 presentation
+**Setup:** staging guild with the request, tracking, support, sticky, release, moderation-log, summary, and error-log channels configured.
+
+1. Trigger one rich message from every cog.
+   - Expected: each message has a colored container and no classic embed payload.
+2. Inspect titles, descriptions, fields, footers, timestamps, thumbnails, and main images.
+   - Expected: the hierarchy is readable, long text is split safely, and media appears in its intended component.
+3. Submit support evidence, request a transcript, and download an audit report.
+   - Expected: every attachment is visible as media or a File component and remains downloadable.
+4. Use every persistent request, help, ticket, tracking, release, and dashboard control before and after restart.
+   - Expected: custom IDs, callbacks, disabled states, ownership checks, and persistence are unchanged.
+5. Edit or resolve an existing classic-embed request, support submission, release proposal, and ban-information request.
+   - Expected: the message upgrades to V2 and the workflow resolves identity from Turso or its legacy compatibility path.
+6. Restart with a pending outbox delivery created before this release.
+   - Expected: the stored embed dictionary is delivered once as V2 without an outbox migration.
+7. Let weekly-offer recovery and sticky recovery scan recent V2 history.
+   - Expected: existing messages are recognized and not duplicated.
+8. Generate a ticket transcript containing classic embeds and V2 containers.
+   - Expected: both formats appear as readable text in chronological order.
+9. Send ordinary plain text responses and run commands that do not build embeds.
+   - Expected: those messages retain their existing compact presentation.
+10. Restart with existing V2 request, support, and release messages.
+    - Expected: every message remains editable because Avenue Guard never attempts to remove Discord's irreversible V2 flag.

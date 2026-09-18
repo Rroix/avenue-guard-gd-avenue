@@ -80,7 +80,7 @@ Some of the reliability methods behind Avenue Guard include:
 
 1. **Turso/libSQL persistent storage for long workflows**: request waves, tickets, weekly rewards, scheduled openings, reviews, transcripts, backups, and impact snapshots are stored in SQLite-compatible remote storage so they can survive restarts and host cache clears.
 2. **Atomic counters and protected state updates**: ticket numbers, request counts, duplicate checks, and review transitions are handled carefully so two users or two reviewers cannot accidentally claim the same state at the same time.
-3. **Persistent Discord components**: buttons and menus are registered again after restarts, so old request buttons, review buttons, ticket controls, and help-menu controls can still route to the correct workflow.
+3. **Persistent Discord components**: native Components V2 containers, buttons, and menus are registered again after restarts, so old request buttons, review buttons, ticket controls, and help-menu controls can still route to the correct workflow.
 4. **Pre-action validation**: the bot checks roles, channels, permissions, level IDs, URLs, request state, and duplicate submissions before allowing important actions to continue.
 5. **External validation with caching and fallbacks**: Geometry Dash level checks use the current request protocol, bounded responses, cached results, one transient retry, and adaptive provider cooldowns so a blocked service does not slow or break the request system.
 6. **Recovery and repair commands**: staff can refresh request buttons, rebuild summaries, relock reviewed requests, check storage, run diagnostics, create backups, and restore local uploaded database copies when running on local SQLite.
@@ -115,7 +115,7 @@ The public version of this repository does not include the source code, but the 
 
 Avenue Guard is built as a modular Discord bot. Each major feature area is separated into its own internal component: requests, tracking, help and tickets, forum reminders, moderation, background summaries, admin tools, and shared utilities. Those components communicate with a persistent database and a central configuration system.
 
-Configuration controls server specific behavior such as which channels are used, which roles are allowed to do certain actions, how embeds are worded, where logs are sent, and how request waves behave. This makes the bot adaptable without hardcoding every server decision directly into the logic.
+Configuration controls server specific behavior such as which channels are used, which roles are allowed to do certain actions, how rich messages are worded, where logs are sent, and how request waves behave. This makes the bot adaptable without hardcoding every server decision directly into the logic.
 
 Persistent storage is used because many workflows last longer than a single bot session. All of the information SHOULD survive a restart.
 
@@ -157,7 +157,7 @@ utils provide persistence, outbox delivery, configuration, and workflow tracing
 Turso remembers state while supervised workers deliver Discord actions
         |
         v
-Discord receives embeds, logs, tickets, reviews, DMs, and summaries
+Discord receives Components V2 cards, logs, tickets, reviews, DMs, and summaries
 ```
 
 ## Why The Code Is Private

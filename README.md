@@ -466,6 +466,20 @@ Uptime setup establishes its startup boundary before background writers start. G
 
 If the local replica is corrupt and Turso reports `file is not a database`, the bot quarantines the replica and its sidecar files, opens a clean replica, and pulls from the remote database before running migrations. Externally visible workflows also save delivery states before sending: an uncertain post-send write therefore remains recoverable without repeatedly sending sticky posts, reminders, weekly offers, satisfaction prompts, or release approvals. If Turso is not configured, SQLite must live outside Render's clearable cache/project filesystem for true persistence. Automatic zipped backups also post to Discord as a second safety net.
 
+## Components V2 Interface
+
+All rich Avenue Guard messages are delivered through Discord Components V2.
+Classic embed builders remain internal content models, then a single presentation
+boundary converts them into accent containers with structured text, thumbnails,
+media galleries, visible files, separators, and integrated action rows. Existing
+persistent button/select custom IDs and callbacks remain unchanged.
+
+Workflow identity and status come from Turso rather than being parsed from the
+rendered card. Compatibility readers still recognize historical classic embeds,
+and transcripts include text from both formats. The complete visual contract,
+attachment behavior, test coverage, and Discord message-flag constraint are described
+in `docs/COMPONENTS_V2_DESIGN_SYSTEM.md`.
+
 ## Local Testing
 
 Install the development tools and run the automated audit suite:

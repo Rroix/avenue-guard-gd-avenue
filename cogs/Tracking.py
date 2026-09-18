@@ -11,6 +11,7 @@ import discord
 from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, basic_color
+from utils.components_v2 import message_component_text
 from utils.discord_refs import fetch_persisted_message, snowflake_matches_legacy
 from utils.errors import log_error
 from utils.db import DatabaseBusyError
@@ -355,6 +356,14 @@ class TrackingCog(commands.Cog):
                 getattr(embed, "description", "") or ""
             ) != expected_description:
                 continue
+            if expected_title or expected_description:
+                return True
+        rendered = message_component_text(message)
+        if rendered:
+            if expected_title and expected_title not in rendered:
+                return False
+            if expected_description and expected_description not in rendered:
+                return False
             if expected_title or expected_description:
                 return True
         return False

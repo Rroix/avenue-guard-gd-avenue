@@ -4,6 +4,8 @@ import io
 
 import discord
 
+from utils.components_v2 import message_component_text
+
 
 def _indented(value: object) -> str:
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -28,6 +30,9 @@ def _message_text(msg: discord.Message) -> str:
             name = _indented(getattr(field, "name", "")) or "Field"
             value = _indented(getattr(field, "value", ""))
             parts.append(f"[embed {index} field] {name}: {value}")
+    component_text = _indented(message_component_text(msg))
+    if component_text:
+        parts.append(f"[structured message] {component_text}")
     for sticker in getattr(msg, "stickers", []) or []:
         parts.append(f"[sticker] {getattr(sticker, 'name', 'sticker')}")
     return "\n    ".join(part for part in parts if part) or "[no text content]"

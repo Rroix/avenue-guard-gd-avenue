@@ -1,15 +1,15 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.25.1",
-  "title": "Public Recommendation Clarity",
-  "summary": "Refines public level pages with private rank bands, precise lifecycle semantics and a responsive Geometry Dash presentation",
+  "version": "3.26.0",
+  "title": "Components V2 Interface",
+  "summary": "Rebuilds every rich Avenue Guard message with native Components V2 containers while preserving all workflow behavior",
   "changes": [
-    "Replaced public exact queue position and queue size with server-derived Top, High, Standard and Lower priority bands",
-    "Separated public recommendation, outreach and outcome states so Rated is never presented as an outreach status",
-    "Rebuilt the desktop hero around a safe content column while preserving the level image and diagonal GD Avenue composition",
-    "Added relative accessible timestamps, safe uploader display, tier-accent Level ID copying and bottom-of-page sharing",
-    "Added an evidence-aware Geometry Dash-style progress timeline with terminal withdrawn and unavailable states",
-    "Expanded the public API privacy allowlist and removed score, CP, rank, requester, reviewer and private outreach data",
-    "Added API, percentile, lifecycle, responsive layout, copy, share, image fallback and accessibility regression coverage"
+    "Converted all outgoing embeds into modern accent containers with structured text, separators and clearer information hierarchy",
+    "Integrated existing buttons and select menus into V2 action rows without changing callbacks, custom IDs or persistent behavior",
+    "Added native thumbnail, media-gallery and visible file components for images, evidence, transcripts and report attachments",
+    "Moved release and ban-information identity recovery to durable database records instead of rendered embed fields",
+    "Updated sticky, weekly-offer and transcript readers to understand both Components V2 and historical classic embeds",
+    "Kept the V2 rendering boundary active across restarts so already-converted messages remain safely editable",
+    "Added Components V2 regression coverage and a dedicated visual architecture guide"
   ]
 }

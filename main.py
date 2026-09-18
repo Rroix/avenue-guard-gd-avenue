@@ -8,6 +8,7 @@ import traceback
 from pathlib import Path
 import discord
 
+from utils.components_v2 import install_components_v2_adapter
 from utils.config import Config
 from utils.db import Database
 from utils.keepalive import get_keepalive_status, set_keepalive_status, start_keepalive, start_keepalive_thread
@@ -35,6 +36,9 @@ TURSO_REPLICA_PATH = "data/turso-replica.db"
 RENDER_DISK_DB_PATH = "/var/data/avenue-guard/bot.db"
 DEFAULT_DISCORD_LOGIN_RETRY_SECONDS = 15 * 60
 DEFAULT_STARTUP_ERROR_RETRY_SECONDS = 5 * 60
+
+
+install_components_v2_adapter()
 
 
 class PersistenceConfigurationError(RuntimeError):

@@ -11,6 +11,7 @@ import discord
 from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, is_mod
+from utils.components_v2 import message_component_text
 from utils.discord_refs import (
     fetch_persisted_channel,
     fetch_persisted_message,
@@ -2553,6 +2554,8 @@ class HelpCog(commands.Cog):
 
     def _requester_id_from_help_log_message(self, message) -> Optional[int]:
         texts: list[str] = []
+        if message is None:
+            return None
         for embed in getattr(message, "embeds", []) or []:
             description = str(getattr(embed, "description", "") or "")
             if description:
@@ -2567,6 +2570,9 @@ class HelpCog(commands.Cog):
                     "user",
                 }:
                     texts.append(str(getattr(field, "value", "") or ""))
+        component_text = message_component_text(message)
+        if component_text:
+            texts.append(component_text)
 
         for text in texts:
             mention = re.search(r"<@!?(\d{15,25})>", text)
@@ -2590,6 +2596,11 @@ class HelpCog(commands.Cog):
                 value = str(getattr(field, "value", "") or "")
                 if re.search(rf"(?<!\d)T?{ticket_id}(?!\d)", value, flags=re.I):
                     return True
+        component_text = message_component_text(message)
+        if "ticket transcript" in component_text.casefold() and re.search(
+            rf"(?<!\d)T?{ticket_id}(?!\d)", component_text, flags=re.I
+        ):
+            return True
         expected_names = {
             f"transcript-{ticket_id}.txt",
             f"transcript-t{ticket_id}.txt",
@@ -2746,17 +2757,29 @@ class HelpCog(commands.Cog):
         try:
             if original is None:
                 original = await message.channel.fetch_message(ref_message_id)
-            if original.embeds:
-                original_embed = original.embeds[0]
-                replaced = False
-                for idx, field in enumerate(original_embed.fields):
-                    if str(field.name).casefold() == "status":
-                        original_embed.set_field_at(idx, name="Status", value=f"Responded by <@{message.author.id}> <t:{now}:R>", inline=True)
-                        replaced = True
-                        break
-                if not replaced:
-                    original_embed.add_field(name="Status", value=f"Responded by <@{message.author.id}> <t:{now}:R>", inline=True)
-                await original.edit(embed=original_embed, allowed_mentions=no_mentions())
+            try:
+                submission_data = json.loads(str(row["data_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                submission_data = {}
+            if not isinstance(submission_data, dict):
+                submission_data = {}
+            original_embed = self._submission_staff_embed(
+                message.guild,
+                requester_id,
+                kind,
+                submission_id,
+                submission_data,
+            )
+            for idx, field in enumerate(original_embed.fields):
+                if str(field.name).casefold() == "status":
+                    original_embed.set_field_at(
+                        idx,
+                        name="Status",
+                        value=f"Responded by <@{message.author.id}> <t:{now}:R>",
+                        inline=True,
+                    )
+                    break
+            await original.edit(embed=original_embed, allowed_mentions=no_mentions())
         except Exception as e:
             await log_error(self.bot, f"Could not update staff submission embed for {code}: {repr(e)}")
 
@@ -2830,7 +2853,7 @@ class HelpCog(commands.Cog):
     def _ban_info_staff_embed(
         self,
         guild: discord.Guild,
-        user: discord.User,
+        user: Any,
         request_id: int,
         history: Dict[str, Any],
     ) -> discord.Embed:
@@ -2841,7 +2864,9 @@ class HelpCog(commands.Cog):
             "A former member does not know why they were banned and is waiting for staff information.",
             discord.Color.gold(),
         )
-        embed.add_field(name="User", value=f"{user.mention}\n`{user.id}`", inline=True)
+        user_id = int(user.id)
+        user_mention = str(getattr(user, "mention", "") or f"<@{user_id}>")
+        embed.add_field(name="User", value=f"{user_mention}\n`{user_id}`", inline=True)
         embed.add_field(name="Status", value="Waiting for staff", inline=True)
         embed.add_field(name="Account created", value=f"<t:{int(user.created_at.timestamp())}:D>", inline=True)
         durable_count = (
@@ -2976,18 +3001,23 @@ class HelpCog(commands.Cog):
     async def handle_ban_info_button(self, interaction: discord.Interaction) -> None:
         if not self._can_handle_ban_info(interaction):
             return await interaction.response.send_message("Only staff can use this control.", ephemeral=True)
-        footer_text = ""
-        if interaction.message and interaction.message.embeds:
-            footer_text = str(getattr(interaction.message.embeds[0].footer, "text", "") or "")
-        match = re.search(r"\bBI-(\d+)\b", footer_text, flags=re.I)
-        if not match:
+        message_id = int(getattr(interaction.message, "id", 0) or 0)
+        row = await self.bot.db.fetchone(
+            "SELECT id,user_id FROM ban_info_requests WHERE guild_id=? AND log_message_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (int(interaction.guild_id or 0), message_id),
+        )
+        if row is None:
             return await interaction.response.send_message(
                 "I couldn't identify this ban information request.",
                 ephemeral=True,
             )
-        requester_id = self._requester_id_from_help_log_message(interaction.message)
         await interaction.response.send_modal(
-            BanInfoModal(self, int(match.group(1)), requester_id=requester_id)
+            BanInfoModal(
+                self,
+                int(row["id"]),
+                requester_id=int(row["user_id"]),
+            )
         )
 
     async def handle_ban_info_modal(
@@ -3187,18 +3217,29 @@ class HelpCog(commands.Cog):
                     "WHERE id=?",
                     (channel.id, message.id, int(time.time()), int(row["id"])),
                 )
-            if not message.embeds:
-                return
-            embed = message.embeds[0]
-            replaced = False
+            user_id = int(row["user_id"])
+            user = self.bot.get_user(user_id)
+            if user is None:
+                try:
+                    user = await self.bot.fetch_user(user_id)
+                except Exception:
+                    user = discord.Object(id=user_id)
+            try:
+                history = json.loads(str(row["history_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                history = {}
+            if not isinstance(history, dict):
+                history = {}
+            embed = self._ban_info_staff_embed(
+                guild,
+                user,
+                int(row["id"]),
+                history,
+            )
             for index, field in enumerate(embed.fields):
                 if str(field.name).casefold() == "status":
                     embed.set_field_at(index, name="Status", value=status_text, inline=True)
-                    replaced = True
                     break
-            if not replaced:
-                embed.add_field(name="Status", value=status_text, inline=True)
-            handled_replaced = False
             for index, field in enumerate(embed.fields):
                 if str(field.name).casefold() == "handled by":
                     embed.set_field_at(
@@ -3207,9 +3248,8 @@ class HelpCog(commands.Cog):
                         value=f"<@{handled_by}>",
                         inline=True,
                     )
-                    handled_replaced = True
                     break
-            if not handled_replaced:
+            else:
                 embed.add_field(name="Handled by", value=f"<@{handled_by}>", inline=True)
             await message.edit(
                 embed=embed,

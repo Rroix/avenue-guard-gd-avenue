@@ -11,6 +11,7 @@ from utils.checks import ensure_allowed_guild_id, basic_color
 from utils.discord_refs import fetch_persisted_message
 from utils.errors import log_error
 from utils.mentions import no_mentions
+from utils.components_v2 import message_component_text
 
 
 class StickyCog(commands.Cog):
@@ -356,6 +357,13 @@ class StickyCog(commands.Cog):
                 for embed in msg.embeds:
                     if (embed.title or "") == expected_title and (embed.description or "") == expected_description:
                         return True
+                rendered = message_component_text(msg)
+                if (
+                    (not expected_title or expected_title in rendered)
+                    and (not expected_description or expected_description in rendered)
+                    and (expected_title or expected_description)
+                ):
+                    return True
         except Exception:
             # If we can't read history, play safe and avoid double posting.
             return True
@@ -427,6 +435,9 @@ class StickyCog(commands.Cog):
                         text_parts.append(embed.title)
                     if embed.description:
                         text_parts.append(embed.description)
+                rendered = message_component_text(msg)
+                if rendered:
+                    text_parts.append(rendered)
         except Exception:
             # If history cannot be read, avoid deleting a valid thread by mistake.
             return True
