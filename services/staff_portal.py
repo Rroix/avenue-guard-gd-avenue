@@ -157,6 +157,15 @@ class StaffPortalService:
         if member is None:
             raise PortalError(403, "not_a_member", "You must be a GD Avenue member to continue")
         principal = self._principal_from_member(member)
+        purpose = str(payload.get("purpose") or "staff").strip().casefold()
+        if purpose not in {"staff", "apply"}:
+            raise PortalError(400, "invalid_session_purpose", "The requested sign-in flow is invalid")
+        if purpose == "staff" and not principal.can("staff.access"):
+            raise PortalError(
+                403,
+                "staff_role_required",
+                "Your Discord account does not currently have staff portal access",
+            )
         raw_session = new_session_token()
         raw_csrf = new_csrf_token()
         now = int(time.time())

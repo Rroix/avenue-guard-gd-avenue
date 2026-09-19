@@ -165,6 +165,63 @@ def test_role_capabilities_do_not_trust_browser_labels():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_id", "expected_role"),
+    ((JUDGE_ID, "judge"), (HEAD_ID, "head_judge"), (OWNER_ID, "owner")),
+)
+async def test_staff_session_maps_live_discord_roles(portal, user_id, expected_role):
+    service, _guild = portal
+    created = await service.create_session({"user_id": user_id, "purpose": "staff"})
+    assert created["user"]["role"] == expected_role
+    assert created["user"]["staff_access"] is True
+    assert set(created["user"]) == {
+        "id",
+        "display_name",
+        "avatar_url",
+        "role",
+        "staff_access",
+        "capabilities",
+    }
+
+
+@pytest.mark.asyncio
+async def test_staff_session_denies_nonstaff_and_outside_guild(portal):
+    service, _guild = portal
+    with pytest.raises(PortalError) as nonstaff:
+        await service.create_session({"user_id": 999, "purpose": "staff"})
+    assert nonstaff.value.status == 403
+    assert nonstaff.value.code == "staff_role_required"
+
+    with pytest.raises(PortalError) as outsider:
+        await service.create_session({"user_id": 998, "purpose": "staff"})
+    assert outsider.value.status == 403
+    assert outsider.value.code == "not_a_member"
+
+    application = await service.create_session({"user_id": 999, "purpose": "apply"})
+    assert application["user"]["role"] == "applicant"
+    assert application["user"]["staff_access"] is False
+
+
+@pytest.mark.asyncio
+async def test_expired_staff_session_is_rejected(portal):
+    service, _guild = portal
+    created = await service.create_session({"user_id": JUDGE_ID, "purpose": "staff"})
+    await service.db.execute("UPDATE staff_web_sessions SET expires_ts=0")
+    with pytest.raises(PortalError) as expired:
+        await service.handle_request(
+            "GET",
+            "/api/staff/session",
+            {
+                "x-avenue-portal-key": "test-service-token",
+                "x-staff-session": created["session_token"],
+            },
+            b"",
+        )
+    assert expired.value.status == 401
+    assert expired.value.code == "session_expired"
+
+
+@pytest.mark.asyncio
 async def test_session_rechecks_discord_role_and_revokes_staff_access(portal):
     service, guild = portal
     created = await service.create_session({"user_id": JUDGE_ID})
