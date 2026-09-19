@@ -207,7 +207,7 @@ class ErrorReporter:
                             ),
                             ("INSERT OR IGNORE INTO error_incident_batches(batch_id,fingerprint,created_ts) VALUES(?,?,?)",
                              (batch_id, key, int(time.time()))),
-                        ], retry_safe=True)
+                        ], retry_safe=True, queue_timeout=0.5, operation_label="errors.persist")
                         entry["pending"] -= delta
                         entry.pop("batch", None)
                         row = await self.bot.db.fetchone("SELECT occurrence_count,log_message_id FROM error_incidents WHERE fingerprint=?", (key,))

@@ -1,14 +1,18 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.26.2",
-  "title": "Validation and Persistence Reliability",
-  "summary": "Improves Turso snapshot resilience, public outcome links and level-validation clarity",
+  "version": "3.26.3",
+  "title": "Turso Maintenance Reliability",
+  "summary": "Keeps startup recovery work from blocking live bot features while preserving safe automatic repair",
   "changes": [
     "Makes daily snapshot writes idempotent, retry-safe and short-queued so active Turso transactions no longer create error incidents",
     "Retries deferred daily snapshots on the next scheduled cycle while preserving the in-memory counters",
     "Builds DM help links exclusively from confirmed public outcome delivery receipts",
     "Hides the outcome link until the public message exists instead of exposing the private staff review card",
     "Shows only successful GD validation evidence on member-facing cards while preserving backup-provider failures in owner diagnostics",
-    "Invalidates older cached validation cards so the cleaner source display takes effect immediately"
+    "Invalidates older cached validation cards so the cleaner source display takes effect immediately",
+    "Plans legacy Discord ID repairs through the read-only replica and applies only matching rows in small idempotent batches",
+    "Moves legacy repair behind online startup, retries temporary Turso failures and records a durable completion marker",
+    "Retries ticket feedback view restoration quietly when the writer is occupied instead of creating a false error incident",
+    "Gives error-incident persistence a short low-priority queue deadline so it cannot delay live workflows"
   ]
 }

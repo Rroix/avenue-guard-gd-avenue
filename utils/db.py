@@ -1812,96 +1812,118 @@ class Database:
         user_map, user_ambiguous = _mapping(user_ids)
         channel_map, channel_ambiguous = _mapping(channel_ids)
 
-        def _run() -> dict[str, int]:
-            assert self._conn is not None
-            result = {
-                "updated": 0,
-                "conflicts": 0,
-                "ambiguous": guild_ambiguous + user_ambiguous + channel_ambiguous,
-                "feedback_requeued": 0,
+        result = {
+            "updated": 0,
+            "conflicts": 0,
+            "ambiguous": guild_ambiguous + user_ambiguous + channel_ambiguous,
+            "feedback_requeued": 0,
+        }
+
+        # Plan from the read-only local replica. The old implementation scanned
+        # every table through the isolated writer process while holding one large
+        # transaction, which could exhaust the worker deadline before any live
+        # command had a chance to use the database.
+        table_rows = await self.fetchall_local(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+        tables = sorted(
+            str(_row_get(row, "name", index=0, default=""))
+            for row in table_rows
+            if str(_row_get(row, "name", index=0, default=""))
+            in _SNOWFLAKE_REPAIR_TABLES
+        )
+        repairs: list[tuple[str, str, int, int]] = []
+        for table in tables:
+            info = await self.fetchall_local(f"PRAGMA table_info({table})")
+            columns = {
+                str(_row_get(row, "name", index=1, default=""))
+                for row in info
             }
-            table_rows = _fetchall(
-                self._conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            for column in sorted(columns):
+                mapping: dict[int, int]
+                if column == "guild_id":
+                    mapping = guild_map
+                elif column in _USER_SNOWFLAKE_COLUMNS:
+                    mapping = user_map
+                elif column in _CHANNEL_SNOWFLAKE_COLUMNS:
+                    mapping = channel_map
+                else:
+                    continue
+                if not mapping:
+                    continue
+                values = await self.fetchall_local(
+                    f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"  # nosec B608
                 )
-            )
-            tables = [str(_row_get(row, "name", index=0, default="")) for row in table_rows]
-
-            try:
-                self._conn.execute("BEGIN IMMEDIATE")
-                for table in tables:
-                    if table not in _SNOWFLAKE_REPAIR_TABLES:
+                for value_row in values:
+                    try:
+                        stored = int(_row_get(value_row, column, index=0))
+                    except (TypeError, ValueError):
                         continue
-                    info = _fetchall(self._conn.execute(f"PRAGMA table_info({table})"))
-                    columns = {
-                        str(_row_get(row, "name", index=1, default=""))
-                        for row in info
-                    }
-                    for column in columns:
-                        mapping: dict[int, int]
-                        if column == "guild_id":
-                            mapping = guild_map
-                        elif column in _USER_SNOWFLAKE_COLUMNS:
-                            mapping = user_map
-                        elif column in _CHANNEL_SNOWFLAKE_COLUMNS:
-                            mapping = channel_map
-                        else:
-                            continue
-                        if not mapping:
-                            continue
+                    exact = mapping.get(stored)
+                    if exact is not None and exact != stored:
+                        repairs.append((table, column, stored, exact))
 
-                        # Both identifiers are selected from fixed registries
-                        # above; neither can contain user or configuration data.
-                        values = _fetchall(
-                            self._conn.execute(
-                                f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"  # nosec
-                            )
-                        )
-                        for value_row in values:
-                            stored_raw = _row_get(value_row, column, index=0)
-                            try:
-                                stored = int(stored_raw)
-                            except (TypeError, ValueError):
-                                continue
-                            exact = mapping.get(stored)
-                            if exact is None or exact == stored:
-                                continue
-                            cursor = self._conn.execute(
-                                f"UPDATE OR IGNORE {table} SET {column}=? WHERE {column}=?",  # nosec
-                                (str(exact), str(stored)),
-                            )
-                            changed = max(0, int(getattr(cursor, "rowcount", 0) or 0))
-                            result["updated"] += changed
-                            if table == "tickets" and column == "creator_id" and changed:
-                                retry_cursor = self._conn.execute(
-                                    "UPDATE tickets SET satisfaction_delivery_status='pending', "
-                                    "satisfaction_delivery_error=NULL "
-                                    "WHERE creator_id=? AND satisfaction_score IS NULL "
-                                    "AND satisfaction_message_id IS NULL "
-                                    "AND satisfaction_delivery_status='recipient_unavailable'",
-                                    (str(exact),),
-                                )
-                                result["feedback_requeued"] += max(
-                                    0,
-                                    int(getattr(retry_cursor, "rowcount", 0) or 0),
-                                )
-                            remaining = self._conn.execute(
-                                f"SELECT COUNT(*) FROM {table} WHERE {column}=?",  # nosec
-                                (str(stored),),
-                            ).fetchone()
-                            result["conflicts"] += int(
-                                _row_get(remaining, "COUNT(*)", index=0, default=0) or 0
-                            )
-                self._commit_and_sync_sync()
-            except Exception:
-                try:
-                    self._conn.rollback()
-                except Exception:
-                    pass
-                raise
+        if not repairs:
             return result
 
-        return await self._run_locked_with_retry(_run, retry_operation=True, operation_name="snowflake_repair")
+        # Each batch is independently idempotent and releases the writer between
+        # chunks. If Turso reports unknown completion, replay can only update rows
+        # that still contain the legacy rounded value.
+        for offset in range(0, len(repairs), 12):
+            batch = repairs[offset : offset + 12]
+
+            def _run_batch() -> dict[str, int]:
+                assert self._conn is not None
+                batch_result = {"updated": 0, "conflicts": 0, "feedback_requeued": 0}
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    for table, column, stored, exact in batch:
+                        cursor = self._conn.execute(
+                            f"UPDATE OR IGNORE {table} SET {column}=? WHERE {column}=?",  # nosec B608
+                            (str(exact), str(stored)),
+                        )
+                        changed = max(0, int(getattr(cursor, "rowcount", 0) or 0))
+                        batch_result["updated"] += changed
+                        if table == "tickets" and column == "creator_id" and changed:
+                            retry_cursor = self._conn.execute(
+                                "UPDATE tickets SET satisfaction_delivery_status='pending', "
+                                "satisfaction_delivery_error=NULL "
+                                "WHERE creator_id=? AND satisfaction_score IS NULL "
+                                "AND satisfaction_message_id IS NULL "
+                                "AND satisfaction_delivery_status='recipient_unavailable'",
+                                (str(exact),),
+                            )
+                            batch_result["feedback_requeued"] += max(
+                                0,
+                                int(getattr(retry_cursor, "rowcount", 0) or 0),
+                            )
+                        remaining = self._conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE {column}=?",  # nosec B608
+                            (str(stored),),
+                        ).fetchone()
+                        batch_result["conflicts"] += int(
+                            _row_get(remaining, "COUNT(*)", index=0, default=0) or 0
+                        )
+                    self._commit_and_sync_sync()
+                except Exception:
+                    try:
+                        self._conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+                return batch_result
+
+            batch_result = await self._run_locked_with_retry(
+                _run_batch,
+                retry_operation=True,
+                operation_name="snowflake_repair",
+                queue_timeout=2.0,
+                operation_label="maintenance.snowflake_repair",
+            )
+            for key in ("updated", "conflicts", "feedback_requeued"):
+                result[key] += int(batch_result.get(key, 0) or 0)
+            await asyncio.sleep(0)
+        return result
 
     def health_snapshot(self) -> dict[str, Any]:
         return {

@@ -10,8 +10,9 @@ import discord
 
 from utils.components_v2 import install_components_v2_adapter
 from utils.config import Config
-from utils.db import Database
+from utils.db import Database, DatabaseBusyError
 from utils.keepalive import get_keepalive_status, set_keepalive_status, start_keepalive, start_keepalive_thread
+from utils.libsql_worker import DatabaseWorkerError
 from utils.errors import setup_global_error_handlers, log_error
 from utils.views import (
     TrackingDeclineConfirmView,
@@ -36,6 +37,7 @@ TURSO_REPLICA_PATH = "data/turso-replica.db"
 RENDER_DISK_DB_PATH = "/var/data/avenue-guard/bot.db"
 DEFAULT_DISCORD_LOGIN_RETRY_SECONDS = 15 * 60
 DEFAULT_STARTUP_ERROR_RETRY_SECONDS = 5 * 60
+LEGACY_SNOWFLAKE_REPAIR_VERSION = 2
 
 
 install_components_v2_adapter()
@@ -138,8 +140,13 @@ async def _gateway_startup_watchdog(bot, *, timeout: float = 300) -> None:
 
 
 async def _repair_legacy_turso_snowflakes(bot: discord.Bot, guild: discord.Guild) -> None:
-    """Repair historical rounded IDs once before persistent workflows start."""
+    """Repair historical rounded IDs once without blocking live workflows."""
     if bool(getattr(bot, "_legacy_snowflake_repair_complete", False)):
+        return
+    saved = await bot.db.get_runtime_setting("maintenance.legacy_snowflake_repair", {})
+    if isinstance(saved, dict) and int(saved.get("version", 0) or 0) >= LEGACY_SNOWFLAKE_REPAIR_VERSION:
+        bot._legacy_snowflake_repair_complete = True
+        bot._last_snowflake_repair = dict(saved)
         return
 
     # A complete member cache gives the precision repair exact IDs supplied by
@@ -182,6 +189,10 @@ async def _repair_legacy_turso_snowflakes(bot: discord.Bot, guild: discord.Guild
         channel_ids=tuple(known_channels),
     )
     bot._last_snowflake_repair = {**repair, "ts": int(time.time())}
+    await bot.db.set_runtime_setting(
+        "maintenance.legacy_snowflake_repair",
+        {**bot._last_snowflake_repair, "version": LEGACY_SNOWFLAKE_REPAIR_VERSION},
+    )
     bot._legacy_snowflake_repair_complete = True
     if any(
         repair.get(key)
@@ -196,8 +207,44 @@ async def _repair_legacy_turso_snowflakes(bot: discord.Bot, guild: discord.Guild
         )
 
 
+async def _legacy_snowflake_repair_loop(
+    bot: discord.Bot,
+    guild: discord.Guild,
+) -> None:
+    attempts = 0
+    while not bot.is_closed() and not bool(
+        getattr(bot, "_legacy_snowflake_repair_complete", False)
+    ):
+        try:
+            await _repair_legacy_turso_snowflakes(bot, guild)
+            return
+        except asyncio.CancelledError:
+            raise
+        except (DatabaseBusyError, DatabaseWorkerError) as e:
+            attempts += 1
+            if attempts in {3, 6}:
+                await log_error(
+                    bot,
+                    "Legacy Turso snowflake repair remains deferred; compatibility "
+                    f"lookups are active and the repair will retry: {e!r}",
+                )
+        except Exception as e:
+            attempts += 1
+            await log_error(
+                bot,
+                "Legacy Turso snowflake repair deferred; compatibility lookups "
+                f"remain active and the repair will retry: {e!r}",
+            )
+        await asyncio.sleep(min(300, 5 * (2 ** min(attempts, 5))))
+
+
 async def _close_runtime_storage(bot: discord.Bot) -> None:
     """Best-effort flush on Discord's event loop before it is torn down."""
+    repair_task = getattr(bot, "_legacy_snowflake_repair_task", None)
+    if repair_task is not None and not repair_task.done():
+        repair_task.cancel()
+        await asyncio.gather(repair_task, return_exceptions=True)
+
     operations = bot.get_cog("OperationsCog")
     close_operations = getattr(operations, "close_resources", None)
     if callable(close_operations):
@@ -487,14 +534,7 @@ def create_bot() -> discord.Bot:
                     await bot.close()
                     return
 
-            try:
-                await _repair_legacy_turso_snowflakes(bot, g)
-            except Exception as e:
-                await log_error(
-                    bot,
-                    "Legacy Turso snowflake repair failed; compatibility lookups remain active: "
-                    f"{e!r}",
-                )
+            bot._legacy_snowflake_repair_guild = g
 
         # Start keepalive server
         try:
@@ -557,6 +597,13 @@ def create_bot() -> discord.Bot:
                 )
         startup_log(f"Logged in as {bot.user} (ID: {bot.user.id})")
         bot._runtime_initialized = True
+        repair_guild = getattr(bot, "_legacy_snowflake_repair_guild", None)
+        repair_task = getattr(bot, "_legacy_snowflake_repair_task", None)
+        if repair_guild is not None and (repair_task is None or repair_task.done()):
+            bot._legacy_snowflake_repair_task = asyncio.create_task(
+                _legacy_snowflake_repair_loop(bot, repair_guild),
+                name="avenue-guard:snowflake-repair",
+            )
 
     @bot.event
     async def on_ready():

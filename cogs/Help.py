@@ -12,12 +12,14 @@ from discord.ext import commands
 
 from utils.checks import ensure_allowed_guild_id, is_mod
 from utils.components_v2 import message_component_text
+from utils.db import DatabaseBusyError
 from utils.discord_refs import (
     fetch_persisted_channel,
     fetch_persisted_message,
     snowflake_matches_legacy,
 )
 from utils.errors import log_error
+from utils.libsql_worker import DatabaseWorkerError
 from utils.mentions import no_mentions, user_and_role_mentions, user_mentions
 from utils.views import (
     BanInfoGiveInfoView,
@@ -449,6 +451,7 @@ class HelpCog(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
         self._ticket_scan_task: Optional[asyncio.Task] = None
+        self._satisfaction_restore_task: Optional[asyncio.Task] = None
         self._started = False
         self._active_ticket_channels: set[int] = set()
         self._ticket_cache_ready = False
@@ -473,10 +476,10 @@ class HelpCog(commands.Cog):
     def cog_unload(self) -> None:
         if self._ticket_scan_task and not self._ticket_scan_task.done():
             self._ticket_scan_task.cancel()
+        if self._satisfaction_restore_task and not self._satisfaction_restore_task.done():
+            self._satisfaction_restore_task.cancel()
 
     async def start_background(self):
-        if self._started and self._ticket_scan_task and not self._ticket_scan_task.done():
-            return
         try:
             await self._reconcile_missing_ticket_channels()
         except Exception as e:
@@ -485,14 +488,53 @@ class HelpCog(commands.Cog):
             await self._load_active_ticket_channels()
         except Exception as e:
             await self._log_background_error("ticket_startup_cache", f"Active ticket cache load failed: {repr(e)}")
-        try:
-            await self._restore_ticket_satisfaction_views()
-        except Exception as e:
-            # Feedback restoration is useful, but it must never prevent the
-            # inactivity scanner and ticket status updates from starting.
-            await self._log_background_error("ticket_satisfaction_restore", f"Ticket feedback view restore failed: {repr(e)}")
-        self._ticket_scan_task = asyncio.create_task(self._ticket_scan_loop())
+        if self._ticket_scan_task is None or self._ticket_scan_task.done():
+            self._ticket_scan_task = asyncio.create_task(
+                self._ticket_scan_loop(),
+                name="avenue-guard:ticket-scan",
+            )
+        if (
+            not self._satisfaction_views_registered
+            and (
+                self._satisfaction_restore_task is None
+                or self._satisfaction_restore_task.done()
+            )
+        ):
+            self._satisfaction_restore_task = asyncio.create_task(
+                self._ticket_satisfaction_restore_loop(),
+                name="avenue-guard:ticket-feedback-restore",
+            )
         self._started = True
+
+    async def _ticket_satisfaction_restore_loop(self) -> None:
+        attempts = 0
+        while not self._satisfaction_views_registered and not self.bot.is_closed():
+            try:
+                await self._restore_ticket_satisfaction_views()
+                return
+            except asyncio.CancelledError:
+                raise
+            except DatabaseBusyError:
+                # A live writer owns the database. This maintenance work was not
+                # started, so waiting and retrying is both safe and expected.
+                pass
+            except DatabaseWorkerError as e:
+                attempts += 1
+                if attempts >= 3:
+                    await self._log_background_error(
+                        "ticket_satisfaction_restore_worker",
+                        f"Ticket feedback restoration is still waiting for Turso recovery: {e!r}",
+                    )
+            except Exception as e:
+                attempts += 1
+                await self._log_background_error(
+                    "ticket_satisfaction_restore",
+                    f"Ticket feedback restoration deferred: {e!r}",
+                )
+            await asyncio.sleep(min(300, 5 * (2 ** min(attempts, 5))))
+
+    def _ticket_feedback_restore_expected(self) -> bool:
+        return not self._satisfaction_views_registered
 
     def on_config_reload(self) -> None:
         pass

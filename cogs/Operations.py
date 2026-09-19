@@ -161,6 +161,7 @@ class OperationsCog(commands.Cog):
             ("tracking.flush", "TrackingCog", "_activity_flush_task"),
             ("tracking.recap", "TrackingCog", "_recap_task"),
             ("help.ticket_scan", "HelpCog", "_ticket_scan_task"),
+            ("help.feedback_restore", "HelpCog", "_satisfaction_restore_task"),
             ("requests.auto_close", "RequestLevelsCog", "_close_task"),
             ("requests.scheduled", "RequestLevelsCog", "_scheduled_open_task"),
             ("priority.maintenance", "PrioritySystemCog", "_maintenance_task"),
@@ -175,6 +176,7 @@ class OperationsCog(commands.Cog):
 
     def _task_expected(self, label: str, cog: Any) -> bool:
         checks = {
+            "help.feedback_restore": "_ticket_feedback_restore_expected",
             "background.daily": "_daily_summary_enabled",
             "background.backup": "_database_backup_enabled",
             "background.status": "_status_rotation_enabled",

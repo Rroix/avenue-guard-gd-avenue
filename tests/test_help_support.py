@@ -13,7 +13,7 @@ from cogs.Help import (
     HelpCog,
     HelpSessionControlView,
 )
-from utils.db import Database
+from utils.db import Database, DatabaseBusyError
 from utils.views import FormerMemberHelpView, HelpMenuView
 
 
@@ -67,12 +67,32 @@ def make_cog(db=None):
         get_user=lambda _user_id: None,
         users=[],
         user=SimpleNamespace(id=1454985687177887866),
+        is_closed=lambda: False,
     )
     cog._last_error_log = {}
     cog._active_ticket_channels = set()
     cog._satisfaction_lock = asyncio.Lock()
     cog._satisfaction_views_registered = False
     return cog
+
+
+@pytest.mark.asyncio
+async def test_ticket_feedback_restore_retries_busy_database_without_error_incident(
+    monkeypatch,
+):
+    cog = make_cog()
+    cog._restore_ticket_satisfaction_views = AsyncMock(
+        side_effect=[DatabaseBusyError("writer occupied"), None]
+    )
+    cog._log_background_error = AsyncMock()
+    sleep = AsyncMock()
+    monkeypatch.setattr(help_module.asyncio, "sleep", sleep)
+
+    await cog._ticket_satisfaction_restore_loop()
+
+    assert cog._restore_ticket_satisfaction_views.await_count == 2
+    cog._log_background_error.assert_not_awaited()
+    sleep.assert_awaited_once()
 
 
 @pytest.mark.asyncio

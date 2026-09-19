@@ -6,6 +6,7 @@ import pytest
 
 import utils.db as db_module
 from utils.db import Database
+from utils.libsql_worker import DatabaseWorkerTimeout
 
 
 @pytest.mark.asyncio
@@ -470,6 +471,108 @@ async def test_startup_repair_skips_float_bucket_with_two_real_discord_ids(tmp_p
 
     assert result["ambiguous"] >= 1
     assert int(row["creator_id"]) == rounded_user_id
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_snowflake_repair_is_resumable_after_unknown_batch_completion(tmp_path):
+    db = Database(str(tmp_path / "uncertain-snowflake-repair.db"))
+    await db.connect()
+    guild_id = 717003826288394271
+    user_id = 1115678273079349288
+    rounded_guild = int(float(guild_id))
+    rounded_user = int(float(user_id))
+    await db.execute(
+        "INSERT INTO tickets("
+        "guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,"
+        "ticket_id,closed_ts,satisfaction_delivery_status,satisfaction_delivery_error"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (
+            rounded_guild,
+            999,
+            rounded_user,
+            1,
+            1,
+            "closed",
+            9,
+            2,
+            "recipient_unavailable",
+            "legacy rounded identity",
+        ),
+    )
+    db.uses_remote = True
+    original = db._run_locked_with_retry
+    lost_confirmation = False
+
+    async def uncertain(operation, **kwargs):
+        nonlocal lost_confirmation
+        result = await original(operation, **kwargs)
+        if kwargs.get("operation_name") == "snowflake_repair" and not lost_confirmation:
+            lost_confirmation = True
+            raise DatabaseWorkerTimeout(
+                "Turso worker timed out; operation completion is unknown"
+            )
+        return result
+
+    db._run_locked_with_retry = uncertain
+    with pytest.raises(DatabaseWorkerTimeout, match="completion is unknown"):
+        await db.repair_legacy_snowflake_precision(
+            guild_ids=(guild_id,),
+            user_ids=(user_id,),
+        )
+
+    db._run_locked_with_retry = original
+    resumed = await db.repair_legacy_snowflake_precision(
+        guild_ids=(guild_id,),
+        user_ids=(user_id,),
+    )
+    row = await db.fetchone(
+        "SELECT guild_id,creator_id,satisfaction_delivery_status "
+        "FROM tickets WHERE ticket_id=9"
+    )
+
+    assert resumed["updated"] == 0
+    assert int(row["guild_id"]) == guild_id
+    assert int(row["creator_id"]) == user_id
+    assert row["satisfaction_delivery_status"] == "pending"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_snowflake_repair_splits_large_plan_into_bounded_writer_batches(tmp_path):
+    db = Database(str(tmp_path / "batched-snowflake-repair.db"))
+    await db.connect()
+    guild_id = 717003826288394271
+    exact_users = [1115678273079349001 + index * 512 for index in range(13)]
+    for index, user_id in enumerate(exact_users):
+        await db.execute(
+            "INSERT INTO help_cooldowns(guild_id,user_id,action,last_used_ts) "
+            "VALUES(?,?,?,?)",
+            (int(float(guild_id)), int(float(user_id)), f"action-{index}", 1),
+        )
+    db.uses_remote = True
+    original = db._run_locked_with_retry
+    repair_batches = 0
+
+    async def count_batches(operation, **kwargs):
+        nonlocal repair_batches
+        if kwargs.get("operation_name") == "snowflake_repair":
+            repair_batches += 1
+        return await original(operation, **kwargs)
+
+    db._run_locked_with_retry = count_batches
+    result = await db.repair_legacy_snowflake_precision(
+        guild_ids=(guild_id,),
+        user_ids=tuple(exact_users),
+    )
+    rows = await db.fetchall(
+        "SELECT guild_id,user_id FROM help_cooldowns ORDER BY action"
+    )
+
+    assert repair_batches == 2
+    assert result["updated"] == 26
+    assert {int(row["guild_id"]) for row in rows} == {guild_id}
+    assert {int(row["user_id"]) for row in rows} == set(exact_users)
     await db.close()
 
 

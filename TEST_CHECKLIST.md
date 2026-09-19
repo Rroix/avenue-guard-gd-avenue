@@ -806,3 +806,19 @@
    - Expected: `Open public outcome` points to the outbox receipt's public channel and delivered message ID.
 4. Validate a level while GDHistory succeeds and Boomlings/GDRate+ are unavailable.
    - Expected: the request card shows `gdhistory: found` without backup-provider errors; owner health diagnostics still retain each provider failure and HTTP status.
+
+---
+
+## 34) Turso maintenance recovery
+1. Hold the Turso writer while ticket feedback views begin restoring after startup.
+   - Expected: the bot reaches online state, no busy-error incident is created, and feedback restoration retries after the writer is released.
+2. Seed rounded historical Discord IDs across more than one repair batch and restart.
+   - Expected: read-only planning does not occupy the writer; repair batches contain at most 12 targets and release the writer between batches.
+3. Simulate a worker timeout immediately after one repair batch commits.
+   - Expected: the next attempt is idempotent, does not duplicate data, and resumes from IDs that still contain rounded values.
+4. Restart after a successful repair.
+   - Expected: the durable maintenance marker skips the historical scan; compatibility lookups remain available for unresolved conflicts.
+5. Inspect Operations while feedback restoration is pending and after it completes.
+   - Expected: `help.feedback_restore` is running while needed and becomes disabled after persistent views are registered.
+6. Trigger an error while the writer is occupied.
+   - Expected: incident persistence defers after a short queue wait under `errors.persist` instead of delaying live database work.
