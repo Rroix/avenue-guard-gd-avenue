@@ -199,6 +199,11 @@ def _legacy_where_params(sql: str, params: Sequence[Any]) -> Optional[tuple[Any,
 
 
 _USER_SNOWFLAKE_COLUMNS = {
+    "actor_id",
+    "applicant_id",
+    "assignee_id",
+    "author_id",
+    "claimed_by",
     "created_by",
     "creator_id",
     "decided_by",
@@ -206,8 +211,11 @@ _USER_SNOWFLAKE_COLUMNS = {
     "handled_by",
     "requested_by",
     "requester_id",
+    "released_by",
     "responded_by",
     "reviewed_by",
+    "started_by",
+    "updated_by",
     "satisfaction_user_id",
     "uploaded_by",
     "user_id",
@@ -244,6 +252,15 @@ _SNOWFLAKE_REPAIR_TABLES = {
     "level_request_wave_summaries",
     "rps_streaks",
     "sticky_state",
+    "staff_application_events",
+    "staff_application_notes",
+    "staff_applications",
+    "staff_members",
+    "staff_notes",
+    "staff_queue_claim_events",
+    "staff_queue_claims",
+    "staff_tasks",
+    "staff_web_sessions",
     "ticket_cooldowns",
     "ticket_sequences",
     "ticket_transcripts",
@@ -831,11 +848,14 @@ class Database:
             raise RuntimeError("Database schema is newer than this bot; deploy matching code instead of downgrading it")
         from utils.historical_audit_schema import AUDIT_SCHEMA, AUDIT_TABLES
         from utils.priority_system_schema import PRIORITY_SCHEMA, PRIORITY_TABLES
+        from utils.staff_portal_schema import STAFF_PORTAL_SCHEMA, STAFF_PORTAL_TABLES
 
         if versions in (
             {**expected, "database": 5},
             {**expected, "database": 6},
             {**expected, "database": 7},
+            {**expected, "database": 8},
+            {**expected, "database": 9},
         ):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -863,6 +883,13 @@ class Database:
                 )
                 for stmt in PRIORITY_SCHEMA:
                     self._conn.execute(stmt)
+                self._ensure_column_sync("level_outreach_attempts", "episode_id", "INTEGER")
+                self._ensure_column_sync(
+                    "level_outreach_attempts", "private_target_key", "TEXT NOT NULL DEFAULT ''"
+                )
+                self._ensure_column_sync("level_outreach_attempts", "event_ts", "INTEGER")
+                for stmt in STAFF_PORTAL_SCHEMA:
+                    self._conn.execute(stmt)
                 self._execute_sync("UPDATE schema_metadata SET schema_version=?,updated_ts=? WHERE component='database'", (DATABASE_SCHEMA_VERSION, int(time.time())))
                 self._commit_and_sync_sync()
             except Exception:
@@ -871,7 +898,7 @@ class Database:
             versions["database"] = DATABASE_SCHEMA_VERSION
         if versions == expected:
             tables = {row[0] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if AUDIT_TABLES | PRIORITY_TABLES | {"tickets", "ticket_transcripts", "activity_counts", "activity_flush_batches", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
+            if AUDIT_TABLES | PRIORITY_TABLES | STAFF_PORTAL_TABLES | {"tickets", "ticket_transcripts", "activity_counts", "activity_flush_batches", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
                 return
         stmts = [
             """CREATE TABLE IF NOT EXISTS activity_counts(
@@ -1552,6 +1579,13 @@ class Database:
         for stmt in AUDIT_SCHEMA:
             self._conn.execute(stmt)
         for stmt in PRIORITY_SCHEMA:
+            self._conn.execute(stmt)
+        self._ensure_column_sync("level_outreach_attempts", "episode_id", "INTEGER")
+        self._ensure_column_sync(
+            "level_outreach_attempts", "private_target_key", "TEXT NOT NULL DEFAULT ''"
+        )
+        self._ensure_column_sync("level_outreach_attempts", "event_ts", "INTEGER")
+        for stmt in STAFF_PORTAL_SCHEMA:
             self._conn.execute(stmt)
         for stmt in index_stmts:
             self._conn.execute(stmt)

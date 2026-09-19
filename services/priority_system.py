@@ -14,6 +14,7 @@ from utils.priority_system import (
     PPS_QUEUE_REFRESH_STATES,
     PPS_ROUTE_TYPES,
     PPS_V1_REVIEW_SYSTEM,
+    normalize_outreach_target,
     normalize_send_type,
     priority_settings,
     score_components,
@@ -228,6 +229,8 @@ class PrioritySystemService:
         notes: str = "",
         target_label: str = "",
         idempotency_key: str,
+        episode_id: int | None = None,
+        event_ts: int | None = None,
     ):
         status = str(status or "").casefold()
         route_type = str(route_type or "").casefold()
@@ -235,6 +238,11 @@ class PrioritySystemService:
             raise ValueError("Unknown outreach attempt status")
         if route_type not in PPS_ROUTE_TYPES:
             raise ValueError("Unknown outreach route")
+        normalized_target = normalize_outreach_target(target_label)
+        normalized_episode_id = int(episode_id or 0) or None
+        recorded_ts = int(event_ts or time.time())
+        if recorded_ts < 1 or recorded_ts > int(time.time()) + 300:
+            raise ValueError("Outreach timestamp is invalid")
         attempt_key = str(idempotency_key)
         existing = await self.db.fetchone(
             "SELECT a.* FROM level_outreach_attempts a "
@@ -251,6 +259,11 @@ class PrioritySystemService:
             ):
                 return existing
             raise ValueError("That outreach interaction was already used for another action")
+        if (
+            status == "follow_up"
+            or (status == "submitted_to_mod" and normalized_episode_id is not None)
+        ) and not normalized_target:
+            raise ValueError("Confirmed submissions and follow-ups require a private target")
         cycle = await self.db.fetchone(
             "SELECT * FROM level_outreach_cycles WHERE id=? AND guild_id=?",
             (cycle_id, guild_id),
@@ -265,8 +278,23 @@ class PrioritySystemService:
         )
         if not member:
             raise ValueError("That queue entry was not eligible when this cycle started")
-        if str(member["queue_state"]) != "in_cycle":
+        allowed_states = (
+            {"in_cycle", "awaiting_outcome"}
+            if status in {"submitted_to_mod", "follow_up"}
+            else {"in_cycle"}
+        )
+        if str(member["queue_state"]) not in allowed_states:
             raise ValueError("That queue entry is no longer eligible in this cycle")
+        if status in {"submitted_to_mod", "follow_up"} and normalized_episode_id:
+            prior_submission = await self.db.fetchone(
+                "SELECT id FROM level_outreach_attempts WHERE episode_id=? AND queue_id=? "
+                "AND private_target_key=? AND status='submitted_to_mod' LIMIT 1",
+                (normalized_episode_id, queue_id, normalized_target),
+            )
+            if status == "follow_up" and prior_submission is None:
+                raise ValueError("A follow-up needs an earlier confirmed submission to the same target")
+            if status == "submitted_to_mod" and prior_submission is not None:
+                raise ValueError("This target already has a confirmed submission; record a follow-up instead")
         now = int(time.time())
         correlation = str(cycle["correlation_id"] or new_correlation_id("pps-outreach"))
         attempt_guard = (
@@ -277,7 +305,8 @@ class PrioritySystemService:
         statements: list[tuple[str, tuple[Any, ...]]] = [
             (
                 "INSERT OR IGNORE INTO level_outreach_attempts(cycle_id,queue_id,actor_id,status,route_type,"
-                "private_notes,private_target_label,created_ts,correlation_id,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "private_notes,private_target_label,created_ts,correlation_id,idempotency_key,episode_id,"
+                "private_target_key,event_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     cycle_id,
                     queue_id,
@@ -289,6 +318,9 @@ class PrioritySystemService:
                     now,
                     correlation,
                     attempt_key,
+                    normalized_episode_id,
+                    normalized_target,
+                    recorded_ts,
                 ),
             ),
             (
@@ -308,7 +340,7 @@ class PrioritySystemService:
                     ),
                     (
                         "UPDATE level_outreach_queue SET queue_state='awaiting_outcome',submitted_to_mod_ts=COALESCE(submitted_to_mod_ts,?),"
-                        "outcome_window_due_ts=COALESCE(outcome_window_due_ts,?),updated_ts=? WHERE id=? AND queue_state IN('queued','in_cycle') "
+                        "outcome_window_due_ts=COALESCE(outcome_window_due_ts,?),updated_ts=? WHERE id=? AND queue_state IN('queued','in_cycle','awaiting_outcome') "
                         f"AND EXISTS({attempt_guard})",  # nosec B608
                         (now, due_ts, now, queue_id, *attempt_guard_params),
                     ),
@@ -326,7 +358,14 @@ class PrioritySystemService:
                     status,
                     guild_id,
                     actor_id,
-                    json.dumps({"cycle_id": cycle_id, "queue_id": queue_id, "route_type": route_type}),
+                    json.dumps(
+                        {
+                            "cycle_id": cycle_id,
+                            "queue_id": queue_id,
+                            "route_type": route_type,
+                            "episode_id": normalized_episode_id,
+                        }
+                    ),
                     now,
                     *attempt_guard_params,
                     correlation,

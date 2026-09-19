@@ -7,7 +7,7 @@ from typing import Any
 CONFIG_SCHEMA_VERSION = 2
 RUNTIME_SCHEMA_VERSION = 2
 EMBED_SCHEMA_VERSION = 2
-DATABASE_SCHEMA_VERSION = 8
+DATABASE_SCHEMA_VERSION = 10
 
 
 @dataclass(frozen=True)
@@ -402,6 +402,33 @@ def validate_config(data: Any) -> list[ConfigIssue]:
                             "must be an integer from 1 to 3650",
                         )
                     )
+    staff_portal = data.get("staff_portal", {})
+    if staff_portal and not isinstance(staff_portal, dict):
+        issues.append(ConfigIssue("staff_portal", "must be a JSON object"))
+    elif isinstance(staff_portal, dict):
+        for key in (
+            "judge_role_ids",
+            "head_judge_role_ids",
+            "owner_role_ids",
+            "owner_user_ids",
+        ):
+            value = staff_portal.get(key, [])
+            if not isinstance(value, list) or any(
+                isinstance(item, bool) or not str(item).isascii() or not str(item).isdecimal()
+                for item in value
+            ):
+                issues.append(ConfigIssue(f"staff_portal.{key}", "must be a list of Discord IDs"))
+        session_hours = staff_portal.get("session_ttl_hours", 8)
+        if isinstance(session_hours, bool) or not isinstance(session_hours, int) or not 1 <= session_hours <= 168:
+            issues.append(ConfigIssue("staff_portal.session_ttl_hours", "must be an integer from 1 to 168"))
+        stale_hours = staff_portal.get("claim_stale_hours", 48)
+        if isinstance(stale_hours, bool) or not isinstance(stale_hours, int) or not 1 <= stale_hours <= 720:
+            issues.append(ConfigIssue("staff_portal.claim_stale_hours", "must be an integer from 1 to 720"))
+        origins = staff_portal.get("allowed_origins", [])
+        if not isinstance(origins, list) or any(
+            not str(origin).startswith("https://") for origin in origins
+        ):
+            issues.append(ConfigIssue("staff_portal.allowed_origins", "must contain HTTPS origins"))
     from utils.historical_audit import audit_settings
     from utils.priority_system import priority_settings
     try:

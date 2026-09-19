@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 try:
     from aiohttp import web
-except Exception:
+except ImportError:
     web = None
 
 _thread_started = False
@@ -39,6 +40,16 @@ _public_releases: list[dict] = []
 _public_levels: dict[str, dict] = {}
 _runtime_heartbeat = 0.0
 _runtime_health: dict = {}
+_staff_api_service = None
+_staff_api_loop = None
+
+
+def configure_staff_api(service, loop) -> None:
+    """Attach the private portal service to the already-running health server."""
+    global _staff_api_service, _staff_api_loop
+    with _status_lock:
+        _staff_api_service = service
+        _staff_api_loop = loop
 
 
 def set_runtime_heartbeat(*, lag_ms: float, tasks: dict, database: dict, incidents: list) -> None:
@@ -265,6 +276,46 @@ def get_public_level_payload(level_id: str) -> dict | None:
         return dict(payload) if payload else None
 
 
+def get_public_levels_payload(query: str = "", *, limit: int = 25) -> dict:
+    """Search only the public recommendation cache; private requests never enter it."""
+    term = str(query or "").strip().casefold()[:100]
+    bounded_limit = max(1, min(50, int(limit or 25)))
+    with _status_lock:
+        levels = [dict(value) for value in _public_levels.values()]
+    if term:
+        def rank(item: dict) -> tuple[int, int, str]:
+            level_id = str(item.get("level_id") or "").casefold()
+            name = str(item.get("level_name") or "").casefold()
+            creator = str(item.get("uploader_name") or "").casefold()
+            if level_id == term:
+                score = 0
+            elif name == term or creator == term:
+                score = 1
+            elif level_id.startswith(term) or name.startswith(term) or creator.startswith(term):
+                score = 2
+            elif term in name or term in creator:
+                score = 3
+            else:
+                score = 99
+            return score, -int(item.get("recommended_at") or 0), level_id
+
+        levels = [item for item in levels if rank(item)[0] < 99]
+        levels.sort(key=rank)
+    else:
+        levels.sort(
+            key=lambda item: (
+                -int(item.get("recommended_at") or 0),
+                str(item.get("level_id") or ""),
+            )
+        )
+    return {
+        "schema_version": 1,
+        "query": str(query or "").strip()[:100],
+        "count": min(len(levels), bounded_limit),
+        "levels": levels[:bounded_limit],
+    }
+
+
 def _public_state_label(state: str) -> str:
     labels = {
         "online": "Operational",
@@ -350,7 +401,8 @@ def get_public_releases_payload() -> dict:
 
 
 def _response_for_path(raw_path: str) -> tuple[bytes, str, str, bool]:
-    path = urlsplit(str(raw_path or "/")).path.rstrip("/") or "/"
+    parsed = urlsplit(str(raw_path or "/"))
+    path = parsed.path.rstrip("/") or "/"
     if path == "/api/bot":
         body = json.dumps(
             get_public_bot_payload(),
@@ -361,6 +413,12 @@ def _response_for_path(raw_path: str) -> tuple[bytes, str, str, bool]:
         body = json.dumps(
             get_public_releases_payload(),
             separators=(",", ":"),
+        ).encode("utf-8")
+        return body, "application/json; charset=utf-8", "public, max-age=30", True
+    if path == "/api/levels":
+        query = parse_qs(parsed.query).get("q", [""])[-1]
+        body = json.dumps(
+            get_public_levels_payload(query), separators=(",", ":")
         ).encode("utf-8")
         return body, "application/json; charset=utf-8", "public, max-age=30", True
     level_prefix = next(
@@ -386,7 +444,7 @@ def _response_for_path(raw_path: str) -> tuple[bytes, str, str, bool]:
             f"OK\n"
             f"state={status.get('state', 'unknown')}\n"
             f"detail={status.get('detail', '')}\n"
-        ).encode("utf-8")
+        ).encode()
         content_type = "text/plain; charset=utf-8"
     return body, content_type, "no-store", False
 
@@ -420,6 +478,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
+        if self._is_staff_api():
+            self._staff_response("GET")
+            return
         body, content_type, cache_control, public_api = self._health_response()
         self._send_health_headers(body, content_type, cache_control, public_api)
         try:
@@ -431,6 +492,82 @@ class _HealthHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         body, content_type, cache_control, public_api = self._health_response()
         self._send_health_headers(body, content_type, cache_control, public_api)
+
+    def do_POST(self) -> None:
+        self._staff_response("POST")
+
+    def do_PATCH(self) -> None:
+        self._staff_response("PATCH")
+
+    def do_DELETE(self) -> None:
+        self._staff_response("DELETE")
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Allow", "GET,HEAD,POST,PATCH,DELETE,OPTIONS")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _is_staff_api(self) -> bool:
+        path = urlsplit(self.path).path
+        return path.startswith(("/api/staff", "/api/apply"))
+
+    def _staff_response(self, method: str) -> None:
+        if not self._is_staff_api():
+            self._send_json(404, {"error": "not_found", "message": "Resource not found"})
+            return
+        with _status_lock:
+            service = _staff_api_service
+            loop = _staff_api_loop
+        if service is None or loop is None or loop.is_closed():
+            self._send_json(
+                503,
+                {"error": "portal_starting", "message": "The staff portal is still starting"},
+            )
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > 1_048_576:
+            self._send_json(413, {"error": "body_too_large", "message": "Request body is too large"})
+            return
+        body = self.rfile.read(length) if length else b""
+        headers = {str(key).casefold(): str(value) for key, value in self.headers.items()}
+        future = asyncio.run_coroutine_threadsafe(
+            service.handle_request(method, self.path, headers, body), loop
+        )
+        try:
+            status, payload = future.result(timeout=28)
+        except TimeoutError:
+            future.cancel()
+            self._send_json(504, {"error": "portal_timeout", "message": "The portal took too long to respond"})
+            return
+        except Exception as exc:  # noqa: BLE001 - bridge futures can surface any service failure.
+            cause = exc.__cause__ or exc
+            status = int(getattr(cause, "status", 500) or 500)
+            if isinstance(cause, PermissionError):
+                status = 403
+            code = str(getattr(cause, "code", "forbidden" if status == 403 else "portal_error"))
+            message = str(getattr(cause, "message", "You do not have access" if status == 403 else "The portal could not complete this request"))
+            self._send_json(status, {"error": code, "message": message})
+            return
+        self._send_json(status, payload)
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
+        self.send_response(int(status))
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def log_message(self, format: str, *args) -> None:
         return
@@ -458,7 +595,33 @@ def start_keepalive_thread() -> None:
 
 
 async def _handle(request: web.Request) -> web.Response:
-    body, content_type, cache_control, public_api = _response_for_path(request.path)
+    if request.path.startswith(("/api/staff", "/api/apply")):
+        with _status_lock:
+            service = _staff_api_service
+        if service is None:
+            return web.json_response(
+                {"error": "portal_starting", "message": "The staff portal is still starting"},
+                status=503,
+            )
+        try:
+            status, payload = await service.handle_request(
+                request.method,
+                str(request.rel_url),
+                {str(key).casefold(): str(value) for key, value in request.headers.items()},
+                await request.read(),
+            )
+        except PermissionError:
+            return web.json_response({"error": "forbidden", "message": "You do not have access"}, status=403)
+        except Exception as exc:  # noqa: BLE001 - translate service failures into private API errors.
+            return web.json_response(
+                {
+                    "error": str(getattr(exc, "code", "portal_error")),
+                    "message": str(getattr(exc, "message", "The portal could not complete this request")),
+                },
+                status=int(getattr(exc, "status", 500) or 500),
+            )
+        return web.json_response(payload, status=status, headers={"Cache-Control": "no-store"})
+    body, content_type, cache_control, public_api = _response_for_path(str(request.rel_url))
     headers = {
         "Cache-Control": cache_control,
         "X-Content-Type-Options": "nosniff",
@@ -494,8 +657,11 @@ async def start_keepalive() -> None:
     app.router.add_route("*", "/ready", _handle)
     app.router.add_route("*", "/api/bot", _handle)
     app.router.add_route("*", "/api/releases", _handle)
+    app.router.add_route("*", "/api/levels", _handle)
     app.router.add_route("*", "/api/level/{level_id}", _handle)
     app.router.add_route("*", "/api/levels/{level_id}", _handle)
+    app.router.add_route("*", "/api/staff/{tail:.*}", _handle)
+    app.router.add_route("*", "/api/apply/{tail:.*}", _handle)
     runner = web.AppRunner(app)
     await runner.setup()
 

@@ -101,6 +101,64 @@ def test_legacy_buttons_keep_custom_ids_callbacks_and_persistence():
     asyncio.run(run())
 
 
+def test_explicit_legacy_rows_are_normalized_for_v2_action_rows():
+    class MultiRowControls(discord.ui.View):
+        @discord.ui.button(label="First", custom_id="first", row=0)
+        async def first(self, button, interaction):
+            return None
+
+        @discord.ui.button(label="Second", custom_id="second", row=1)
+        async def second(self, button, interaction):
+            return None
+
+    async def run():
+        legacy = MultiRowControls()
+        callbacks = [item.callback for item in legacy.children]
+        view = build_components_v2(
+            [discord.Embed(title="Multi-row controls")],
+            view=legacy,
+        )
+        payload = _payload(view)
+        action_rows = [
+            item for item in _walk_payload(payload) if item.get("type") == 1
+        ]
+        assert len(action_rows) == 2
+        assert [
+            row["components"][0]["custom_id"] for row in action_rows
+        ] == ["first", "second"]
+        assert [item.callback for item in legacy.children] == callbacks
+        assert all(item.row is None for item in legacy.children)
+
+    asyncio.run(run())
+
+
+def test_help_ticket_topic_view_converts_with_all_controls():
+    from cogs.Help import HelpTicketTopicView
+
+    async def run():
+        legacy = HelpTicketTopicView(object(), user_id=1, guild_id=2)
+        view = build_components_v2(
+            [discord.Embed(title="Contact Staff")],
+            view=legacy,
+        )
+        payload = _payload(view)
+        buttons = [item for item in _walk_payload(payload) if item.get("type") == 2]
+        assert [item["label"] for item in buttons] == [
+            "Moderation",
+            "Level requests",
+            "Server help",
+            "Back",
+            "Start over",
+            "Other",
+            "Cancel",
+        ]
+        assert len(
+            [item for item in _walk_payload(payload) if item.get("type") == 1]
+        ) == 2
+
+    asyncio.run(run())
+
+
 def test_call_adapter_removes_classic_content_and_embed_fields():
     async def run():
         embed = discord.Embed(title="Modern")

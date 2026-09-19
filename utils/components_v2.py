@@ -130,6 +130,14 @@ def _legacy_action_rows(view: discord.ui.View | None) -> list[discord.ui.ActionR
     for row_number in sorted(grouped):
         items = grouped[row_number]
         if items:
+            # ``row`` is a legacy View layout hint. Pycord rejects controls with
+            # that hint when the same objects are adopted by an explicit V2
+            # ActionRow, so preserve the resolved grouping above and normalize
+            # the controls before transferring them. Their callbacks, custom IDs,
+            # disabled state, and other interaction data remain on the objects.
+            for item in items:
+                if hasattr(item, "row"):
+                    item.row = None
             rows.append(discord.ui.ActionRow(*items))
     return rows
 

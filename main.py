@@ -11,7 +11,13 @@ import discord
 from utils.components_v2 import install_components_v2_adapter
 from utils.config import Config
 from utils.db import Database, DatabaseBusyError
-from utils.keepalive import get_keepalive_status, set_keepalive_status, start_keepalive, start_keepalive_thread
+from utils.keepalive import (
+    configure_staff_api,
+    get_keepalive_status,
+    set_keepalive_status,
+    start_keepalive,
+    start_keepalive_thread,
+)
 from utils.libsql_worker import DatabaseWorkerError
 from utils.errors import setup_global_error_handlers, log_error
 from utils.views import (
@@ -534,6 +540,14 @@ def create_bot() -> discord.Bot:
                     return
 
             bot._legacy_snowflake_repair_guild = g
+
+        # The keepalive server runs in a native thread. Its private portal bridge
+        # schedules every operation back onto this Discord loop so all Turso work
+        # continues through the established Database wrapper.
+        from services.staff_portal import StaffPortalService
+
+        bot.staff_portal = StaffPortalService(bot)
+        configure_staff_api(bot.staff_portal, asyncio.get_running_loop())
 
         # Start keepalive server
         try:

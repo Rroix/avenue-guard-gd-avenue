@@ -96,6 +96,12 @@ The private `/pps` command group lets the configured owner inspect the ranked qu
 
 Recommended levels also have a privacy-filtered public page at `gdavenue.netlify.app/level/[level-id]`. The public API separates recommendation, outreach and outcome state, converts private rank into Top/High/Standard/Lower bands, and never exposes exact position, score components, CP, requester/reviewer data or private outreach evidence. Relative times, creator metadata when reliably resolved, and the public progress timeline are presentation-only; they do not modify PPS ordering or state transitions.
 
+### Staff Portal
+
+The role-aware Staff Portal at `gdavenue.netlify.app/staff` is the preferred interface for internal queue, claim, outreach, task, note, QA, application, staff-access, and operations work. It uses Discord OAuth through Netlify Functions, then asks Avenue Guard to resolve current guild roles and capabilities on every request. Browsers never connect to Turso or receive the private service key. Existing `/pps` commands remain available as the Discord recovery interface and use the same durable state.
+
+The public `/levels` search reads only the privacy-filtered recommendation cache. Exact rank, PPS components, Creator Points, requester/reviewer identity, private targets, notes, QA, applications, and audit records remain private. Architecture, endpoints, capability mapping, secrets, deployment order, and smoke tests are documented in [the Staff Portal guide](docs/STAFF_PORTAL.md).
+
 ### Help Menu And Staff Tickets
 - DMs members a compact help dashboard with active tickets, weekly activity, recent support, and their current-wave level request when one exists.
 - Shows the user's current level as pending, accepted, rejected, or rejected for a specific reason, with a direct link to the review message.
@@ -401,6 +407,7 @@ pip install -r requirements.txt
 
 ```bash
 export DISCORD_TOKEN="your-token"
+export STAFF_API_TOKEN="a-separate-long-random-service-secret"
 ```
 
 Because this repository has a Turso URL configured, production refuses to silently fall back to disposable storage when `TURSO_AUTH_TOKEN` is missing. For intentional local-only development, opt in explicitly:

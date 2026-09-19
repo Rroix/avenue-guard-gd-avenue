@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
 from typing import Any
 
 
@@ -18,7 +19,13 @@ PPS_SEND_TYPE_LABELS = {
 PPS_QUEUE_ACTIVE_STATES = ("queued", "in_cycle")
 PPS_QUEUE_REFRESH_STATES = (*PPS_QUEUE_ACTIVE_STATES, "awaiting_outcome")
 PPS_ROUTE_TYPES = ("direct", "network", "stream", "event", "other")
-PPS_ATTEMPT_STATUSES = ("planned", "attempted", "submitted_to_mod", "failed")
+PPS_ATTEMPT_STATUSES = (
+    "planned",
+    "attempted",
+    "submitted_to_mod",
+    "follow_up",
+    "failed",
+)
 PUBLIC_PRIORITY_BAND_THRESHOLDS = (
     (0.10, "top_priority"),
     (0.30, "high_priority"),
@@ -33,6 +40,13 @@ PUBLIC_QUEUE_STATES = {
     "withdrawn",
     "invalid",
 }
+
+
+def normalize_outreach_target(value: Any) -> str:
+    """Create a private comparison key without exposing or guessing identity."""
+    text = str(value or "").strip().casefold()
+    text = re.sub(r"^@+", "", text)
+    return re.sub(r"[^a-z0-9]+", "", text)[:160]
 
 
 @dataclass(frozen=True)

@@ -40,6 +40,28 @@
     "_comment": "Permission policy toggles.",
     "manage_guild_counts_as_mod": true
   },
+  "staff_portal": {
+    "_comment": "Role-aware web operations portal. Secrets remain environment variables, never config.json.",
+    "enabled": true,
+    "judge_role_ids": [
+      "785212232786640966"
+    ],
+    "head_judge_role_ids": [
+      "1430214323720163498"
+    ],
+    "owner_role_ids": [],
+    "owner_user_ids": [
+      "1102884420207255653"
+    ],
+    "session_ttl_hours": 8,
+    "claim_stale_hours": 48,
+    "application_types": [
+      "judge"
+    ],
+    "allowed_origins": [
+      "https://gdavenue.netlify.app"
+    ]
+  },
   "review_access": {
     "_comment": "Users must send this phrase in channels.review_access_channel_id to receive roles.review_access_role_id. Matching is case-insensitive and allows one character of variation after cleanup.",
     "agreement_phrase": "I have read and understood the review access conditions"

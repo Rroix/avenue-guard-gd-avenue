@@ -822,3 +822,35 @@
    - Expected: `help.feedback_restore` is running while needed and becomes disabled after persistent views are registered.
 6. Trigger an error while the writer is occupied.
    - Expected: incident persistence defers after a short queue wait under `errors.persist` instead of delaying live database work.
+
+---
+
+## 35) Staff Portal V1
+1. Complete Discord OAuth from `/staff`.
+   - Expected: the browser receives no Discord token, Turso credential, or private API key.
+2. Sign in as an ordinary member, Judge, Head Judge, and owner.
+   - Expected: members can use `/apply`; staff modules and actions follow the capability map; Admin is owner-only.
+3. Remove a Judge role while their browser is open, then refresh a portal view.
+   - Expected: the next API request loses staff access because Discord roles are resolved again.
+4. Race two claims for the same queue entry.
+   - Expected: exactly one active owner remains; own release works; Head release of another person's claim requires it to be stale.
+5. Record an attempt, confirmed submission, same-target follow-up, and different-target submission.
+   - Expected: the follow-up does not count as another confirmed submission; a duplicate same-target submission is denied; retries remain idempotent.
+6. Requeue an eligible entry.
+   - Expected: old evidence remains, a new episode exists, W resets, CP refresh is requested, and PPS recalculates.
+7. Exercise personal, assigned, team, and generated tasks plus each permitted note scope.
+   - Expected: progress uses real totals, generated tasks do not duplicate on refresh, and private notes remain isolated.
+8. Run Review QA, Judge application, and owner staff-access flows.
+   - Expected: tier history is preserved, Head Judges cannot adjust after confirmed submission, Owners can perform a corrective adjustment, final application decisions are durable, and Discord roles change only through the outbox.
+9. Search `/levels` by ID, name, and creator.
+   - Expected: only public recommended levels and allowlisted fields appear.
+10. Check Overview, Queue, Tasks, Applications, Statistics, and level detail at desktop and 390 px widths.
+   - Expected: navigation, tables, dialogs, and drawers remain usable without incoherent overlap.
+11. Submit a mutation with a missing or mismatched CSRF header, then log out normally.
+   - Expected: the mutation is rejected before reaching Avenue Guard; logout succeeds only through the CSRF-protected POST flow and clears both cookies.
+12. Temporarily fail public-cache refresh immediately after a valid claim, state change, or tier correction.
+   - Expected: the durable action succeeds, the secondary refresh failure is logged, and retry does not duplicate the action.
+13. Deactivate a test Judge, wait for the outbox role removal, then reopen Team -> Staff.
+   - Expected: effective access follows the live Discord role, while the inactive staff record remains visible to the owner and can be restored.
+14. Accept a test application, deliver its Judge-role outbox item, and have the applicant reopen `/apply` before staff revisit Applications.
+   - Expected: applicant status reconciles from `accepted_pending_role` to `accepted`, and no internal note or event detail appears in the applicant payload.

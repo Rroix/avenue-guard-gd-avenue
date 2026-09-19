@@ -376,7 +376,7 @@ class CommandsCog(commands.Cog):
         status: discord.Option(
             str,
             "What happened during this outreach attempt",
-            choices=["planned", "attempted", "submitted_to_mod", "failed"],
+            choices=["planned", "attempted", "submitted_to_mod", "follow_up", "failed"],
         ),
         route: discord.Option(
             str,
