@@ -6,7 +6,9 @@ import json
 import os
 import re
 import time
+import unicodedata
 from collections import defaultdict, deque
+from dataclasses import replace
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -21,22 +23,62 @@ from utils.priority_system import (
     score_components,
 )
 from utils.staff_auth import (
+    ROLE_ORDER,
     StaffPrincipal,
     capability_set,
     new_csrf_token,
     new_session_token,
     resolve_staff_role,
+    role_label,
     token_hash,
     tokens_match,
 )
 from utils.workflows import new_correlation_id
 
+MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
+DISCORD_ID_FIELDS = {
+    "actor_id",
+    "applicant_id",
+    "assignee_id",
+    "author_id",
+    "channel_id",
+    "claimed_by",
+    "created_by",
+    "decided_by",
+    "ended_by",
+    "guild_id",
+    "log_message_id",
+    "message_id",
+    "new_owner_id",
+    "offer_channel_id",
+    "offer_message_id",
+    "previous_owner_id",
+    "request_message_id",
+    "requester_id",
+    "reviewed_by",
+    "reviewer_id",
+    "role_id",
+    "started_by",
+    "thread_id",
+    "updated_by",
+    "uploader_user_id",
+    "user_id",
+}
+
 
 class PortalError(RuntimeError):
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        correlation_id: str = "",
+    ):
         self.status = int(status)
         self.code = str(code)
         self.message = str(message)
+        self.correlation_id = str(correlation_id or "")
         super().__init__(message)
 
 
@@ -70,15 +112,45 @@ def _bounded_text(value: Any, limit: int, *, required: bool = False) -> str:
     return text
 
 
+def _discord_id(value: Any, *, field: str = "Discord ID") -> int:
+    if isinstance(value, bool):
+        raise PortalError(422, "invalid_discord_id", f"{field} must be a Discord ID string")
+    if isinstance(value, int):
+        if value > MAX_SAFE_JS_INTEGER:
+            raise PortalError(
+                422,
+                "unsafe_discord_id",
+                f"{field} must be sent as a string to preserve all digits",
+            )
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text.isascii() or not text.isdecimal():
+            raise PortalError(422, "invalid_discord_id", f"{field} must contain only digits")
+        parsed = int(text)
+    if parsed <= 0:
+        raise PortalError(422, "invalid_discord_id", f"{field} is invalid")
+    return parsed
+
+
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
+        safe = {}
+        for key, item in value.items():
+            name = str(key)
+            if name in DISCORD_ID_FIELDS and item is not None:
+                safe[name] = str(item)
+            elif name == "role_ids" and isinstance(item, (list, tuple, set)):
+                safe[name] = [str(role_id) for role_id in item]
+            else:
+                safe[name] = _json_safe(item)
+        return safe
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(item) for item in value]
     row = _row_dict(value)
-    return {key: _json_safe(item) for key, item in row.items()} if row else str(value)
+    return _json_safe(row) if row else str(value)
 
 
 class StaffPortalService:
@@ -96,6 +168,7 @@ class StaffPortalService:
         self._episode_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._rate_lock = asyncio.Lock()
         self._rate_windows: dict[str, deque[float]] = defaultdict(deque)
+        self._identity_cache: dict[int, tuple[float, dict[str, Any]]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -135,28 +208,286 @@ class StaffPortalService:
         role_ids = tuple(int(role.id) for role in getattr(member, "roles", ()) if getattr(role, "id", 0))
         role = resolve_staff_role(member.id, role_ids, self.bot.config)
         avatar = getattr(getattr(member, "display_avatar", None), "url", "")
+        discord_display_name = str(
+            getattr(member, "display_name", "") or getattr(member, "name", "Staff")
+        )[:100]
+        global_display_name = str(getattr(member, "global_name", "") or "")[:100]
+        username = str(getattr(member, "name", "") or "")[:100]
         return StaffPrincipal(
             user_id=int(member.id),
             guild_id=self.guild_id,
-            display_name=str(getattr(member, "display_name", "") or getattr(member, "name", "Staff"))[:100],
+            display_name=discord_display_name,
             avatar_url=str(avatar or "")[:1000],
             role=role,
             role_ids=role_ids,
             capabilities=capability_set(role),
             session_hash=session_hash,
+            discord_display_name=discord_display_name,
+            global_display_name=global_display_name,
+            username=username,
         )
 
+    async def _principal_with_profile(
+        self, principal: StaffPrincipal
+    ) -> StaffPrincipal:
+        row = await self.db.fetchone(
+            "SELECT portal_nickname FROM staff_portal_profiles WHERE guild_id=? AND user_id=?",
+            (principal.guild_id, principal.user_id),
+        )
+        nickname = str(row["portal_nickname"] or "").strip() if row else ""
+        display_name = (
+            nickname
+            or principal.discord_display_name
+            or principal.global_display_name
+            or principal.username
+            or f"Reviewer {principal.user_id}"
+        )
+        return replace(
+            principal,
+            display_name=display_name[:100],
+            portal_nickname=nickname[:40],
+        )
+
+    @property
+    def _identity_cache_ttl(self) -> int:
+        return max(
+            30,
+            min(
+                3600,
+                self.bot.config.get_int(
+                    "staff_portal", "identity_cache_ttl_seconds", default=300
+                ),
+            ),
+        )
+
+    def _invalidate_identity(self, user_id: int) -> None:
+        self._identity_cache.pop(int(user_id), None)
+
+    async def _resolve_identity(self, user_id: int) -> dict[str, Any]:
+        user_id = int(user_id)
+        cached = self._identity_cache.get(user_id)
+        if cached and cached[0] > time.monotonic():
+            return dict(cached[1])
+        guild = self.bot.get_guild(self.guild_id)
+        member = guild.get_member(user_id) if guild is not None else None
+        profile = await self.db.fetchone(
+            "SELECT portal_nickname FROM staff_portal_profiles "
+            "WHERE guild_id=? AND user_id=?",
+            (self.guild_id, user_id),
+        )
+        nickname = str(profile["portal_nickname"] or "").strip() if profile else ""
+        discord_display = str(getattr(member, "display_name", "") or "")[:100]
+        global_display = str(getattr(member, "global_name", "") or "")[:100]
+        username = str(getattr(member, "name", "") or "")[:100]
+        display_name = (
+            nickname
+            or discord_display
+            or global_display
+            or username
+            or f"Reviewer {user_id}"
+        )
+        roles = tuple(
+            int(role.id)
+            for role in getattr(member, "roles", ())
+            if getattr(role, "id", 0)
+        )
+        role = resolve_staff_role(user_id, roles, self.bot.config)
+        avatar = str(
+            getattr(getattr(member, "display_avatar", None), "url", "") or ""
+        )[:1000]
+        identity = {
+            "id": str(user_id),
+            "portal_nickname": nickname[:40],
+            "discord_display_name": discord_display,
+            "global_display_name": global_display,
+            "username": username,
+            "display_name": display_name[:100],
+            "formatted_name": f"{display_name[:100]} ({user_id})",
+            "avatar_url": avatar,
+            "role": role,
+            "role_label": role_label(role),
+        }
+        self._identity_cache[user_id] = (
+            time.monotonic() + self._identity_cache_ttl,
+            identity,
+        )
+        return dict(identity)
+
+    async def _resolve_identities(
+        self, user_ids: set[int] | list[int] | tuple[int, ...]
+    ) -> dict[int, dict[str, Any]]:
+        resolved: dict[int, dict[str, Any]] = {}
+        for user_id in dict.fromkeys(int(item) for item in user_ids if item):
+            resolved[user_id] = await self._resolve_identity(user_id)
+        return resolved
+
+    @staticmethod
+    def _normalize_portal_nickname(value: Any) -> str:
+        nickname = " ".join(str(value or "").strip().split())
+        if len(nickname) > 40:
+            raise PortalError(
+                422,
+                "nickname_too_long",
+                "Portal nickname must be 40 characters or fewer.",
+            )
+        if any(unicodedata.category(char).startswith("C") for char in nickname):
+            raise PortalError(
+                422,
+                "nickname_unsafe",
+                "Portal nickname contains unsupported control characters.",
+            )
+        lowered = nickname.casefold()
+        if "@everyone" in lowered or "@here" in lowered or "://" in lowered:
+            raise PortalError(
+                422,
+                "nickname_unsafe",
+                "Portal nickname cannot contain mentions or links.",
+            )
+        reserved = {
+            "admin",
+            "avenue guard",
+            "dev",
+            "discord",
+            "gd avenue",
+            "head reviewer",
+            "owner",
+            "reviewer",
+        }
+        if lowered in reserved:
+            raise PortalError(
+                422,
+                "nickname_reserved",
+                "That portal nickname could be mistaken for an official role or service.",
+            )
+        return nickname
+
+    async def profile(self, principal: StaffPrincipal) -> dict[str, Any]:
+        return {"profile": await self._resolve_identity(principal.user_id)}
+
+    async def update_portal_nickname(
+        self,
+        principal: StaffPrincipal,
+        target_user_id: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        target_user_id = int(target_user_id)
+        changing_other = target_user_id != principal.user_id
+        if changing_other:
+            principal.require("staff.manage_nicknames")
+        nickname = self._normalize_portal_nickname(payload.get("portal_nickname"))
+        reason = _bounded_text(payload.get("reason"), 500)
+        if changing_other and not reason:
+            raise PortalError(
+                422,
+                "reason_required",
+                "A reason is required when changing another staff member's nickname.",
+            )
+        current = await self.db.fetchone(
+            "SELECT portal_nickname FROM staff_portal_profiles "
+            "WHERE guild_id=? AND user_id=?",
+            (principal.guild_id, target_user_id),
+        )
+        old_nickname = str(current["portal_nickname"] or "") if current else ""
+        now = int(time.time())
+        correlation = new_correlation_id("staff-nickname")
+        event_payload = {
+            "old_nickname": old_nickname,
+            "new_nickname": nickname,
+            "reason": reason,
+        }
+        await self.db.execute_transaction(
+            [
+                (
+                    (
+                        "INSERT INTO staff_portal_profiles("
+                        "guild_id,user_id,portal_nickname,updated_ts,updated_by"
+                        ") VALUES(?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET "
+                        "portal_nickname=excluded.portal_nickname,"
+                        "updated_ts=excluded.updated_ts,updated_by=excluded.updated_by"
+                    ),
+                    (
+                        principal.guild_id,
+                        target_user_id,
+                        nickname,
+                        now,
+                        principal.user_id,
+                    ),
+                ),
+                (
+                    (
+                        "INSERT INTO staff_portal_nickname_history("
+                        "guild_id,user_id,actor_id,old_nickname,new_nickname,reason,"
+                        "created_ts,correlation_id) VALUES(?,?,?,?,?,?,?,?)"
+                    ),
+                    (
+                        principal.guild_id,
+                        target_user_id,
+                        principal.user_id,
+                        old_nickname,
+                        nickname,
+                        reason,
+                        now,
+                        correlation,
+                    ),
+                ),
+                (
+                    (
+                        "INSERT INTO workflow_events("
+                        "correlation_id,workflow_type,entity_id,event,guild_id,actor_id,"
+                        "payload_json,created_ts) VALUES(?,'staff_portal',?,"
+                        "'portal_nickname_changed',?,?,?,?)"
+                    ),
+                    (
+                        correlation,
+                        f"staff:{target_user_id}",
+                        principal.guild_id,
+                        principal.user_id,
+                        json.dumps(event_payload, separators=(",", ":")),
+                        now,
+                    ),
+                ),
+            ],
+            retry_safe=True,
+        )
+        self._invalidate_identity(target_user_id)
+        return {
+            "ok": True,
+            "profile": await self._resolve_identity(target_user_id),
+        }
+
+    async def nickname_history(
+        self, principal: StaffPrincipal, target_user_id: int
+    ) -> dict[str, Any]:
+        principal.require("audit.view_full")
+        rows = await self.db.fetchall(
+            "SELECT id,user_id,actor_id,old_nickname,new_nickname,reason,"
+            "created_ts,correlation_id FROM staff_portal_nickname_history "
+            "WHERE guild_id=? AND user_id=? ORDER BY created_ts DESC,id DESC LIMIT 100",
+            (principal.guild_id, int(target_user_id)),
+        )
+        identities = await self._resolve_identities(
+            {
+                int(row["actor_id"])
+                for row in rows
+                if row["actor_id"] is not None
+            }
+        )
+        items = []
+        for row in rows:
+            item = _row_dict(row)
+            actor_id = row["actor_id"]
+            item["actor"] = (
+                identities.get(int(actor_id)) if actor_id is not None else None
+            )
+            items.append(item)
+        return {"items": items}
+
     async def create_session(self, payload: dict[str, Any]) -> dict[str, Any]:
-        try:
-            user_id = int(payload.get("user_id") or 0)
-        except (TypeError, ValueError):
-            user_id = 0
-        if user_id <= 0:
-            raise PortalError(400, "invalid_identity", "Discord identity was not supplied")
+        user_id = _discord_id(payload.get("user_id"), field="Discord user ID")
         _guild, member = await self._member(user_id)
         if member is None:
             raise PortalError(403, "not_a_member", "You must be a GD Avenue member to continue")
-        principal = self._principal_from_member(member)
+        principal = await self._principal_with_profile(self._principal_from_member(member))
         purpose = str(payload.get("purpose") or "staff").strip().casefold()
         if purpose not in {"staff", "apply"}:
             raise PortalError(400, "invalid_session_purpose", "The requested sign-in flow is invalid")
@@ -213,7 +544,9 @@ class StaffPortalService:
                 (now, digest),
             )
             raise PortalError(403, "membership_required", "GD Avenue membership is required")
-        principal = self._principal_from_member(member, session_hash=digest)
+        principal = await self._principal_with_profile(
+            self._principal_from_member(member, session_hash=digest)
+        )
         if (
             now - int(row["last_seen_ts"] or 0) >= 300
             or str(row["display_name"] or "") != principal.display_name
@@ -248,8 +581,13 @@ class StaffPortalService:
         return {
             "id": str(principal.user_id),
             "display_name": principal.display_name,
+            "portal_nickname": principal.portal_nickname,
+            "discord_display_name": principal.discord_display_name,
+            "global_display_name": principal.global_display_name,
+            "username": principal.username,
             "avatar_url": principal.avatar_url,
             "role": principal.role,
+            "role_label": role_label(principal.role),
             "staff_access": principal.can("staff.access"),
             "capabilities": sorted(principal.capabilities),
         }
@@ -267,6 +605,42 @@ class StaffPortalService:
             window.append(now)
 
     async def handle_request(
+        self,
+        method: str,
+        raw_path: str,
+        headers: dict[str, str],
+        body: bytes,
+    ) -> tuple[int, dict[str, Any]]:
+        correlation = new_correlation_id("staff-api")
+        try:
+            status, response = await self._handle_request_inner(
+                method, raw_path, headers, body
+            )
+            return status, _json_safe(response)
+        except (PortalError, PermissionError):
+            raise
+        except Exception as exc:
+            path = urlsplit(str(raw_path or "")).path
+            code = (
+                "STAFF_OVERVIEW_FAILED"
+                if path == "/api/staff/overview"
+                else "STAFF_API_FAILED"
+            )
+            await log_error(
+                self.bot,
+                f"Staff portal API failure correlation={correlation} method={method} "
+                f"path={path}: {type(exc).__name__}: {exc}",
+            )
+            raise PortalError(
+                500,
+                code,
+                "Could not load staff overview."
+                if code == "STAFF_OVERVIEW_FAILED"
+                else "The portal could not complete this request.",
+                correlation_id=correlation,
+            ) from exc
+
+    async def _handle_request_inner(
         self,
         method: str,
         raw_path: str,
@@ -370,6 +744,13 @@ class StaffPortalService:
     ) -> tuple[int, dict[str, Any]]:
         if path == "/api/staff/overview" and method == "GET":
             return 200, await self.overview(principal)
+        if path == "/api/staff/profile":
+            if method == "GET":
+                return 200, await self.profile(principal)
+            if method == "PATCH":
+                return 200, await self.update_portal_nickname(
+                    principal, principal.user_id, payload
+                )
         if path == "/api/staff/queue" and method == "GET":
             return 200, await self.queue(principal, query)
         if path == "/api/staff/outreach" and method == "GET":
@@ -397,11 +778,29 @@ class StaffPortalService:
             principal.require("applications.review_judge")
             return 200, await self.applications(principal, query)
         if path == "/api/staff/staff" and method == "GET":
-            principal.require("staff.manage")
+            principal.require("staff.view")
             return 200, await self.staff_list(principal)
         if path == "/api/staff/operations" and method == "GET":
             principal.require("operations.view")
             return 200, await self.operations(principal)
+        if path == "/api/staff/requests":
+            principal.require("requests.manage")
+            if method == "GET":
+                return 200, await self.requests_admin(principal)
+            if method == "POST":
+                return 200, await self.requests_action(principal, payload)
+        if path == "/api/staff/community":
+            principal.require("admin.access")
+            if method == "GET":
+                return 200, await self.community(principal)
+            if method == "POST":
+                return 200, await self.community_action(principal, payload)
+        if path == "/api/staff/system":
+            principal.require("developer.access")
+            if method == "GET":
+                return 200, await self.system(principal)
+            if method == "POST":
+                return 200, await self.system_action(principal, payload)
         if path == "/api/staff/pps":
             principal.require("pps.manage_cycles")
             if method == "GET":
@@ -409,7 +808,10 @@ class StaffPortalService:
             if method == "POST":
                 return 200, await self.pps_action(principal, payload)
         if path == "/api/staff/audit" and method == "GET":
-            principal.require("audit.view")
+            if not (
+                principal.can("audit.view_limited") or principal.can("audit.view")
+            ):
+                raise PermissionError("Missing capability: audit.view_limited")
             return 200, await self.audit(principal, query)
         if path == "/api/staff/configuration":
             principal.require("config.manage_safe")
@@ -447,105 +849,274 @@ class StaffPortalService:
             return 200, await self.application_action(principal, int(app_match.group(1)), payload)
         staff_match = re.fullmatch(r"/api/staff/staff/(\d+)/action", path)
         if staff_match and method == "POST":
-            principal.require("staff.manage")
-            return 200, await self.staff_action(principal, int(staff_match.group(1)), payload)
+            principal.require("staff.manage_standard_roles")
+            return 200, await self.staff_action(principal, staff_match.group(1), payload)
+        nickname_match = re.fullmatch(
+            r"/api/staff/staff/(\d+)/nickname(?:/(history))?", path
+        )
+        if nickname_match:
+            target_user_id = _discord_id(
+                nickname_match.group(1), field="Staff member ID"
+            )
+            if method == "PATCH" and not nickname_match.group(2):
+                return 200, await self.update_portal_nickname(
+                    principal, target_user_id, payload
+                )
+            if method == "GET" and nickname_match.group(2) == "history":
+                return 200, await self.nickname_history(
+                    principal, target_user_id
+                )
+        incident_match = re.fullmatch(
+            r"/api/staff/operations/incidents/([a-f0-9]{8,64})", path
+        )
+        if incident_match and method == "GET":
+            principal.require("operations.view")
+            return 200, await self.incident_detail(
+                principal, incident_match.group(1)
+            )
         raise PortalError(404, "not_found", "That portal resource does not exist")
 
     async def overview(self, principal: StaffPrincipal) -> dict[str, Any]:
-        await self._sync_system_tasks(principal.guild_id)
+        correlation = new_correlation_id("staff-overview")
+        warnings: list[dict[str, str]] = []
+        failures = 0
+
+        async def part(name: str, operation, fallback):
+            nonlocal failures
+            try:
+                return await operation
+            except Exception as exc:  # noqa: BLE001 - overview supports partial data.
+                failures += 1
+                warning_id = f"{correlation}:{name}"
+                warnings.append(
+                    {
+                        "section": name,
+                        "message": "Some data could not be refreshed",
+                        "correlation_id": warning_id,
+                    }
+                )
+                await log_error(
+                    self.bot,
+                    f"Staff overview partial failure correlation={warning_id}: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+                return fallback
+
+        await part(
+            "attention_tasks",
+            self._sync_system_tasks(principal.guild_id),
+            None,
+        )
         now = int(time.time())
         month_start = now - 31 * 86400
         stale_cutoff = now - await self._claim_stale_seconds()
-        claim_row = await self.db.fetchone(
-            "SELECT COUNT(*) AS active,SUM(CASE WHEN claimed_ts<? THEN 1 ELSE 0 END) AS stale "
-            "FROM staff_queue_claims WHERE guild_id=? AND claimed_by=? AND claim_state='active'",
-            (stale_cutoff, principal.guild_id, principal.user_id),
+        claim_row = _row_dict(
+            await part(
+                "claims",
+                self.db.fetchone(
+                    "SELECT COUNT(*) AS active,"
+                    "SUM(CASE WHEN claimed_ts<? THEN 1 ELSE 0 END) AS stale "
+                    "FROM staff_queue_claims WHERE guild_id=? AND claimed_by=? "
+                    "AND claim_state='active'",
+                    (stale_cutoff, principal.guild_id, principal.user_id),
+                ),
+                {},
+            )
         )
-        task_row = await self.db.fetchone(
-            "SELECT COUNT(*) AS total,SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,"
-            "SUM(CASE WHEN status IN('todo','in_progress') AND due_ts IS NOT NULL AND due_ts<=? THEN 1 ELSE 0 END) AS due "
-            "FROM staff_tasks WHERE guild_id=? AND (assignee_id=? OR (task_type='personal' AND created_by=?)) "
-            "AND status!='cancelled'",
-            (now + 86400, principal.guild_id, principal.user_id, principal.user_id),
+        task_row = _row_dict(
+            await part(
+                "tasks",
+                self.db.fetchone(
+                    "SELECT COUNT(*) AS total,"
+                    "SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,"
+                    "SUM(CASE WHEN status IN('todo','in_progress') "
+                    "AND due_ts IS NOT NULL AND due_ts<=? THEN 1 ELSE 0 END) AS due "
+                    "FROM staff_tasks WHERE guild_id=? AND "
+                    "(assignee_id=? OR (task_type='personal' AND created_by=?)) "
+                    "AND status!='cancelled'",
+                    (
+                        now + 86400,
+                        principal.guild_id,
+                        principal.user_id,
+                        principal.user_id,
+                    ),
+                ),
+                {},
+            )
         )
-        reviews = await self.db.fetchone(
-            "SELECT COUNT(*) AS total,SUM(CASE WHEN reviewed_ts>=? THEN 1 ELSE 0 END) AS c "
-            "FROM level_request_submissions WHERE guild_id=? AND reviewed_by=? AND status='reviewed'",
-            (month_start, principal.guild_id, principal.user_id),
+        reviews = _row_dict(
+            await part(
+                "reviews",
+                self.db.fetchone(
+                    "SELECT COUNT(*) AS total,"
+                    "SUM(CASE WHEN reviewed_ts>=? THEN 1 ELSE 0 END) AS c "
+                    "FROM level_request_submissions WHERE guild_id=? "
+                    "AND reviewed_by=? AND status='reviewed'",
+                    (month_start, principal.guild_id, principal.user_id),
+                ),
+                {},
+            )
         )
-        outreach = await self.db.fetchone(
-            "SELECT SUM(CASE WHEN a.created_ts>=? THEN 1 ELSE 0 END) AS attempts,"
-            "SUM(CASE WHEN a.created_ts>=? AND status='submitted_to_mod' THEN 1 ELSE 0 END) AS submitted,"
-            "SUM(CASE WHEN status='submitted_to_mod' THEN 1 ELSE 0 END) AS submitted_total "
-            "FROM level_outreach_attempts a JOIN level_outreach_cycles c ON c.id=a.cycle_id "
-            "WHERE c.guild_id=? AND a.actor_id=?",
-            (month_start, month_start, principal.guild_id, principal.user_id),
+        outreach = _row_dict(
+            await part(
+                "outreach",
+                self.db.fetchone(
+                    "SELECT SUM(CASE WHEN a.created_ts>=? THEN 1 ELSE 0 END) "
+                    "AS attempts,"
+                    "SUM(CASE WHEN a.created_ts>=? "
+                    "AND a.status='submitted_to_mod' THEN 1 ELSE 0 END) AS submitted,"
+                    "SUM(CASE WHEN a.status='submitted_to_mod' THEN 1 ELSE 0 END) "
+                    "AS submitted_total "
+                    "FROM level_outreach_attempts a "
+                    "JOIN level_outreach_cycles c ON c.id=a.cycle_id "
+                    "WHERE c.guild_id=? AND a.actor_id=?",
+                    (
+                        month_start,
+                        month_start,
+                        principal.guild_id,
+                        principal.user_id,
+                    ),
+                ),
+                {},
+            )
         )
-        active_days = await self.db.fetchone(
-            "SELECT COUNT(DISTINCT day) AS c FROM ("
-            "SELECT date(reviewed_ts,'unixepoch') AS day FROM level_request_submissions "
-            "WHERE guild_id=? AND reviewed_by=? AND reviewed_ts>=? "
-            "UNION SELECT date(a.created_ts,'unixepoch') FROM level_outreach_attempts a "
-            "JOIN level_outreach_cycles c ON c.id=a.cycle_id WHERE c.guild_id=? AND a.actor_id=? AND a.created_ts>=? "
-            "UNION SELECT date(completed_ts,'unixepoch') FROM staff_tasks WHERE guild_id=? AND assignee_id=? "
-            "AND completed_ts>=?)",
-            (
-                principal.guild_id,
-                principal.user_id,
-                month_start,
-                principal.guild_id,
-                principal.user_id,
-                month_start,
-                principal.guild_id,
-                principal.user_id,
-                month_start,
+        active_days = _row_dict(
+            await part(
+                "active_days",
+                self.db.fetchone(
+                    "SELECT COUNT(DISTINCT day) AS c FROM ("
+                    "SELECT date(reviewed_ts,'unixepoch') AS day "
+                    "FROM level_request_submissions WHERE guild_id=? "
+                    "AND reviewed_by=? AND reviewed_ts>=? "
+                    "UNION SELECT date(a.created_ts,'unixepoch') "
+                    "FROM level_outreach_attempts a "
+                    "JOIN level_outreach_cycles c ON c.id=a.cycle_id "
+                    "WHERE c.guild_id=? AND a.actor_id=? AND a.created_ts>=? "
+                    "UNION SELECT date(completed_ts,'unixepoch') FROM staff_tasks "
+                    "WHERE guild_id=? AND assignee_id=? AND completed_ts>=?)",
+                    (
+                        principal.guild_id,
+                        principal.user_id,
+                        month_start,
+                        principal.guild_id,
+                        principal.user_id,
+                        month_start,
+                        principal.guild_id,
+                        principal.user_id,
+                        month_start,
+                    ),
+                ),
+                {},
+            )
+        )
+        followups = _row_dict(
+            await part(
+                "followups",
+                self.db.fetchone(
+                    "SELECT COUNT(*) AS c FROM level_outreach_queue q "
+                    "JOIN staff_queue_claims c ON c.queue_id=q.id "
+                    "WHERE q.guild_id=? AND c.claim_state='active' "
+                    "AND c.claimed_by=? AND q.queue_state='awaiting_outcome' "
+                    "AND q.outcome_window_due_ts IS NOT NULL "
+                    "AND q.outcome_window_due_ts<=?",
+                    (principal.guild_id, principal.user_id, now + 86400),
+                ),
+                {},
+            )
+        )
+        pipeline_rows = await part(
+            "pipeline",
+            self.db.fetchall(
+                "SELECT queue_state,COUNT(*) AS c FROM level_outreach_queue "
+                "WHERE guild_id=? GROUP BY queue_state",
+                (principal.guild_id,),
             ),
+            [],
         )
-        followups = await self.db.fetchone(
-            "SELECT COUNT(*) AS c FROM level_outreach_queue q JOIN staff_queue_claims c ON c.queue_id=q.id "
-            "WHERE q.guild_id=? AND c.claim_state='active' AND c.claimed_by=? "
-            "AND q.queue_state='awaiting_outcome' AND q.outcome_window_due_ts IS NOT NULL "
-            "AND q.outcome_window_due_ts<=?",
-            (principal.guild_id, principal.user_id, now + 86400),
+        application_count = _row_dict(
+            await part(
+                "applications",
+                self.db.fetchone(
+                    "SELECT COUNT(*) AS c FROM staff_applications WHERE guild_id=? "
+                    "AND status IN('submitted','under_review','interview','hold')",
+                    (principal.guild_id,),
+                ),
+                {},
+            )
         )
-        pipeline_rows = await self.db.fetchall(
-            "SELECT queue_state,COUNT(*) AS c FROM level_outreach_queue WHERE guild_id=? GROUP BY queue_state",
-            (principal.guild_id,),
+        events = await part(
+            "activity",
+            self.db.fetchall(
+                "SELECT event,entity_id,actor_id,created_ts FROM workflow_events "
+                "WHERE guild_id=? ORDER BY created_ts DESC,id DESC LIMIT 8",
+                (principal.guild_id,),
+            ),
+            [],
         )
-        application_count = await self.db.fetchone(
-            "SELECT COUNT(*) AS c FROM staff_applications WHERE guild_id=? AND status IN('submitted','under_review','interview','hold')",
-            (principal.guild_id,),
-        )
-        events = await self.db.fetchall(
-            "SELECT event,entity_id,actor_id,created_ts FROM workflow_events WHERE guild_id=? "
-            "ORDER BY created_ts DESC,id DESC LIMIT 8",
-            (principal.guild_id,),
-        )
+        if failures >= 9:
+            raise PortalError(
+                503,
+                "STAFF_OVERVIEW_UNAVAILABLE",
+                "Staff overview data is temporarily unavailable.",
+                correlation_id=correlation,
+            )
         milestones = self._milestones(
-            int(reviews["total"] or 0), int(outreach["submitted_total"] or 0)
+            int(reviews.get("total") or 0),
+            int(outreach.get("submitted_total") or 0),
         )
-        await self._persist_milestones(principal, milestones)
+        await part(
+            "milestones",
+            self._persist_milestones(principal, milestones),
+            None,
+        )
+        activity_identities = await part(
+            "activity_identities",
+            self._resolve_identities(
+                {
+                    int(row["actor_id"])
+                    for row in events
+                    if row["actor_id"] is not None
+                }
+            ),
+            {},
+        )
+        recent_activity = []
+        for row in events:
+            item = _row_dict(row)
+            actor_id = row["actor_id"]
+            item["actor"] = (
+                activity_identities.get(int(actor_id))
+                if actor_id is not None
+                else None
+            )
+            recent_activity.append(item)
         return {
             "user": self._principal_payload(principal),
             "summary": {
-                "active_claims": int(claim_row["active"] or 0),
-                "stale_claims": int(claim_row["stale"] or 0),
-                "tasks_remaining": max(0, int(task_row["total"] or 0) - int(task_row["done"] or 0)),
-                "tasks_due": int(task_row["due"] or 0),
-                "followups_due": int(followups["c"] or 0),
+                "active_claims": int(claim_row.get("active") or 0),
+                "stale_claims": int(claim_row.get("stale") or 0),
+                "tasks_remaining": max(
+                    0,
+                    int(task_row.get("total") or 0)
+                    - int(task_row.get("done") or 0),
+                ),
+                "tasks_due": int(task_row.get("due") or 0),
+                "followups_due": int(followups.get("c") or 0),
             },
             "progress": {
-                "reviews_month": int(reviews["c"] or 0),
-                "tasks_done": int(task_row["done"] or 0),
-                "tasks_total": int(task_row["total"] or 0),
-                "outreach_attempts": int(outreach["attempts"] or 0),
-                "confirmed_submissions": int(outreach["submitted"] or 0),
-                "active_days": int(active_days["c"] or 0),
+                "reviews_month": int(reviews.get("c") or 0),
+                "tasks_done": int(task_row.get("done") or 0),
+                "tasks_total": int(task_row.get("total") or 0),
+                "outreach_attempts": int(outreach.get("attempts") or 0),
+                "confirmed_submissions": int(outreach.get("submitted") or 0),
+                "active_days": int(active_days.get("c") or 0),
                 "milestones": milestones,
             },
             "pipeline": {str(row["queue_state"]): int(row["c"] or 0) for row in pipeline_rows},
-            "pending_applications": int(application_count["c"] or 0),
-            "recent_activity": [_row_dict(row) for row in events],
+            "pending_applications": int(application_count.get("c") or 0),
+            "recent_activity": recent_activity,
+            "warnings": warnings,
+            "correlation_id": correlation,
         }
 
     @staticmethod
@@ -818,6 +1389,10 @@ class StaffPortalService:
         queued_ts = int(data.get("queued_ts") or 0)
         claim_ts = int(data.get("claimed_ts") or 0)
         stale = bool(claim_ts and claim_ts < int(time.time()) - await self._claim_stale_seconds())
+        claim_user_id = int(data.get("claimed_by") or 0)
+        claim_identity = (
+            await self._resolve_identity(claim_user_id) if claim_user_id else None
+        )
         return {
             "id": int(data.get("id") or 0),
             "rank": int(data.get("exact_rank") or 0) or None,
@@ -839,6 +1414,7 @@ class StaffPortalService:
             "claim": (
                 {
                     "user_id": str(data.get("claimed_by")),
+                    "identity": claim_identity,
                     "claimed_ts": claim_ts,
                     "stale": stale,
                 }
@@ -870,17 +1446,38 @@ class StaffPortalService:
             (principal.guild_id, f"queue:{queue_id}%"),
         )
         notes = await self._notes_for_entity(principal, "level", str(queue_id))
+        actor_ids = {
+            int(item[key])
+            for item in (*attempts, *events)
+            for key in ("actor_id",)
+            if item[key] is not None
+        }
+        identities = await self._resolve_identities(actor_ids)
+        outreach_items = []
+        for item in attempts:
+            payload = _row_dict(item)
+            payload["actor"] = identities.get(int(item["actor_id"]))
+            outreach_items.append(payload)
+        history_items = []
+        for item in events:
+            payload = _row_dict(item)
+            payload["actor"] = identities.get(int(item["actor_id"]))
+            history_items.append(payload)
         return {
             "queue": await self._queue_payload(row),
-            "outreach": [_row_dict(item) for item in attempts],
-            "history": [_row_dict(item) for item in events],
+            "outreach": outreach_items,
+            "history": history_items,
             "notes": notes,
         }
 
     async def queue_action(self, principal, queue_id: int, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if action == "claim":
             principal.require("queue.claim")
-            assignee = int(payload.get("assignee_id") or principal.user_id)
+            assignee = (
+                _discord_id(payload.get("assignee_id"), field="Assignee ID")
+                if payload.get("assignee_id")
+                else principal.user_id
+            )
             if assignee != principal.user_id:
                 principal.require("queue.reassign")
             return await self._claim(principal, queue_id, assignee, _bounded_text(payload.get("reason"), 500))
@@ -888,7 +1485,13 @@ class StaffPortalService:
             return await self._release_claim(principal, queue_id, _bounded_text(payload.get("reason"), 500))
         if action == "reassign":
             principal.require("queue.reassign")
-            return await self._claim(principal, queue_id, int(payload.get("assignee_id") or 0), _bounded_text(payload.get("reason"), 500, required=True), reassign=True)
+            return await self._claim(
+                principal,
+                queue_id,
+                _discord_id(payload.get("assignee_id"), field="Assignee ID"),
+                _bounded_text(payload.get("reason"), 500, required=True),
+                reassign=True,
+            )
         if action == "state":
             principal.require("queue.manage_state")
             return await self._transition_queue(principal, queue_id, payload)
@@ -968,10 +1571,10 @@ class StaffPortalService:
         if owner != principal.user_id:
             principal.require("queue.reassign")
             if not reason:
-                raise PortalError(400, "reason_required", "A reason is required to release another Judge's claim")
+                raise PortalError(400, "reason_required", "A reason is required to release another Reviewer's claim")
             stale = int(claim["claimed_ts"] or 0) < int(time.time()) - await self._claim_stale_seconds()
             if not principal.can("pps.override") and not stale:
-                raise PortalError(409, "claim_not_stale", "Only stale claims can be released by another Judge")
+                raise PortalError(409, "claim_not_stale", "Only stale claims can be released by another Reviewer")
         else:
             principal.require("queue.release_own")
         now = int(time.time())
@@ -1115,7 +1718,23 @@ class StaffPortalService:
             "SELECT status,COUNT(*) AS c FROM staff_outreach_episodes WHERE guild_id=? GROUP BY status",
             (principal.guild_id,),
         )
-        return {"items": [_row_dict(row) for row in rows], "pipeline": {str(row["status"]): int(row["c"] or 0) for row in counts}}
+        identities = await self._resolve_identities(
+            {int(row["actor_id"]) for row in rows if row["actor_id"] is not None}
+        )
+        items = []
+        for row in rows:
+            item = _row_dict(row)
+            actor_id = int(row["actor_id"]) if row["actor_id"] is not None else 0
+            item["actor"] = identities.get(actor_id)
+            if not principal.can("audit.view_full"):
+                item.pop("payload_json", None)
+            items.append(item)
+        return {
+            "items": items,
+            "pipeline": {
+                str(row["status"]): int(row["c"] or 0) for row in counts
+            },
+        }
 
     async def _requeue(self, principal, queue_id: int, payload: dict[str, Any]):
         if payload.get("confirmed") is not True:
@@ -1205,6 +1824,19 @@ class StaffPortalService:
         else:
             rows = await self.db.fetchall("SELECT * FROM staff_tasks WHERE guild_id=? AND (assignee_id=? OR task_type='team' OR (task_type='personal' AND created_by=?)) ORDER BY status,COALESCE(due_ts,9223372036854775807),priority DESC,id DESC LIMIT 200", (principal.guild_id, principal.user_id, principal.user_id))
         items = [_row_dict(row) for row in rows]
+        identities = await self._resolve_identities(
+            {
+                int(item[field])
+                for item in items
+                for field in ("assignee_id", "created_by")
+                if item.get(field)
+            }
+        )
+        for item in items:
+            if item.get("assignee_id"):
+                item["assignee"] = identities.get(int(item["assignee_id"]))
+            if item.get("created_by"):
+                item["creator"] = identities.get(int(item["created_by"]))
         total = sum(item["status"] != "cancelled" for item in items)
         done = sum(item["status"] == "done" for item in items)
         return {"items": items, "progress": {"done": done, "total": total}}
@@ -1218,7 +1850,11 @@ class StaffPortalService:
         assignee_id = (
             None
             if task_type == "team" and not raw_assignee
-            else int(raw_assignee or principal.user_id)
+            else (
+                _discord_id(raw_assignee, field="Assignee ID")
+                if raw_assignee
+                else principal.user_id
+            )
         )
         if task_type != "personal" or assignee_id != principal.user_id:
             principal.require("tasks.assign")
@@ -1261,7 +1897,17 @@ class StaffPortalService:
     async def notes(self, principal, query):
         scopes = self._note_scopes(principal)
         rows = await self.db.fetchall("SELECT * FROM staff_notes WHERE guild_id=? AND archived_ts IS NULL ORDER BY updated_ts DESC LIMIT 200", (principal.guild_id,))
-        return {"items": [item for row in rows if (item := _row_dict(row)) and self._note_visible(principal, item, scopes)]}
+        items = [
+            item
+            for row in rows
+            if (item := _row_dict(row)) and self._note_visible(principal, item, scopes)
+        ]
+        identities = await self._resolve_identities(
+            {int(item["author_id"]) for item in items if item.get("author_id")}
+        )
+        for item in items:
+            item["author"] = identities.get(int(item["author_id"]))
+        return {"items": items}
 
     def _note_visible(self, principal, item, scopes=None):
         scopes = scopes or self._note_scopes(principal)
@@ -1272,7 +1918,17 @@ class StaffPortalService:
 
     async def _notes_for_entity(self, principal, entity_type, entity_id):
         rows = await self.db.fetchall("SELECT * FROM staff_notes WHERE guild_id=? AND entity_type=? AND entity_id=? AND archived_ts IS NULL ORDER BY updated_ts DESC LIMIT 100", (principal.guild_id, entity_type, entity_id))
-        return [item for row in rows if (item := _row_dict(row)) and self._note_visible(principal, item)]
+        items = [
+            item
+            for row in rows
+            if (item := _row_dict(row)) and self._note_visible(principal, item)
+        ]
+        identities = await self._resolve_identities(
+            {int(item["author_id"]) for item in items if item.get("author_id")}
+        )
+        for item in items:
+            item["author"] = identities.get(int(item["author_id"]))
+        return items
 
     async def create_note(self, principal, payload):
         scope = str(payload.get("scope") or "private").casefold()
@@ -1323,6 +1979,13 @@ class StaffPortalService:
             "AND claim_state='active' GROUP BY claimed_by ORDER BY c DESC,claimed_by LIMIT 20",
             (principal.guild_id,),
         )
+        workload_identities = await self._resolve_identities(
+            {
+                int(row["claimed_by"])
+                for row in workload
+                if row["claimed_by"] is not None
+            }
+        )
         return {
             "review_progress": {"done": reviewed, "total": total},
             "queue": {str(row["queue_state"]): int(row["c"] or 0) for row in queue_counts},
@@ -1333,7 +1996,11 @@ class StaffPortalService:
             },
             "pending_applications": int(applications["c"] or 0),
             "workload": [
-                {"user_id": str(row["claimed_by"]), "active_claims": int(row["c"] or 0)}
+                {
+                    "user_id": str(row["claimed_by"]),
+                    "identity": workload_identities.get(int(row["claimed_by"])),
+                    "active_claims": int(row["c"] or 0),
+                }
                 for row in workload
             ],
         }
@@ -1409,8 +2076,22 @@ class StaffPortalService:
             "SELECT COUNT(*) AS c FROM staff_queue_claims WHERE guild_id=? AND claim_state='active' AND claimed_ts<?",
             (principal.guild_id, int(time.time()) - await self._claim_stale_seconds()),
         )
+        reviewer_identities = await self._resolve_identities(
+            {
+                int(row["reviewed_by"])
+                for row in reviews
+                if row["reviewed_by"] is not None
+            }
+        )
+        reviewer_items = []
+        for row in reviews:
+            item = _row_dict(row)
+            reviewer_id = int(item["reviewed_by"])
+            item["reviewed_by"] = str(reviewer_id)
+            item["identity"] = reviewer_identities.get(reviewer_id)
+            reviewer_items.append(item)
         return {
-            "reviewers": [_row_dict(row) for row in reviews],
+            "reviewers": reviewer_items,
             "tiers": {_row_dict(row).get("send_type") or "rejected": int(row["c"] or 0) for row in tiers},
             "results": {str(row["result"]): int(row["c"] or 0) for row in results},
             "outreach": {
@@ -1430,7 +2111,20 @@ class StaffPortalService:
 
     async def qa_list(self, principal, query):
         rows = await self.db.fetchall("SELECT s.request_message_id,s.level_id,s.user_id,s.result,s.send_type,s.review_text,s.reviewed_by,s.reviewed_ts,q.qa_status,q.adjusted_send_type,q.reason FROM level_request_submissions s LEFT JOIN staff_review_qa q ON q.guild_id=s.guild_id AND q.request_message_id=s.request_message_id WHERE s.guild_id=? AND s.status='reviewed' ORDER BY s.reviewed_ts DESC LIMIT 100", (principal.guild_id,))
-        return {"items": [_row_dict(row) for row in rows]}
+        identities = await self._resolve_identities(
+            {
+                int(row["reviewed_by"])
+                for row in rows
+                if row["reviewed_by"] is not None
+            }
+        )
+        items = []
+        for row in rows:
+            item = _row_dict(row)
+            if row["reviewed_by"] is not None:
+                item["reviewer"] = identities.get(int(row["reviewed_by"]))
+            items.append(item)
+        return {"items": items}
 
     async def qa_action(self, principal, request_message_id, payload):
         action = str(payload.get("action") or "").casefold()
@@ -1528,7 +2222,7 @@ class StaffPortalService:
                     user_id=int(row["applicant_id"]),
                     payload={
                         "role_id": judge_roles[0],
-                        "reason": f"Judge application #{int(row['id'])} accepted",
+                        "reason": f"Reviewer application #{int(row['id'])} accepted",
                     },
                     correlation_id=f"staff-application:{int(row['id'])}",
                     idempotency_key=f"staff-application:{int(row['id'])}:judge-role",
@@ -1541,7 +2235,7 @@ class StaffPortalService:
             except Exception as exc:  # noqa: BLE001 - keep the durable pending state retryable.
                 await log_error(
                     self.bot,
-                    f"Judge application role outbox reconciliation deferred application_id={int(row['id'])}: {exc!r}",
+                    f"Reviewer application role outbox reconciliation deferred application_id={int(row['id'])}: {exc!r}",
                 )
         rows = await self.db.fetchall("SELECT a.id,a.role_outbox_id,o.status FROM staff_applications a JOIN discord_outbox o ON o.id=a.role_outbox_id WHERE a.status='accepted_pending_role' LIMIT 50")
         for row in rows:
@@ -1576,16 +2270,31 @@ class StaffPortalService:
         )
         notes_by_application: dict[int, list[dict[str, Any]]] = defaultdict(list)
         events_by_application: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        identity_ids = {
+            int(row["applicant_id"])
+            for row in rows
+            if row["applicant_id"] is not None
+        }
         for note in notes:
+            identity_ids.add(int(note["author_id"]))
             notes_by_application[int(note["application_id"])].append(_row_dict(note))
         for event in events:
+            identity_ids.add(int(event["actor_id"]))
             event_payload = _row_dict(event)
             event_payload["detail"] = _json_object(event_payload.pop("detail_json", "{}"))
             events_by_application[int(event["application_id"])].append(event_payload)
+        identities = await self._resolve_identities(identity_ids)
+        for note_items in notes_by_application.values():
+            for note in note_items:
+                note["author"] = identities.get(int(note["author_id"]))
+        for event_items in events_by_application.values():
+            for event in event_items:
+                event["actor"] = identities.get(int(event["actor_id"]))
         return {
             "items": [
                 {
                     **_row_dict(row),
+                    "applicant": identities.get(int(row["applicant_id"])),
                     "answers": _json_object(row["answers_json"]),
                     "internal_notes": notes_by_application[int(row["id"])],
                     "timeline": events_by_application[int(row["id"])],
@@ -1620,7 +2329,7 @@ class StaffPortalService:
             if action == "accept":
                 judge_roles = self.bot.config.get_int_list("staff_portal", "judge_role_ids")
                 if not judge_roles:
-                    raise PortalError(503, "judge_role_missing", "The Judge role is not configured")
+                    raise PortalError(503, "reviewer_role_missing", "The Reviewer role is not configured")
             correlation = new_correlation_id("application")
             await self.db.execute_transaction(
                 [
@@ -1667,7 +2376,7 @@ class StaffPortalService:
                     user_id=int(row["applicant_id"]),
                     payload={
                         "role_id": judge_roles[0],
-                        "reason": f"Judge application #{application_id} accepted",
+                        "reason": f"Reviewer application #{application_id} accepted",
                     },
                     correlation_id=f"staff-application:{application_id}",
                     idempotency_key=f"staff-application:{application_id}:judge-role",
@@ -1696,8 +2405,26 @@ class StaffPortalService:
 
     async def staff_list(self, principal):
         guild, _member = await self._member(principal.user_id)
-        role_ids = set(self.bot.config.get_int_list("staff_portal", "judge_role_ids") + self.bot.config.get_int_list("staff_portal", "head_judge_role_ids") + self.bot.config.get_int_list("staff_portal", "owner_role_ids"))
-        owner_users = set(self.bot.config.get_int_list("staff_portal", "owner_user_ids"))
+        role_ids_by_key = {
+            "reviewer": self.bot.config.get_int_list(
+                "staff_portal", "judge_role_ids"
+            ),
+            "head_reviewer": self.bot.config.get_int_list(
+                "staff_portal", "head_judge_role_ids"
+            ),
+            "admin": self.bot.config.get_int_list(
+                "staff_portal", "admin_role_ids"
+            ),
+            "owner": self.bot.config.get_int_list(
+                "staff_portal", "owner_role_ids"
+            ),
+        }
+        role_ids = {
+            role_id for values in role_ids_by_key.values() for role_id in values
+        }
+        allowlisted_users = set(
+            self.bot.config.get_int_list("staff_portal", "owner_user_ids")
+        ) | set(self.bot.config.get_int_list("staff_portal", "dev_user_ids"))
         persisted_rows = await self.db.fetchall(
             "SELECT s.*,o.status AS role_delivery_status FROM staff_members s "
             "LEFT JOIN discord_outbox o ON o.id=s.role_outbox_id WHERE s.guild_id=?",
@@ -1705,7 +2432,7 @@ class StaffPortalService:
         )
         persisted = {int(row["user_id"]): _row_dict(row) for row in persisted_rows}
         member_by_id = {int(member.id): member for member in getattr(guild, "members", ())}
-        tracked_ids = set(persisted) | owner_users
+        tracked_ids = set(persisted) | allowlisted_users
         for member in member_by_id.values():
             member_roles = {int(role.id) for role in getattr(member, "roles", ())}
             if member_roles & role_ids:
@@ -1723,6 +2450,7 @@ class StaffPortalService:
         )
         reviews_by_user = {int(row["reviewed_by"]): _row_dict(row) for row in review_rows}
         claims_by_user = {int(row["claimed_by"]): int(row["c"] or 0) for row in claim_rows}
+        identities = await self._resolve_identities(tracked_ids)
         items = []
         for user_id in tracked_ids:
             member = member_by_id.get(user_id)
@@ -1730,17 +2458,22 @@ class StaffPortalService:
             role = resolve_staff_role(user_id, member_roles, self.bot.config)
             saved = persisted.get(user_id, {})
             review = reviews_by_user.get(user_id, {})
+            identity = identities.get(user_id) or {
+                "id": str(user_id),
+                "display_name": f"Former staff {user_id}",
+                "portal_nickname": "",
+                "discord_display_name": "",
+                "global_display_name": "",
+                "username": "",
+                "avatar_url": "",
+            }
             items.append(
                 {
                     "id": str(user_id),
-                    "display_name": str(
-                        getattr(member, "display_name", "") or f"Former staff {user_id}"
-                    ),
-                    "avatar_url": str(
-                        getattr(getattr(member, "display_avatar", None), "url", "") or ""
-                    ),
+                    **identity,
                     "role": role,
-                    "active": role in {"judge", "head_judge", "owner"},
+                    "role_label": role_label(role),
+                    "active": role != "applicant",
                     "desired_role": saved.get("desired_role"),
                     "desired_status": saved.get("status"),
                     "role_delivery_status": saved.get("role_delivery_status"),
@@ -1749,51 +2482,611 @@ class StaffPortalService:
                     "last_activity_ts": review.get("last_ts"),
                 }
             )
-        order = {"owner": 0, "head_judge": 1, "judge": 2, "applicant": 3}
-        items.sort(key=lambda item: (order.get(str(item["role"]), 4), str(item["display_name"]).casefold()))
+        items.sort(
+            key=lambda item: (
+                -ROLE_ORDER.get(str(item["role"]), -1),
+                str(item["display_name"]).casefold(),
+            )
+        )
         return {"items": items}
 
     async def staff_action(self, principal, user_id, payload):
         action = str(payload.get("action") or "").casefold()
         reason = _bounded_text(payload.get("reason"), 1000, required=True)
-        role_map = {"promote": "head_judge", "demote": "judge", "deactivate": "inactive", "restore": "judge"}
+        role_map = {
+            "promote": "head_reviewer",
+            "demote": "reviewer",
+            "deactivate": "inactive",
+            "restore": "reviewer",
+            "set_admin": "admin",
+            "revoke_admin": "head_reviewer",
+            "set_owner": "owner",
+            "revoke_owner": "admin",
+        }
         desired = role_map.get(action)
         if desired is None:
             raise PortalError(400, "invalid_staff_action", "Choose a valid staff action")
         if payload.get("confirmed") is not True:
             raise PortalError(400, "confirmation_required", "Confirm the staff access change")
-        owner_users = set(self.bot.config.get_int_list("staff_portal", "owner_user_ids"))
-        if int(user_id) in owner_users or int(user_id) == principal.user_id:
+        user_id = _discord_id(user_id, field="Staff member ID")
+        if user_id == principal.user_id:
             raise PortalError(409, "protected_staff_account", "That staff account cannot be changed here")
-        judge_roles = self.bot.config.get_int_list("staff_portal", "judge_role_ids")
-        head_roles = self.bot.config.get_int_list("staff_portal", "head_judge_role_ids")
-        if not judge_roles or not head_roles:
-            raise PortalError(503, "staff_roles_missing", "Judge roles are not fully configured")
-        correlation = new_correlation_id("staff-role")
-        actions = []
-        if action == "promote":
-            actions = [("add_role", head_roles[0]), ("remove_role", judge_roles[0])]
-        elif action == "demote":
-            actions = [("add_role", judge_roles[0]), ("remove_role", head_roles[0])]
-        elif action == "deactivate":
-            actions = [("remove_role", judge_roles[0]), ("remove_role", head_roles[0])]
+        dev_users = set(self.bot.config.get_int_list("staff_portal", "dev_user_ids"))
+        if user_id in dev_users:
+            raise PortalError(
+                409,
+                "protected_developer_account",
+                "Developer access is config-only and cannot be changed in the portal",
+            )
+
+        guild, _actor = await self._member(principal.user_id)
+        target_member = guild.get_member(user_id)
+        if target_member is None:
+            try:
+                target_member = await guild.fetch_member(user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                raise PortalError(
+                    404, "staff_member_not_found", "That guild member could not be found"
+                ) from exc
+        target_role_ids = {
+            int(role.id) for role in getattr(target_member, "roles", ())
+        }
+        current = resolve_staff_role(user_id, target_role_ids, self.bot.config)
+
+        if desired == "owner" or current == "owner":
+            principal.require("developer.access")
+        elif desired == "admin" or current == "admin":
+            principal.require("staff.manage_all")
         else:
-            actions = [("add_role", judge_roles[0])]
+            principal.require("staff.manage_standard_roles")
+
+        role_ids_by_key = {
+            "reviewer": self.bot.config.get_int_list(
+                "staff_portal", "judge_role_ids"
+            ),
+            "head_reviewer": self.bot.config.get_int_list(
+                "staff_portal", "head_judge_role_ids"
+            ),
+            "admin": self.bot.config.get_int_list(
+                "staff_portal", "admin_role_ids"
+            ),
+            "owner": self.bot.config.get_int_list(
+                "staff_portal", "owner_role_ids"
+            ),
+        }
+        if desired != "inactive" and not role_ids_by_key.get(desired):
+            raise PortalError(
+                503,
+                "staff_role_missing",
+                f"The {role_label(desired)} Discord role is not configured",
+            )
+        correlation = new_correlation_id("staff-role")
+        managed_role_ids = {
+            role_id for values in role_ids_by_key.values() for role_id in values
+        }
+        desired_role_id = (
+            role_ids_by_key[desired][0] if desired != "inactive" else None
+        )
+        actions = []
+        if desired_role_id is not None and desired_role_id not in target_role_ids:
+            actions.append(("add_role", desired_role_id))
+        for role_id in sorted(managed_role_ids & target_role_ids):
+            if role_id != desired_role_id:
+                actions.append(("remove_role", role_id))
         outbox_ids = []
         for index, (kind, role_id) in enumerate(actions):
             outbox_ids.append(await self.bot.outbox.enqueue(kind, guild_id=principal.guild_id, user_id=user_id, payload={"role_id": role_id, "reason": reason}, correlation_id=correlation, idempotency_key=f"staff-role:{correlation}:{index}"))
         now = int(time.time())
         await self.db.execute("INSERT INTO staff_members(guild_id,user_id,desired_role,status,updated_by,updated_ts,reason,role_outbox_id) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET desired_role=excluded.desired_role,status=excluded.status,updated_by=excluded.updated_by,updated_ts=excluded.updated_ts,reason=excluded.reason,role_outbox_id=excluded.role_outbox_id", (principal.guild_id, user_id, desired, "inactive" if desired == "inactive" else "active", principal.user_id, now, reason, outbox_ids[0] if outbox_ids else None))
-        await self.db.execute("INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) VALUES(?,'staff_portal',?,'staff_role_requested',?,?,?,?)", (correlation, f"staff:{user_id}", principal.guild_id, principal.user_id, json.dumps({"action": action, "reason": reason}), now))
-        return {"ok": True, "delivery": "pending"}
+        await self.db.execute("INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) VALUES(?,'staff_portal',?,'staff_role_requested',?,?,?,?)", (correlation, f"staff:{user_id}", principal.guild_id, principal.user_id, json.dumps({"action": action, "from_role": current, "to_role": desired, "reason": reason}), now))
+        self._invalidate_identity(user_id)
+        return {
+            "ok": True,
+            "delivery": "pending" if actions else "unchanged",
+            "from_role": current,
+            "to_role": desired,
+        }
+
+    async def _record_admin_event(
+        self,
+        principal: StaffPrincipal,
+        event: str,
+        *,
+        entity_id: str = "",
+        payload: dict[str, Any] | None = None,
+        correlation_id: str = "",
+    ) -> str:
+        correlation = correlation_id or new_correlation_id("staff-admin")
+        await self.db.execute(
+            "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,"
+            "event,guild_id,actor_id,payload_json,created_ts) VALUES(?,"
+            "'staff_portal',?,?,?,?,?,?)",
+            (
+                correlation,
+                str(entity_id),
+                str(event),
+                principal.guild_id,
+                principal.user_id,
+                json.dumps(payload or {}, separators=(",", ":")),
+                int(time.time()),
+            ),
+        )
+        return correlation
+
+    async def requests_admin(self, principal: StaffPrincipal) -> dict[str, Any]:
+        state = await self.db.fetchone(
+            "SELECT * FROM level_request_state WHERE guild_id=?",
+            (principal.guild_id,),
+        )
+        scheduled = await self.db.fetchall(
+            "SELECT id,request_limit,close_minutes,open_ts,request_type,"
+            "open_message,created_by,created_ts,status FROM "
+            "level_request_scheduled_openings WHERE guild_id=? AND "
+            "status='pending' ORDER BY open_ts,id",
+            (principal.guild_id,),
+        )
+        state_data = _row_dict(state)
+        wave_id = int(state_data.get("wave_id") or 0)
+        review_counts = await self.db.fetchone(
+            "SELECT COUNT(*) AS total,"
+            "SUM(CASE WHEN status='reviewed' THEN 1 ELSE 0 END) AS reviewed,"
+            "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending "
+            "FROM level_request_submissions WHERE guild_id=? AND wave_id=?",
+            (principal.guild_id, wave_id),
+        )
+        return {
+            "state": state_data,
+            "progress": {
+                "total": int(review_counts["total"] or 0),
+                "reviewed": int(review_counts["reviewed"] or 0),
+                "pending": int(review_counts["pending"] or 0),
+            },
+            "scheduled": [_row_dict(row) for row in scheduled],
+            "request_types": [
+                "any",
+                "needs_showcase",
+                "only_demons",
+                "only_plats",
+                "only_classic",
+                "only_classic_non_demons",
+                "only_plats_non_demons",
+                "long_level",
+            ],
+        }
+
+    async def requests_action(
+        self, principal: StaffPrincipal, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        principal.require("requests.manage")
+        action = str(payload.get("action") or "").strip().casefold()
+        if payload.get("confirmed") is not True:
+            raise PortalError(422, "confirmation_required", "Confirm the request action")
+        guild = self.bot.get_guild(principal.guild_id)
+        cog = self.bot.get_cog("RequestLevelsCog")
+        if guild is None or cog is None:
+            raise PortalError(
+                503,
+                "request_system_unavailable",
+                "The request system is not available right now",
+            )
+        reason = _bounded_text(payload.get("reason"), 500)
+        result: dict[str, Any]
+        if action == "open":
+            request_limit = int(payload.get("request_limit") or 0) or None
+            close_minutes = int(payload.get("close_minutes") or 0) or None
+            if request_limit is not None and not 1 <= request_limit <= 10000:
+                raise PortalError(422, "invalid_request_limit", "Request limit must be from 1 to 10,000")
+            if close_minutes is not None and not 1 <= close_minutes <= 43200:
+                raise PortalError(422, "invalid_close_time", "Close time must be from 1 to 43,200 minutes")
+            request_type = str(payload.get("request_type") or "").strip()
+            normalized = cog._normalize_request_type(request_type)
+            if normalized is None:
+                raise PortalError(422, "invalid_request_type", "Choose a supported request type")
+            announcement = cog._clean_open_message(payload.get("open_message"))
+            wave_id, close_ts = await cog._open_requests_now(
+                guild,
+                request_limit,
+                close_minutes,
+                normalized or "",
+                announcement,
+            )
+            result = {"wave_id": wave_id, "close_ts": close_ts}
+        elif action == "close":
+            row = await cog._get_state(principal.guild_id)
+            if str(row["state"]) != "closed":
+                await cog._set_state_closed(
+                    guild, reason=f"staff portal by {principal.user_id}: {reason}"
+                )
+            result = {"state": "closed", "wave_id": int(row["wave_id"] or 0)}
+        elif action == "schedule":
+            principal.require("requests.schedule")
+            open_ts = int(payload.get("open_ts") or 0)
+            if open_ts <= int(time.time()):
+                raise PortalError(422, "invalid_open_time", "Opening time must be in the future")
+            request_limit = int(payload.get("request_limit") or 0) or None
+            close_minutes = int(payload.get("close_minutes") or 0) or None
+            request_type = str(payload.get("request_type") or "").strip()
+            normalized = cog._normalize_request_type(request_type)
+            if normalized is None:
+                raise PortalError(422, "invalid_request_type", "Choose a supported request type")
+            announcement = cog._clean_open_message(payload.get("open_message"))
+            opening_id = await self.db.execute_insert(
+                "INSERT INTO level_request_scheduled_openings(guild_id,"
+                "request_limit,close_minutes,open_ts,created_by,created_ts,status,"
+                "request_type,open_message,correlation_id) VALUES(?,?,?,?,?,?,"
+                "'pending',?,?,?)",
+                (
+                    principal.guild_id,
+                    request_limit,
+                    close_minutes,
+                    open_ts,
+                    principal.user_id,
+                    int(time.time()),
+                    normalized or None,
+                    announcement,
+                    new_correlation_id("scheduled"),
+                ),
+            )
+            result = {"opening_id": opening_id, "open_ts": open_ts}
+        elif action == "edit_scheduled":
+            principal.require("requests.schedule")
+            opening_id = int(payload.get("opening_id") or 0)
+            open_ts = int(payload.get("open_ts") or 0)
+            if open_ts <= int(time.time()):
+                raise PortalError(
+                    422,
+                    "invalid_open_time",
+                    "Opening time must be in the future",
+                )
+            request_limit = int(payload.get("request_limit") or 0) or None
+            close_minutes = int(payload.get("close_minutes") or 0) or None
+            if request_limit is not None and not 1 <= request_limit <= 10000:
+                raise PortalError(
+                    422,
+                    "invalid_request_limit",
+                    "Request limit must be from 1 to 10,000",
+                )
+            if close_minutes is not None and not 1 <= close_minutes <= 43200:
+                raise PortalError(
+                    422,
+                    "invalid_close_time",
+                    "Close time must be from 1 to 43,200 minutes",
+                )
+            normalized = cog._normalize_request_type(
+                str(payload.get("request_type") or "").strip()
+            )
+            if normalized is None:
+                raise PortalError(
+                    422,
+                    "invalid_request_type",
+                    "Choose a supported request type",
+                )
+            announcement = cog._clean_open_message(payload.get("open_message"))
+            changed = await self.db.execute_affected(
+                "UPDATE level_request_scheduled_openings SET request_limit=?,"
+                "close_minutes=?,open_ts=?,request_type=?,open_message=? "
+                "WHERE guild_id=? AND id=? AND status='pending'",
+                (
+                    request_limit,
+                    close_minutes,
+                    open_ts,
+                    normalized or None,
+                    announcement,
+                    principal.guild_id,
+                    opening_id,
+                ),
+            )
+            if not changed:
+                raise PortalError(
+                    404,
+                    "scheduled_opening_not_found",
+                    "That pending opening no longer exists",
+                )
+            result = {"opening_id": opening_id, "open_ts": open_ts}
+        elif action == "cancel_scheduled":
+            principal.require("requests.schedule")
+            opening_id = int(payload.get("opening_id") or 0)
+            changed = await self.db.execute_affected(
+                "UPDATE level_request_scheduled_openings SET status='deleted' "
+                "WHERE guild_id=? AND id=? AND status='pending'",
+                (principal.guild_id, opening_id),
+            )
+            if not changed:
+                raise PortalError(404, "scheduled_opening_not_found", "That pending opening no longer exists")
+            result = {"opening_id": opening_id, "status": "deleted"}
+        elif action == "refresh_button":
+            message = await cog.refresh_or_create_request_button(guild)
+            result = {
+                "message_id": str(message.id) if message is not None else None,
+                "refreshed": message is not None,
+            }
+        elif action == "repair":
+            result = await cog.repair_request_system(guild)
+        else:
+            raise PortalError(400, "invalid_request_action", "Choose a valid request action")
+        await self._record_admin_event(
+            principal,
+            f"requests_{action}",
+            entity_id="request-system",
+            payload={"reason": reason, "result": result},
+        )
+        return {"ok": True, "result": result}
+
+    async def community(self, principal: StaffPrincipal) -> dict[str, Any]:
+        ticket_rows = await self.db.fetchall(
+            "SELECT status,COUNT(*) AS c FROM tickets GROUP BY status"
+        )
+        tracking = self.bot.get_cog("TrackingCog")
+        icon = self.bot.config.get("server_icon_rotation", default={}) or {}
+        forum_entries = self.bot.config.get("forum_first_message", "entries", default=[])
+        return {
+            "tracking": {
+                "available": tracking is not None,
+                "weekly_reward": "managed_per_week",
+            },
+            "support": {
+                "tickets": {
+                    str(row["status"]): int(row["c"] or 0) for row in ticket_rows
+                }
+            },
+            "forum": {
+                "rules": [
+                    {
+                        "forum_channel_id": str(entry.get("forum_channel_id") or ""),
+                        "required_word": str(entry.get("required_word") or ""),
+                        "match_mode": str(
+                            entry.get("required_word_match_mode") or "contains"
+                        ),
+                    }
+                    for entry in forum_entries
+                    if isinstance(entry, dict)
+                ]
+            },
+            "server_presentation": {
+                "icon_rotation_mode": str(icon.get("mode") or "disabled"),
+                "icon_count": len(icon.get("urls") or []),
+                "current_index": int(icon.get("current_index") or -1),
+            },
+        }
+
+    async def community_action(
+        self, principal: StaffPrincipal, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        action = str(payload.get("action") or "").strip().casefold()
+        if payload.get("confirmed") is not True:
+            raise PortalError(422, "confirmation_required", "Confirm the community action")
+        if action not in {"enable_weekly_reward", "disable_weekly_reward"}:
+            raise PortalError(400, "invalid_community_action", "Choose a valid community action")
+        principal.require("tracking.manage")
+        tracking = self.bot.get_cog("TrackingCog")
+        guild = self.bot.get_guild(principal.guild_id)
+        if tracking is None or guild is None:
+            raise PortalError(503, "tracking_unavailable", "Tracking is not available right now")
+        if action == "disable_weekly_reward":
+            week_start = await tracking.disable_weekly_reward_for_current_week(
+                guild, principal.user_id
+            )
+            result = {"week_start": week_start, "disabled": True}
+        else:
+            week_start, was_disabled = await tracking.enable_weekly_reward_for_current_week(
+                guild, principal.user_id
+            )
+            result = {
+                "week_start": week_start,
+                "disabled": False,
+                "was_disabled": was_disabled,
+            }
+        await self._record_admin_event(
+            principal, f"tracking_{action}", entity_id="tracking", payload=result
+        )
+        return {"ok": True, "result": result}
+
+    @staticmethod
+    def _incident_summary(message: Any) -> tuple[str, str]:
+        text = str(message or "").strip()
+        first_line = text.splitlines()[0] if text else "Unknown error"
+        match = re.search(r"\b([A-Z][A-Za-z]+(?:Error|Exception))\b", text)
+        error_type = match.group(1) if match else "Error"
+        normalized = re.sub(r"\s+", " ", first_line)[:180]
+        return error_type, normalized
+
+    @staticmethod
+    def _sanitize_incident_detail(message: Any) -> str:
+        text = str(message or "")[:20000]
+        text = re.sub(
+            r"(?i)\b(DISCORD_TOKEN|TURSO_AUTH_TOKEN|LIBSQL_AUTH_TOKEN|DATABASE_URL|"
+            r"STAFF_API_TOKEN|DISCORD_CLIENT_SECRET)\s*[:=]\s*([^\s,;]+)",
+            lambda match: f"{match.group(1)}=[REDACTED]",
+            text,
+        )
+        text = re.sub(
+            r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+            "[REDACTED JWT]",
+            text,
+        )
+        return text
 
     async def operations(self, principal):
         runtime = get_runtime_health()
         database = self.db.health_snapshot()
         outbox = await self.db.fetchall("SELECT status,COUNT(*) AS c FROM discord_outbox GROUP BY status")
-        incidents = await self.db.fetchall("SELECT fingerprint,last_message,last_seen_ts,occurrence_count FROM error_incidents WHERE status='open' ORDER BY last_seen_ts DESC LIMIT 10")
+        incidents = await self.db.fetchall(
+            "SELECT fingerprint,category,last_message,first_seen_ts,last_seen_ts,"
+            "occurrence_count,last_correlation_id,status FROM error_incidents "
+            "WHERE status='open' ORDER BY last_seen_ts DESC LIMIT 20"
+        )
         request_state = await self.db.fetchone("SELECT state,wave_id,submitted_count,request_limit,close_ts FROM level_request_state WHERE guild_id=?", (principal.guild_id,))
-        return {"service": get_keepalive_status(), "runtime": runtime, "database": database, "outbox": {str(row["status"]): int(row["c"] or 0) for row in outbox}, "request_wave": _row_dict(request_state), "incidents": [_row_dict(row) for row in incidents]}
+        request_cog = self.bot.get_cog("RequestLevelsCog")
+        provider_data = (
+            request_cog.validation_provider_snapshot()
+            if request_cog is not None
+            and hasattr(request_cog, "validation_provider_snapshot")
+            else {}
+        )
+        operations_cog = self.bot.get_cog("OperationsCog")
+        tasks = (
+            operations_cog.task_snapshot()
+            if operations_cog is not None
+            and hasattr(operations_cog, "task_snapshot")
+            else runtime.get("tasks", {})
+        )
+        incident_items = []
+        for row in incidents:
+            error_type, summary = self._incident_summary(row["last_message"])
+            incident_items.append(
+                {
+                    "fingerprint": str(row["fingerprint"]),
+                    "component": str(row["category"] or "Component error")[:120],
+                    "error_type": error_type,
+                    "summary": summary,
+                    "first_seen_ts": row["first_seen_ts"],
+                    "last_seen_ts": row["last_seen_ts"],
+                    "occurrence_count": int(row["occurrence_count"] or 0),
+                    "correlation_id": str(row["last_correlation_id"] or ""),
+                    "status": str(row["status"] or "open"),
+                    "details_available": principal.can("audit.view_full"),
+                }
+            )
+        outbox_counts = {
+            str(row["status"]): int(row["c"] or 0) for row in outbox
+        }
+        return {
+            "service": get_keepalive_status(),
+            "runtime": runtime,
+            "database": database,
+            "outbox": {
+                "pending": outbox_counts.get("pending", 0),
+                "processing": outbox_counts.get("processing", 0),
+                "dead": outbox_counts.get("dead", 0),
+                "delivered": outbox_counts.get("delivered", 0),
+            },
+            "background_workers": tasks,
+            "providers": provider_data,
+            "request_wave": _row_dict(request_state),
+            "pps_worker": str(tasks.get("priority.maintenance", "unknown")),
+            "public_cache": {
+                "state": "available"
+                if self.bot.get_cog("PrioritySystemCog") is not None
+                else "unavailable"
+            },
+            "incidents": incident_items,
+        }
+
+    async def incident_detail(
+        self, principal: StaffPrincipal, fingerprint: str
+    ) -> dict[str, Any]:
+        if not principal.can("audit.view_full"):
+            raise PortalError(
+                403,
+                "incident_detail_denied",
+                "Full incident traces are limited to Owner and Dev",
+            )
+        row = await self.db.fetchone(
+            "SELECT fingerprint,category,status,first_seen_ts,last_seen_ts,"
+            "occurrence_count,last_message,last_correlation_id,resolved_ts "
+            "FROM error_incidents WHERE fingerprint=?",
+            (fingerprint,),
+        )
+        if row is None:
+            raise PortalError(404, "incident_not_found", "That incident no longer exists")
+        error_type, summary = self._incident_summary(row["last_message"])
+        return {
+            "incident": {
+                "fingerprint": str(row["fingerprint"]),
+                "component": str(row["category"] or "Component error")[:120],
+                "error_type": error_type,
+                "summary": summary,
+                "trace": self._sanitize_incident_detail(row["last_message"]),
+                "correlation_id": str(row["last_correlation_id"] or ""),
+                "first_seen_ts": row["first_seen_ts"],
+                "last_seen_ts": row["last_seen_ts"],
+                "occurrence_count": int(row["occurrence_count"] or 0),
+                "status": str(row["status"] or "open"),
+                "resolved_ts": row["resolved_ts"],
+            }
+        }
+
+    async def system(self, principal: StaffPrincipal) -> dict[str, Any]:
+        principal.require("developer.access")
+        operations = await self.operations(principal)
+        schema_rows = await self.db.fetchall(
+            "SELECT component,schema_version,updated_ts FROM schema_metadata "
+            "ORDER BY component"
+        )
+        dead_rows = await self.db.fetchall(
+            "SELECT id,correlation_id,action_type,attempts,created_ts,updated_ts,"
+            "last_error FROM discord_outbox WHERE status='dead' "
+            "ORDER BY updated_ts DESC LIMIT 50"
+        )
+        restore = await self.db.fetchone(
+            "SELECT drill_ts,status,duration_ms,size_bytes,table_count,"
+            "missing_tables_json,error_text,trigger FROM restore_drills "
+            "ORDER BY drill_ts DESC LIMIT 1"
+        )
+        database = dict(operations["database"])
+        database.pop("remote_url", None)
+        database.pop("auth_token", None)
+        return {
+            **operations,
+            "database": database,
+            "schemas": [_row_dict(row) for row in schema_rows],
+            "dead_outbox": [
+                {
+                    **_row_dict(row),
+                    "last_error": self._sanitize_incident_detail(row["last_error"])[
+                        :1000
+                    ],
+                }
+                for row in dead_rows
+            ],
+            "last_restore_drill": _row_dict(restore),
+            "available_actions": [
+                "restart_stopped_tasks",
+                "rebuild_public_cache",
+                "request_repair",
+                "restore_drill",
+            ],
+        }
+
+    async def system_action(
+        self, principal: StaffPrincipal, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        principal.require("developer.access")
+        action = str(payload.get("action") or "").strip().casefold()
+        if payload.get("confirmed") is not True:
+            raise PortalError(422, "confirmation_required", "Confirm the system action")
+        reason = _bounded_text(payload.get("reason"), 1000, required=True)
+        guild = self.bot.get_guild(principal.guild_id)
+        if action == "restart_stopped_tasks":
+            operations_cog = self.bot.get_cog("OperationsCog")
+            if operations_cog is None:
+                raise PortalError(503, "operations_unavailable", "Operations supervisor is unavailable")
+            result = await operations_cog.restart_stopped_tasks()
+        elif action == "rebuild_public_cache":
+            priority_cog = self.bot.get_cog("PrioritySystemCog")
+            if priority_cog is None:
+                raise PortalError(503, "pps_unavailable", "PPS is unavailable")
+            result = {"levels": await priority_cog.refresh_public_level_cache()}
+        elif action == "request_repair":
+            request_cog = self.bot.get_cog("RequestLevelsCog")
+            if request_cog is None or guild is None:
+                raise PortalError(503, "request_system_unavailable", "Request repair is unavailable")
+            result = await request_cog.repair_request_system(guild)
+        elif action == "restore_drill":
+            principal.require("restore_drills.manage")
+            operations_cog = self.bot.get_cog("OperationsCog")
+            if operations_cog is None:
+                raise PortalError(503, "operations_unavailable", "Restore drill is unavailable")
+            result = await operations_cog.run_restore_drill(trigger="staff_portal")
+        else:
+            raise PortalError(400, "invalid_system_action", "Choose a supported recovery action")
+        correlation = await self._record_admin_event(
+            principal,
+            f"system_{action}",
+            entity_id="avenue-guard",
+            payload={"reason": reason, "result": result},
+        )
+        return {"ok": True, "result": result, "correlation_id": correlation}
 
     async def pps_admin(self, principal):
         data = await self.priority.dashboard(principal.guild_id)
@@ -1870,7 +3163,18 @@ class StaffPortalService:
             "ORDER BY created_ts DESC,id DESC LIMIT 250",
             tuple(params),
         )
-        return {"items": [_row_dict(row) for row in rows]}
+        identities = await self._resolve_identities(
+            {int(row["actor_id"]) for row in rows if row["actor_id"] is not None}
+        )
+        items = []
+        for row in rows:
+            item = _row_dict(row)
+            actor_id = row["actor_id"]
+            item["actor"] = (
+                identities.get(int(actor_id)) if actor_id is not None else None
+            )
+            items.append(item)
+        return {"items": items}
 
     async def safe_configuration(self):
         saved = await self.db.get_runtime_setting("staff_portal.safe_config", {})
@@ -1912,11 +3216,12 @@ class StaffPortalService:
             staff_role_ids = set(
                 self.bot.config.get_int_list("staff_portal", "judge_role_ids")
                 + self.bot.config.get_int_list("staff_portal", "head_judge_role_ids")
+                + self.bot.config.get_int_list("staff_portal", "admin_role_ids")
                 + self.bot.config.get_int_list("staff_portal", "owner_role_ids")
             )
             owner_users = set(
                 self.bot.config.get_int_list("staff_portal", "owner_user_ids")
-            )
+            ) | set(self.bot.config.get_int_list("staff_portal", "dev_user_ids"))
             lowered = term.casefold()
             for member in getattr(guild, "members", ()):
                 roles = {int(role.id) for role in getattr(member, "roles", ())}

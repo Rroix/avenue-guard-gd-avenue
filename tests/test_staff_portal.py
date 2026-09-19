@@ -11,14 +11,22 @@ from services.staff_portal import PortalError, StaffPortalService
 from utils.db import Database
 from utils.keepalive import get_public_levels_payload, set_public_level_data
 from utils.priority_system import priority_settings, score_components
-from utils.staff_auth import StaffPrincipal, capability_set, resolve_staff_role
+from utils.staff_auth import (
+    StaffPrincipal,
+    canonical_role,
+    capability_set,
+    resolve_staff_role,
+)
 
 GUILD_ID = 717003826288394271
 JUDGE_ID = 101
 HEAD_ID = 102
 OWNER_ID = 1102884420207255653
+DEV_ID = 1102884420207255552
+ADMIN_ID = 103
 JUDGE_ROLE = 785212232786640966
 HEAD_ROLE = 1430214323720163498
+ADMIN_ROLE = 1524000000000000001
 
 
 class PortalConfig:
@@ -31,8 +39,10 @@ class PortalConfig:
                 "enabled": True,
                 "judge_role_ids": [JUDGE_ROLE],
                 "head_judge_role_ids": [HEAD_ROLE],
+                "admin_role_ids": [ADMIN_ROLE],
                 "owner_role_ids": [],
                 "owner_user_ids": [OWNER_ID],
+                "dev_user_ids": [DEV_ID],
             }
         )
 
@@ -85,7 +95,16 @@ class FakeOutbox:
 
 
 def principal(user_id, role):
-    role_ids = () if role == "owner" else (HEAD_ROLE if role == "head_judge" else JUDGE_ROLE,)
+    role = canonical_role(role)
+    role_ids = (
+        (HEAD_ROLE,)
+        if role == "head_reviewer"
+        else (ADMIN_ROLE,)
+        if role == "admin"
+        else (JUDGE_ROLE,)
+        if role == "reviewer"
+        else ()
+    )
     return StaffPrincipal(
         user_id=user_id,
         guild_id=GUILD_ID,
@@ -104,7 +123,9 @@ async def portal(tmp_path, monkeypatch):
     members = [
         FakeMember(JUDGE_ID, [JUDGE_ROLE]),
         FakeMember(HEAD_ID, [HEAD_ROLE]),
+        FakeMember(ADMIN_ID, [ADMIN_ROLE]),
         FakeMember(OWNER_ID, []),
+        FakeMember(DEV_ID, []),
         FakeMember(999, []),
     ]
     guild = FakeGuild(members)
@@ -156,9 +177,11 @@ async def insert_queue(service, *, level_id, message_id, priority, cp=0, state="
 
 def test_role_capabilities_do_not_trust_browser_labels():
     config = PortalConfig()
-    assert resolve_staff_role(JUDGE_ID, [JUDGE_ROLE], config) == "judge"
-    assert resolve_staff_role(HEAD_ID, [HEAD_ROLE], config) == "head_judge"
+    assert resolve_staff_role(JUDGE_ID, [JUDGE_ROLE], config) == "reviewer"
+    assert resolve_staff_role(HEAD_ID, [HEAD_ROLE], config) == "head_reviewer"
+    assert resolve_staff_role(ADMIN_ID, [ADMIN_ROLE], config) == "admin"
     assert resolve_staff_role(OWNER_ID, [], config) == "owner"
+    assert resolve_staff_role(DEV_ID, [], config) == "dev"
     assert "queue.reassign" not in capability_set("judge")
     assert "queue.reassign" in capability_set("head_judge")
     assert "staff.manage" in capability_set("owner")
@@ -167,18 +190,29 @@ def test_role_capabilities_do_not_trust_browser_labels():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("user_id", "expected_role"),
-    ((JUDGE_ID, "judge"), (HEAD_ID, "head_judge"), (OWNER_ID, "owner")),
+    (
+        (JUDGE_ID, "reviewer"),
+        (HEAD_ID, "head_reviewer"),
+        (ADMIN_ID, "admin"),
+        (OWNER_ID, "owner"),
+        (DEV_ID, "dev"),
+    ),
 )
 async def test_staff_session_maps_live_discord_roles(portal, user_id, expected_role):
     service, _guild = portal
-    created = await service.create_session({"user_id": user_id, "purpose": "staff"})
+    created = await service.create_session({"user_id": str(user_id), "purpose": "staff"})
     assert created["user"]["role"] == expected_role
     assert created["user"]["staff_access"] is True
     assert set(created["user"]) == {
         "id",
         "display_name",
+        "portal_nickname",
+        "discord_display_name",
+        "global_display_name",
+        "username",
         "avatar_url",
         "role",
+        "role_label",
         "staff_access",
         "capabilities",
     }
@@ -231,7 +265,7 @@ async def test_session_rechecks_discord_role_and_revokes_staff_access(portal):
     }
     status, payload = await service.handle_request("GET", "/api/staff/session", headers, b"")
     assert status == 200
-    assert payload["user"]["role"] == "judge"
+    assert payload["user"]["role"] == "reviewer"
 
     guild.get_member(JUDGE_ID).roles = []
     with pytest.raises(PermissionError):
@@ -242,7 +276,7 @@ async def test_session_rechecks_discord_role_and_revokes_staff_access(portal):
 async def test_browser_role_claim_is_ignored_and_logout_revokes_session(portal):
     service, _guild = portal
     created = await service.create_session({"user_id": JUDGE_ID, "role": "owner"})
-    assert created["user"]["role"] == "judge"
+    assert created["user"]["role"] == "reviewer"
     headers = {
         "x-avenue-portal-key": "test-service-token",
         "x-staff-session": created["session_token"],
@@ -255,6 +289,190 @@ async def test_browser_role_claim_is_ignored_and_logout_revokes_session(portal):
     assert payload == {"ok": True}
     with pytest.raises(PortalError, match="session expired"):
         await service.handle_request("GET", "/api/staff/session", headers, b"")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_id", "role"),
+    (
+        (JUDGE_ID, "reviewer"),
+        (HEAD_ID, "head_reviewer"),
+        (ADMIN_ID, "admin"),
+        (OWNER_ID, "owner"),
+        (DEV_ID, "dev"),
+    ),
+)
+async def test_overview_empty_account_works_for_every_staff_role(portal, user_id, role):
+    service, _guild = portal
+    payload = await service.overview(principal(user_id, role))
+    assert payload["summary"] == {
+        "active_claims": 0,
+        "stale_claims": 0,
+        "tasks_remaining": 0,
+        "tasks_due": 0,
+        "followups_due": 0,
+    }
+    assert payload["progress"]["outreach_attempts"] == 0
+    assert payload["warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_overview_returns_partial_data_for_null_actor_and_failed_section(
+    portal, monkeypatch
+):
+    service, _guild = portal
+    await service.db.execute(
+        "INSERT INTO workflow_events("
+        "correlation_id,workflow_type,entity_id,event,guild_id,actor_id,"
+        "payload_json,created_ts) VALUES(?,?,?,?,?,NULL,'{}',?)",
+        ("overview-null-actor", "test", "overview", "system_event", GUILD_ID, 1),
+    )
+    original_fetchall = service.db.fetchall
+
+    async def fail_pipeline(sql, params=()):
+        if "GROUP BY queue_state" in sql:
+            raise RuntimeError("synthetic pipeline failure")
+        return await original_fetchall(sql, params)
+
+    error_log = AsyncMock()
+    monkeypatch.setattr(service.db, "fetchall", fail_pipeline)
+    monkeypatch.setattr("services.staff_portal.log_error", error_log)
+
+    payload = await service.overview(principal(JUDGE_ID, "reviewer"))
+
+    assert payload["pipeline"] == {}
+    assert payload["recent_activity"][0]["actor"] is None
+    assert payload["warnings"][0]["section"] == "pipeline"
+    assert payload["warnings"][0]["correlation_id"].startswith("staff-overvi-")
+    error_log.assert_awaited_once()
+    audit = await service.audit(principal(ADMIN_ID, "admin"), {})
+    assert audit["items"][0]["actor"] is None
+
+
+@pytest.mark.asyncio
+async def test_api_preserves_real_snowflakes_as_strings(portal):
+    service, _guild = portal
+    created = await service.create_session(
+        {"user_id": str(DEV_ID), "purpose": "staff"}
+    )
+    headers = {
+        "x-avenue-portal-key": "test-service-token",
+        "x-staff-session": created["session_token"],
+    }
+    status, payload = await service.handle_request(
+        "GET", "/api/staff/session", headers, b""
+    )
+    assert status == 200
+    assert payload["user"]["id"] == "1102884420207255552"
+    assert isinstance(payload["user"]["id"], str)
+    with pytest.raises(PortalError) as unsafe:
+        await service.create_session({"user_id": DEV_ID, "purpose": "staff"})
+    assert unsafe.value.code == "unsafe_discord_id"
+
+
+@pytest.mark.asyncio
+async def test_portal_nickname_permissions_fallback_and_audit(portal):
+    service, _guild = portal
+    reviewer = principal(JUDGE_ID, "reviewer")
+    admin = principal(ADMIN_ID, "admin")
+    owner = principal(OWNER_ID, "owner")
+    changed = await service.update_portal_nickname(
+        reviewer, JUDGE_ID, {"portal_nickname": "  Average  "}
+    )
+    assert changed["profile"]["display_name"] == "Average"
+    with pytest.raises(PermissionError):
+        await service.update_portal_nickname(
+            reviewer,
+            HEAD_ID,
+            {"portal_nickname": "Nope", "reason": "Escalation"},
+        )
+    reset = await service.update_portal_nickname(
+        admin,
+        JUDGE_ID,
+        {"portal_nickname": "", "reason": "Requested reset"},
+    )
+    assert reset["profile"]["display_name"] == f"Member {JUDGE_ID}"
+    history = await service.nickname_history(owner, JUDGE_ID)
+    assert [item["new_nickname"] for item in history["items"]] == ["", "Average"]
+    with pytest.raises(PortalError) as unsafe:
+        await service.update_portal_nickname(
+            reviewer, JUDGE_ID, {"portal_nickname": "@everyone"}
+        )
+    assert unsafe.value.code == "nickname_unsafe"
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_grant_owner_or_dev(portal):
+    service, _guild = portal
+    with pytest.raises(PermissionError):
+        await service.staff_action(
+            principal(ADMIN_ID, "admin"),
+            str(JUDGE_ID),
+            {
+                "action": "set_owner",
+                "reason": "Attempted browser escalation",
+                "confirmed": True,
+            },
+        )
+    with pytest.raises(PortalError) as protected:
+        await service.staff_action(
+            principal(DEV_ID, "dev"),
+            str(DEV_ID),
+            {
+                "action": "deactivate",
+                "reason": "Cannot mutate Dev membership",
+                "confirmed": True,
+            },
+        )
+    assert protected.value.code == "protected_staff_account"
+
+
+@pytest.mark.asyncio
+async def test_admin_can_edit_pending_request_opening(portal):
+    service, _guild = portal
+    opening_id = await service.db.execute_insert(
+        "INSERT INTO level_request_scheduled_openings("
+        "guild_id,request_limit,close_minutes,open_ts,created_by,created_ts,"
+        "status,request_type,open_message,correlation_id) "
+        "VALUES(?,?,?,?,?,?,'pending',?,?,?)",
+        (GUILD_ID, 10, 30, 2_000_000_000, ADMIN_ID, 1, "any", "Old", "edit-test"),
+    )
+    request_cog = SimpleNamespace(
+        _normalize_request_type=lambda value: value if value == "only_demons" else None,
+        _clean_open_message=lambda value: str(value or "").strip() or None,
+    )
+    service.bot.get_cog = (
+        lambda name: request_cog if name == "RequestLevelsCog" else None
+    )
+
+    result = await service.requests_action(
+        principal(ADMIN_ID, "admin"),
+        {
+            "action": "edit_scheduled",
+            "opening_id": opening_id,
+            "open_ts": 2_000_000_100,
+            "request_limit": 25,
+            "close_minutes": 45,
+            "request_type": "only_demons",
+            "open_message": "Updated opening",
+            "reason": "Schedule changed",
+            "confirmed": True,
+        },
+    )
+
+    saved = await service.db.fetchone(
+        "SELECT request_limit,close_minutes,open_ts,request_type,open_message "
+        "FROM level_request_scheduled_openings WHERE id=?",
+        (opening_id,),
+    )
+    assert result["result"]["opening_id"] == opening_id
+    assert dict(saved) == {
+        "request_limit": 25,
+        "close_minutes": 45,
+        "open_ts": 2_000_000_100,
+        "request_type": "only_demons",
+        "open_message": "Updated opening",
+    }
 
 
 @pytest.mark.asyncio

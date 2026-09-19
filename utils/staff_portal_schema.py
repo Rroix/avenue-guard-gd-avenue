@@ -12,6 +12,8 @@ STAFF_PORTAL_TABLES = {
     "staff_application_events",
     "staff_application_notes",
     "staff_members",
+    "staff_portal_profiles",
+    "staff_portal_nickname_history",
     "staff_milestones",
     "staff_idempotency",
 }
@@ -157,6 +159,25 @@ STAFF_PORTAL_SCHEMA = (
         role_outbox_id INTEGER,
         PRIMARY KEY(guild_id, user_id)
     );""",
+    """CREATE TABLE IF NOT EXISTS staff_portal_profiles(
+        guild_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        portal_nickname TEXT NOT NULL DEFAULT '',
+        updated_ts INTEGER NOT NULL,
+        updated_by INTEGER NOT NULL,
+        PRIMARY KEY(guild_id, user_id)
+    );""",
+    """CREATE TABLE IF NOT EXISTS staff_portal_nickname_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        actor_id INTEGER NOT NULL,
+        old_nickname TEXT NOT NULL DEFAULT '',
+        new_nickname TEXT NOT NULL DEFAULT '',
+        reason TEXT NOT NULL DEFAULT '',
+        created_ts INTEGER NOT NULL,
+        correlation_id TEXT NOT NULL
+    );""",
     """CREATE TABLE IF NOT EXISTS staff_milestones(
         guild_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
@@ -205,6 +226,8 @@ STAFF_PORTAL_SCHEMA = (
         ON staff_application_events(application_id,created_ts);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_idempotency_expiry
         ON staff_idempotency(expires_ts);""",
+    """CREATE INDEX IF NOT EXISTS idx_staff_nickname_history_user
+        ON staff_portal_nickname_history(guild_id,user_id,created_ts DESC);""",
     """CREATE UNIQUE INDEX IF NOT EXISTS idx_outreach_submission_target
         ON level_outreach_attempts(episode_id,queue_id,private_target_key)
         WHERE status='submitted_to_mod' AND episode_id IS NOT NULL AND private_target_key!='';""",

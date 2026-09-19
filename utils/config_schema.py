@@ -409,8 +409,10 @@ def validate_config(data: Any) -> list[ConfigIssue]:
         for key in (
             "judge_role_ids",
             "head_judge_role_ids",
+            "admin_role_ids",
             "owner_role_ids",
             "owner_user_ids",
+            "dev_user_ids",
         ):
             value = staff_portal.get(key, [])
             if not isinstance(value, list) or any(
@@ -424,6 +426,18 @@ def validate_config(data: Any) -> list[ConfigIssue]:
         stale_hours = staff_portal.get("claim_stale_hours", 48)
         if isinstance(stale_hours, bool) or not isinstance(stale_hours, int) or not 1 <= stale_hours <= 720:
             issues.append(ConfigIssue("staff_portal.claim_stale_hours", "must be an integer from 1 to 720"))
+        identity_ttl = staff_portal.get("identity_cache_ttl_seconds", 300)
+        if (
+            isinstance(identity_ttl, bool)
+            or not isinstance(identity_ttl, int)
+            or not 30 <= identity_ttl <= 3600
+        ):
+            issues.append(
+                ConfigIssue(
+                    "staff_portal.identity_cache_ttl_seconds",
+                    "must be an integer from 30 to 3600",
+                )
+            )
         origins = staff_portal.get("allowed_origins", [])
         if not isinstance(origins, list) or any(
             not str(origin).startswith("https://") for origin in origins

@@ -42,9 +42,13 @@ Discord roles are mapped in `config.json` under `staff_portal`.
 | Role | Main capabilities |
 |---|---|
 | Applicant | Save, submit, track, and withdraw their own application |
-| Judge | Portal access, queue view, own claim/release, outreach attempts/submissions/follow-ups, own tasks, private/team notes |
-| Head Judge | Judge capabilities plus reassignment, stale release, queue state operations, team tasks, review QA, tier adjustment before submission, Judge applications |
-| Owner | All capabilities plus staff access changes, operations, PPS cycles/overrides, audit, and safe configuration |
+| Reviewer | Portal access, queue view, own claim/release, outreach attempts/submissions/follow-ups, own tasks, private/team notes |
+| Head Reviewer | Reviewer capabilities plus reassignment, stale release, queue state operations, team tasks, review QA, tier adjustment before submission, Reviewer applications |
+| Admin | Normal request, PPS, tracking, forum, support, staff, and operations management; summarized incidents |
+| Owner | Admin capabilities plus higher staff access, overrides, backups, restore drills, releases, full audit, and safe configuration |
+| Dev | Owner capabilities plus sanitized runtime, schema, outbox, worker, provider, incident, and recovery diagnostics |
+
+`Dev` is assigned only through `staff_portal.dev_user_ids`; it is never inferred from a Discord role or grantable from the portal. Legacy internal keys `judge` and `head_judge` remain accepted as aliases while every API and UI label is canonical.
 
 The capability map lives in `utils/staff_auth.py`. UI visibility is convenience only; `services/staff_portal.py` enforces every capability again.
 
@@ -57,10 +61,12 @@ Overview
 Work
   My Work | Queue | Outreach | Tasks | Notes
 Team
-  Overview | Statistics | Review QA | Applications | Staff (owner only)
-Admin (owner only)
-  Operations | PPS | Audit | Configuration
+  Overview | Statistics | Review QA | Applications | Staff
+Admin (Admin+)
+  Operations | Requests | PPS | Community | Staff | Audit | System | Configuration
 ```
+
+Each Admin section is capability-gated again by Avenue Guard. Hiding a browser tab is never treated as authorization. The System section is Dev-only.
 
 Overview is personalized and uses real counts. Progress bars appear only where the database provides a denominator, such as completed tasks or reviewed requests in the current wave. Counts are contribution indicators, not reviewer-quality or send-rate scores.
 
@@ -79,6 +85,8 @@ Database schema 10 adds these tables without replacing existing request/PPS tabl
 - `staff_application_events`
 - `staff_application_notes`
 - `staff_members`
+- `staff_portal_profiles`
+- `staff_portal_nickname_history`
 - `staff_milestones`
 - `staff_idempotency`
 
@@ -103,6 +111,7 @@ All private endpoints require the service key. Except for OAuth session creation
 | `POST /api/staff/auth/session` | Exchange verified Discord user ID for an opaque portal session |
 | `GET/DELETE /api/staff/session` | Read current capabilities or revoke the session |
 | `GET /api/staff/overview` | Personalized progress and attention summary |
+| `GET/PATCH /api/staff/profile` | Resolved Discord identity and private portal nickname |
 | `GET /api/staff/queue` | Paginated exact-order queue and filters |
 | `GET /api/staff/queue/{id}` | Internal level summary, PPS, outreach, history, notes |
 | `POST /api/staff/queue/{id}/{action}` | Claim, release, reassign, state, requeue, or tier action |
@@ -113,9 +122,13 @@ All private endpoints require the service key. Except for OAuth session creation
 | `GET /api/staff/statistics` | Real activity aggregates and median turnaround |
 | `GET/POST /api/staff/qa...` | Head/owner review QA |
 | `GET/POST /api/staff/applications...` | Application management and decisions |
-| `GET/POST /api/staff/staff...` | Owner staff access management through outbox |
-| `GET /api/staff/operations` | Existing runtime/database/outbox health |
+| `GET/POST /api/staff/staff...` | Capability-gated staff access and nickname management |
+| `GET /api/staff/operations` | Structured runtime, database, worker, provider, outbox, and incident summaries |
+| `GET /api/staff/operations/incidents/{fingerprint}` | Sanitized full trace for Owner/Dev |
+| `GET/POST /api/staff/requests` | Request waves, scheduled openings, button refresh, and repair |
+| `GET/POST /api/staff/community` | Tracking, support, forum, and server-presentation operations |
 | `GET/POST /api/staff/pps` | Existing PPS dashboard and cycle/override services |
+| `GET/POST /api/staff/system` | Dev-only sanitized diagnostics and safe recovery actions |
 | `GET /api/staff/audit` | Filtered durable workflow events |
 | `GET/PATCH /api/staff/configuration` | Allowlisted safe settings only |
 | `GET /api/staff/search` | Permission-aware internal search |
@@ -161,13 +174,14 @@ For local Netlify development, add the local callback separately if needed. Prod
 
 ## Deployment
 
-1. Deploy Avenue Guard first. Startup runs the additive schema-10 migration through the existing database wrapper and Turso worker.
-2. Confirm Render `/ready` returns HTTP 200.
-3. Add `STAFF_API_TOKEN` to Render and redeploy.
-4. Add the five website environment variables to Netlify.
-5. Add the Discord OAuth redirect URL.
-6. Deploy the website repository containing `netlify.toml`, `netlify/functions`, `/staff`, `/apply`, `/levels`, and `/level`.
-7. Sign in as a Judge, Head Judge, owner, and ordinary member to verify role-specific access.
+1. Configure `admin_role_ids`, `owner_role_ids` or `owner_user_ids`, and the explicit `dev_user_ids` allowlist.
+2. Deploy Avenue Guard. Startup applies the additive schema-10 tables through the existing database wrapper and Turso worker.
+3. Confirm Render `/ready` returns HTTP 200.
+4. Add `STAFF_API_TOKEN` to Render and redeploy.
+5. Add the five website environment variables to Netlify.
+6. Add the Discord OAuth redirect URL.
+7. Deploy the website repository containing `netlify.toml`, `netlify/functions`, `/staff`, `/apply`, `/levels`, and `/level`.
+8. Sign in as Reviewer, Head Reviewer, Admin, Owner, Dev, and an ordinary member to verify role-specific access.
 
 If the bot is unavailable, Netlify returns a concise 503 and does not fall back to direct Turso access. Discord `/pps` remains the recovery interface.
 
@@ -175,25 +189,25 @@ If the bot is unavailable, Netlify returns a concise 503 and does not fall back 
 
 - Open `/staff` signed out and complete Discord OAuth.
 - Verify an ordinary member cannot open staff modules but can open `/apply`.
-- Remove a test Judge role and verify their next staff request is denied.
-- Confirm Judge, Head Judge, and owner navigation differs as expected.
+- Remove a test Reviewer role and verify their next staff request is denied.
+- Confirm Reviewer, Head Reviewer, Admin, Owner, and Dev navigation differs as expected.
 - Claim one queue entry in two browser sessions; verify only one owner wins.
-- Release the owner's own claim; verify a Head Judge cannot release a fresh third-party claim but can release it after the configured stale threshold.
+- Release the owner's own claim; verify a Head Reviewer cannot release a fresh third-party claim but can release it after the configured stale threshold.
 - Record an attempt, confirmed submission, same-target follow-up, and different-target submission.
 - Verify the same-target second submission is rejected and suggests a follow-up.
 - Requeue an eligible entry and verify W resets while old episode history remains.
 - Create, complete, and inspect a personal task; verify generated attention tasks are not duplicated by refreshes.
-- Create each permitted note scope and verify a different Judge cannot read a private note.
+- Create each permitted note scope and verify a different Reviewer cannot read a private note.
 - Perform a QA action and confirm a post-submission tier correction is owner-only.
 - Save and submit an application; retry the request and verify only one active application exists.
-- Accept a test application and confirm `accepted_pending_role` changes only after the outbox delivers the Judge role.
+- Accept a test application and confirm `accepted_pending_role` changes only after the outbox delivers the Reviewer role.
 - Promote/demote a test staff member and inspect the outbox and audit event.
 - Search `/levels` by exact ID, name, and creator; inspect the response for absence of private fields.
 - Check queue, applications, tasks, detail drawer, and statistics at 390 px width.
-- Deactivate a test Judge, wait for role removal, and verify the inactive record remains available for Restore.
+- Deactivate a test Reviewer, wait for role removal, and verify the inactive record remains available for Restore.
 - Run `./scripts/quality_check.sh` in the bot repository.
 
-The implementation was verified with the full Python quality gate (compile, Ruff, pytest, Bandit, and dependency audit), 376 passing Python tests, five Netlify function tests, JavaScript syntax checks, and desktop/mobile browser inspection.
+The implementation was verified with Python compilation, critical Ruff checks, 395 passing Python tests, Bandit's high-severity gate, configuration validation, 26 website/Netlify tests, JavaScript syntax checks, and desktop/mobile browser inspection. The local `pip-audit` process stalled while importing its HTTP dependency and was stopped; rerun that external dependency audit in CI or the deployment environment before release.
 
 ## Recovery And Rollback
 

@@ -449,6 +449,18 @@ def _response_for_path(raw_path: str) -> tuple[bytes, str, str, bool]:
     return body, content_type, "no-store", False
 
 
+def _private_api_error(
+    code: str, message: str, correlation_id: str = ""
+) -> dict[str, object]:
+    error: dict[str, str] = {
+        "code": str(code),
+        "message": str(message),
+    }
+    if correlation_id:
+        error["correlation_id"] = str(correlation_id)
+    return {"ok": False, "error": error}
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def _health_response(self) -> tuple[bytes, str, str, bool]:
         return _response_for_path(self.path)
@@ -514,7 +526,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
     def _staff_response(self, method: str) -> None:
         if not self._is_staff_api():
-            self._send_json(404, {"error": "not_found", "message": "Resource not found"})
+            self._send_json(404, _private_api_error("not_found", "Resource not found"))
             return
         with _status_lock:
             service = _staff_api_service
@@ -522,7 +534,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
         if service is None or loop is None or loop.is_closed():
             self._send_json(
                 503,
-                {"error": "portal_starting", "message": "The staff portal is still starting"},
+                _private_api_error(
+                    "portal_starting", "The staff portal is still starting"
+                ),
             )
             return
         try:
@@ -530,7 +544,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
         except ValueError:
             length = -1
         if length < 0 or length > 1_048_576:
-            self._send_json(413, {"error": "body_too_large", "message": "Request body is too large"})
+            self._send_json(
+                413, _private_api_error("body_too_large", "Request body is too large")
+            )
             return
         body = self.rfile.read(length) if length else b""
         headers = {str(key).casefold(): str(value) for key, value in self.headers.items()}
@@ -541,7 +557,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
             status, payload = future.result(timeout=28)
         except TimeoutError:
             future.cancel()
-            self._send_json(504, {"error": "portal_timeout", "message": "The portal took too long to respond"})
+            self._send_json(
+                504,
+                _private_api_error(
+                    "portal_timeout", "The portal took too long to respond"
+                ),
+            )
             return
         except Exception as exc:  # noqa: BLE001 - bridge futures can surface any service failure.
             cause = exc.__cause__ or exc
@@ -550,7 +571,14 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 status = 403
             code = str(getattr(cause, "code", "forbidden" if status == 403 else "portal_error"))
             message = str(getattr(cause, "message", "You do not have access" if status == 403 else "The portal could not complete this request"))
-            self._send_json(status, {"error": code, "message": message})
+            self._send_json(
+                status,
+                _private_api_error(
+                    code,
+                    message,
+                    str(getattr(cause, "correlation_id", "") or ""),
+                ),
+            )
             return
         self._send_json(status, payload)
 
@@ -600,7 +628,9 @@ async def _handle(request: web.Request) -> web.Response:
             service = _staff_api_service
         if service is None:
             return web.json_response(
-                {"error": "portal_starting", "message": "The staff portal is still starting"},
+                _private_api_error(
+                    "portal_starting", "The staff portal is still starting"
+                ),
                 status=503,
             )
         try:
@@ -611,13 +641,22 @@ async def _handle(request: web.Request) -> web.Response:
                 await request.read(),
             )
         except PermissionError:
-            return web.json_response({"error": "forbidden", "message": "You do not have access"}, status=403)
+            return web.json_response(
+                _private_api_error("forbidden", "You do not have access"), status=403
+            )
         except Exception as exc:  # noqa: BLE001 - translate service failures into private API errors.
             return web.json_response(
-                {
-                    "error": str(getattr(exc, "code", "portal_error")),
-                    "message": str(getattr(exc, "message", "The portal could not complete this request")),
-                },
+                _private_api_error(
+                    str(getattr(exc, "code", "portal_error")),
+                    str(
+                        getattr(
+                            exc,
+                            "message",
+                            "The portal could not complete this request",
+                        )
+                    ),
+                    str(getattr(exc, "correlation_id", "") or ""),
+                ),
                 status=int(getattr(exc, "status", 500) or 500),
             )
         return web.json_response(payload, status=status, headers={"Cache-Control": "no-store"})
