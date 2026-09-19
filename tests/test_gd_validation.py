@@ -314,7 +314,7 @@ async def test_gdhistory_fetch_404_remains_unknown_and_uses_brief_endpoint():
     assert session.request.url.endswith("/api/v1/level/999999999/brief/")
 
 
-def test_source_summary_includes_provider_http_status():
+def test_provider_failure_details_are_internal_diagnostics_only():
     result = combine_level_validation(
         "111111111",
         {
@@ -328,5 +328,42 @@ def test_source_summary_includes_provider_http_status():
         },
     )
 
-    assert "upstream" not in result["source_summary"]
-    assert "access denied; HTTP 403" in result["source_summary"]
+    assert result["source_summary"] == ""
+    assert "upstream" not in result["source_diagnostics"]
+    assert "access denied; HTTP 403" in result["source_diagnostics"]
+    assert "Sources:" not in validation_notice(result)
+
+
+def test_successful_source_hides_failed_backups_from_public_notice():
+    result = combine_level_validation(
+        "111111111",
+        {
+            "gdhistory": {
+                "provider": "gdhistory",
+                "ok": True,
+                "exists": True,
+                "name": "Example",
+            },
+            "boomlings": {
+                "provider": "boomlings",
+                "ok": False,
+                "exists": None,
+                "failure_kind": "access_denied",
+                "status_code": 403,
+            },
+            "gdrateplus": {
+                "provider": "gdrateplus",
+                "ok": False,
+                "exists": None,
+                "failure_kind": "network_error",
+            },
+        },
+    )
+
+    assert result["source_summary"] == "gdhistory: found"
+    assert "boomlings: unavailable" in result["source_diagnostics"]
+    assert "gdrateplus: unavailable" in result["source_diagnostics"]
+    notice = validation_notice(result)
+    assert "No validation warnings." in notice
+    assert "Sources: gdhistory: found." in notice
+    assert "unavailable" not in notice

@@ -165,10 +165,39 @@ async def test_request_panel_only_shows_current_wave_submission(tmp_path):
     )
     cog = make_cog(db)
 
+    without_outcome = await cog._request_state_text(717, 42)
+    assert "Open public outcome" not in without_outcome
+    assert "/717/1120741230570127371/987" not in without_outcome
+    await db.execute(
+        "INSERT INTO discord_outbox("
+        "correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,"
+        "message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts,"
+        "delivered_ts,delivered_message_id"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "review:717:987",
+            "request-result-channel:717:987",
+            "send_channel",
+            717,
+            222,
+            42,
+            987,
+            "{}",
+            "delivered",
+            1,
+            1,
+            1,
+            1,
+            2,
+            333,
+        ),
+    )
     text = await cog._request_state_text(717, 42)
     assert "Rejected: Stolen level" in text
     assert "Test Level (`111111111`)" in text
-    assert "/717/1120741230570127371/987" in text
+    assert "Open public outcome" in text
+    assert "/717/222/333" in text
+    assert "/717/1120741230570127371/987" not in text
     assert await cog._request_state_text(717, 99) == ""
 
     await db.execute("UPDATE level_request_state SET wave_id=5 WHERE guild_id=717")

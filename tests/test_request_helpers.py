@@ -133,6 +133,7 @@ async def test_validation_cache_is_invalidated_when_an_enabled_provider_is_missi
 async def test_validation_cache_accepts_the_current_enabled_provider_set(monkeypatch):
     cog = make_cog()
     cached = {
+        "validation_format_version": request_module.VALIDATION_FORMAT_VERSION,
         "providers": {
             "gdhistory": {"ok": True, "exists": True},
             "gdrateplus": {"ok": False},
@@ -149,6 +150,31 @@ async def test_validation_cache_accepts_the_current_enabled_provider_set(monkeyp
     result = await cog._cached_level_validation("111111111")
 
     assert result["cache_hit"] is True
+
+
+@pytest.mark.asyncio
+async def test_validation_cache_rejects_old_public_summary_format(monkeypatch):
+    cog = make_cog()
+    cog.bot.db = SimpleNamespace(
+        fetchone=AsyncMock(
+            return_value={
+                "expires_ts": 2_000,
+                "data_json": json.dumps(
+                    {
+                        "providers": {
+                            "gdhistory": {"ok": True, "exists": True},
+                            "gdrateplus": {"ok": False},
+                            "boomlings": {"ok": False},
+                        },
+                        "source_summary": "gdhistory: found | boomlings: unavailable",
+                    }
+                ),
+            }
+        )
+    )
+    monkeypatch.setattr(request_module.time_module, "time", lambda: 1_000)
+
+    assert await cog._cached_level_validation("111111111") == {}
 
 
 def test_access_denied_provider_enters_long_cooldown_immediately(monkeypatch):

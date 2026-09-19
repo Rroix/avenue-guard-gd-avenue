@@ -21,6 +21,7 @@ from utils.checks import basic_color, is_admin_or_owner, is_mod, member_has_any_
 from utils.discord_refs import fetch_persisted_channel, fetch_persisted_message
 from utils.errors import log_error
 from utils.gd_validation import (
+    VALIDATION_FORMAT_VERSION,
     combine_level_validation,
     fetch_boomlings_level,
     fetch_gdbrowser_level,
@@ -1352,6 +1353,8 @@ class RequestLevelsCog(commands.Cog):
                 return {}
             cached = self._safe_json_loads(row["data_json"], {})
             if isinstance(cached, dict):
+                if cached.get("validation_format_version") != VALIDATION_FORMAT_VERSION:
+                    return {}
                 cached_providers = cached.get("providers")
                 if not isinstance(cached_providers, dict):
                     return {}
@@ -3905,7 +3908,11 @@ class RequestLevelsCog(commands.Cog):
         await record_workflow_event(self.bot.db, workflow_type="level_request", entity_id=str(message_id),
                                     event="validation_rechecked", correlation_id=correlation,
                                     guild_id=interaction.guild.id, actor_id=interaction.user.id,
-                                    payload={"exists": validation.get("exists"), "sources": validation.get("source_summary")})
+                                    payload={
+                                        "exists": validation.get("exists"),
+                                        "sources": validation.get("source_diagnostics")
+                                        or validation.get("source_summary"),
+                                    })
         await self._reply_ephemeral(interaction, (validation_notice(validation) or "Validation refreshed successfully.")[:1900])
 
     async def _refresh_review_validation(self, guild, target_kind, row, *, message=None):

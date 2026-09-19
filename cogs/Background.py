@@ -19,6 +19,7 @@ import discord
 from discord.ext import commands, tasks
 
 from utils.checks import ensure_allowed_guild_id
+from utils.db import DatabaseBusyError
 from utils.errors import log_error
 from utils.mentions import no_mentions
 from utils.server_icons import (
@@ -111,6 +112,7 @@ class BackgroundCog(commands.Cog):
         self._last_db_backup_ts = 0
         self._completed_day_stats: Dict[str, DailyStats] = {}
         self._persist_tasks: set[asyncio.Task] = set()
+        self._deferred_snapshot_persists = 0
         self._server_icon_lock = asyncio.Lock()
         self._daily_summary_lock = asyncio.Lock()
         self._icon_http_session: Optional[aiohttp.ClientSession] = None
@@ -734,10 +736,16 @@ class BackgroundCog(commands.Cog):
 
     async def _persist_daily_stats(self, guild_id: int, day_key: str, snapshot: DailyStats) -> None:
         payload = self._stats_payload(day_key, snapshot)
-        await self.bot.db.execute(
-            "INSERT OR REPLACE INTO daily_stats(guild_id, day_key, payload_json, created_ts) VALUES(?,?,?,?)",
-            (guild_id, day_key, json.dumps(payload, separators=(',', ':')), int(time.time())),
+        await self.bot.db.execute_transaction(
+            ((
+                "INSERT OR REPLACE INTO daily_stats(guild_id, day_key, payload_json, created_ts) VALUES(?,?,?,?)",
+                (guild_id, day_key, json.dumps(payload, separators=(',', ':')), int(time.time())),
+            ),),
+            retry_safe=True,
+            queue_timeout=0.5,
+            operation_label="daily.snapshot",
         )
+        self._deferred_snapshot_persists = 0
 
     async def _persist_current_day(self) -> None:
         allowed = self.bot.config.get_int("guild", "allowed_guild_id")
@@ -777,12 +785,20 @@ class BackgroundCog(commands.Cog):
             except Exception as e:
                 exc = e
             if exc:
+                if isinstance(exc, DatabaseBusyError):
+                    self._record_snapshot_deferral()
+                    return
                 try:
                     asyncio.create_task(log_error(self.bot, f"Daily stats persist failed: {repr(exc)}"))
                 except Exception:
                     pass
 
         task.add_done_callback(_done)
+
+    def _record_snapshot_deferral(self) -> None:
+        self._deferred_snapshot_persists = int(
+            getattr(self, "_deferred_snapshot_persists", 0) or 0
+        ) + 1
 
     def _rollover_if_needed(self, guild: Optional[discord.Guild] = None):
         today = _day_key()
@@ -1005,6 +1021,9 @@ class BackgroundCog(commands.Cog):
                 await log_error(self.bot, f"Daily summary retry failed for {report_day}: {repr(e)}")
 
     async def _log_snapshot_failure(self, error: Exception) -> None:
+        if isinstance(error, DatabaseBusyError):
+            self._record_snapshot_deferral()
+            return
         await log_error(self.bot, f"Daily snapshot persist failed: {repr(error)}")
 
     @update_snapshot.before_loop
@@ -1247,6 +1266,9 @@ class BackgroundCog(commands.Cog):
         # must already contain the day that was announced.
         try:
             await self._persist_daily_stats(guild.id, day_key, snapshot)
+        except DatabaseBusyError:
+            self._record_snapshot_deferral()
+            return False
         except Exception as e:
             await log_error(self.bot, f"Daily summary stats persist failed for {day_key}: {repr(e)}")
             return False

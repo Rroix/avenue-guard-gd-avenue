@@ -1,12 +1,14 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.26.1",
-  "title": "Components V2 Edit Compatibility",
-  "summary": "Makes Components V2 message refreshes safe for both historical embeds and already-modernized cards",
+  "version": "3.26.2",
+  "title": "Validation and Persistence Reliability",
+  "summary": "Improves Turso snapshot resilience, public outcome links and level-validation clarity",
   "changes": [
-    "Migrates historical embed messages in two safe edits before enabling Discord's Components V2 flag",
-    "Stops refresh payloads from mixing forbidden content or embed fields with Components V2 containers",
-    "Preserves card text and structure when request, weekly or support workflows only replace or disable buttons",
-    "Covers classic-to-V2 refreshes, existing V2 edits and controls-only updates with regression tests"
+    "Makes daily snapshot writes idempotent, retry-safe and short-queued so active Turso transactions no longer create error incidents",
+    "Retries deferred daily snapshots on the next scheduled cycle while preserving the in-memory counters",
+    "Builds DM help links exclusively from confirmed public outcome delivery receipts",
+    "Hides the outcome link until the public message exists instead of exposing the private staff review card",
+    "Shows only successful GD validation evidence on member-facing cards while preserving backup-provider failures in owner diagnostics",
+    "Invalidates older cached validation cards so the cleaner source display takes effect immediately"
   ]
 }

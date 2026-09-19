@@ -16,6 +16,7 @@ GDHISTORY_LEVEL_URL = (
 # Public Geometry Dash protocol value, not an application credential.
 COMMON_SECRET = "Wmfd2893gb7"  # nosec B105
 MAX_PROVIDER_RESPONSE_BYTES = 1_000_000
+VALIDATION_FORMAT_VERSION = 2
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -675,12 +676,15 @@ def combine_level_validation(
     if requires_showcase:
         warnings.append("This level appears to be a demon or platformer; a showcase is required.")
 
-    sources = []
+    public_sources: list[str] = []
+    diagnostic_sources: list[str] = []
     for provider, result in sorted(results.items()):
         if result.get("ok") and result.get("exists") is True:
             status = "found"
+            public_sources.append(f"{provider}: {status}")
         elif result.get("ok") and result.get("exists") is False:
             status = "missing"
+            public_sources.append(f"{provider}: {status}")
         else:
             kind = str(
                 result.get("circuit_reason")
@@ -692,7 +696,7 @@ def combine_level_validation(
             if status_code:
                 detail = f"{detail}; HTTP {status_code}"
             status = f"unavailable ({detail})"
-        sources.append(f"{provider}: {status}")
+        diagnostic_sources.append(f"{provider}: {status}")
 
     return {
         "level_id": str(level_id),
@@ -716,7 +720,11 @@ def combine_level_validation(
         "mythic": bool(chosen.get("mythic")),
         "demon": bool(chosen.get("demon")),
         "platformer": bool(chosen.get("platformer")),
-        "source_summary": " | ".join(sources),
+        # Public cards only need usable evidence. Failed backup providers remain
+        # available to owner diagnostics without making a valid level look broken.
+        "source_summary": " | ".join(public_sources),
+        "source_diagnostics": " | ".join(diagnostic_sources),
+        "validation_format_version": VALIDATION_FORMAT_VERSION,
     }
 
 

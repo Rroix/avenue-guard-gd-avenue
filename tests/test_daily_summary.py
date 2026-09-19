@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import cogs.Background as background_module
 from cogs.Background import BackgroundCog, DailyStats
+from utils.db import DatabaseBusyError
 from utils.timeutils import TZ
 
 
@@ -139,6 +140,40 @@ async def test_snapshot_loop_retries_previous_daily_summary_after_due_time(monke
 
     cog._persist_current_day.assert_awaited_once()
     cog._send_daily_summary_for_day.assert_awaited_once_with(guild, "2026-07-12")
+
+
+@pytest.mark.asyncio
+async def test_daily_snapshot_uses_short_idempotent_background_transaction():
+    db = SimpleNamespace(execute_transaction=AsyncMock())
+    cog = object.__new__(BackgroundCog)
+    cog.bot = SimpleNamespace(db=db)
+    cog._deferred_snapshot_persists = 2
+
+    await cog._persist_daily_stats(717, "2026-07-12", DailyStats(messages=4))
+
+    statements = db.execute_transaction.await_args.args[0]
+    options = db.execute_transaction.await_args.kwargs
+    assert "INSERT OR REPLACE INTO daily_stats" in statements[0][0]
+    assert options == {
+        "retry_safe": True,
+        "queue_timeout": 0.5,
+        "operation_label": "daily.snapshot",
+    }
+    assert cog._deferred_snapshot_persists == 0
+
+
+@pytest.mark.asyncio
+async def test_database_busy_daily_snapshot_is_deferred_without_error_incident(monkeypatch):
+    cog = object.__new__(BackgroundCog)
+    cog.bot = SimpleNamespace()
+    cog._deferred_snapshot_persists = 0
+    logged = AsyncMock()
+    monkeypatch.setattr(background_module, "log_error", logged)
+
+    await cog._log_snapshot_failure(DatabaseBusyError("writer occupied"))
+
+    assert cog._deferred_snapshot_persists == 1
+    logged.assert_not_awaited()
 
 
 async def _async_value(value):

@@ -794,3 +794,15 @@
     - Expected: both edits succeed, the card remains visible, and only the intended controls change.
 12. Restart with existing V2 request, support, and release messages.
     - Expected: every message remains editable because Avenue Guard never attempts to remove Discord's irreversible V2 flag.
+
+---
+
+## 33) Snapshot contention and DM outcome links
+1. Hold the Turso writer with another transaction while the five-minute daily snapshot runs.
+   - Expected: the snapshot defers without creating a bot-error incident and persists on a later cycle after the writer is available.
+2. Open the DM help dashboard for a reviewed request before its public outcome outbox delivery completes.
+   - Expected: request status is visible, but no private staff-review URL or premature outcome link appears.
+3. Open the dashboard again after the public result-channel delivery is confirmed.
+   - Expected: `Open public outcome` points to the outbox receipt's public channel and delivered message ID.
+4. Validate a level while GDHistory succeeds and Boomlings/GDRate+ are unavailable.
+   - Expected: the request card shows `gdhistory: found` without backup-provider errors; owner health diagnostics still retain each provider failure and HTTP status.

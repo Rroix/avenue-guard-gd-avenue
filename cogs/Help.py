@@ -1220,11 +1220,24 @@ class HelpCog(commands.Cog):
             lines.append(level_name)
         elif level_id:
             lines.append(f"Level `{level_id}`")
-        message_id = int(submission["request_message_id"] or 0)
-        review_channel_id = self.bot.config.get_int("level_requests", "level_requested", default=0)
-        if message_id and review_channel_id:
-            url = f"https://discord.com/channels/{guild_id}/{review_channel_id}/{message_id}"
-            lines.append(f"[Open review message]({url})")
+        request_message_id = int(submission["request_message_id"] or 0)
+        if request_message_id and str(submission["status"] or "").casefold() == "reviewed":
+            outcome = await self.bot.db.fetchone(
+                "SELECT channel_id, delivered_message_id FROM discord_outbox "
+                "WHERE guild_id=? AND user_id=? AND message_id=? AND action_type='send_channel' "
+                "AND status='delivered' AND delivered_message_id IS NOT NULL "
+                "ORDER BY delivered_ts DESC, id DESC LIMIT 1",
+                (guild_id, user_id, request_message_id),
+            )
+            if outcome:
+                outcome_channel_id = int(outcome["channel_id"] or 0)
+                outcome_message_id = int(outcome["delivered_message_id"] or 0)
+                if outcome_channel_id and outcome_message_id:
+                    url = (
+                        f"https://discord.com/channels/{guild_id}/"
+                        f"{outcome_channel_id}/{outcome_message_id}"
+                    )
+                    lines.append(f"[Open public outcome]({url})")
         return "\n".join(lines)
 
     async def _active_ticket_text(self, guild: discord.Guild, user_id: int) -> str:
