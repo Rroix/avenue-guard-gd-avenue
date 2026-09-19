@@ -1870,9 +1870,9 @@ class Database:
         # chunks. If Turso reports unknown completion, replay can only update rows
         # that still contain the legacy rounded value.
         for offset in range(0, len(repairs), 12):
-            batch = repairs[offset : offset + 12]
+            batch = tuple(repairs[offset : offset + 12])
 
-            def _run_batch() -> dict[str, int]:
+            def _run_batch(batch=batch) -> dict[str, int]:
                 assert self._conn is not None
                 batch_result = {"updated": 0, "conflicts": 0, "feedback_requeued": 0}
                 try:

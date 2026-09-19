@@ -14,7 +14,7 @@ from cogs.Help import (
     HelpSessionControlView,
 )
 from utils.db import Database, DatabaseBusyError
-from utils.views import FormerMemberHelpView, HelpMenuView
+from utils.views import HelpMenuView
 
 
 class FakeConfig:
@@ -124,14 +124,52 @@ async def test_ticket_close_lock_serializes_and_cleans_up_without_private_asynci
 
 
 @pytest.mark.asyncio
-async def test_help_menus_are_simple_and_context_specific():
+async def test_member_help_menu_is_simple():
     member_options = HelpMenuView().children[0].options
     member_values = {option.value for option in member_options}
     assert "faq_search" not in member_values
     assert "partnership" in member_values
 
-    former_options = FormerMemberHelpView().children[0].options
-    assert [option.value for option in former_options] == ["ban_appeal", "ban_info"]
+
+@pytest.mark.asyncio
+async def test_nonmember_dashboard_is_a_static_join_notice():
+    cog = make_cog()
+    cog._resolve_member = AsyncMock(return_value=None)
+    channel = SimpleNamespace(send=AsyncMock())
+
+    await cog._send_dm_dashboard(channel, SimpleNamespace(id=717), 42)
+
+    kwargs = channel.send.await_args.kwargs
+    assert "only to GD Avenue members" in kwargs["embed"].description
+    assert "view" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_nonmember_dm_clears_legacy_support_session(tmp_path):
+    db = Database(str(tmp_path / "nonmember-help.db"))
+    await db.connect()
+    cog = make_cog(db)
+    guild = SimpleNamespace(id=717)
+    cog.bot.get_guild = lambda guild_id: guild if guild_id == guild.id else None
+    cog._resolve_member = AsyncMock(return_value=None)
+    cog._send_nonmember_notice = AsyncMock()
+    author = SimpleNamespace(id=42, bot=False)
+    await cog._start_help_session(author.id, guild.id, "appeal_reason", {})
+
+    await cog.on_message(
+        SimpleNamespace(
+            id=123,
+            author=author,
+            guild=None,
+            channel=SimpleNamespace(send=AsyncMock()),
+            content="legacy appeal answer",
+            attachments=[],
+        )
+    )
+
+    assert await cog._get_help_session(author.id, guild.id) is None
+    cog._send_nonmember_notice.assert_awaited_once()
+    await db.close()
 
 
 def test_faq_is_paginated_and_uses_questions_as_field_titles():
@@ -674,7 +712,6 @@ def test_editing_a_submission_removes_old_answers_and_attachments():
 
     assert cog._fresh_edit_data("appeal", original) == {
         "appeal_type": "ban",
-        "former_member": True,
     }
     assert cog._fresh_edit_data("report", original) == {}
 
@@ -1239,6 +1276,7 @@ async def test_active_help_session_owns_dm_before_weekly_workflow(tmp_path):
     guild = SimpleNamespace(id=717)
     cog.bot.get_guild = lambda guild_id: guild if guild_id == guild.id else None
     cog.bot.get_cog = lambda name: tracking if name == "TrackingCog" else None
+    cog._resolve_member = AsyncMock(return_value=SimpleNamespace(id=42, roles=[]))
     author = SimpleNamespace(id=42, bot=False)
     channel = SimpleNamespace(send=AsyncMock())
     await cog._start_help_session(author.id, guild.id, "report_details", {})
@@ -1267,6 +1305,7 @@ async def test_final_support_dm_remains_claimed_after_session_is_cleared(tmp_pat
     guild = SimpleNamespace(id=717)
     cog.bot.get_guild = lambda guild_id: guild if guild_id == guild.id else None
     cog.bot.get_cog = lambda _name: None
+    cog._resolve_member = AsyncMock(return_value=SimpleNamespace(id=42, roles=[]))
     cog._send_dm_dashboard = AsyncMock()
     author = SimpleNamespace(id=42, bot=False)
     channel = SimpleNamespace(send=AsyncMock())

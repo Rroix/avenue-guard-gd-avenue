@@ -106,8 +106,8 @@ Recommended levels also have a privacy-filtered public page at `gdavenue.netlify
 - Hides the current help screen from the menu so members are not offered the same page they are already viewing.
 - Presents the configured FAQ as short paginated pages without intercepting normal DM text as a search query.
 - Supports FAQ, three-step punishment appeals, user reports, bot issue reports, weekly status checks, transcript requests, partnership requests, and staff contact tickets.
-- Lets former members appeal a server ban or ask staff to retrieve their ban information without being in the guild.
-- Gives staff a persistent ban-information control with optional reason, date, evidence links, notes, and modal file uploads, followed by a delivery preview and DM.
+- Shows non-members a static server invitation instead of starting an unsupported off-server help workflow.
+- Keeps historical ban-information records and staff delivery controls compatible for requests created before the off-server workflow was retired.
 - Routes partnership tickets only to the configured partnership role while retaining normal moderator visibility.
 - Appeals, reports, and bot issue reports show a preview before submission, keep attachment links, receive tracked IDs, and can be checked later from My submissions.
 - Editing a preview replaces its previous answers and attachment list, so removed evidence is not accidentally retained.
@@ -330,13 +330,13 @@ DM support and ticket routing use the `help` and `tickets` sections in `config.j
 
 - `help.faq.entries`: the paginated FAQ shown in DMs. Normal messages are not interpreted as searches.
 - `help.partnership.requirements_message`: the confirmation text shown before opening a partnership ticket.
-- `help.ban_info_max_evidence_mb`: the combined evidence-file memory limit while staff previews ban information.
+- `help.ban_info_max_evidence_mb`: the combined evidence-file memory limit for historical ban-information requests still awaiting staff delivery.
 - `help.session_timeout_seconds`: how long an unfinished appeal, report, bug, or transcript flow remains active.
 - `help.max_submission_chars`, `help.duplicate_window_hours`, `help.flow_start_window_seconds`, and `help.max_flow_starts_per_window`: input and abuse-control limits validated by `/bot config_check`.
 - `tickets.partnership_ping_role_id`: the only role mentioned when a partnership ticket opens. The normal moderator role still receives channel access without being pinged.
 - `tickets.staff_ping_role_id`: the notification role used for ordinary staff tickets.
 - `tickets.ticket_creation_cooldown_hours`, `tickets.ticket_inactivity_hours`, and `tickets.satisfaction_prompt`: ticket timing and feedback settings validated by `/bot config_check`.
-- Ban-information requests and their delivery states are stored in `ban_info_requests`; transcript request decisions and retry diagnostics are stored in `transcript_requests`, so pending staff work survives restarts.
+- Historical ban-information requests and their delivery states remain stored in `ban_info_requests`; new off-server requests are disabled. Transcript request decisions and retry diagnostics are stored in `transcript_requests`, so pending staff work survives restarts.
 
 ### Level Request Config
 

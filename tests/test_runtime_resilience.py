@@ -310,7 +310,8 @@ async def test_persistent_views_are_registered_before_database_startup_and_only_
         assert bot.db._ready is False
         await bot.register_persistent_views()
         await bot.register_persistent_views()
-        assert len(calls) == 10
+        assert len(calls) == 9
+        assert "FormerMemberHelpView" not in calls
         assert "LevelRequestReviewView" in calls
         assert "LevelRequestPPSReviewView" in calls
     finally:

@@ -12,7 +12,6 @@ CID_TICKET_CLOSE_YES = "ticket_close_yes"
 CID_TICKET_CLOSE_NO = "ticket_close_no"
 
 CID_HELP_MENU = "help_menu_select"
-CID_FORMER_MEMBER_HELP_MENU = "former_member_help_menu_select"
 CID_TRANSCRIPT_APPROVE = "transcript_approve"
 CID_TRANSCRIPT_DENY = "transcript_deny"
 CID_BAN_INFO_GIVE = "ban_info_give"
@@ -236,48 +235,6 @@ class HelpMenuView(discord.ui.View):
     def __init__(self, exclude_values=None):
         super().__init__(timeout=None)
         self.add_item(_HelpMenuSelect(exclude_values=exclude_values))
-
-
-class _FormerMemberHelpSelect(discord.ui.Select):
-    def __init__(self, exclude_values=None):
-        exclude = {str(value) for value in (exclude_values or set())}
-        options = [
-            discord.SelectOption(
-                label="Appeal ban",
-                value="ban_appeal",
-                description="Submit a server ban appeal to staff",
-            ),
-            discord.SelectOption(
-                label="I don't know why I was banned",
-                value="ban_info",
-                description="Ask staff to retrieve your ban information",
-            ),
-        ]
-        options = [option for option in options if option.value not in exclude]
-        super().__init__(
-            placeholder="Choose what you need help with…",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id=CID_FORMER_MEMBER_HELP_MENU,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        cog = interaction.client.get_cog("HelpCog")
-        if cog:
-            await cog.handle_help_selection(interaction, self.values[0])
-        else:
-            await interaction.response.send_message(
-                "Help system is unavailable right now. Please try again later.",
-                ephemeral=True,
-                allowed_mentions=no_mentions(),
-            )
-
-
-class FormerMemberHelpView(discord.ui.View):
-    def __init__(self, exclude_values=None):
-        super().__init__(timeout=None)
-        self.add_item(_FormerMemberHelpSelect(exclude_values=exclude_values))
 
 
 class BanInfoGiveInfoView(discord.ui.View):

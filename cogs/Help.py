@@ -23,7 +23,6 @@ from utils.libsql_worker import DatabaseWorkerError
 from utils.mentions import no_mentions, user_and_role_mentions, user_mentions
 from utils.views import (
     BanInfoGiveInfoView,
-    FormerMemberHelpView,
     HelpMenuView,
     TicketClosePromptView,
     TranscriptRequestView,
@@ -1075,6 +1074,20 @@ class HelpCog(commands.Cog):
             if guild is None:
                 return
 
+            member = await self._resolve_member(guild, message.author.id)
+            if member is None:
+                # Sessions created before off-server support was retired must
+                # not keep accepting answers from users outside the guild.
+                await self._clear_help_session(message.author.id, guild.id)
+                try:
+                    await self._send_nonmember_notice(message.channel)
+                except Exception as e:
+                    await self._log_background_error(
+                        "dm_nonmember_notice",
+                        f"Non-member DM notice failed user_id={message.author.id}: {e!r}",
+                    )
+                return
+
             # An explicitly started support flow owns the next DM. This keeps
             # the weekly reward listener from interpreting support answers as
             # level-request text.
@@ -1083,18 +1096,16 @@ class HelpCog(commands.Cog):
                 if await self._handle_help_session_message(guild, message):
                     return
 
-            member = await self._resolve_member(guild, message.author.id)
-            if member is not None:
-                tracking = self.bot.get_cog("TrackingCog")
-                if tracking:
-                    try:
-                        if await tracking.user_in_weekly_process(message.author.id):
-                            return
-                    except Exception as e:
-                        await self._log_background_error(
-                            "dm_weekly_session_check",
-                            f"Weekly DM session check failed for user_id={message.author.id}: {e!r}",
-                        )
+            tracking = self.bot.get_cog("TrackingCog")
+            if tracking:
+                try:
+                    if await tracking.user_in_weekly_process(message.author.id):
+                        return
+                except Exception as e:
+                    await self._log_background_error(
+                        "dm_weekly_session_check",
+                        f"Weekly DM session check failed for user_id={message.author.id}: {e!r}",
+                    )
 
             try:
                 await self._send_dm_dashboard(message.channel, guild, message.author.id)
@@ -1343,7 +1354,7 @@ class HelpCog(commands.Cog):
     async def _send_dm_dashboard(self, channel, guild: discord.Guild, user_id: int) -> None:
         member = await self._resolve_member(guild, user_id)
         if member is None:
-            return await self._send_former_member_dashboard(channel)
+            return await self._send_nonmember_notice(channel)
 
         embed = self._help_embed(
             "Help & Support",
@@ -1362,19 +1373,19 @@ class HelpCog(commands.Cog):
             embed.add_field(name="Recent Support", value=recent, inline=False)
         await channel.send(embed=embed, view=HelpMenuView(exclude_values={"dashboard"}), allowed_mentions=no_mentions())
 
-    async def _send_former_member_dashboard(self, channel) -> None:
+    async def _send_nonmember_notice(self, channel) -> None:
         embed = self._help_embed(
             "GD Avenue Support",
-            "You are currently not in GD Avenue. You can [join our community](https://discord.gg/matVTsj)!\n\n"
-            "If you can't join the server, you are most probably banned. You can appeal your punishment below.",
-            "gold",
+            "This help desk is currently available only to GD Avenue members. "
+            "You can [join our community](https://discord.gg/matVTsj) and then DM me again.",
+            "blurple",
         )
-        await channel.send(embed=embed, view=FormerMemberHelpView(), allowed_mentions=no_mentions())
+        await channel.send(embed=embed, allowed_mentions=no_mentions())
 
     async def _home_menu_view(self, guild: discord.Guild, user_id: int, exclude_values=None):
         member = await self._resolve_member(guild, user_id)
         if member is None:
-            return FormerMemberHelpView(exclude_values=exclude_values)
+            return None
         return HelpMenuView(exclude_values=exclude_values)
 
     def _faq_entries(self) -> list[str]:
@@ -1405,11 +1416,10 @@ class HelpCog(commands.Cog):
 
         await self._ack_and_delete_source(interaction)
         member = await self._resolve_member(guild, interaction.user.id)
-        if member is None and value == "appeal":
-            value = "ban_appeal"
-        if member is None and value not in {"dashboard", "ban_appeal", "ban_info"}:
-            return await self._send_former_member_dashboard(interaction.channel)
-        if member is not None and value in {"ban_appeal", "ban_info"}:
+        if member is None:
+            await self._clear_help_session(interaction.user.id, guild.id)
+            return await self._send_nonmember_notice(interaction.channel)
+        if value in {"ban_appeal", "ban_info"}:
             return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
 
         if value == "dashboard":
@@ -1459,39 +1469,32 @@ class HelpCog(commands.Cog):
             return await interaction.channel.send(embed=embed, view=HelpMenuView(exclude_values={"submission_status"}), allowed_mentions=no_mentions())
 
         cds = self._cooldowns()
-        if value in {"appeal", "ban_appeal", "report", "bot_issue", "transcript", "mod_contact"}:
+        if value in {"appeal", "report", "bot_issue", "transcript", "mod_contact"}:
             limit_msg = self._flow_start_limit_message(interaction.user.id)
             if limit_msg:
                 return await interaction.channel.send(limit_msg, allowed_mentions=no_mentions())
 
-        if value in {"appeal", "ban_appeal"}:
+        if value == "appeal":
             remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "appeal", cds["appeal"][1])
             if remaining:
                 embed = await self._cooldown_embed(guild.id, interaction.user.id, "appeal", cds["appeal"][0], cds["appeal"][1])
-                view = (
-                    FormerMemberHelpView(exclude_values={"ban_appeal"})
-                    if value == "ban_appeal"
-                    else HelpMenuView(exclude_values={"appeal"})
+                return await interaction.channel.send(
+                    embed=embed,
+                    view=HelpMenuView(exclude_values={"appeal"}),
+                    allowed_mentions=no_mentions(),
                 )
-                return await interaction.channel.send(embed=embed, view=view, allowed_mentions=no_mentions())
 
-            ban_only = value == "ban_appeal"
             await self._start_help_session(
                 interaction.user.id,
                 guild.id,
                 "appeal_punishment",
                 {
-                    "appeal_type": "ban" if ban_only else "punishment",
-                    "former_member": ban_only,
+                    "appeal_type": "punishment",
                 },
             )
             embed = self._help_embed(
-                title="Appeal ban" if ban_only else "Appeal punishment",
-                description=(
-                    "Tell us what happened leading to your server ban. Attach screenshots if they help."
-                    if ban_only
-                    else "What punishment are you appealing, and what happened? Attach screenshots if they help."
-                ),
+                title="Appeal punishment",
+                description="What punishment are you appealing, and what happened? Attach screenshots if they help.",
             )
             embed.set_footer(text="Press Start, or send your first answer as your next DM")
             return await interaction.channel.send(
@@ -1583,9 +1586,6 @@ class HelpCog(commands.Cog):
         if value == "mod_contact":
             return await self._send_ticket_topics(interaction.channel, interaction.user.id, guild.id)
 
-        if value == "ban_info":
-            return await self._create_ban_info_request(interaction, guild)
-
         return await interaction.channel.send("That option isn't available yet.", allowed_mentions=no_mentions())
 
     async def _send_faq(self, interaction: discord.Interaction):
@@ -1640,6 +1640,9 @@ class HelpCog(commands.Cog):
         if guild is None:
             return await interaction.response.send_message("Server not found.", ephemeral=True)
         await self._ack_and_delete_source(interaction)
+        if await self._resolve_member(guild, interaction.user.id) is None:
+            await self._clear_help_session(interaction.user.id, guild.id)
+            return await self._send_nonmember_notice(interaction.channel)
         if int(page) < 0:
             return await self._send_dm_dashboard(interaction.channel, guild, interaction.user.id)
         await self._send_faq_page(
@@ -1654,7 +1657,7 @@ class HelpCog(commands.Cog):
         excluded_role_ids = set(cfg.get_int_list("roles", "excluded_tracking_role_id"))
         member = await self._resolve_member(guild, interaction.user.id)
         if member is None:
-            return await self._send_former_member_dashboard(interaction.channel)
+            return await self._send_nonmember_notice(interaction.channel)
 
         if excluded_role_ids and any(r.id in excluded_role_ids for r in member.roles):
             return await interaction.channel.send("You are excluded from weekly tracking.", allowed_mentions=no_mentions())
@@ -1950,7 +1953,6 @@ class HelpCog(commands.Cog):
         if kind == "appeal":
             return {
                 "appeal_type": str(data.get("appeal_type") or "punishment"),
-                "former_member": bool(data.get("former_member", False)),
             }
         return {}
 
@@ -2385,6 +2387,9 @@ class HelpCog(commands.Cog):
         if guild is None:
             return await interaction.response.send_message("Guild not found.")
         await self._ack_and_delete_source(interaction)
+        if await self._resolve_member(guild, interaction.user.id) is None:
+            await self._clear_help_session(interaction.user.id, guild.id)
+            return await self._send_nonmember_notice(interaction.channel)
         lock = self._help_session_lock(guild.id, interaction.user.id)
         async with lock:
             return await self._handle_help_session_control_locked(interaction, guild, action)
@@ -2497,6 +2502,9 @@ class HelpCog(commands.Cog):
         if guild is None:
             return await self._respond_interaction(interaction, "Guild not found.", ephemeral=True)
         await self._ack_and_delete_source(interaction)
+        if await self._resolve_member(guild, interaction.user.id) is None:
+            await self._clear_help_session(interaction.user.id, guild.id)
+            return await self._send_nonmember_notice(interaction.channel)
         sess = await self._get_help_session(interaction.user.id, guild.id)
         data = sess["data"] if sess else {}
         if action == "cancel":
@@ -2950,96 +2958,6 @@ class HelpCog(commands.Cog):
         )
         embed.set_footer(text=f"Ban information request • {code}")
         return embed
-
-    async def _create_ban_info_request(self, interaction: discord.Interaction, guild: discord.Guild) -> None:
-        async with self._ban_info_lock:
-            existing = await self.bot.db.fetchone(
-                "SELECT id, log_channel_id, log_message_id FROM ban_info_requests "
-                "WHERE guild_id=? AND user_id=? AND status IN ('pending','delivery_failed') "
-                "ORDER BY created_ts DESC LIMIT 1",
-                (guild.id, interaction.user.id),
-            )
-            if existing:
-                code = self._ban_info_code(int(existing["id"]))
-                return await interaction.channel.send(
-                    f"Staff is already looking into `{code}`. Thanks for your patience.",
-                    view=FormerMemberHelpView(exclude_values={"ban_info"}),
-                    allowed_mentions=no_mentions(),
-                )
-
-            history = await self._known_user_history(guild, interaction.user.id)
-            now = int(time.time())
-            request_id = await self.bot.db.execute_insert(
-                "INSERT INTO ban_info_requests("
-                "guild_id,user_id,status,created_ts,updated_ts,history_json"
-                ") VALUES(?,?,?,?,?,?)",
-                (
-                    guild.id,
-                    interaction.user.id,
-                    "pending",
-                    now,
-                    now,
-                    json.dumps(history, separators=(",", ":")),
-                ),
-            )
-            channel = await self._submission_log_channel(guild, "appeal")
-            if not request_id or channel is None:
-                if request_id:
-                    await self.bot.db.execute(
-                        "UPDATE ban_info_requests SET status='failed', error_text=?, updated_ts=? WHERE id=?",
-                        ("Appeals log channel is unavailable", now, request_id),
-                    )
-                await log_error(self.bot, "Ban information request failed: appeals log channel is missing or invalid.")
-                return await interaction.channel.send(
-                    "I couldn't send that request to staff right now. Please try again later.",
-                    view=FormerMemberHelpView(),
-                    allowed_mentions=no_mentions(),
-                )
-
-            staff_message = None
-            try:
-                staff_message = await channel.send(
-                    embed=self._ban_info_staff_embed(guild, interaction.user, request_id, history),
-                    view=BanInfoGiveInfoView(),
-                    allowed_mentions=no_mentions(),
-                )
-                await self.bot.db.execute(
-                    "UPDATE ban_info_requests SET log_channel_id=?, log_message_id=?, updated_ts=? WHERE id=?",
-                    (channel.id, staff_message.id, int(time.time()), request_id),
-                )
-            except Exception as e:
-                if staff_message is not None:
-                    try:
-                        await staff_message.delete()
-                    except Exception:
-                        pass
-                await self.bot.db.execute(
-                    "UPDATE ban_info_requests SET status='failed', error_text=?, updated_ts=? WHERE id=?",
-                    (str(e)[:1000], int(time.time()), request_id),
-                )
-                await log_error(self.bot, f"Ban information staff notification failed request_id={request_id}: {e!r}")
-                return await interaction.channel.send(
-                    "I couldn't send that request to staff right now. Please try again later.",
-                    view=FormerMemberHelpView(),
-                    allowed_mentions=no_mentions(),
-                )
-
-        await self._log_help_action(
-            guild,
-            interaction.user.id,
-            "ban_information_requested",
-            f"id={self._ban_info_code(request_id)}",
-        )
-        embed = self._help_embed(
-            "Request Sent",
-            "Staff will get back to you as soon as possible with your ban information. Thanks for your understanding.",
-            "green",
-        )
-        await interaction.channel.send(
-            embed=embed,
-            view=FormerMemberHelpView(exclude_values={"ban_info"}),
-            allowed_mentions=no_mentions(),
-        )
 
     def _can_handle_ban_info(self, interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
