@@ -1,15 +1,12 @@
 {
   "_comment": "Optional deployment release proposal. Set a new semantic version and notes before deploying; Avenue Guard will DM the configured owner and publish it only after approval. Leave version blank when no automatic proposal is needed.",
-  "version": "3.26.0",
-  "title": "Components V2 Interface",
-  "summary": "Rebuilds every rich Avenue Guard message with native Components V2 containers while preserving all workflow behavior",
+  "version": "3.26.1",
+  "title": "Components V2 Edit Compatibility",
+  "summary": "Makes Components V2 message refreshes safe for both historical embeds and already-modernized cards",
   "changes": [
-    "Converted all outgoing embeds into modern accent containers with structured text, separators and clearer information hierarchy",
-    "Integrated existing buttons and select menus into V2 action rows without changing callbacks, custom IDs or persistent behavior",
-    "Added native thumbnail, media-gallery and visible file components for images, evidence, transcripts and report attachments",
-    "Moved release and ban-information identity recovery to durable database records instead of rendered embed fields",
-    "Updated sticky, weekly-offer and transcript readers to understand both Components V2 and historical classic embeds",
-    "Kept the V2 rendering boundary active across restarts so already-converted messages remain safely editable",
-    "Added Components V2 regression coverage and a dedicated visual architecture guide"
+    "Migrates historical embed messages in two safe edits before enabling Discord's Components V2 flag",
+    "Stops refresh payloads from mixing forbidden content or embed fields with Components V2 containers",
+    "Preserves card text and structure when request, weekly or support workflows only replace or disable buttons",
+    "Covers classic-to-V2 refreshes, existing V2 edits and controls-only updates with regression tests"
   ]
 }

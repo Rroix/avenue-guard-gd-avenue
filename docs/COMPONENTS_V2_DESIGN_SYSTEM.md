@@ -34,6 +34,11 @@ uses Discord's small-text markdown. Long text is split at paragraph, line, or
 word boundaries before it reaches Discord's component limits. A message never
 mixes V2 components with classic `content` or `embeds` fields.
 
+Historical messages use a two-step migration. The adapter first clears classic
+content and embeds while the message is still legacy, then installs the new
+container and V2 flag. Existing V2 cards receive V2-only payloads, and
+controls-only edits preserve the card layout while replacing its action rows.
+
 ## Interaction Compatibility
 
 `AvenueDesignerView` transfers existing button and select objects into V2 action

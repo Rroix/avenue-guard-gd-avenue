@@ -4,10 +4,14 @@ import asyncio
 from types import SimpleNamespace
 
 import discord
+from discord.components import _component_factory
 
 from utils.components_v2 import (
     AvenueDesignerView,
+    _legacy_message_cleanup,
     _modernize_call,
+    _prepare_existing_v2_edit,
+    _wrap_method,
     build_components_v2,
     install_components_v2_adapter,
     message_component_text,
@@ -112,6 +116,126 @@ def test_call_adapter_removes_classic_content_and_embed_fields():
         rendered = str(kwargs["view"].to_components())
         assert "Original content" in rendered
         assert "Modern" in rendered
+
+    asyncio.run(run())
+
+
+def test_embed_edit_without_content_does_not_emit_legacy_content_field():
+    async def run():
+        _, kwargs = _modernize_call(
+            (),
+            {"embed": discord.Embed(title="Refresh")},
+            content_position=0,
+            content_replacement=discord.utils.MISSING,
+        )
+        assert "content" not in kwargs
+        assert "embed" not in kwargs
+        assert "embeds" not in kwargs
+        assert isinstance(kwargs["view"], discord.ui.DesignerView)
+
+    asyncio.run(run())
+
+
+def test_legacy_message_cleanup_keeps_unknown_values_unknown():
+    assert _legacy_message_cleanup(
+        SimpleNamespace(content="old text", embeds=[object()])
+    ) == {"content": None, "embed": None}
+    assert _legacy_message_cleanup(
+        SimpleNamespace(content="", embeds=[])
+    ) == {}
+
+
+def test_existing_v2_edit_drops_forbidden_empty_embed_fields():
+    async def run():
+        message = SimpleNamespace(
+            flags=SimpleNamespace(is_components_v2=True),
+            components=[],
+        )
+        _, kwargs = _prepare_existing_v2_edit(
+            message,
+            (),
+            {"content": "Updated", "embed": None, "view": None},
+            content_position=0,
+        )
+        assert "content" not in kwargs
+        assert "embed" not in kwargs
+        assert "embeds" not in kwargs
+        assert isinstance(kwargs["view"], discord.ui.DesignerView)
+        assert "Updated" in str(kwargs["view"].to_components())
+
+    asyncio.run(run())
+
+
+def test_legacy_message_is_cleared_before_v2_conversion():
+    class FakeMessage:
+        def __init__(self):
+            self.flags = SimpleNamespace(is_components_v2=False)
+            self.content = "legacy content"
+            self.embeds = [object()]
+            self.calls = []
+
+        async def edit(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return self
+
+    _wrap_method(
+        FakeMessage,
+        "edit",
+        content_position=0,
+        edit_target="self",
+    )
+
+    async def run():
+        message = FakeMessage()
+        await message.edit(embed=discord.Embed(title="Modern"))
+        assert len(message.calls) == 2
+        assert message.calls[0] == ((), {"content": None, "embed": None})
+        final_args, final_kwargs = message.calls[1]
+        assert final_args == ()
+        assert "content" not in final_kwargs
+        assert "embed" not in final_kwargs
+        assert "embeds" not in final_kwargs
+        assert isinstance(final_kwargs["view"], discord.ui.DesignerView)
+
+    asyncio.run(run())
+
+
+def test_view_only_v2_edit_preserves_card_and_replaces_controls():
+    class EnabledControls(discord.ui.View):
+        @discord.ui.button(label="Review", custom_id="review", disabled=False)
+        async def review(self, button, interaction):
+            return None
+
+    class DisabledControls(discord.ui.View):
+        @discord.ui.button(label="Review", custom_id="review", disabled=True)
+        async def review(self, button, interaction):
+            return None
+
+    async def run():
+        initial = build_components_v2(
+            [discord.Embed(title="Level Request", description="Keep this card")],
+            view=EnabledControls(),
+        )
+        message = SimpleNamespace(
+            flags=SimpleNamespace(is_components_v2=True),
+            components=[
+                _component_factory(component) for component in initial.to_components()
+            ],
+        )
+        _, kwargs = _prepare_existing_v2_edit(
+            message,
+            (),
+            {"view": DisabledControls()},
+            content_position=0,
+        )
+        payload = kwargs["view"].to_components()
+        rendered = str(payload)
+        buttons = [item for item in _walk_payload(payload) if item.get("type") == 2]
+        assert "Level Request" in rendered
+        assert "Keep this card" in rendered
+        assert len(buttons) == 1
+        assert buttons[0]["custom_id"] == "review"
+        assert buttons[0]["disabled"] is True
 
     asyncio.run(run())
 

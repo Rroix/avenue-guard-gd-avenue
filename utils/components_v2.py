@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import inspect
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from datetime import datetime
 from functools import wraps
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import discord
-
 
 TEXT_DISPLAY_LIMIT = 3900
 MAX_COMPONENTS = 40
@@ -306,6 +306,7 @@ def _modernize_call(
     kwargs: dict[str, Any],
     *,
     content_position: int | None,
+    content_replacement: Any = None,
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
     embed = kwargs.get("embed", discord.utils.MISSING)
     embeds = kwargs.get("embeds", discord.utils.MISSING)
@@ -321,10 +322,9 @@ def _modernize_call(
     mutable_args = list(args)
     if content_position is not None and len(mutable_args) > content_position:
         content = mutable_args[content_position]
-        mutable_args[content_position] = None
+        mutable_args[content_position] = content_replacement
     else:
-        content = kwargs.get("content", None)
-        kwargs["content"] = None
+        content = kwargs.pop("content", None)
 
     kwargs["view"] = build_components_v2(
         embed_list,
@@ -338,18 +338,212 @@ def _modernize_call(
     return tuple(mutable_args), kwargs
 
 
-def _wrap_method(owner: type, name: str, *, content_position: int | None) -> None:
+def _message_is_components_v2(message: Any) -> bool:
+    flags = getattr(message, "flags", None)
+    return bool(getattr(flags, "is_components_v2", False))
+
+
+def _legacy_message_cleanup(message: Any) -> dict[str, Any]:
+    """Return the legacy fields that must be cleared before enabling V2."""
+    cleanup: dict[str, Any] = {}
+    if _clean(getattr(message, "content", "")):
+        cleanup["content"] = None
+    if getattr(message, "embeds", ()):
+        cleanup["embed"] = None
+    return cleanup
+
+
+def _content_from_edit(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    content_position: int | None,
+) -> tuple[bool, Any, tuple[Any, ...], dict[str, Any]]:
+    mutable_args = list(args)
+    if content_position is not None and len(mutable_args) > content_position:
+        content = mutable_args[content_position]
+        mutable_args[content_position] = discord.utils.MISSING
+        return True, content, tuple(mutable_args), kwargs
+    if "content" in kwargs and kwargs["content"] is not discord.utils.MISSING:
+        content = kwargs.pop("content")
+        return True, content, tuple(mutable_args), kwargs
+    return False, discord.utils.MISSING, tuple(mutable_args), kwargs
+
+
+def _content_components_v2(
+    content: Any,
+    view: discord.ui.BaseView | None = None,
+) -> AvenueDesignerView:
+    text = "" if content in (None, discord.utils.MISSING) else str(content).strip()
+    items: list[discord.ui.ViewItem] = [
+        discord.ui.TextDisplay(chunk) for chunk in _split_markdown(text)
+    ]
+    legacy_view = view if isinstance(view, discord.ui.View) else None
+    action_rows = _legacy_action_rows(legacy_view)
+    if action_rows:
+        if items:
+            items.append(discord.ui.Separator(spacing=discord.SeparatorSpacingSize.small))
+        items.extend(action_rows)
+    if not items:
+        items.append(discord.ui.TextDisplay("Avenue Guard"))
+    result = AvenueDesignerView(
+        discord.ui.Container(*items),
+        legacy_view=legacy_view,
+    )
+    if _component_count(result.to_components()) > MAX_COMPONENTS:
+        raise ValueError("Components V2 layout exceeds Discord's 40-component limit")
+    return result
+
+
+def _replace_v2_controls(
+    message: Any,
+    view: discord.ui.BaseView | None,
+) -> discord.ui.DesignerView:
+    """Preserve a V2 message's layout while replacing its action controls."""
+    if isinstance(view, discord.ui.DesignerView):
+        return view
+
+    legacy_view = view if isinstance(view, discord.ui.View) else None
+    try:
+        current = discord.ui.DesignerView.from_message(
+            message,
+            timeout=getattr(legacy_view, "timeout", None),
+        )
+        top_level = list(current.children)
+    except (AttributeError, TypeError, ValueError):
+        return _content_components_v2(message_component_text(message), legacy_view)
+
+    containers = [
+        item for item in top_level if isinstance(item, discord.ui.Container)
+    ]
+    for container in containers:
+        removed_rows = False
+        for item in list(container.items):
+            if isinstance(item, discord.ui.ActionRow):
+                container.remove_item(item)
+                removed_rows = True
+        if (
+            removed_rows
+            and container.items
+            and isinstance(container.items[-1], discord.ui.Separator)
+        ):
+            container.remove_item(container.items[-1])
+
+    action_rows = _legacy_action_rows(legacy_view)
+    if action_rows:
+        if containers:
+            target = containers[-1]
+        else:
+            target = discord.ui.Container(discord.ui.TextDisplay("Avenue Guard"))
+            top_level.append(target)
+        if target.items:
+            target.add_item(
+                discord.ui.Separator(spacing=discord.SeparatorSpacingSize.small)
+            )
+        for row in action_rows:
+            target.add_item(row)
+
+    result = AvenueDesignerView(*top_level, legacy_view=legacy_view)
+    if _component_count(result.to_components()) > MAX_COMPONENTS:
+        raise ValueError("Components V2 layout exceeds Discord's 40-component limit")
+    return result
+
+
+def _prepare_existing_v2_edit(
+    message: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    content_position: int | None,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Translate legacy edit arguments into a valid V2-only payload."""
+    if not _message_is_components_v2(message):
+        return args, kwargs
+
+    embed = kwargs.get("embed", discord.utils.MISSING)
+    embeds = kwargs.get("embeds", discord.utils.MISSING)
+    if _provided(embed) or (_provided(embeds) and embeds):
+        return _modernize_call(
+            args,
+            kwargs,
+            content_position=content_position,
+            content_replacement=discord.utils.MISSING,
+        )
+
+    # A V2 message cannot contain even an empty legacy embed field.
+    kwargs.pop("embed", None)
+    kwargs.pop("embeds", None)
+    has_content, content, args, kwargs = _content_from_edit(
+        args,
+        kwargs,
+        content_position=content_position,
+    )
+    if has_content:
+        supplied_view = kwargs.get("view")
+        kwargs["view"] = _content_components_v2(content, supplied_view)
+    elif "view" in kwargs and not isinstance(kwargs["view"], discord.ui.DesignerView):
+        kwargs["view"] = _replace_v2_controls(message, kwargs["view"])
+    return args, kwargs
+
+
+def _wrap_method(
+    owner: type,
+    name: str,
+    *,
+    content_position: int | None,
+    edit_target: str | None = None,
+) -> None:
     original = getattr(owner, name)
     if getattr(original, "__avenue_components_v2__", False):
         return
 
     @wraps(original)
     async def wrapped(self, *args, **kwargs):
-        new_args, new_kwargs = _modernize_call(
-            args,
-            dict(kwargs),
-            content_position=content_position,
+        call_kwargs = dict(kwargs)
+        target = self if edit_target == "self" else None
+        if edit_target == "interaction":
+            parent = getattr(self, "_parent", None)
+            target = getattr(parent, "message", None) or getattr(
+                parent, "_original_response", None
+            )
+
+        if target is not None and _message_is_components_v2(target):
+            new_args, new_kwargs = _prepare_existing_v2_edit(
+                target,
+                args,
+                call_kwargs,
+                content_position=content_position,
+            )
+        else:
+            new_args, new_kwargs = _modernize_call(
+                args,
+                call_kwargs,
+                content_position=content_position,
+                content_replacement=(
+                    discord.utils.MISSING if edit_target else None
+                ),
+            )
+
+        converted_to_v2 = isinstance(
+            new_kwargs.get("view"), discord.ui.DesignerView
         )
+        cleanup = (
+            _legacy_message_cleanup(target)
+            if target is not None
+            and converted_to_v2
+            and not _message_is_components_v2(target)
+            else {}
+        )
+        if cleanup:
+            if edit_target == "self":
+                await original(self, **cleanup)
+            elif edit_target == "interaction":
+                message_edit = getattr(
+                    discord.Message.edit,
+                    "__avenue_original__",
+                    discord.Message.edit,
+                )
+                await message_edit(target, **cleanup)
         return await original(self, *new_args, **new_kwargs)
 
     wrapped.__avenue_components_v2__ = True
@@ -360,12 +554,27 @@ def _wrap_method(owner: type, name: str, *, content_position: int | None) -> Non
 def install_components_v2_adapter() -> None:
     """Install one idempotent boundary adapter for every Discord send path."""
     _wrap_method(discord.abc.Messageable, "send", content_position=0)
-    _wrap_method(discord.Message, "edit", content_position=0)
+    _wrap_method(
+        discord.Message,
+        "edit",
+        content_position=0,
+        edit_target="self",
+    )
     _wrap_method(discord.InteractionResponse, "send_message", content_position=0)
-    _wrap_method(discord.InteractionResponse, "edit_message", content_position=None)
+    _wrap_method(
+        discord.InteractionResponse,
+        "edit_message",
+        content_position=None,
+        edit_target="interaction",
+    )
     _wrap_method(discord.Webhook, "send", content_position=0)
     _wrap_method(discord.Webhook, "edit_message", content_position=None)
-    _wrap_method(discord.WebhookMessage, "edit", content_position=0)
+    _wrap_method(
+        discord.WebhookMessage,
+        "edit",
+        content_position=0,
+        edit_target="self",
+    )
 
 
 def message_component_text(message: Any) -> str:

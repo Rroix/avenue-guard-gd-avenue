@@ -788,5 +788,9 @@
    - Expected: both formats appear as readable text in chronological order.
 9. Send ordinary plain text responses and run commands that do not build embeds.
    - Expected: those messages retain their existing compact presentation.
-10. Restart with existing V2 request, support, and release messages.
+10. Keep a request-button message created before the V2 deployment, then run `/refresh-request-button`.
+    - Expected: the classic embed is cleared, the message becomes a V2 container, and Discord returns no `50035` invalid-form error.
+11. Refresh that request button again and complete a request review that disables its controls.
+    - Expected: both edits succeed, the card remains visible, and only the intended controls change.
+12. Restart with existing V2 request, support, and release messages.
     - Expected: every message remains editable because Avenue Guard never attempts to remove Discord's irreversible V2 flag.
