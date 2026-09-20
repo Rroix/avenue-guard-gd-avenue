@@ -985,8 +985,10 @@ async def test_dev_view_mode_uses_effective_capabilities_and_is_read_only(portal
     assert status == 200
     assert payload["user"]["role"] == "reviewer"
     assert payload["view_mode"]["actual_role"] == "dev"
-    assert payload["api"]["version"] >= 2
+    assert payload["api"]["version"] >= 5
     assert "staff_manual_management" in payload["api"]["features"]
+    assert "staff_assignee_directory" in payload["api"]["features"]
+    assert "task_recipient_dm" in payload["api"]["features"]
     assert "developer.access" not in payload["user"]["capabilities"]
 
     headers["x-csrf-token"] = created["csrf_token"]
@@ -1151,12 +1153,126 @@ async def test_assigned_task_enqueues_private_notification(portal):
     service, _guild = portal
     await service.create_task(
         principal(HEAD_ID, "head_reviewer"),
-        {"task_type": "assigned", "assignee_id": JUDGE_ID, "title": "Review calibration"},
+        {
+            "task_type": "assigned",
+            "assignee_id": JUDGE_ID,
+            "title": "Review calibration",
+            "description": "Compare the two sample reviews.",
+            "due_ts": 2_000_000_000,
+        },
     )
     kind, call = service.bot.outbox.calls[-1]
     assert kind == "send_dm"
     assert call["user_id"] == JUDGE_ID
-    assert call["idempotency_key"].endswith(f":assigned:{JUDGE_ID}")
+    assert call["idempotency_key"].endswith(f":created:{JUDGE_ID}")
+    embed = call["payload"]["embed"]
+    assert embed["title"] == "New assigned staff task"
+    assert embed["description"] == "Compare the two sample reviews."
+    fields = {field["name"]: field["value"] for field in embed["fields"]}
+    assert fields["Title"] == "Review calibration"
+    assert "<t:2000000000:F>" in fields["Due date"]
+
+
+@pytest.mark.asyncio
+async def test_task_notifications_cover_personal_assigned_and_whole_team(portal):
+    service, _guild = portal
+    personal = await service.create_task(
+        principal(JUDGE_ID, "reviewer"),
+        {
+            "task_type": "personal",
+            "title": "Check my draft",
+            "description": "Read the saved notes.",
+        },
+    )
+    assert personal["notification_recipient_count"] == 1
+    assert service.bot.outbox.calls[-1][1]["user_id"] == JUDGE_ID
+
+    service.bot.outbox.calls.clear()
+    team = await service.create_task(
+        principal(HEAD_ID, "head_reviewer"),
+        {
+            "task_type": "team",
+            "title": "Attend calibration",
+            "description": "Bring one review example.",
+        },
+    )
+    expected_recipients = {JUDGE_ID, HEAD_ID, ADMIN_ID, OWNER_ID, DEV_ID}
+    assert team["notification_recipient_count"] == len(expected_recipients)
+    assert {call[1]["user_id"] for call in service.bot.outbox.calls} == expected_recipients
+    assert all(call[0] == "send_dm" for call in service.bot.outbox.calls)
+    assert all(
+        call[1]["payload"]["embed"]["description"] == "Bring one review example."
+        for call in service.bot.outbox.calls
+    )
+    assert all(
+        any(
+            field["name"] == "Due date" and field["value"] == "No due date"
+            for field in call[1]["payload"]["embed"]["fields"]
+        )
+        for call in service.bot.outbox.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_staff_assignee_directory_is_active_sanitized_and_enforced(portal):
+    service, _guild = portal
+    head = principal(HEAD_ID, "head_reviewer")
+    directory = await service.staff_assignees(head)
+    assert {item["id"] for item in directory["items"]} == {
+        str(JUDGE_ID),
+        str(HEAD_ID),
+        str(ADMIN_ID),
+        str(OWNER_ID),
+        str(DEV_ID),
+    }
+    assert set(directory["items"][0]) == {
+        "id",
+        "display_name",
+        "role",
+        "role_label",
+        "avatar_url",
+    }
+    with pytest.raises(PermissionError):
+        await service.staff_assignees(principal(JUDGE_ID, "reviewer"))
+    with pytest.raises(PortalError) as invalid:
+        await service.create_task(
+            head,
+            {"task_type": "assigned", "assignee_id": 999, "title": "Invalid"},
+        )
+    assert invalid.value.code == "invalid_staff_assignee"
+    with pytest.raises(PortalError) as missing:
+        await service.create_task(
+            head,
+            {"task_type": "assigned", "title": "Missing"},
+        )
+    assert missing.value.code == "assignee_required"
+
+
+@pytest.mark.asyncio
+async def test_task_linked_record_requires_a_supported_complete_pair(portal):
+    service, _guild = portal
+    reviewer = principal(JUDGE_ID, "reviewer")
+    with pytest.raises(PortalError) as incomplete:
+        await service.create_task(
+            reviewer,
+            {
+                "task_type": "personal",
+                "title": "Incomplete link",
+                "linked_entity_type": "level",
+            },
+        )
+    assert incomplete.value.code == "incomplete_linked_entity"
+    with pytest.raises(PortalError) as unsupported:
+        await service.create_task(
+            reviewer,
+            {
+                "task_type": "personal",
+                "title": "Unsupported link",
+                "linked_entity_type": "mystery",
+                "linked_entity_id": "1",
+            },
+        )
+    assert unsupported.value.code == "invalid_linked_entity_type"
 
 
 @pytest.mark.asyncio

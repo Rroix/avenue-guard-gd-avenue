@@ -116,7 +116,9 @@ The interview decision persists before side effects. Its outbox action creates o
 
 The `hidden` queue state is Dev-only and reversible. Normal queue reads, counts, public caches, priority statistics, and maintenance workflows exclude hidden rows. The previous queue state is retained in `hidden_from_state` and restored explicitly, with both actions recorded in `workflow_events`.
 
-Assigned staff tasks enqueue a private Avenue Guard notification after the task row is committed. Delivery failure does not undo the task, and retrying the outbox does not produce a second logical assignment notification.
+Manual personal, assigned, and team tasks enqueue private Avenue Guard notifications after the task row is committed. Personal tasks notify their creator, assigned tasks notify the selected active staff member, and team tasks notify every active staff identity, including the creator. Each notification contains the title, description, priority, type, and due date. Stable per-task/per-recipient idempotency keys prevent duplicate logical notifications during outbox retries. The staff-only assignee directory is resolved server-side and task or queue reassignment rejects an ID that is not an active staff identity.
+
+The optional linked-record fields attach a task to an internal level queue entry, staff application, or staff task. They do not change workflow state or notify the linked record's owner. Both the type and numeric internal record ID are required together; ordinary tasks should leave both blank.
 
 ### Application configuration
 
@@ -245,7 +247,9 @@ If the bot is unavailable, Netlify returns a concise 503 and does not fall back 
 - Record an attempt, confirmed submission, same-target follow-up, and different-target submission.
 - Verify the same-target second submission is rejected and suggests a follow-up.
 - Requeue an eligible entry and verify W resets while old episode history remains.
-- Create, complete, and inspect a personal task; verify generated attention tasks are not duplicated by refreshes.
+- Create personal, assigned, and team tasks; verify the recipient DMs include title, description, and due date, including a self-DM for the personal task and one DM per active staff member for the team task.
+- Search the assignee picker by staff name, role, and Discord ID; verify inactive and non-staff identities cannot be submitted through the API.
+- Link a task to a queue entry and verify the inspector explains and displays the internal record; verify an incomplete or unsupported link is rejected.
 - Create each permitted note scope and verify a different Reviewer cannot read a private note.
 - Perform a QA action and confirm a post-submission tier correction is owner-only.
 - Save and submit an application; retry the request and verify only one active application exists for that type.

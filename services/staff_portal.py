@@ -37,7 +37,7 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 4
+PORTAL_API_VERSION = 5
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
@@ -50,7 +50,9 @@ PORTAL_FEATURES = (
     "multi_type_applications",
     "hidden_queue_entries",
     "staff_manual_management",
+    "staff_assignee_directory",
     "task_assignment_dm",
+    "task_recipient_dm",
     "view_role_preview",
 )
 DISCORD_ID_FIELDS = {
@@ -846,6 +848,8 @@ class StaffPortalService:
                 return 200, await self.tasks(principal, query)
             if method == "POST":
                 return 201, await self.create_task(principal, payload)
+        if path == "/api/staff/assignees" and method == "GET":
+            return 200, await self.staff_assignees(principal)
         if path == "/api/staff/notes":
             if method == "GET":
                 return 200, await self.notes(principal, query)
@@ -1586,15 +1590,18 @@ class StaffPortalService:
             )
             if assignee != principal.user_id:
                 principal.require("queue.reassign")
+                await self._require_active_staff_assignee(principal, assignee)
             return await self._claim(principal, queue_id, assignee, _bounded_text(payload.get("reason"), 500))
         if action == "release":
             return await self._release_claim(principal, queue_id, _bounded_text(payload.get("reason"), 500))
         if action == "reassign":
             principal.require("queue.reassign")
+            assignee = _discord_id(payload.get("assignee_id"), field="Assignee ID")
+            await self._require_active_staff_assignee(principal, assignee)
             return await self._claim(
                 principal,
                 queue_id,
-                _discord_id(payload.get("assignee_id"), field="Assignee ID"),
+                assignee,
                 _bounded_text(payload.get("reason"), 500, required=True),
                 reassign=True,
             )
@@ -2033,53 +2040,161 @@ class StaffPortalService:
         done = sum(item["status"] == "done" for item in items)
         return {"items": items, "progress": {"done": done, "total": total}}
 
+    async def staff_assignees(self, principal):
+        if not (
+            principal.can("tasks.assign") or principal.can("queue.reassign")
+        ):
+            raise PermissionError("Missing capability: tasks.assign or queue.reassign")
+        directory = await self.staff_list(principal)
+        return {
+            "items": [
+                {
+                    "id": str(item["id"]),
+                    "display_name": str(item["display_name"]),
+                    "role": str(item["role"]),
+                    "role_label": str(item["role_label"]),
+                    "avatar_url": str(item.get("avatar_url") or ""),
+                }
+                for item in directory["items"]
+                if item.get("active")
+            ]
+        }
+
+    async def _require_active_staff_assignee(self, principal, user_id: int) -> None:
+        directory = await self.staff_assignees(principal)
+        if int(user_id) not in {int(item["id"]) for item in directory["items"]}:
+            raise PortalError(
+                400,
+                "invalid_staff_assignee",
+                "Choose an active member of the GD Avenue staff team",
+            )
+
+    @staticmethod
+    def _task_notification_embed(
+        *,
+        task_type: str,
+        title: str,
+        description: str,
+        priority: str,
+        due_ts: int | None,
+    ) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"New {task_type} staff task",
+            description=description or "No description was provided.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Title", value=title, inline=False)
+        embed.add_field(name="Priority", value=priority.title(), inline=True)
+        embed.add_field(name="Type", value=task_type.title(), inline=True)
+        embed.add_field(
+            name="Due date",
+            value=(f"<t:{due_ts}:F>\n<t:{due_ts}:R>" if due_ts else "No due date"),
+            inline=False,
+        )
+        embed.set_footer(text="Open the GD Avenue Staff Portal to update this task.")
+        return embed
+
     async def create_task(self, principal, payload):
         principal.require("tasks.create")
         task_type = str(payload.get("task_type") or "personal").casefold()
         if task_type not in {"personal", "assigned", "team"}:
             raise PortalError(400, "invalid_task_type", "Choose a valid task type")
         raw_assignee = payload.get("assignee_id")
-        assignee_id = (
-            None
-            if task_type == "team" and not raw_assignee
-            else (
-                _discord_id(raw_assignee, field="Assignee ID")
-                if raw_assignee
-                else principal.user_id
-            )
-        )
-        if task_type != "personal" or assignee_id != principal.user_id:
+        staff_directory = None
+        if task_type == "personal":
+            assignee_id = principal.user_id
+            if raw_assignee and _discord_id(raw_assignee, field="Assignee ID") != principal.user_id:
+                raise PortalError(
+                    400,
+                    "invalid_personal_assignee",
+                    "Personal tasks can only be assigned to yourself",
+                )
+        elif task_type == "assigned":
             principal.require("tasks.assign")
+            if not raw_assignee:
+                raise PortalError(
+                    400,
+                    "assignee_required",
+                    "Choose a staff member for an assigned task",
+                )
+            assignee_id = _discord_id(raw_assignee, field="Assignee ID")
+            staff_directory = await self.staff_assignees(principal)
+            active_staff_ids = {int(item["id"]) for item in staff_directory["items"]}
+            if assignee_id not in active_staff_ids:
+                raise PortalError(
+                    400,
+                    "invalid_staff_assignee",
+                    "Choose an active member of the GD Avenue staff team",
+                )
+        else:
+            principal.require("tasks.assign")
+            assignee_id = None
+            staff_directory = await self.staff_assignees(principal)
         title = _bounded_text(payload.get("title"), 160, required=True)
         description = _bounded_text(payload.get("description"), 4000)
         priority = str(payload.get("priority") or "normal").casefold()
         if priority not in {"low", "normal", "high", "urgent"}:
             priority = "normal"
-        due_ts = int(payload.get("due_ts") or 0) or None
+        try:
+            due_ts = int(payload.get("due_ts") or 0) or None
+        except (TypeError, ValueError) as exc:
+            raise PortalError(
+                400, "invalid_due_date", "Choose a valid task due date"
+            ) from exc
+        linked_entity_type = _bounded_text(payload.get("linked_entity_type"), 40).casefold()
+        linked_entity_id = _bounded_text(payload.get("linked_entity_id"), 100)
+        if linked_entity_type not in {"", "level", "application", "task"}:
+            raise PortalError(
+                400,
+                "invalid_linked_entity_type",
+                "Choose a supported linked record type",
+            )
+        if bool(linked_entity_type) != bool(linked_entity_id):
+            raise PortalError(
+                400,
+                "incomplete_linked_entity",
+                "Choose both a linked record type and its internal ID, or leave both blank",
+            )
+        if linked_entity_id and not linked_entity_id.isdigit():
+            raise PortalError(
+                400,
+                "invalid_linked_entity_id",
+                "The linked record ID must contain digits only",
+            )
         now = int(time.time())
         task_id = await self.db.execute_insert(
             "INSERT INTO staff_tasks(guild_id,task_type,title,description,priority,status,created_by,assignee_id,created_ts,updated_ts,due_ts,linked_entity_type,linked_entity_id) VALUES(?,?,?,?,?,'todo',?,?,?,?,?,?,?)",
-            (principal.guild_id, task_type, title, description, priority, principal.user_id, assignee_id, now, now, due_ts, _bounded_text(payload.get("linked_entity_type"), 40) or None, _bounded_text(payload.get("linked_entity_id"), 100) or None),
+            (principal.guild_id, task_type, title, description, priority, principal.user_id, assignee_id, now, now, due_ts, linked_entity_type or None, linked_entity_id or None),
         )
-        if assignee_id and assignee_id != principal.user_id:
-            embed = discord.Embed(
-                title="New staff task assigned",
-                description=description or "Open the Staff Portal to view and update this task.",
-                color=discord.Color.blurple(),
-            )
-            embed.add_field(name="Task", value=title, inline=False)
-            embed.add_field(name="Priority", value=priority.title(), inline=True)
-            if due_ts:
-                embed.add_field(name="Due", value=f"<t:{due_ts}:F>\n<t:{due_ts}:R>", inline=True)
+        if task_type == "team":
+            recipient_ids = {
+                int(item["id"])
+                for item in (staff_directory or {"items": []})["items"]
+            } | {principal.user_id}
+        else:
+            recipient_ids = {int(assignee_id)}
+        embed = self._task_notification_embed(
+            task_type=task_type,
+            title=title,
+            description=description,
+            priority=priority,
+            due_ts=due_ts,
+        )
+        for recipient_id in sorted(recipient_ids):
             await self.bot.outbox.enqueue(
                 "send_dm",
                 guild_id=principal.guild_id,
-                user_id=assignee_id,
+                user_id=recipient_id,
                 payload={"embed": embed.to_dict()},
                 correlation_id=f"staff-task:{task_id}",
-                idempotency_key=f"staff-task:{task_id}:assigned:{assignee_id}",
+                idempotency_key=f"staff-task:{task_id}:created:{recipient_id}",
             )
-        return {"task": _row_dict(await self.db.fetchone("SELECT * FROM staff_tasks WHERE id=?", (task_id,)))}
+        return {
+            "task": _row_dict(
+                await self.db.fetchone("SELECT * FROM staff_tasks WHERE id=?", (task_id,))
+            ),
+            "notification_recipient_count": len(recipient_ids),
+        }
 
     async def update_task(self, principal, task_id: int, payload):
         row = await self.db.fetchone("SELECT * FROM staff_tasks WHERE id=? AND guild_id=?", (task_id, principal.guild_id))
