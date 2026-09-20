@@ -103,7 +103,9 @@ Application acceptance persists `accepted_pending_role` before requesting the Di
 
 Private session responses include a versioned API contract and explicit feature keys. The website gates newer controls against those keys, so deploying the website before its matching Avenue Guard release leaves the affected Dev controls visibly disabled instead of calling a backend route that does not exist.
 
-Application forms are configured through `staff_portal.application_questions`. They support short text, long text, and single-choice questions. A question marked `uses_review_prompt` receives one weighted entry from `staff_portal.application_review_levels`; the chosen key is persisted with the draft so refreshes cannot reroll it. On submission, Avenue Guard validates the configured choices and required fields server-side, then the outbox creates one private forum thread in `application_review_channel_id` containing a stable snapshot of every question, answer, and selected showcase.
+Application forms are configured through `staff_portal.application_questions`. They support short text, long text, and single-choice questions. A question marked `uses_review_prompt` receives one weighted entry from `staff_portal.application_review_levels`; the chosen key is persisted with the draft so refreshes cannot reroll it. On submission, Avenue Guard validates the configured choices and required fields server-side, then the outbox creates one review discussion in `application_review_channel_id` containing the applicant, Staff Portal link, and a stable snapshot of every question, answer, and selected showcase. Forum channels receive a forum post; normal text channels receive a notification with a public thread attached.
+
+Application delivery is restart-safe. A submitted application keeps its outbox identity and Discord thread identity in Turso. Startup reconciliation revives a dead or missing application delivery, while the outbox reuses an existing stored thread before sending the answer snapshot. Dead-letter logs include the outbox ID, action, channel, target user, attempt count, and terminal error so a configuration or permission problem is diagnosable without database access.
 
 A Dev can use `DELETE /api/apply/mine` with the exact confirmation value `DELETE` to remove their own stale application data. The operation atomically removes application rows, child events and notes, retires pending application deliveries, and clears application idempotency cache entries. Existing Discord threads or interview channels are preserved for audit safety and reported in the response rather than silently deleted.
 
@@ -242,7 +244,7 @@ If the bot is unavailable, Netlify returns a concise 503 and does not fall back 
 - Create each permitted note scope and verify a different Reviewer cannot read a private note.
 - Perform a QA action and confirm a post-submission tier correction is owner-only.
 - Save and submit an application; retry the request and verify only one active application exists.
-- Verify the application keeps the same weighted review prompt across refreshes and that its private forum thread contains every configured question, answer, and showcase link.
+- Verify the application keeps the same weighted review prompt across refreshes and that its Discord review thread contains every configured question, answer, and showcase link.
 - Proceed with interview and verify one private ticket, one opening status, one ticket database row, and one applicant DM.
 - Accept a test application and confirm `accepted_pending_role` changes only after the outbox delivers the Reviewer role.
 - Add a test team member by Discord ID, verify the profile appears before first web sign-in, then remove it and verify managed roles are removed.

@@ -448,7 +448,12 @@ def validate_config(data: Any) -> list[ConfigIssue]:
         portal_enabled = bool(staff_portal.get("enabled"))
         review_channel = staff_portal.get("application_review_channel_id", 0)
         if portal_enabled and not _is_discord_id(review_channel):
-            issues.append(ConfigIssue("staff_portal.application_review_channel_id", "must be a Discord forum channel ID"))
+            issues.append(
+                ConfigIssue(
+                    "staff_portal.application_review_channel_id",
+                    "must be a Discord forum or text channel ID",
+                )
+            )
         questions = staff_portal.get("application_questions", [])
         needs_review_prompt = False
         if portal_enabled and (not isinstance(questions, list) or not questions):

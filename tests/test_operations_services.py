@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import discord
 import pytest
@@ -204,6 +205,7 @@ async def test_outbox_is_idempotent_and_records_delivery(tmp_path):
 
     assert first == second
     assert await outbox.process_once() == {"delivered": 1, "retried": 0, "dead": 0}
+    assert outbox.last_dead_letter_ids() == ()
     assert await outbox.process_once() == {"delivered": 0, "retried": 0, "dead": 0}
     assert [message["content"] for message in channel.messages] == ["durable delivery"]
     row = await database.fetchone(
@@ -247,9 +249,11 @@ async def test_application_thread_delivery_persists_thread_and_review_link(
         def __init__(self):
             self.threads = []
             self.created = 0
+            self.create_kwargs = []
 
-        async def create_thread(self, **_kwargs):
+        async def create_thread(self, **kwargs):
             self.created += 1
+            self.create_kwargs.append(kwargs)
             thread = Thread()
             self.threads.append(thread)
             return SimpleNamespace(thread=thread)
@@ -274,6 +278,8 @@ async def test_application_thread_delivery_persists_thread_and_review_link(
         channel_id=123,
         payload={
             "application_id": application_id,
+            "submitted_ts": 100,
+            "review_url": "https://gdavenue.netlify.app/staff/#team/applications",
             "responses": [
                 {
                     "question": "Review Synergy - https://youtu.be/example",
@@ -290,7 +296,84 @@ async def test_application_thread_delivery_persists_thread_and_review_link(
     )
     assert int(saved["review_thread_id"]) == 654
     assert forum.created == 1
+    assert "New reviewer application by <@99>" in forum.create_kwargs[0]["content"]
+    assert "Open this application in the Staff Portal" in forum.create_kwargs[0]["content"]
     assert "https://youtu.be/example" in forum.threads[0].messages[0]["content"]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_application_delivery_supports_text_channel_notification_thread(
+    tmp_path, monkeypatch
+):
+    database = Database(str(tmp_path / "application-text-thread.db"))
+    await database.connect()
+    application_id = await database.execute_insert(
+        "INSERT INTO staff_applications("
+        "guild_id,applicant_id,application_type,status,answers_json,created_ts,updated_ts) "
+        "VALUES(1,99,'judge','submitted','{}',1,1)"
+    )
+
+    class Thread:
+        id = 987
+
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, **kwargs):
+            self.messages.append(kwargs)
+            return SimpleNamespace(id=1000 + len(self.messages))
+
+    class TextChannel:
+        def __init__(self):
+            self.threads = []
+            self.notifications = []
+            self.thread_kwargs = []
+
+        async def send(self, **kwargs):
+            self.notifications.append(kwargs)
+            return SimpleNamespace(id=800)
+
+        async def create_thread(self, **kwargs):
+            self.thread_kwargs.append(kwargs)
+            thread = Thread()
+            self.threads.append(thread)
+            return thread
+
+    monkeypatch.setattr(discord, "TextChannel", TextChannel)
+    channel = TextChannel()
+    bot = SimpleNamespace(
+        db=database,
+        get_channel=lambda channel_id: channel if channel_id == 123 else None,
+        fetch_channel=AsyncMock(return_value=channel),
+        get_cog=lambda _name: None,
+    )
+    outbox = DiscordOutbox(bot)
+    bot.outbox = outbox
+    await outbox.enqueue(
+        "create_application_thread",
+        guild_id=1,
+        channel_id=123,
+        payload={
+            "application_id": application_id,
+            "responses": [{"question": "Why?", "answer": "Because"}],
+        },
+        idempotency_key=f"application:{application_id}:text-thread",
+    )
+
+    assert await outbox.process_once() == {
+        "delivered": 1,
+        "retried": 0,
+        "dead": 0,
+    }
+    assert "New reviewer application by <@99>" in channel.notifications[0]["content"]
+    assert channel.thread_kwargs[0]["message"].id == 800
+    assert channel.threads[0].messages[0]["content"].endswith("Because")
+    saved = await database.fetchone(
+        "SELECT review_thread_id FROM staff_applications WHERE id=?",
+        (application_id,),
+    )
+    assert int(saved["review_thread_id"]) == 987
     await database.close()
 
 

@@ -1135,6 +1135,65 @@ async def test_application_form_persists_prompt_and_submission_enqueues_thread(p
     assert service.bot.outbox.calls[-1][0] == "create_application_thread"
 
 
+@pytest.mark.asyncio
+async def test_application_delivery_reconciliation_revives_dead_outbox(portal):
+    service, _guild = portal
+    now = 100
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications("
+        "guild_id,applicant_id,application_type,status,answers_json,created_ts,"
+        "updated_ts,submitted_ts,review_prompt_key) VALUES(?,?,'judge','submitted',"
+        "?,?,?,?,?)",
+        (
+            GUILD_ID,
+            999,
+            json.dumps({"motivation": "I want to help"}),
+            now,
+            now,
+            now,
+            "synergy-101935961",
+        ),
+    )
+    outbox_id = await service.db.execute_insert(
+        "INSERT INTO discord_outbox("
+        "correlation_id,idempotency_key,action_type,guild_id,channel_id,user_id,"
+        "payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts,last_error) "
+        "VALUES(?,?,?,?,?,?,?,'dead',8,?,?,?,'old channel type assumption')",
+        (
+            f"staff-application:{application_id}",
+            f"staff-application:{application_id}:review-thread",
+            "create_application_thread",
+            GUILD_ID,
+            1461483580197703832,
+            999,
+            "{}",
+            now,
+            now,
+            now,
+        ),
+    )
+    await service.db.execute(
+        "UPDATE staff_applications SET review_thread_outbox_id=? WHERE id=?",
+        (outbox_id, application_id),
+    )
+
+    assert await service.reconcile_application_deliveries() == 1
+    revived = await service.db.fetchone(
+        "SELECT status,attempts,last_error,payload_json FROM discord_outbox WHERE id=?",
+        (outbox_id,),
+    )
+    payload = json.loads(revived["payload_json"])
+    assert revived["status"] == "pending"
+    assert int(revived["attempts"]) == 0
+    assert revived["last_error"] is None
+    assert payload["application_id"] == application_id
+    assert payload["review_url"].endswith("/staff/#team/applications")
+    assert any(
+        item["answer"] == "I want to help" for item in payload["responses"]
+    )
+    assert await service.reconcile_application_deliveries() == 0
+
+
 def test_application_review_pool_and_youtube_embed_urls_are_valid(portal):
     service, _guild = portal
     levels = service._application_review_levels()

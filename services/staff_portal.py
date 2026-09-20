@@ -34,7 +34,7 @@ from utils.staff_auth import (
     token_hash,
     tokens_match,
 )
-from utils.workflows import new_correlation_id
+from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
 PORTAL_API_VERSION = 2
@@ -2628,14 +2628,33 @@ class StaffPortalService:
             raise PortalError(503, "review_prompt_missing", "No application review level is configured")
         return safe
 
-    async def _ensure_application_thread_outbox(self, application_id: int) -> int:
-        row = await self.db.fetchone("SELECT * FROM staff_applications WHERE id=?", (application_id,))
-        if row is None or str(row["status"]) == "draft":
-            return 0
-        if row["review_thread_outbox_id"] is not None:
-            return int(row["review_thread_outbox_id"])
+    def _application_review_url(self) -> str:
+        origins = self.bot.config.get(
+            "staff_portal", "allowed_origins", default=[]
+        )
+        if isinstance(origins, list):
+            origin = next(
+                (
+                    str(item).strip().rstrip("/")
+                    for item in origins
+                    if str(item).strip().startswith("https://")
+                ),
+                "",
+            )
+            if origin:
+                return f"{origin}/staff/#team/applications"
+        return "https://gdavenue.netlify.app/staff/#team/applications"
+
+    def _application_thread_payload(self, row) -> dict[str, Any]:
         prompt_key = str(row["review_prompt_key"] or "")
-        prompt = next((item for item in self._application_review_levels() if item["key"] == prompt_key), None)
+        prompt = next(
+            (
+                item
+                for item in self._application_review_levels()
+                if item["key"] == prompt_key
+            ),
+            None,
+        )
         answers = _json_object(row["answers_json"])
         responses = []
         for question in self._application_questions(prompt):
@@ -2645,28 +2664,99 @@ class StaffPortalService:
             responses.append(
                 {"question": label, "answer": answers.get(question["key"], "")}
             )
+        return {
+            "application_id": int(row["id"]),
+            "application_type": str(row["application_type"]),
+            "submitted_ts": int(row["submitted_ts"] or row["updated_ts"] or 0),
+            "responses": responses,
+            "review_prompt": prompt,
+            "review_url": self._application_review_url(),
+        }
+
+    async def _ensure_application_thread_outbox(self, application_id: int) -> int:
+        row = await self.db.fetchone("SELECT * FROM staff_applications WHERE id=?", (application_id,))
+        if row is None or str(row["status"]) == "draft":
+            return 0
         channel_id = self.bot.config.get_int("staff_portal", "application_review_channel_id", default=0)
         if not channel_id:
             raise PortalError(503, "application_channel_missing", "The application review channel is not configured")
+        payload = self._application_thread_payload(row)
+        linked_outbox_id = int(row["review_thread_outbox_id"] or 0)
+        if linked_outbox_id:
+            linked = await self.db.fetchone(
+                "SELECT id,status FROM discord_outbox WHERE id=?",
+                (linked_outbox_id,),
+            )
+            if linked is not None and str(linked["status"]) != "dead":
+                return linked_outbox_id
+            if linked is not None:
+                now = int(time.time())
+                revived = await self.db.execute_affected(
+                    "UPDATE discord_outbox SET channel_id=?,user_id=?,payload_json=?,"
+                    "status='pending',attempts=0,next_attempt_ts=?,updated_ts=?,"
+                    "delivered_ts=NULL,delivered_message_id=NULL,last_error=NULL "
+                    "WHERE id=? AND status='dead' AND action_type='create_application_thread'",
+                    (
+                        channel_id,
+                        int(row["applicant_id"]),
+                        json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+                        now,
+                        now,
+                        linked_outbox_id,
+                    ),
+                )
+                if revived:
+                    await record_workflow_event(
+                        self.db,
+                        workflow_type="discord_outbox",
+                        entity_id=str(linked_outbox_id),
+                        event="requeued",
+                        correlation_id=f"staff-application:{application_id}",
+                        guild_id=int(row["guild_id"]),
+                        payload={
+                            "action": "create_application_thread",
+                            "reason": "application review delivery recovery",
+                        },
+                    )
+                    return linked_outbox_id
         outbox_id = await self.bot.outbox.enqueue(
             "create_application_thread",
             guild_id=int(row["guild_id"]),
             channel_id=channel_id,
             user_id=int(row["applicant_id"]),
-            payload={
-                "application_id": application_id,
-                "application_type": str(row["application_type"]),
-                "responses": responses,
-                "review_prompt": prompt,
-            },
+            payload=payload,
             correlation_id=f"staff-application:{application_id}",
             idempotency_key=f"staff-application:{application_id}:review-thread",
         )
         await self.db.execute(
-            "UPDATE staff_applications SET review_thread_outbox_id=?,updated_ts=? WHERE id=? AND review_thread_outbox_id IS NULL",
+            "UPDATE staff_applications SET review_thread_outbox_id=?,updated_ts=? WHERE id=?",
             (outbox_id, int(time.time()), application_id),
         )
         return outbox_id
+
+    async def reconcile_application_deliveries(self, *, limit: int = 50) -> int:
+        """Restore missing/dead application notifications after an interruption."""
+        rows = await self.db.fetchall(
+            "SELECT a.id FROM staff_applications a "
+            "LEFT JOIN discord_outbox o ON o.id=a.review_thread_outbox_id "
+            "WHERE a.status NOT IN('draft','withdrawn') AND "
+            "(a.review_thread_outbox_id IS NULL OR o.id IS NULL OR o.status='dead') "
+            "ORDER BY COALESCE(a.submitted_ts,a.created_ts),a.id LIMIT ?",
+            (max(1, min(200, int(limit))),),
+        )
+        repaired = 0
+        for pending in rows:
+            application_id = int(pending["id"])
+            try:
+                if await self._ensure_application_thread_outbox(application_id):
+                    repaired += 1
+            except Exception as exc:  # noqa: BLE001 - another startup may retry it.
+                await log_error(
+                    self.bot,
+                    "Reviewer application delivery reconciliation deferred "
+                    f"application_id={application_id}: {exc!r}",
+                )
+        return repaired
 
     async def save_application(self, principal, payload, *, submit):
         configuration = (await self.safe_configuration())["configuration"]

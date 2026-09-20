@@ -35,6 +35,10 @@ class DiscordOutbox:
         self.max_attempts = max(1, min(20, int(max_attempts)))
         self._worker_lock = asyncio.Lock()
         self._delivery_receipts: dict[int, int] = {}
+        self._last_dead_letter_ids: list[int] = []
+
+    def last_dead_letter_ids(self) -> tuple[int, ...]:
+        return tuple(self._last_dead_letter_ids)
 
     async def enqueue(
         self,
@@ -95,6 +99,7 @@ class DiscordOutbox:
         if self._worker_lock.locked():
             return result
         async with self._worker_lock:
+            self._last_dead_letter_ids = []
             if self._delivery_receipts:
                 receipt_ids = list(self._delivery_receipts)
                 for start in range(0, len(receipt_ids), 100):
@@ -115,6 +120,8 @@ class DiscordOutbox:
             for row in rows:
                 outcome = await self._process_row(row)
                 result[outcome] += 1
+                if outcome == "dead":
+                    self._last_dead_letter_ids.append(int(row["id"]))
         return result
 
     async def _process_row(self, row) -> str:
@@ -261,21 +268,59 @@ class DiscordOutbox:
                 except discord.NotFound:
                     thread = None
             if thread is None:
-                forum = await self._channel(channel_id)
-                if not isinstance(forum, discord.ForumChannel):
-                    raise PermanentOutboxError("application review channel is not a forum")
+                destination = await self._channel(channel_id)
                 thread_name = f"reviewer-application-{application_id}-{int(application['applicant_id'])}"[:100]
-                existing = next((item for item in getattr(forum, "threads", ()) if str(getattr(item, "name", "")) == thread_name), None)
+                existing = next(
+                    (
+                        item
+                        for item in getattr(destination, "threads", ())
+                        if str(getattr(item, "name", "")) == thread_name
+                    ),
+                    None,
+                )
                 if existing is not None:
                     thread = existing
                 else:
-                    created = await forum.create_thread(
-                        name=thread_name,
-                        content=f"Reviewer application **#{application_id}** from <@{int(application['applicant_id'])}>",
-                        allowed_mentions=no_mentions(),
-                        reason=f"Reviewer application #{application_id} submitted",
-                    )
-                    thread = getattr(created, "thread", created)
+                    applicant_id = int(application["applicant_id"])
+                    review_url = str(payload.get("review_url") or "").strip()
+                    submitted_ts = int(payload.get("submitted_ts") or 0)
+                    starter_parts = [
+                        f"## New reviewer application by <@{applicant_id}>",
+                        f"**Application:** #{application_id}",
+                    ]
+                    if submitted_ts:
+                        starter_parts.append(f"**Submitted:** <t:{submitted_ts}:F> (<t:{submitted_ts}:R>)")
+                    if review_url:
+                        starter_parts.append(f"[Open this application in the Staff Portal](<{review_url}>)")
+                    starter_parts.append("The submitted questions and answers are copied below.")
+                    starter = "\n".join(starter_parts)[:2000]
+                    reason = f"Reviewer application #{application_id} submitted"
+                    if isinstance(destination, discord.ForumChannel):
+                        created = await destination.create_thread(
+                            name=thread_name,
+                            content=starter,
+                            allowed_mentions=no_mentions(),
+                            nonce=nonce,
+                            reason=reason,
+                        )
+                        thread = getattr(created, "thread", created)
+                    elif isinstance(destination, discord.TextChannel):
+                        notification = await destination.send(
+                            content=starter,
+                            allowed_mentions=no_mentions(),
+                            nonce=nonce,
+                            enforce_nonce=True,
+                        )
+                        thread = await destination.create_thread(
+                            name=thread_name,
+                            message=notification,
+                            reason=reason,
+                        )
+                    else:
+                        raise PermanentOutboxError(
+                            "application review channel must be a forum or text channel "
+                            f"(received {type(destination).__name__})"
+                        )
                 thread_id = int(getattr(thread, "id", 0) or 0)
                 if not thread_id:
                     raise RuntimeError("Discord did not return the application thread")

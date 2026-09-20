@@ -18,8 +18,8 @@ from utils.config_schema import (
     RUNTIME_SCHEMA_VERSION,
     operations_settings,
 )
-from utils.errors import log_error
 from utils.db import DatabaseBusyError
+from utils.errors import log_error
 from utils.keepalive import set_runtime_heartbeat
 from utils.supervision import start_cog_background
 from utils.timeutils import now_madrid
@@ -120,6 +120,23 @@ class OperationsCog(commands.Cog):
         )
         self._last_restore_drill = int(drill_row["ts"] or 0) if drill_row else 0
         await self.bot.outbox.recover_stale()
+        portal = getattr(self.bot, "staff_portal", None)
+        reconcile_applications = getattr(
+            portal, "reconcile_application_deliveries", None
+        )
+        if callable(reconcile_applications):
+            repaired = await reconcile_applications(limit=50)
+            if repaired:
+                await record_workflow_event(
+                    self.bot.db,
+                    workflow_type="staff_portal",
+                    entity_id="application-delivery",
+                    event="application_deliveries_requeued",
+                    guild_id=self.bot.config.get_int(
+                        "guild", "allowed_guild_id", default=0
+                    ),
+                    payload={"count": repaired},
+                )
 
     def task_snapshot(self) -> dict[str, str]:
         snapshot = dict(self._task_states)
@@ -259,9 +276,33 @@ class OperationsCog(commands.Cog):
                 await self.bot.outbox.recover_stale()
                 result = await self.bot.outbox.process_once(limit=15)
                 if result.get("dead"):
+                    dead_ids = tuple(self.bot.outbox.last_dead_letter_ids())
+                    if dead_ids:
+                        placeholders = ",".join("?" for _ in dead_ids)
+                        dead_rows = await self.bot.db.fetchall(
+                            "SELECT id,action_type,channel_id,user_id,attempts,last_error "
+                            f"FROM discord_outbox WHERE id IN ({placeholders}) "  # nosec B608
+                            "ORDER BY id",
+                            dead_ids,
+                        )
+                    else:
+                        dead_rows = []
+                    details = "; ".join(
+                        (
+                            f"#{int(row['id'])} action={row['action_type']} "
+                            f"channel={int(row['channel_id'] or 0)} "
+                            f"user={int(row['user_id'] or 0)} "
+                            f"attempts={int(row['attempts'] or 0)} "
+                            f"error={str(row['last_error'] or 'unknown')[:300]}"
+                        )
+                        for row in dead_rows
+                    )
+                    if not details:
+                        details = "details unavailable; inspect Admin > System > Delivery"
                     await log_error(
                         self.bot,
-                        f"Discord outbox moved {result['dead']} action(s) to dead-letter status",
+                        "Discord outbox moved "
+                        f"{result['dead']} action(s) to dead-letter status: {details}",
                     )
             except asyncio.CancelledError:
                 raise
