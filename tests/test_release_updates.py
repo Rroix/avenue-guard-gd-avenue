@@ -12,10 +12,13 @@ from utils.keepalive import (
     _response_for_path,
     get_public_bot_payload,
     get_public_level_payload,
+    get_public_team_payload,
     set_keepalive_status,
     set_public_bot_metrics,
+    set_public_health_history,
     set_public_level_data,
     set_public_release_data,
+    set_public_team_data,
     set_runtime_heartbeat,
 )
 from utils.releases import (
@@ -170,6 +173,39 @@ def test_public_status_payload_is_sanitized_and_versioned():
             }
         ]
     )
+    set_public_health_history(
+        [
+            {
+                "sample_ts": 1200,
+                "healthy": True,
+                "database_ok": True,
+                "gateway_latency_ms": 42.125,
+                "database_latency_ms": "invalid",
+                "provider_available": 1,
+                "provider_total": 2,
+            },
+            {
+                "sample_ts": "invalid",
+                "gateway_latency_ms": "invalid",
+                "provider_available": "invalid",
+                "provider_total": object(),
+            },
+        ]
+    )
+    set_public_team_data(
+        [
+            {
+                "id": "1102884420207255653",
+                "display_name": "Average",
+                "avatar_url": "https://cdn.example/avatar.png",
+            },
+            {
+                "id": "not-a-snowflake",
+                "display_name": "Invalid",
+                "avatar_url": "http://insecure.example/avatar.png",
+            },
+        ]
+    )
 
     payload = get_public_bot_payload()
     assert payload["online"] is True
@@ -178,7 +214,15 @@ def test_public_status_payload_is_sanitized_and_versioned():
     assert payload["member_count"] == 2500
     assert payload["uptime_percentage"] == 99.875
     assert payload["uptime_tracking_since_ts"] == 1200
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
+    assert payload["health_history"][0]["gateway_latency_ms"] == 42.12
+    assert payload["health_history"][0]["database_latency_ms"] is None
+    assert len(payload["health_history"]) == 1
+    assert any(item["name"] == "Database" for item in payload["systems"])
+    provider = next(
+        item for item in payload["systems"] if item["name"] == "GD validation providers"
+    )
+    assert provider["status"] == "degraded"
     assert payload["service_started_ts"] == payload["process_started_ts"]
     assert payload["service_uptime_seconds"] == payload["process_uptime_seconds"]
     assert payload["discord_connected_since_ts"] == payload["online_since_ts"]
@@ -196,6 +240,24 @@ def test_public_status_payload_is_sanitized_and_versioned():
     assert content_type.startswith("application/json")
     assert cache_control == "no-store"
     assert public_api is True
+
+    team = get_public_team_payload()
+    assert team == {
+        "schema_version": 1,
+        "count": 1,
+        "members": [
+            {
+                "id": "1102884420207255653",
+                "display_name": "Average",
+                "avatar_url": "https://cdn.example/avatar.png",
+            }
+        ],
+    }
+    team_body, team_type, team_cache, team_public = _response_for_path("/api/team")
+    assert json.loads(team_body)["count"] == 1
+    assert team_type.startswith("application/json")
+    assert team_cache == "public, max-age=300"
+    assert team_public is True
 
 
 def test_public_level_payload_is_privacy_filtered_and_versioned():
@@ -683,6 +745,88 @@ async def test_public_member_count_only_uses_configured_gd_avenue_guild(tmp_path
     assert payload["member_count"] == 2431
     assert payload["guild_count"] == 1
     assert payload["avatar_url"].endswith("/live.webp")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_public_health_and_team_caches_use_sanitized_bot_data(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    await db.connect()
+    owner = _Owner()
+    owner.display_name = "Average"
+    owner.name = "average"
+    owner.display_avatar = SimpleNamespace(
+        url="https://cdn.discordapp.com/avatars/1102884420207255653/current.webp"
+    )
+    config = _Config(tmp_path / "release.json")
+    config.data["release_updates"]["public_team_user_ids"] = [str(OWNER_ID)]
+    bot = _Bot(db, config, owner)
+    await db.execute(
+        "INSERT INTO health_metrics(guild_id,sample_ts,metric_type,value,payload_json) "
+        "VALUES(?,?,'runtime',?,?)",
+        (
+            717003826288394271,
+            1234,
+            1.0,
+            json.dumps(
+                {
+                    "db_ok": True,
+                    "db_probe_ms": 3.5,
+                    "gateway_latency_ms": 37.25,
+                    "tasks": {"priority.maintenance": "running"},
+                    "providers": {
+                        "boomlings": {"enabled": True, "available": True},
+                        "gdhistory": {"enabled": True, "available": False},
+                    },
+                }
+            ),
+        ),
+    )
+
+    cog = ReleaseCog(bot)
+    await cog.refresh_public_health_cache()
+    await cog.refresh_public_team_cache()
+
+    health = get_public_bot_payload()["health_history"]
+    assert health == [
+        {
+            "sample_ts": 1234,
+            "healthy": True,
+            "database_ok": True,
+            "gateway_latency_ms": 37.25,
+            "database_latency_ms": 3.5,
+            "provider_available": 1,
+            "provider_total": 2,
+        }
+    ]
+    assert get_public_team_payload()["members"] == [
+        {
+            "id": str(OWNER_ID),
+            "display_name": "Average",
+            "avatar_url": (
+                "https://cdn.discordapp.com/avatars/"
+                "1102884420207255653/current.webp"
+            ),
+        }
+    ]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_public_cache_failure_does_not_block_other_cache(tmp_path):
+    db = Database(str(tmp_path / "bot.db"))
+    await db.connect()
+    cog = ReleaseCog(_Bot(db, _Config(tmp_path / "release.json"), _Owner()))
+    cog.refresh_public_health_cache = AsyncMock(
+        side_effect=release_module.DatabaseBusyError("database busy")
+    )
+    cog.refresh_public_team_cache = AsyncMock()
+
+    await cog.refresh_public_auxiliary_caches()
+
+    cog.refresh_public_health_cache.assert_awaited_once()
+    cog.refresh_public_team_cache.assert_awaited_once()
+    assert cog._last_public_auxiliary_refresh > 0
     await db.close()
 
 

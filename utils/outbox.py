@@ -274,7 +274,11 @@ class DiscordOutbox:
                     payload.get("application_label")
                     or ("Reviewer application" if application_type == "judge" else f"{application_type.replace('_', ' ').title()} application")
                 )[:100]
-                thread_name = f"{application_type}-application-{application_id}-{int(application['applicant_id'])}"[:100]
+                submitted_ts = int(payload.get("submitted_ts") or 0)
+                thread_name = (
+                    f"{application_type}-application-"
+                    f"{int(application['applicant_id'])}-{submitted_ts or 'submitted'}"
+                )[:100]
                 existing = next(
                     (
                         item
@@ -288,10 +292,8 @@ class DiscordOutbox:
                 else:
                     applicant_id = int(application["applicant_id"])
                     review_url = str(payload.get("review_url") or "").strip()
-                    submitted_ts = int(payload.get("submitted_ts") or 0)
                     starter_parts = [
                         f"## New {application_label.lower()} by <@{applicant_id}>",
-                        f"**Application:** #{application_id}",
                     ]
                     if submitted_ts:
                         starter_parts.append(f"**Submitted:** <t:{submitted_ts}:F> (<t:{submitted_ts}:R>)")
@@ -299,7 +301,7 @@ class DiscordOutbox:
                         starter_parts.append(f"[Open this application in the Staff Portal](<{review_url}>)")
                     starter_parts.append("The submitted questions and answers are copied below.")
                     starter = "\n".join(starter_parts)[:2000]
-                    reason = f"{application_label} #{application_id} submitted"
+                    reason = f"{application_label} submitted"
                     if isinstance(destination, discord.ForumChannel):
                         created = await destination.create_thread(
                             name=thread_name,
@@ -405,11 +407,11 @@ class DiscordOutbox:
                     if role is not None:
                         overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
                 interview = await guild.create_text_channel(
-                    name=f"{application_type}-interview-{application_id}-{getattr(member, 'name', 'applicant')}"[:90],
+                    name=f"{application_type}-interview-{getattr(member, 'name', 'applicant')}"[:90],
                     category=category,
                     topic=marker,
                     overwrites=overwrites,
-                    reason=f"{application_label} #{application_id} interview",
+                    reason=f"{application_label} interview",
                 )
             now = int(time.time())
             ticket = await self.bot.db.fetchone("SELECT ticket_id,opening_message_id FROM tickets WHERE channel_id=?", (int(interview.id),))
@@ -433,7 +435,7 @@ class DiscordOutbox:
                 opening_message_id = int(ticket["opening_message_id"] or 0)
             if not opening_message_id:
                 opening = await interview.send(
-                    content=f"Welcome {member.mention}. This private channel is your GD Avenue {application_label} interview for application **#{application_id}**.\nStatus: **Waiting for staff**",
+                    content=f"Welcome {member.mention}. This private channel is your GD Avenue {application_label} interview.\nStatus: **Waiting for staff**",
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
                     nonce=hashlib.sha256(
                         f"application:{application_id}:{interview_run_id or 'initial'}:interview-opening".encode()

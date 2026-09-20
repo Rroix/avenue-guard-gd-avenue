@@ -38,6 +38,8 @@ _public_metrics = {
 }
 _public_releases: list[dict] = []
 _public_levels: dict[str, dict] = {}
+_public_health_history: list[dict] = []
+_public_team_members: list[dict] = []
 _runtime_heartbeat = 0.0
 _runtime_health: dict = {}
 _staff_api_service = None
@@ -156,6 +158,85 @@ def set_public_bot_metrics(
                 "updated_ts": int(time.time()),
             }
         )
+
+
+def _safe_public_metric(sample: dict, name: str) -> float | None:
+    value = sample.get(name)
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return (
+        round(max(0.0, min(60_000.0, parsed)), 2)
+        if math.isfinite(parsed)
+        else None
+    )
+
+
+def _safe_public_count(sample: dict, name: str) -> int:
+    try:
+        value = int(sample.get(name) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(10_000, value))
+
+
+def set_public_health_history(samples: list[dict]) -> None:
+    safe_samples: list[dict] = []
+    for sample in samples[-288:]:
+        if not isinstance(sample, dict):
+            continue
+        try:
+            sample_ts = max(0, int(sample.get("sample_ts") or 0))
+        except (TypeError, ValueError):
+            continue
+        if not sample_ts:
+            continue
+
+        safe_samples.append(
+            {
+                "sample_ts": sample_ts,
+                "healthy": bool(sample.get("healthy")),
+                "database_ok": bool(sample.get("database_ok")),
+                "gateway_latency_ms": _safe_public_metric(
+                    sample, "gateway_latency_ms"
+                ),
+                "database_latency_ms": _safe_public_metric(
+                    sample, "database_latency_ms"
+                ),
+                "provider_available": _safe_public_count(
+                    sample, "provider_available"
+                ),
+                "provider_total": _safe_public_count(sample, "provider_total"),
+            }
+        )
+    safe_samples.sort(key=lambda item: item["sample_ts"])
+    with _status_lock:
+        _public_health_history[:] = safe_samples
+
+
+def set_public_team_data(members: list[dict]) -> None:
+    safe_members: list[dict] = []
+    for member in members[:50]:
+        if not isinstance(member, dict):
+            continue
+        user_id = str(member.get("id") or "").strip()
+        if not (user_id.isascii() and user_id.isdecimal() and 16 <= len(user_id) <= 20):
+            continue
+        avatar_url = str(member.get("avatar_url") or "").strip()
+        if avatar_url and not avatar_url.casefold().startswith("https://"):
+            avatar_url = ""
+        safe_members.append(
+            {
+                "id": user_id,
+                "display_name": str(member.get("display_name") or "")[:100],
+                "avatar_url": avatar_url[:1000],
+            }
+        )
+    with _status_lock:
+        _public_team_members[:] = safe_members
 
 
 def set_public_release_data(releases: list[dict]) -> None:
@@ -338,6 +419,7 @@ def get_public_bot_payload() -> dict:
         status = dict(_status)
         metrics = dict(_public_metrics)
         current_release = dict(_public_releases[0]) if _public_releases else None
+        health_history = [dict(sample) for sample in _public_health_history]
 
     state = str(status.get("state") or "unknown")
     runtime = get_runtime_health()
@@ -349,8 +431,59 @@ def get_public_bot_payload() -> dict:
         if state == "online" and online_since_ts
         else 0
     )
+    database = runtime.get("database") if isinstance(runtime.get("database"), dict) else {}
+    database_failed = (
+        database.get("connected") is False
+        or (database.get("uses_remote") and database.get("worker_alive") is not True)
+    )
+    database_degraded = bool(
+        database.get("primary_write_degraded")
+        or database.get("write_queue_stalled")
+    )
+    task_states = runtime.get("tasks") if isinstance(runtime.get("tasks"), dict) else {}
+    auxiliary_tasks = {
+        "operations.smoke",
+        "operations.bootstrap",
+        "operations.restarts",
+        "operations.timeline",
+        "release.bootstrap",
+    }
+    task_failed = any(
+        str(value).startswith(("failed", "stopped", "missing"))
+        for name, value in task_states.items()
+        if name not in auxiliary_tasks
+    )
+    latest_history = health_history[-1] if health_history else {}
+    provider_total = int(latest_history.get("provider_total") or 0)
+    provider_available = int(latest_history.get("provider_available") or 0)
+
+    def system(name: str, status_value: str, detail: str) -> dict[str, str]:
+        return {"name": name, "status": status_value, "detail": detail}
+
+    systems = [
+        system(
+            "Discord gateway",
+            "operational" if state == "online" and runtime["responsive"] else "degraded" if state == "online" else "unavailable",
+            "Connected and responsive" if state == "online" and runtime["responsive"] else "Connection is recovering" if state == "online" else "Not connected",
+        ),
+        system(
+            "Database",
+            "unavailable" if database_failed else "degraded" if database_degraded else "operational" if database else "unknown",
+            "Connected" if database and not database_failed and not database_degraded else "Write service is degraded" if database_degraded else "Connection unavailable" if database_failed else "No recent signal",
+        ),
+        system(
+            "Background services",
+            "unavailable" if not runtime["responsive"] else "degraded" if task_failed else "operational",
+            "Core tasks running" if runtime["responsive"] and not task_failed else "A core task needs attention" if task_failed else "No recent heartbeat",
+        ),
+        system(
+            "GD validation providers",
+            "unknown" if provider_total <= 0 else "operational" if provider_available == provider_total else "degraded" if provider_available else "unavailable",
+            "No recent provider sample" if provider_total <= 0 else f"{provider_available} of {provider_total} available",
+        ),
+    ]
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "service": "Avenue Guard",
         "bot_name": str(metrics.get("bot_name") or "Avenue Guard"),
         "avatar_url": str(metrics.get("avatar_url") or ""),
@@ -386,6 +519,8 @@ def get_public_bot_payload() -> dict:
             int(status.get("updated_ts") or 0),
             int(metrics.get("updated_ts") or 0),
         ),
+        "systems": systems,
+        "health_history": health_history,
         "current_release": current_release,
     }
 
@@ -398,6 +533,12 @@ def get_public_releases_payload() -> dict:
         "count": len(releases),
         "releases": releases,
     }
+
+
+def get_public_team_payload() -> dict:
+    with _status_lock:
+        members = [dict(member) for member in _public_team_members]
+    return {"schema_version": 1, "count": len(members), "members": members}
 
 
 def _response_for_path(raw_path: str) -> tuple[bytes, str, str, bool]:
@@ -415,6 +556,11 @@ def _response_for_path(raw_path: str) -> tuple[bytes, str, str, bool]:
             separators=(",", ":"),
         ).encode("utf-8")
         return body, "application/json; charset=utf-8", "public, max-age=30", True
+    if path == "/api/team":
+        body = json.dumps(
+            get_public_team_payload(), separators=(",", ":")
+        ).encode("utf-8")
+        return body, "application/json; charset=utf-8", "public, max-age=300", True
     if path == "/api/levels":
         query = parse_qs(parsed.query).get("q", [""])[-1]
         body = json.dumps(
@@ -696,6 +842,7 @@ async def start_keepalive() -> None:
     app.router.add_route("*", "/ready", _handle)
     app.router.add_route("*", "/api/bot", _handle)
     app.router.add_route("*", "/api/releases", _handle)
+    app.router.add_route("*", "/api/team", _handle)
     app.router.add_route("*", "/api/levels", _handle)
     app.router.add_route("*", "/api/level/{level_id}", _handle)
     app.router.add_route("*", "/api/levels/{level_id}", _handle)

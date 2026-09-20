@@ -1325,6 +1325,10 @@ async def test_application_catalog_and_mod_form_are_server_defined(portal):
     assert by_type["appeal"]["enabled"] is False
     assert options["cooldowns"]["judge"]["days"] == 5
     assert options["cooldowns"]["mod"]["active"] is False
+    assert options["application_open_by_type"] == {"judge": True, "mod": True}
+    assert by_type["judge"]["open"] is True
+    assert by_type["mod"]["open"] is True
+    assert by_type["appeal"]["open"] is False
 
     form = await service.application_form(applicant, "mod")
     questions = {item["key"]: item for item in form["questions"]}
@@ -1333,6 +1337,42 @@ async def test_application_catalog_and_mod_form_are_server_defined(portal):
     assert questions["timezone"]["type"] == "short_text"
     assert "moderation_scenario" in questions
     assert all(item.get("review_prompt") is None for item in form["questions"])
+
+
+@pytest.mark.asyncio
+async def test_application_type_can_close_without_closing_other_forms(portal):
+    service, _guild = portal
+    applicant = principal(999, "applicant")
+    existing_mod = await service.application_form(applicant, "mod")
+
+    updated = await service.update_safe_configuration(
+        principal(OWNER_ID, "owner"),
+        {"application_open_by_type": {"mod": False, "judge": True}},
+    )
+    assert updated["configuration"]["application_open_by_type"] == {
+        "judge": True,
+        "mod": False,
+    }
+
+    options = await service.application_options(applicant)
+    by_type = {item["application_type"]: item for item in options["items"]}
+    assert by_type["judge"]["open"] is True
+    assert by_type["mod"]["open"] is False
+
+    resumed = await service.application_form(applicant, "mod")
+    assert resumed["application"]["id"] == existing_mod["application"]["id"]
+    await service.application_form(principal(1000, "applicant"), "judge")
+    with pytest.raises(PortalError) as closed_form:
+        await service.application_form(principal(1000, "applicant"), "mod")
+    assert closed_form.value.code == "applications_closed"
+
+    with pytest.raises(PortalError) as closed_submit:
+        await service.save_application(
+            applicant,
+            {"application_type": "mod", "answers": {}},
+            submit=True,
+        )
+    assert closed_submit.value.code == "applications_closed"
 
 
 @pytest.mark.asyncio
@@ -1399,6 +1439,12 @@ async def test_mod_application_scope_and_acceptance_never_grant_reviewer_role(po
     assert result["role_delivery"] == "manual"
     assert all(kind != "add_role" for kind, _payload in service.bot.outbox.calls)
     assert any(kind == "send_dm" for kind, _payload in service.bot.outbox.calls)
+    dm_content = next(
+        payload["payload"]["content"]
+        for kind, payload in service.bot.outbox.calls
+        if kind == "send_dm"
+    )
+    assert f"#{application_id}" not in dm_content
 
 
 @pytest.mark.asyncio
@@ -1430,6 +1476,7 @@ async def test_application_actions_follow_status_and_staff_dm_preserves_state(po
     assert kind == "send_dm"
     assert call["user_id"] == 999
     assert "Please check your Discord roles." in call["payload"]["content"]
+    assert f"#{application_id}" not in call["payload"]["content"]
 
     event = await service.db.fetchone(
         "SELECT event,from_status,to_status,detail_json FROM staff_application_events "

@@ -37,10 +37,11 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 5
+PORTAL_API_VERSION = 6
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
+    "application_type_availability",
     "application_repeat_interviews",
     "application_review_embeds",
     "application_review_threads",
@@ -1329,7 +1330,7 @@ class StaffPortalService:
                 key,
             )
         application_rows = await self.db.fetchall(
-            "SELECT id FROM staff_applications WHERE guild_id=? AND status IN('submitted','under_review','interview','hold') "
+            "SELECT id,application_type FROM staff_applications WHERE guild_id=? AND status IN('submitted','under_review','interview','hold') "
             "AND updated_ts<=? LIMIT 100",
             (guild_id, now - 7 * 86400),
         )
@@ -1338,7 +1339,7 @@ class StaffPortalService:
             desired[key] = (
                 guild_id,
                 "system",
-                f"Application #{int(row['id'])} needs attention",
+                f"{self._application_label(str(row['application_type']))} needs attention",
                 "This application has not changed stage in seven days.",
                 "normal",
                 "todo",
@@ -2700,6 +2701,17 @@ class StaffPortalService:
             return label
         return f"{str(application_type or 'staff').replace('_', ' ').title()} application"
 
+    @staticmethod
+    def _application_type_is_open(
+        configuration: dict[str, Any], application_type: str
+    ) -> bool:
+        if not bool(configuration.get("applications_open", True)):
+            return False
+        per_type = configuration.get("application_open_by_type")
+        if not isinstance(per_type, dict):
+            return True
+        return bool(per_type.get(application_type, True))
+
     def _application_role_ids(self, application_type: str) -> list[int]:
         key = "judge_role_ids" if application_type == "judge" else f"{application_type}_role_ids"
         return self.bot.config.get_int_list("staff_portal", key)
@@ -2781,6 +2793,7 @@ class StaffPortalService:
 
     async def application_options(self, principal: StaffPrincipal) -> dict[str, Any]:
         configured_types = self._configured_application_types()
+        configuration = (await self.safe_configuration())["configuration"]
         forms = []
         cooldowns: dict[str, dict[str, Any]] = {}
         for application_type in configured_types:
@@ -2795,6 +2808,9 @@ class StaffPortalService:
                     "label": self._application_label(application_type),
                     "description": str(config.get("description") or "").strip()[:500],
                     "enabled": True,
+                    "open": self._application_type_is_open(
+                        configuration, application_type
+                    ),
                     "cooldown": cooldown,
                 }
             )
@@ -2805,6 +2821,7 @@ class StaffPortalService:
                     "label": "Appeal application",
                     "description": "This application will be added in a future update.",
                     "enabled": False,
+                    "open": False,
                 }
             )
         active_rows = await self.db.fetchall(
@@ -2815,10 +2832,12 @@ class StaffPortalService:
             (principal.guild_id, principal.user_id),
         )
         active_applications = [_row_dict(row) for row in active_rows]
-        configuration = (await self.safe_configuration())["configuration"]
         return {
             "items": forms,
             "applications_open": bool(configuration["applications_open"]),
+            "application_open_by_type": dict(
+                configuration["application_open_by_type"]
+            ),
             "cooldown": {"days": self._application_cooldown_days(), "active": False},
             "cooldowns": cooldowns,
             "active_applications": active_applications,
@@ -2921,6 +2940,15 @@ class StaffPortalService:
                 (principal.guild_id, principal.user_id, application_type),
             )
             if row is None:
+                configuration = (await self.safe_configuration())["configuration"]
+                if not self._application_type_is_open(
+                    configuration, application_type
+                ):
+                    raise PortalError(
+                        409,
+                        "applications_closed",
+                        f"{self._application_label(application_type)} submissions are currently closed",
+                    )
                 cooldown = await self._application_cooldown(principal, application_type)
                 if cooldown["active"]:
                     raise PortalError(
@@ -3145,14 +3173,18 @@ class StaffPortalService:
 
     async def save_application(self, principal, payload, *, submit):
         configuration = (await self.safe_configuration())["configuration"]
-        if submit and not configuration["applications_open"]:
-            raise PortalError(409, "applications_closed", "Applications are currently closed")
         app_type = str(payload.get("application_type") or "judge").casefold()
         if (
             app_type not in self._configured_application_types()
             or not self._application_form_config(app_type)
         ):
             raise PortalError(400, "application_closed", "That application is not available")
+        if submit and not self._application_type_is_open(configuration, app_type):
+            raise PortalError(
+                409,
+                "applications_closed",
+                f"{self._application_label(app_type)} submissions are currently closed",
+            )
         answers = payload.get("answers")
         if not isinstance(answers, dict):
             raise PortalError(400, "invalid_answers", "Application answers are missing")
@@ -3480,7 +3512,7 @@ class StaffPortalService:
                     payload={
                         "content": (
                             f"GD Avenue staff sent you a message about your "
-                            f"{application_label} #{application_id}:\n\n{message}"
+                            f"{application_label}:\n\n{message}"
                         )
                     },
                     correlation_id=correlation,
@@ -3553,7 +3585,7 @@ class StaffPortalService:
                         user_id=int(row["applicant_id"]),
                         payload={
                             "role_id": role_ids[0],
-                            "reason": f"{application_label} #{application_id} accepted",
+                            "reason": f"{application_label} accepted",
                         },
                         correlation_id=f"staff-application:{application_id}",
                         idempotency_key=f"staff-application:{application_id}:{application_type}-role",
@@ -3567,12 +3599,12 @@ class StaffPortalService:
                     "send_dm",
                     guild_id=principal.guild_id,
                     user_id=int(row["applicant_id"]),
-                    payload={"content": f"Your GD Avenue {application_label} #{application_id} was accepted. Welcome to the team."},
+                    payload={"content": f"Your GD Avenue {application_label} was accepted. Welcome to the team."},
                     correlation_id=f"staff-application:{application_id}",
                     idempotency_key=f"staff-application:{application_id}:accepted-dm",
                 )
             elif action == "reject":
-                message = f"Your GD Avenue {application_label} #{application_id} was not accepted."
+                message = f"Your GD Avenue {application_label} was not accepted."
                 if reason:
                     message += f"\n\nReason: {reason}"
                 await self.bot.outbox.enqueue(
@@ -4444,7 +4476,27 @@ class StaffPortalService:
 
     async def safe_configuration(self):
         saved = await self.db.get_runtime_setting("staff_portal.safe_config", {})
-        return {"configuration": {"claim_stale_hours": int((saved or {}).get("claim_stale_hours") or self.bot.config.get_int("staff_portal", "claim_stale_hours", default=48)), "applications_open": bool((saved or {}).get("applications_open", True))}}
+        saved = saved if isinstance(saved, dict) else {}
+        saved_by_type = saved.get("application_open_by_type")
+        saved_by_type = saved_by_type if isinstance(saved_by_type, dict) else {}
+        configured_types = self._configured_application_types()
+        return {
+            "configuration": {
+                "claim_stale_hours": int(
+                    saved.get("claim_stale_hours")
+                    or self.bot.config.get_int(
+                        "staff_portal", "claim_stale_hours", default=48
+                    )
+                ),
+                "applications_open": bool(saved.get("applications_open", True)),
+                "application_open_by_type": {
+                    application_type: bool(
+                        saved_by_type.get(application_type, True)
+                    )
+                    for application_type in configured_types
+                },
+            }
+        }
 
     async def update_safe_configuration(self, principal, payload):
         current = (await self.safe_configuration())["configuration"]
@@ -4455,6 +4507,25 @@ class StaffPortalService:
             current["claim_stale_hours"] = value
         if "applications_open" in payload:
             current["applications_open"] = bool(payload["applications_open"])
+        if "application_open_by_type" in payload:
+            incoming = payload["application_open_by_type"]
+            if not isinstance(incoming, dict):
+                raise PortalError(
+                    400,
+                    "invalid_application_availability",
+                    "Application availability must be an object",
+                )
+            configured_types = set(self._configured_application_types())
+            for application_type, is_open in incoming.items():
+                if application_type not in configured_types or not isinstance(
+                    is_open, bool
+                ):
+                    raise PortalError(
+                        400,
+                        "invalid_application_availability",
+                        "Choose a configured application type and a valid open state",
+                    )
+                current["application_open_by_type"][application_type] = is_open
         await self.db.set_runtime_setting("staff_portal.safe_config", current)
         return {"configuration": current}
 

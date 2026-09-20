@@ -297,6 +297,7 @@ async def test_application_thread_delivery_persists_thread_and_review_link(
     assert int(saved["review_thread_id"]) == 654
     assert forum.created == 1
     assert "New reviewer application by <@99>" in forum.create_kwargs[0]["content"]
+    assert f"#{application_id}" not in forum.create_kwargs[0]["content"]
     assert "Open this application in the Staff Portal" in forum.create_kwargs[0]["content"]
     assert "https://youtu.be/example" in forum.threads[0].messages[0]["content"]
     await database.close()
@@ -367,6 +368,7 @@ async def test_application_delivery_supports_text_channel_notification_thread(
         "dead": 0,
     }
     assert "New reviewer application by <@99>" in channel.notifications[0]["content"]
+    assert f"#{application_id}" not in channel.notifications[0]["content"]
     assert channel.thread_kwargs[0]["message"].id == 800
     assert channel.threads[0].messages[0]["content"].endswith("Because")
     saved = await database.fetchone(

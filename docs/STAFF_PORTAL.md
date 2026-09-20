@@ -102,9 +102,11 @@ Outreach episodes preserve attempts and outcomes across a manual requeue. A conf
 
 Application acceptance persists `accepted_pending_role` before requesting the Discord role side effect. The durable outbox uses a stable idempotency key; reconciliation recreates a missing outbox row and changes the application to `accepted` only after delivery succeeds.
 
-Private session responses include a versioned API contract and explicit feature keys. The website gates newer controls against those keys, so deploying the website before its matching Avenue Guard release leaves the affected Dev controls visibly disabled instead of calling a backend route that does not exist.
+Private session responses include a versioned API contract and explicit feature keys. API version 6 adds per-application-type availability. The website gates newer controls against those keys, so deploying the website before its matching Avenue Guard release leaves the affected Dev controls visibly disabled instead of calling a backend route that does not exist.
 
 Application forms are configured by type through `staff_portal.application_forms`. Reviewer (`judge`) and Mod (`mod`) applications share the same typed question engine, server-side validation, durable state machine, Discord review channel, notes, interviews, and decisions. Short text, long text, and single-choice questions are supported. A question marked `uses_review_prompt` receives one weighted entry from `staff_portal.application_review_levels`; the chosen key is persisted with the Reviewer draft so refreshes cannot reroll it. The applicant browser suggests its local IANA timezone only when the saved timezone answer is blank. Avenue Guard permits one active application per type and applies the five-day cooldown only to repeat submissions of that same type.
+
+Owners and Devs can close Reviewer and Mod submissions independently through the allowlisted safe configuration. Closing one type prevents new drafts and submissions for that type without closing the other type. Existing drafts and submitted records remain accessible so applicants and staff do not lose context. The global application switch remains an emergency master control.
 
 On submission, the outbox creates one review discussion in `application_review_channel_id` containing the application type, applicant, Staff Portal link, and a stable snapshot of every question, answer, and selected showcase. Forum channels receive a forum post; normal text channels receive a notification with a public thread attached. Head Reviewers can review Reviewer applications; Admins can additionally review Mod applications; Owner and Dev capabilities can review every stored type. Mod role delivery is optional through `staff_portal.mod_role_ids`; when it is empty, acceptance is recorded without ever substituting the Reviewer role.
 
@@ -184,7 +186,7 @@ All private endpoints require the service key. Except for OAuth session creation
 | `GET /api/apply/form` | Current draft plus server-configured typed questions and assigned review prompt |
 | `GET/POST /api/apply...` | Applicant save, submit, status, and withdrawal self-service |
 
-The public endpoints are `GET /api/levels?q=...` and `GET /api/level/{level_id}`.
+The intentionally sanitized public endpoints are `GET /api/bot`, `GET /api/releases`, `GET /api/team`, `GET /api/levels?q=...`, and `GET /api/level/{level_id}`. `/api/team` contains only configured public profile IDs, current display names, and HTTPS avatar URLs. `/api/bot` health history contains timestamps, booleans, bounded latency measurements, and provider counts without provider errors, secrets, or private Discord state.
 
 ## Environment Variables
 

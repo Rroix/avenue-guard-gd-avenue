@@ -724,6 +724,14 @@
     "version_floor": "3.18.7",
     "public_release_limit": 20,
     "bot_avatar_url": "https://cdn.discordapp.com/avatars/1454985687177887866/d268221fd7a7a5529897730d18edd5a0.webp?size=2048",
+    "public_team_user_ids": [
+      "1102884420207255653",
+      "705529842342428764",
+      "1447023401347584103",
+      "1253449240966070303",
+      "1156180438977617990",
+      "914081687883874314"
+    ],
     "website_url": "https://gdavenue.netlify.app/bot",
     "public_api_url": "https://avenue-guard.onrender.com"
   },

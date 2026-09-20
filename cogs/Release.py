@@ -11,13 +11,15 @@ from typing import Any
 import discord
 from discord.ext import commands
 
-from utils.errors import log_error
 from utils.components_v2 import message_component_text
 from utils.db import DatabaseBusyError
+from utils.errors import log_error
 from utils.keepalive import (
     get_keepalive_status,
     set_public_bot_metrics,
+    set_public_health_history,
     set_public_release_data,
+    set_public_team_data,
 )
 from utils.mentions import no_mentions
 from utils.releases import (
@@ -80,6 +82,7 @@ class ReleaseCog(commands.Cog):
         self._uptime_pending: list[tuple[int, bool]] = []
         self._last_member_count = 0
         self._last_member_fetch_attempt = 0.0
+        self._last_public_auxiliary_refresh = 0.0
 
     def cog_unload(self) -> None:
         for task in (self._metrics_task, self._bootstrap_task):
@@ -740,6 +743,118 @@ class ReleaseCog(commands.Cog):
                 uptime["tracking_started_ts"] or 0
             ),
         )
+        if time.monotonic() - self._last_public_auxiliary_refresh >= 300:
+            await self.refresh_public_auxiliary_caches()
+
+    async def refresh_public_auxiliary_caches(self) -> None:
+        self._last_public_auxiliary_refresh = time.monotonic()
+        for label, refresh in (
+            ("health history", self.refresh_public_health_cache),
+            ("public team", self.refresh_public_team_cache),
+        ):
+            try:
+                await refresh()
+            except DatabaseBusyError:
+                # Stale public cache data is preferable to contending with live work.
+                continue
+            except Exception as exc:
+                await log_error(
+                    self.bot,
+                    f"Public {label} cache refresh deferred: {exc!r}",
+                )
+
+    async def refresh_public_health_cache(self) -> None:
+        rows = await self.bot.db.fetchall(
+            "SELECT sample_ts,payload_json FROM health_metrics "
+            "WHERE metric_type='runtime' ORDER BY sample_ts DESC LIMIT 288"
+        )
+        auxiliary_tasks = {
+            "operations.smoke",
+            "operations.bootstrap",
+            "operations.restarts",
+            "operations.timeline",
+            "release.bootstrap",
+        }
+        samples = []
+        for row in reversed(rows):
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            tasks = payload.get("tasks") if isinstance(payload.get("tasks"), dict) else {}
+            tasks_ok = not any(
+                str(value).startswith(("failed", "stopped", "missing"))
+                for name, value in tasks.items()
+                if name not in auxiliary_tasks
+            )
+            providers = payload.get("providers")
+            providers = providers if isinstance(providers, dict) else {}
+            enabled_providers = [
+                provider
+                for provider in providers.values()
+                if isinstance(provider, dict) and provider.get("enabled")
+            ]
+            database_ok = bool(payload.get("db_ok"))
+            samples.append(
+                {
+                    "sample_ts": int(row["sample_ts"] or 0),
+                    "healthy": database_ok and tasks_ok,
+                    "database_ok": database_ok,
+                    "gateway_latency_ms": payload.get("gateway_latency_ms"),
+                    "database_latency_ms": payload.get("db_probe_ms"),
+                    "provider_available": sum(
+                        bool(provider.get("available"))
+                        for provider in enabled_providers
+                    ),
+                    "provider_total": len(enabled_providers),
+                }
+            )
+        set_public_health_history(samples)
+
+    async def refresh_public_team_cache(self) -> None:
+        configured_ids = self.bot.config.get_int_list(
+            "release_updates", "public_team_user_ids"
+        )
+        if not configured_ids:
+            set_public_team_data([])
+            return
+        guild_id = self.bot.config.get_int(
+            "guild", "allowed_guild_id", default=0
+        )
+        get_guild = getattr(self.bot, "get_guild", None)
+        get_user = getattr(self.bot, "get_user", None)
+        fetch_user = getattr(self.bot, "fetch_user", None)
+        guild = get_guild(guild_id) if guild_id and callable(get_guild) else None
+        members = []
+        for user_id in configured_ids:
+            guild_get_member = getattr(guild, "get_member", None)
+            user = (
+                guild_get_member(user_id)
+                if guild is not None and callable(guild_get_member)
+                else None
+            )
+            if user is None and callable(get_user):
+                user = get_user(user_id)
+            if user is None and callable(fetch_user):
+                try:
+                    user = await fetch_user(user_id)
+                except (discord.HTTPException, discord.NotFound):
+                    continue
+            if user is None:
+                continue
+            members.append(
+                {
+                    "id": str(user_id),
+                    "display_name": str(
+                        getattr(user, "display_name", None)
+                        or getattr(user, "name", "")
+                    ),
+                    "avatar_url": str(
+                        getattr(getattr(user, "display_avatar", None), "url", "")
+                    ),
+                }
+            )
+        set_public_team_data(members)
 
     async def _metrics_loop(self) -> None:
         refresh_count = 0
