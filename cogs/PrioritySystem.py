@@ -10,8 +10,8 @@ from discord.ext import commands
 
 from services.priority_system import PrioritySystemService
 from utils.errors import log_error
-from utils.mentions import no_mentions
 from utils.keepalive import set_public_level_data
+from utils.mentions import no_mentions
 from utils.priority_system import (
     public_lifecycle_state,
     public_priority_band,
@@ -68,7 +68,7 @@ class PrioritySystemCog(commands.Cog):
             "SELECT q.*,s.data_json FROM level_outreach_queue q "
             "LEFT JOIN level_request_submissions s ON s.guild_id=q.guild_id "
             "AND s.request_message_id=q.request_message_id "
-            "WHERE q.guild_id=? ORDER BY q.level_id,q.queued_ts DESC,q.id DESC",
+            "WHERE q.guild_id=? AND q.queue_state!='hidden' ORDER BY q.level_id,q.queued_ts DESC,q.id DESC",
             (int(guild_id),),
         )
         levels = []
@@ -427,7 +427,7 @@ class PrioritySystemCog(commands.Cog):
                 raise ValueError("No outreach cycle was found")
             cycle_id = int(cycle["id"])
             if action == "complete":
-                saved, incremented = await self.service.complete_cycle(
+                _saved, incremented = await self.service.complete_cycle(
                     guild_id, cycle_id, ctx.user.id
                 )
                 await self.refresh_public_level_cache()
@@ -553,11 +553,11 @@ class PrioritySystemCog(commands.Cog):
             "SUM(CASE WHEN rated_observed_ts IS NOT NULL AND submitted_to_mod_ts IS NOT NULL THEN 1 ELSE 0 END) AS rated_after,"
             "SUM(CASE WHEN outcome_window_completed_ts IS NOT NULL THEN 1 ELSE 0 END) AS windows,"
             "SUM(CASE WHEN rated_within_window=1 THEN 1 ELSE 0 END) AS rated_windows "
-            "FROM level_outreach_queue WHERE guild_id=?",
+            "FROM level_outreach_queue WHERE guild_id=? AND queue_state!='hidden'",
             (guild_id,),
         )
         tiers = await self.bot.db.fetchall(
-            "SELECT send_type,COUNT(*) AS c FROM level_outreach_queue WHERE guild_id=? GROUP BY send_type ORDER BY c DESC",
+            "SELECT send_type,COUNT(*) AS c FROM level_outreach_queue WHERE guild_id=? AND queue_state!='hidden' GROUP BY send_type ORDER BY c DESC",
             (guild_id,),
         )
         cycles = await self.bot.db.fetchone(

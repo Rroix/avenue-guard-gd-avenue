@@ -16,6 +16,7 @@ STAFF_PORTAL_TABLES = {
     "staff_portal_nickname_history",
     "staff_milestones",
     "staff_idempotency",
+    "staff_snowflake_repairs",
 }
 
 
@@ -127,7 +128,12 @@ STAFF_PORTAL_SCHEMA = (
         decided_by INTEGER,
         decided_ts INTEGER,
         decision_reason TEXT NOT NULL DEFAULT '',
-        role_outbox_id INTEGER
+        role_outbox_id INTEGER,
+        review_prompt_key TEXT,
+        review_thread_outbox_id INTEGER,
+        review_thread_id INTEGER,
+        interview_ticket_outbox_id INTEGER,
+        interview_ticket_channel_id INTEGER
     );""",
     """CREATE TABLE IF NOT EXISTS staff_application_events(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,6 +199,18 @@ STAFF_PORTAL_SCHEMA = (
         created_ts INTEGER NOT NULL,
         expires_ts INTEGER NOT NULL
     );""",
+    """CREATE TABLE IF NOT EXISTS staff_snowflake_repairs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        table_name TEXT NOT NULL,
+        column_name TEXT NOT NULL,
+        old_id TEXT NOT NULL,
+        repaired_id TEXT,
+        status TEXT NOT NULL,
+        source TEXT NOT NULL,
+        rows_changed INTEGER NOT NULL DEFAULT 0,
+        checked_ts INTEGER NOT NULL,
+        UNIQUE(table_name,column_name,old_id)
+    );""",
     """CREATE INDEX IF NOT EXISTS idx_staff_sessions_user
         ON staff_web_sessions(guild_id,user_id,expires_ts DESC);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_sessions_expiry
@@ -228,6 +246,8 @@ STAFF_PORTAL_SCHEMA = (
         ON staff_idempotency(expires_ts);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_nickname_history_user
         ON staff_portal_nickname_history(guild_id,user_id,created_ts DESC);""",
+    """CREATE INDEX IF NOT EXISTS idx_staff_snowflake_repairs_status
+        ON staff_snowflake_repairs(status,checked_ts DESC);""",
     """CREATE UNIQUE INDEX IF NOT EXISTS idx_outreach_submission_target
         ON level_outreach_attempts(episode_id,queue_id,private_target_key)
         WHERE status='submitted_to_mod' AND episode_id IS NOT NULL AND private_target_key!='';""",

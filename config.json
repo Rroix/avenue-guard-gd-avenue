@@ -49,7 +49,9 @@
     "head_judge_role_ids": [
       "1430214323720163498"
     ],
-    "admin_role_ids": [],
+    "admin_role_ids": [
+      "901431567719731230"
+    ],
     "owner_role_ids": [],
     "owner_user_ids": [
       "705529842342428764"
@@ -62,6 +64,92 @@
     "claim_stale_hours": 48,
     "application_types": [
       "judge"
+    ],
+    "application_review_channel_id": "1461483580197703832",
+    "application_questions": [
+      {
+        "key": "age",
+        "label": "How old are you?",
+        "type": "single_choice",
+        "required": true,
+        "options": ["12 or under", "13 to 15", "16 to 18", "19 or above"]
+      },
+      {
+        "key": "motivation",
+        "label": "Why do you want to be a judge?",
+        "type": "long_text",
+        "required": true
+      },
+      {
+        "key": "experience",
+        "label": "Tell us a bit about your experience reviewing levels across different servers",
+        "type": "long_text",
+        "required": true
+      },
+      {
+        "key": "improvements",
+        "label": "What do you think GD Avenue can improve on? It doesn't have to be a big change, just something you think might enhance the server experience",
+        "type": "long_text",
+        "required": true
+      },
+      {
+        "key": "weekly_capacity",
+        "label": "How many levels can you review per week? This will create an expectation, so please be honest",
+        "type": "single_choice",
+        "required": true,
+        "options": ["1-2", "3-6", "7-9", "10 or more"]
+      },
+      {
+        "key": "timezone",
+        "label": "What is your timezone?",
+        "type": "short_text",
+        "required": true,
+        "help_url": "https://www.checkmytimezone.com/"
+      },
+      {
+        "key": "level_review",
+        "label": "Review this level",
+        "type": "long_text",
+        "required": true,
+        "uses_review_prompt": true
+      }
+    ],
+    "application_review_levels": [
+      {
+        "key": "synergy-101935961",
+        "name": "Synergy",
+        "level_id": "101935961",
+        "youtube_url": "https://www.youtube.com/watch?v=bfQj4ZU2nQM",
+        "weight": 1
+      },
+      {
+        "key": "madeline-139439179",
+        "name": "Madeline",
+        "level_id": "139439179",
+        "youtube_url": "https://youtu.be/v5tr0Tg9-9c?si=G1DLyRMWd4xUZbjw",
+        "weight": 1
+      },
+      {
+        "key": "vibe-94859569",
+        "name": "V I B E",
+        "level_id": "94859569",
+        "youtube_url": "https://youtu.be/w-P9W70SJbg?si=GBpDboYSN3ZYiGsd",
+        "weight": 1
+      },
+      {
+        "key": "speed-100117857",
+        "name": "Speed",
+        "level_id": "100117857",
+        "youtube_url": "https://youtu.be/WFtl-RC3tFw?si=anda-WOIQX5qkk2N",
+        "weight": 1
+      },
+      {
+        "key": "distimia-107166460",
+        "name": "Distimia",
+        "level_id": "107166460",
+        "youtube_url": "https://youtu.be/SHkoSRJe22c?si=P2_w9aqC8GXBdHiM",
+        "weight": 1
+      }
     ],
     "allowed_origins": [
       "https://gdavenue.netlify.app"

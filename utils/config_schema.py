@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from string import Formatter
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 CONFIG_SCHEMA_VERSION = 2
 RUNTIME_SCHEMA_VERSION = 2
 EMBED_SCHEMA_VERSION = 2
-DATABASE_SCHEMA_VERSION = 10
+DATABASE_SCHEMA_VERSION = 11
 
 
 @dataclass(frozen=True)
@@ -443,6 +445,79 @@ def validate_config(data: Any) -> list[ConfigIssue]:
             not str(origin).startswith("https://") for origin in origins
         ):
             issues.append(ConfigIssue("staff_portal.allowed_origins", "must contain HTTPS origins"))
+        portal_enabled = bool(staff_portal.get("enabled"))
+        review_channel = staff_portal.get("application_review_channel_id", 0)
+        if portal_enabled and not _is_discord_id(review_channel):
+            issues.append(ConfigIssue("staff_portal.application_review_channel_id", "must be a Discord forum channel ID"))
+        questions = staff_portal.get("application_questions", [])
+        needs_review_prompt = False
+        if portal_enabled and (not isinstance(questions, list) or not questions):
+            issues.append(ConfigIssue("staff_portal.application_questions", "must contain at least one application question"))
+        elif portal_enabled:
+            seen_keys: set[str] = set()
+            for index, question in enumerate(questions):
+                path = f"staff_portal.application_questions[{index}]"
+                if not isinstance(question, dict):
+                    issues.append(ConfigIssue(path, "must be an object"))
+                    continue
+                key = str(question.get("key") or "").strip()
+                kind = str(question.get("type") or "").strip()
+                if not key or key in seen_keys:
+                    issues.append(ConfigIssue(f"{path}.key", "must be present and unique"))
+                seen_keys.add(key)
+                if not str(question.get("label") or "").strip():
+                    issues.append(ConfigIssue(f"{path}.label", "must not be empty"))
+                if kind not in {"short_text", "long_text", "single_choice"}:
+                    issues.append(ConfigIssue(f"{path}.type", "must be short_text, long_text, or single_choice"))
+                if kind == "single_choice":
+                    options = question.get("options")
+                    normalized_options = (
+                        [str(option).strip() for option in options]
+                        if isinstance(options, list)
+                        else []
+                    )
+                    if not normalized_options or any(not option for option in normalized_options):
+                        issues.append(ConfigIssue(f"{path}.options", "must contain non-empty choices"))
+                    elif len(set(normalized_options)) != len(normalized_options):
+                        issues.append(ConfigIssue(f"{path}.options", "must not contain duplicate choices"))
+                needs_review_prompt = needs_review_prompt or bool(
+                    question.get("uses_review_prompt")
+                )
+        review_levels = staff_portal.get("application_review_levels", [])
+        if portal_enabled and needs_review_prompt and (
+            not isinstance(review_levels, list) or not review_levels
+        ):
+            issues.append(ConfigIssue("staff_portal.application_review_levels", "must contain at least one weighted review level"))
+        elif portal_enabled:
+            seen_level_keys: set[str] = set()
+            for index, level in enumerate(review_levels):
+                path = f"staff_portal.application_review_levels[{index}]"
+                if not isinstance(level, dict):
+                    issues.append(ConfigIssue(path, "must be an object"))
+                    continue
+                key = str(level.get("key") or "").strip()
+                if not key or key in seen_level_keys:
+                    issues.append(ConfigIssue(f"{path}.key", "must be present and unique"))
+                seen_level_keys.add(key)
+                if not str(level.get("name") or "").strip():
+                    issues.append(ConfigIssue(f"{path}.name", "must not be empty"))
+                parsed = urlparse(str(level.get("youtube_url") or ""))
+                if parsed.scheme != "https" or parsed.hostname not in {"youtube.com", "www.youtube.com", "youtu.be"}:
+                    issues.append(ConfigIssue(f"{path}.youtube_url", "must be an HTTPS YouTube URL"))
+                else:
+                    video_id = (
+                        parsed.path.strip("/").split("/", 1)[0]
+                        if parsed.hostname == "youtu.be"
+                        else parse_qs(parsed.query).get("v", [""])[-1]
+                    )
+                    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                        issues.append(ConfigIssue(f"{path}.youtube_url", "must contain a valid YouTube video ID"))
+                level_id = str(level.get("level_id") or "")
+                if not level_id.isdigit() or not 7 <= len(level_id) <= 10:
+                    issues.append(ConfigIssue(f"{path}.level_id", "must contain 7 to 10 digits"))
+                weight = level.get("weight", 1)
+                if isinstance(weight, bool) or not isinstance(weight, int) or weight < 1:
+                    issues.append(ConfigIssue(f"{path}.weight", "must be a positive integer"))
     from utils.historical_audit import audit_settings
     from utils.priority_system import priority_settings
     try:

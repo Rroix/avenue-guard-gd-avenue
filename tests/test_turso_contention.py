@@ -165,7 +165,7 @@ async def test_schema_five_upgrade_is_additive_and_preserves_counts(db, tmp_path
     try:
         await restored.connect()
         assert (await restored.fetchone("SELECT count FROM activity_counts"))["count"] == 9
-        assert (await restored.fetchone("SELECT schema_version FROM schema_metadata WHERE component='database'"))["schema_version"] == 10
+        assert (await restored.fetchone("SELECT schema_version FROM schema_metadata WHERE component='database'"))["schema_version"] == 11
         assert await restored.fetchall("SELECT * FROM activity_flush_batches") == []
     finally:
         await restored.close()

@@ -100,11 +100,21 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     schema_rows = await db.fetchall("SELECT component,schema_version FROM schema_metadata")
     schema_versions = {str(row["component"]): int(row["schema_version"]) for row in schema_rows}
     assert schema_versions == {
-            "database": 10,
+            "database": 11,
         "config": 2,
         "runtime_settings": 2,
         "embed_templates": 2,
     }
+    queue_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(level_outreach_queue)")}
+    application_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(staff_applications)")}
+    assert "hidden_from_state" in queue_columns
+    assert {
+        "review_prompt_key",
+        "review_thread_outbox_id",
+        "review_thread_id",
+        "interview_ticket_outbox_id",
+        "interview_ticket_channel_id",
+    } <= application_columns
 
     weekly_claim_columns = {
         str(row["name"]) for row in await db.fetchall("PRAGMA table_info(weekly_claims)")
@@ -484,6 +494,59 @@ async def test_startup_repair_skips_float_bucket_with_two_real_discord_ids(tmp_p
 
     assert result["ambiguous"] >= 1
     assert int(row["creator_id"]) == rounded_user_id
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_snowflake_repair_covers_staff_qa_and_audits_old_value(tmp_path):
+    db = Database(str(tmp_path / "staff-snowflake-repair.db"))
+    await db.connect()
+    guild_id = 717003826288394271
+    reviewer_id = 1102884420207255653
+    rounded_reviewer = int(float(reviewer_id))
+    await db.execute(
+        "INSERT INTO staff_review_qa("
+        "guild_id,request_message_id,reviewer_id,qa_status,qa_by,created_ts,updated_ts"
+        ") VALUES(?,?,?,'unreviewed',?,?,?)",
+        (guild_id, 12345, rounded_reviewer, rounded_reviewer, 1, 1),
+    )
+    db.uses_remote = True
+
+    result = await db.repair_legacy_snowflake_precision(
+        guild_ids=(guild_id,),
+        user_ids=(reviewer_id,),
+    )
+    row = await db.fetchone(
+        "SELECT reviewer_id,qa_by FROM staff_review_qa WHERE request_message_id=12345"
+    )
+    audit_rows = await db.fetchall(
+        "SELECT column_name,old_id,repaired_id,status,rows_changed,source "
+        "FROM staff_snowflake_repairs WHERE table_name='staff_review_qa' "
+        "ORDER BY column_name"
+    )
+
+    assert result["updated"] == 2
+    assert result["audited"] == 2
+    assert int(row["reviewer_id"]) == reviewer_id
+    assert int(row["qa_by"]) == reviewer_id
+    assert [dict(item) for item in audit_rows] == [
+        {
+            "column_name": "qa_by",
+            "old_id": str(rounded_reviewer),
+            "repaired_id": str(reviewer_id),
+            "status": "repaired",
+            "rows_changed": 1,
+            "source": "turso_libsql_f64_backfill",
+        },
+        {
+            "column_name": "reviewer_id",
+            "old_id": str(rounded_reviewer),
+            "repaired_id": str(reviewer_id),
+            "status": "repaired",
+            "rows_changed": 1,
+            "source": "turso_libsql_f64_backfill",
+        },
+    ]
     await db.close()
 
 

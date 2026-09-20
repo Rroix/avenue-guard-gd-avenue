@@ -143,17 +143,21 @@ class PrioritySystemService:
         )
         return rows, total
 
-    async def queue_entry(self, guild_id: int, identity: int | str):
+    async def queue_entry(
+        self, guild_id: int, identity: int | str, *, include_hidden: bool = False
+    ):
         text = str(identity or "").strip()
+        visible = "" if include_hidden else " AND queue_state!='hidden'"
         if text.isascii() and text.isdecimal():
             row = await self.db.fetchone(
-                "SELECT * FROM level_outreach_queue WHERE guild_id=? AND id=?",
+                f"SELECT * FROM level_outreach_queue WHERE guild_id=? AND id=?{visible}",  # nosec B608
                 (guild_id, int(text)),
             )
             if row:
                 return row
         return await self.db.fetchone(
-            "SELECT * FROM level_outreach_queue WHERE guild_id=? AND level_id=? ORDER BY queued_ts DESC LIMIT 1",
+            f"SELECT * FROM level_outreach_queue WHERE guild_id=? AND level_id=?{visible} "  # nosec B608
+            "ORDER BY queued_ts DESC LIMIT 1",
             (guild_id, text),
         )
 
@@ -212,7 +216,8 @@ class PrioritySystemService:
         return await self.db.fetchall(
             "SELECT e.*,q.level_id,q.send_type,q.queue_state,q.current_level_name "
             "FROM level_outreach_cycle_entries e JOIN level_outreach_queue q ON q.id=e.queue_id "
-            "WHERE e.cycle_id=? ORDER BY CASE WHEN e.priority_complete_snapshot=1 THEN 0 ELSE 1 END, "
+            "WHERE e.cycle_id=? AND q.queue_state!='hidden' "
+            "ORDER BY CASE WHEN e.priority_complete_snapshot=1 THEN 0 ELSE 1 END, "
             "e.priority_points_snapshot DESC,e.waiting_cycles_snapshot DESC,q.queued_ts,e.queue_id",
             (cycle_id,),
         )
@@ -399,7 +404,7 @@ class PrioritySystemService:
             entries = await self.db.fetchall(
                 "SELECT e.*,q.send_type,q.current_creator_points,q.waiting_cycles,q.queue_state "
                 "FROM level_outreach_cycle_entries e JOIN level_outreach_queue q ON q.id=e.queue_id "
-                "WHERE e.cycle_id=?",
+                "WHERE e.cycle_id=? AND q.queue_state!='hidden'",
                 (cycle_id,),
             )
             if not any(int(row["submitted_to_mod"] or 0) == 1 for row in entries):
@@ -704,7 +709,8 @@ class PrioritySystemService:
         row = await self.db.fetchone(
             "SELECT s.*,q.current_level_name FROM level_outreach_level_snapshots s "
             "JOIN level_outreach_queue q ON q.id=s.queue_id WHERE q.level_id=? "
-            "AND s.lookup_status='ok' AND s.checked_ts>=? ORDER BY s.checked_ts DESC LIMIT 1",
+            "AND q.queue_state!='hidden' AND s.lookup_status='ok' AND s.checked_ts>=? "
+            "ORDER BY s.checked_ts DESC LIMIT 1",
             (level_id, cutoff),
         )
         if not row:
@@ -862,7 +868,8 @@ class PrioritySystemService:
         due = await self.db.fetchall(
             "SELECT id,rated_observed_ts,outcome_window_due_ts FROM level_outreach_queue "
             "WHERE guild_id=? AND submitted_to_mod_ts IS NOT NULL AND outcome_window_due_ts<=? "
-            "AND outcome_window_completed_ts IS NULL ORDER BY outcome_window_due_ts LIMIT ?",
+            "AND outcome_window_completed_ts IS NULL AND queue_state!='hidden' "
+            "ORDER BY outcome_window_due_ts LIMIT ?",
             (guild_id, now, settings.maintenance_batch_size),
         )
         completed = 0
@@ -911,7 +918,9 @@ class PrioritySystemService:
 
     async def dashboard(self, guild_id: int) -> dict[str, Any]:
         rows = await self.db.fetchall(
-            "SELECT queue_state,priority_complete,COUNT(*) AS c FROM level_outreach_queue WHERE guild_id=? GROUP BY queue_state,priority_complete",
+            "SELECT queue_state,priority_complete,COUNT(*) AS c FROM level_outreach_queue "
+            "WHERE guild_id=? AND queue_state!='hidden' "
+            "GROUP BY queue_state,priority_complete",
             (guild_id,),
         )
         state_counts: dict[str, int] = {}

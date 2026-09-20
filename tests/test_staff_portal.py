@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
-from services.staff_portal import PortalError, StaffPortalService
+from services.staff_portal import (
+    PortalError,
+    StaffPortalService,
+    _json_safe,
+    _youtube_embed_url,
+)
 from utils.db import Database
 from utils.keepalive import get_public_levels_payload, set_public_level_data
 from utils.priority_system import priority_settings, score_components
@@ -27,6 +32,12 @@ ADMIN_ID = 103
 JUDGE_ROLE = 785212232786640966
 HEAD_ROLE = 1430214323720163498
 ADMIN_ROLE = 1524000000000000001
+
+
+def test_production_portal_admin_role_is_configured_as_string():
+    with open("config.json", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    assert "901431567719731230" in config["staff_portal"]["admin_role_ids"]
 
 
 class PortalConfig:
@@ -368,6 +379,51 @@ async def test_api_preserves_real_snowflakes_as_strings(portal):
     with pytest.raises(PortalError) as unsafe:
         await service.create_session({"user_id": DEV_ID, "purpose": "staff"})
     assert unsafe.value.code == "unsafe_discord_id"
+
+
+def test_nested_portal_payload_preserves_every_staff_snowflake_as_text():
+    exact = "1102884420207255653"
+    payload = _json_safe(
+        {
+            "profile": {"user_id": int(exact), "role_ids": [901431567719731230]},
+            "claim": {"claimed_by": int(exact)},
+            "outreach": {"actor_id": int(exact), "released_by": int(exact)},
+            "qa": {
+                "reviewer_id": int(exact),
+                "qa_by": int(exact),
+                "request_message_id": int(exact),
+            },
+            "audit": {"actor_id": int(exact)},
+            "task": {"assignee_id": int(exact), "created_by": int(exact)},
+            "application": {"applicant_id": int(exact), "decided_by": int(exact)},
+            "discord": {
+                "guild_id": int(exact),
+                "channel_id": int(exact),
+                "forum_channel_id": int(exact),
+                "message_id": int(exact),
+            },
+        }
+    )
+    assert payload["profile"]["user_id"] == exact
+    assert payload["profile"]["role_ids"] == ["901431567719731230"]
+    for section in (
+        "claim",
+        "outreach",
+        "qa",
+        "audit",
+        "task",
+        "application",
+        "discord",
+    ):
+        for key, value in payload[section].items():
+            if key.endswith("_id") or key in {
+                "claimed_by",
+                "created_by",
+                "decided_by",
+                "qa_by",
+                "released_by",
+            }:
+                assert value == exact
 
 
 @pytest.mark.asyncio
@@ -744,7 +800,15 @@ async def test_application_submit_retry_returns_same_active_application(portal):
     applicant = principal(999, "applicant")
     payload = {
         "application_type": "judge",
-        "answers": {"experience": "Experience", "motivation": "Motivation", "availability": "Weekends"},
+        "answers": {
+            "age": "16 to 18",
+            "motivation": "Motivation",
+            "experience": "Experience",
+            "improvements": "More review calibration",
+            "weekly_capacity": "3-6",
+            "timezone": "UTC+1",
+            "level_review": "A structured level review",
+        },
     }
     first = await service.save_application(applicant, payload, submit=True)
     second = await service.save_application(applicant, payload, submit=True)
@@ -880,3 +944,212 @@ def test_public_level_search_exposes_only_allowlisted_cache_fields():
     assert "requester_id" not in item
     assert "private_target_label" not in item
     assert "priority_points" not in item
+
+
+@pytest.mark.asyncio
+async def test_dev_view_mode_uses_effective_capabilities_and_is_read_only(portal):
+    service, _guild = portal
+    created = await service.create_session({"user_id": str(DEV_ID), "purpose": "staff"})
+    headers = {
+        "x-avenue-portal-key": "test-service-token",
+        "x-staff-session": created["session_token"],
+        "x-staff-view-role": "reviewer",
+    }
+    status, payload = await service.handle_request("GET", "/api/staff/session", headers, b"")
+    assert status == 200
+    assert payload["user"]["role"] == "reviewer"
+    assert payload["view_mode"]["actual_role"] == "dev"
+    assert payload["api"]["version"] >= 2
+    assert "staff_manual_management" in payload["api"]["features"]
+    assert "developer.access" not in payload["user"]["capabilities"]
+
+    headers["x-csrf-token"] = created["csrf_token"]
+    with pytest.raises(PortalError) as read_only:
+        await service.handle_request("POST", "/api/staff/tasks", headers, b"{}")
+    assert read_only.value.code == "view_mode_read_only"
+
+
+@pytest.mark.asyncio
+async def test_dev_can_reset_own_stale_application_data_atomically(portal):
+    service, _guild = portal
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,"
+        "answers_json,created_ts,updated_ts,submitted_ts,review_thread_outbox_id) "
+        "VALUES(?,?,'judge','submitted','{}',100,100,100,?)",
+        (GUILD_ID, DEV_ID, 9001),
+    )
+    await service.db.execute(
+        "INSERT INTO staff_application_events(application_id,actor_id,event,from_status,"
+        "to_status,detail_json,created_ts,correlation_id) VALUES(?,?,'submitted','draft',"
+        "'submitted','{}',100,'application-reset-test')",
+        (application_id, DEV_ID),
+    )
+    await service.db.execute(
+        "INSERT INTO staff_application_notes(application_id,author_id,body,created_ts,updated_ts) "
+        "VALUES(?,?,?,100,100)",
+        (application_id, DEV_ID, "Old application note"),
+    )
+    await service.db.execute(
+        "INSERT INTO discord_outbox(id,correlation_id,idempotency_key,action_type,guild_id,"
+        "payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) "
+        "VALUES(9001,'application-reset-test','application-reset-test','create_application_thread',"
+        "?,'{}','pending',0,100,100,100)",
+        (GUILD_ID,),
+    )
+    await service.db.execute(
+        "INSERT INTO staff_idempotency(idempotency_key,user_id,operation,response_json,created_ts,expires_ts) "
+        "VALUES('old-application-save',?,'POST /api/apply/save','{}',100,9999999999)",
+        (DEV_ID,),
+    )
+
+    status, result = await service._handle_apply(
+        "DELETE",
+        "/api/apply/mine",
+        principal(DEV_ID, "dev"),
+        {"confirmation": "DELETE"},
+    )
+
+    assert status == 200
+    assert result["applications_removed"] == 1
+    assert await service.db.fetchone(
+        "SELECT 1 FROM staff_applications WHERE id=?", (application_id,)
+    ) is None
+    assert await service.db.fetchone(
+        "SELECT 1 FROM staff_application_events WHERE application_id=?", (application_id,)
+    ) is None
+    assert await service.db.fetchone(
+        "SELECT 1 FROM staff_application_notes WHERE application_id=?", (application_id,)
+    ) is None
+    outbox = await service.db.fetchone("SELECT status FROM discord_outbox WHERE id=9001")
+    assert outbox["status"] == "dead"
+    assert await service.db.fetchone(
+        "SELECT 1 FROM staff_idempotency WHERE idempotency_key='old-application-save'"
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_applicant_cannot_erase_an_active_submitted_application(portal):
+    service, _guild = portal
+    await service.db.execute(
+        "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,"
+        "answers_json,created_ts,updated_ts,submitted_ts) "
+        "VALUES(?,999,'judge','submitted','{}',100,100,100)",
+        (GUILD_ID,),
+    )
+    with pytest.raises(PortalError) as restricted:
+        await service.reset_own_application_data(
+            principal(999, "applicant"), {"confirmation": "DELETE"}
+        )
+    assert restricted.value.code == "application_reset_restricted"
+
+
+@pytest.mark.asyncio
+async def test_hidden_queue_is_reversible_and_excluded_from_normal_views(portal):
+    service, _guild = portal
+    queue_id = await insert_queue(service, level_id="565656565", message_id=56, priority=5)
+    dev = principal(DEV_ID, "dev")
+    hidden = await service._hide_queue(dev, queue_id, {"reason": "Duplicate test entry", "confirmed": True})
+    assert hidden["state"] == "hidden"
+    assert (await service.queue(principal(JUDGE_ID, "reviewer"), {}))["total"] == 0
+    with pytest.raises(PortalError) as blocked:
+        await service.queue_action(
+            principal(JUDGE_ID, "reviewer"), queue_id, "claim", {}
+        )
+    assert blocked.value.code == "queue_hidden"
+    assert "hidden" not in (await service.priority.dashboard(GUILD_ID))["states"]
+    hidden_view = await service.queue(dev, {"filter": "hidden"})
+    assert hidden_view["items"][0]["id"] == queue_id
+    restored = await service._restore_hidden_queue(dev, queue_id, {"reason": "Restore test entry", "confirmed": True})
+    assert restored["state"] == "queued"
+    assert (await service.queue(principal(JUDGE_ID, "reviewer"), {}))["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dev_can_add_and_remove_staff_profiles_by_discord_id(portal):
+    service, _guild = portal
+    dev = principal(DEV_ID, "dev")
+    added = await service.add_staff(
+        dev,
+        {"user_id": "999", "role": "reviewer", "reason": "New reviewer", "confirmed": True},
+    )
+    assert added["to_role"] == "reviewer"
+    assert service.bot.outbox.calls[-1][0] == "add_role"
+    removed = await service.staff_action(
+        dev,
+        "999",
+        {"action": "remove", "reason": "Left the team", "confirmed": True},
+    )
+    assert removed["to_role"] == "inactive"
+    saved = await service.db.fetchone("SELECT status FROM staff_members WHERE guild_id=? AND user_id=?", (GUILD_ID, 999))
+    assert saved["status"] == "removed"
+
+
+@pytest.mark.asyncio
+async def test_assigned_task_enqueues_private_notification(portal):
+    service, _guild = portal
+    await service.create_task(
+        principal(HEAD_ID, "head_reviewer"),
+        {"task_type": "assigned", "assignee_id": JUDGE_ID, "title": "Review calibration"},
+    )
+    kind, call = service.bot.outbox.calls[-1]
+    assert kind == "send_dm"
+    assert call["user_id"] == JUDGE_ID
+    assert call["idempotency_key"].endswith(f":assigned:{JUDGE_ID}")
+
+
+@pytest.mark.asyncio
+async def test_application_form_persists_prompt_and_submission_enqueues_thread(portal):
+    service, _guild = portal
+    applicant = principal(999, "applicant")
+    first = await service.application_form(applicant)
+    second = await service.application_form(applicant)
+    assert first["application"]["id"] == second["application"]["id"]
+    review_question = next(item for item in first["questions"] if item["key"] == "level_review")
+    selected_prompt = review_question["review_prompt"]
+    assert selected_prompt["level_id"] in {
+        "101935961",
+        "139439179",
+        "94859569",
+        "100117857",
+        "107166460",
+    }
+    assert selected_prompt["youtube_embed_url"].startswith(
+        "https://www.youtube-nocookie.com/embed/"
+    )
+    assert next(
+        item for item in second["questions"] if item["key"] == "level_review"
+    )["review_prompt"] == selected_prompt
+    answers = {
+        "age": "16 to 18",
+        "motivation": "I want to help creators",
+        "experience": "I review levels regularly",
+        "improvements": "More calibration sessions",
+        "weekly_capacity": "3-6",
+        "timezone": "UTC+1",
+        "level_review": "A detailed review",
+    }
+    result = await service.save_application(
+        applicant, {"application_type": "judge", "answers": answers}, submit=True
+    )
+    assert result["application"]["review_prompt_key"] == selected_prompt["key"]
+    assert service.bot.outbox.calls[-1][0] == "create_application_thread"
+
+
+def test_application_review_pool_and_youtube_embed_urls_are_valid(portal):
+    service, _guild = portal
+    levels = service._application_review_levels()
+    assert [(level["name"], level["level_id"], level["weight"]) for level in levels] == [
+        ("Synergy", "101935961", 1),
+        ("Madeline", "139439179", 1),
+        ("V I B E", "94859569", 1),
+        ("Speed", "100117857", 1),
+        ("Distimia", "107166460", 1),
+    ]
+    assert _youtube_embed_url("https://youtu.be/v5tr0Tg9-9c?si=test") == (
+        "https://www.youtube-nocookie.com/embed/v5tr0Tg9-9c"
+    )
+    assert _youtube_embed_url("https://www.youtube.com/watch?v=bfQj4ZU2nQM") == (
+        "https://www.youtube-nocookie.com/embed/bfQj4ZU2nQM"
+    )
+    assert _youtube_embed_url("https://example.com/watch?v=bfQj4ZU2nQM") == ""
+    assert _youtube_embed_url("https://youtu.be/too-short") == ""

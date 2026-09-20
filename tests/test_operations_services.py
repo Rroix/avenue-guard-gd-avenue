@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import discord
 import pytest
 
 from services.backups import run_restore_drill
@@ -35,6 +36,25 @@ def test_typed_config_validation_and_operation_bounds():
     config["level_requests"]["sent_result_embed"]["description"] = "{unknown_variable}"
     issues = validate_config(config)
     assert any(issue.path == "level_requests.sent_result_embed" for issue in issues)
+
+    config["staff_portal"]["application_questions"][0]["options"] = []
+    config["staff_portal"]["application_review_levels"][0]["level_id"] = "123"
+    config["staff_portal"]["application_review_levels"][1]["youtube_url"] = (
+        "https://youtu.be/too-short"
+    )
+    issues = validate_config(config)
+    assert any(
+        issue.path == "staff_portal.application_questions[0].options"
+        for issue in issues
+    )
+    assert any(
+        issue.path == "staff_portal.application_review_levels[0].level_id"
+        for issue in issues
+    )
+    assert any(
+        issue.path == "staff_portal.application_review_levels[1].youtube_url"
+        for issue in issues
+    )
 
     settings = operations_settings(
         {
@@ -198,6 +218,199 @@ async def test_outbox_is_idempotent_and_records_delivery(tmp_path):
         "SELECT event FROM workflow_events WHERE workflow_type='discord_outbox' ORDER BY id"
     )
     assert [row["event"] for row in timeline] == ["delivered"]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_application_thread_delivery_persists_thread_and_review_link(
+    tmp_path, monkeypatch
+):
+    database = Database(str(tmp_path / "application-thread.db"))
+    await database.connect()
+    application_id = await database.execute_insert(
+        "INSERT INTO staff_applications("
+        "guild_id,applicant_id,application_type,status,answers_json,created_ts,updated_ts) "
+        "VALUES(1,99,'judge','submitted','{}',1,1)"
+    )
+
+    class Thread:
+        id = 654
+
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, **kwargs):
+            self.messages.append(kwargs)
+            return SimpleNamespace(id=700 + len(self.messages))
+
+    class Forum:
+        def __init__(self):
+            self.threads = []
+            self.created = 0
+
+        async def create_thread(self, **_kwargs):
+            self.created += 1
+            thread = Thread()
+            self.threads.append(thread)
+            return SimpleNamespace(thread=thread)
+
+    monkeypatch.setattr(discord, "ForumChannel", Forum)
+    forum = Forum()
+
+    async def fetch_channel(_channel_id):
+        return forum
+
+    bot = SimpleNamespace(
+        db=database,
+        get_channel=lambda channel_id: forum if channel_id == 123 else None,
+        fetch_channel=fetch_channel,
+        get_cog=lambda _name: None,
+    )
+    outbox = DiscordOutbox(bot)
+    bot.outbox = outbox
+    await outbox.enqueue(
+        "create_application_thread",
+        guild_id=1,
+        channel_id=123,
+        payload={
+            "application_id": application_id,
+            "responses": [
+                {
+                    "question": "Review Synergy - https://youtu.be/example",
+                    "answer": "Detailed feedback",
+                }
+            ],
+        },
+        idempotency_key=f"application:{application_id}:thread",
+    )
+
+    assert await outbox.process_once() == {"delivered": 1, "retried": 0, "dead": 0}
+    saved = await database.fetchone(
+        "SELECT review_thread_id FROM staff_applications WHERE id=?", (application_id,)
+    )
+    assert int(saved["review_thread_id"]) == 654
+    assert forum.created == 1
+    assert "https://youtu.be/example" in forum.threads[0].messages[0]["content"]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_interview_delivery_creates_ticket_and_durable_dm(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "application-interview.db"))
+    await database.connect()
+    application_id = await database.execute_insert(
+        "INSERT INTO staff_applications("
+        "guild_id,applicant_id,application_type,status,answers_json,created_ts,updated_ts) "
+        "VALUES(1,99,'judge','interview','{}',1,1)"
+    )
+
+    class Category:
+        id = 456
+
+    class Member:
+        id = 99
+        name = "applicant"
+        mention = "<@99>"
+
+    class Interview:
+        id = 789
+        mention = "<#789>"
+        topic = f"avenue-application-interview:{application_id}"
+
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, **kwargs):
+            self.messages.append(kwargs)
+            return SimpleNamespace(id=800 + len(self.messages))
+
+    class Config:
+        def get_int(self, *path, default=0):
+            return 456 if path == ("tickets", "ticket_category_id") else default
+
+        def get_int_list(self, *_path, default=None):
+            return list(default or [])
+
+    class Guild:
+        id = 1
+        default_role = object()
+
+        def __init__(self):
+            self.member = Member()
+            self.category = Category()
+            self.channels = []
+
+        def get_member(self, user_id):
+            return self.member if user_id == 99 else None
+
+        async def fetch_member(self, user_id):
+            return self.get_member(user_id)
+
+        def get_channel(self, channel_id):
+            if channel_id == 456:
+                return self.category
+            return next((item for item in self.channels if item.id == channel_id), None)
+
+        def get_role(self, _role_id):
+            return None
+
+        async def create_text_channel(self, **_kwargs):
+            interview = Interview()
+            self.channels.append(interview)
+            return interview
+
+    class User:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, **kwargs):
+            self.messages.append(kwargs)
+            return SimpleNamespace(id=900 + len(self.messages))
+
+    monkeypatch.setattr(discord, "CategoryChannel", Category)
+    guild = Guild()
+    user = User()
+
+    async def fetch_guild(_guild_id):
+        return guild
+
+    async def fetch_user(_user_id):
+        return user
+
+    async def fetch_channel(_channel_id):
+        return None
+
+    bot = SimpleNamespace(
+        db=database,
+        config=Config(),
+        get_guild=lambda guild_id: guild if guild_id == 1 else None,
+        fetch_guild=fetch_guild,
+        get_channel=lambda _channel_id: None,
+        fetch_channel=fetch_channel,
+        get_user=lambda user_id: user if user_id == 99 else None,
+        fetch_user=fetch_user,
+        get_cog=lambda _name: None,
+    )
+    outbox = DiscordOutbox(bot)
+    bot.outbox = outbox
+    await outbox.enqueue(
+        "create_interview_ticket",
+        guild_id=1,
+        user_id=99,
+        payload={"application_id": application_id},
+        idempotency_key=f"application:{application_id}:interview",
+    )
+
+    assert await outbox.process_once() == {"delivered": 1, "retried": 0, "dead": 0}
+    assert await outbox.process_once() == {"delivered": 1, "retried": 0, "dead": 0}
+    ticket = await database.fetchone("SELECT * FROM tickets WHERE channel_id=789")
+    application = await database.fetchone(
+        "SELECT interview_ticket_channel_id FROM staff_applications WHERE id=?",
+        (application_id,),
+    )
+    assert ticket["status_tag"] == "waiting_staff"
+    assert int(application["interview_ticket_channel_id"]) == 789
+    assert "<#789>" in user.messages[0]["content"]
     await database.close()
 
 

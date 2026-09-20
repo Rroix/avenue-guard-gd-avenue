@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import hashlib
+import json
 import time
 from typing import Any
 
@@ -18,6 +18,8 @@ SUPPORTED_ACTIONS = {
     "delete_message",
     "add_role",
     "remove_role",
+    "create_application_thread",
+    "create_interview_ticket",
 }
 
 
@@ -140,7 +142,7 @@ class DiscordOutbox:
             else:
                 delivered_message_id = await asyncio.wait_for(self._deliver(claimed), timeout=45)
                 self._delivery_receipts[outbox_id] = int(delivered_message_id or 0)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - all delivery failures must be durably retried or dead-lettered.
             terminal = self._terminal_failure(exc) or attempts >= self.max_attempts
             target = "dead" if terminal else "pending"
             OUTBOX_STATES.require("processing", target)
@@ -242,6 +244,148 @@ class DiscordOutbox:
         embed = self._embed(payload)
         mentions = self._mentions(payload)
         nonce = hashlib.sha256(str(row["idempotency_key"]).encode()).hexdigest()[:24]
+
+        if action == "create_application_thread":
+            application_id = int(payload.get("application_id") or 0)
+            application = await self.bot.db.fetchone(
+                "SELECT review_thread_id,applicant_id FROM staff_applications WHERE id=? AND guild_id=?",
+                (application_id, int(row["guild_id"] or 0)),
+            )
+            if application is None:
+                raise PermanentOutboxError("application no longer exists")
+            thread_id = int(application["review_thread_id"] or 0)
+            thread = self.bot.get_channel(thread_id) if thread_id else None
+            if thread is None and thread_id:
+                try:
+                    thread = await self.bot.fetch_channel(thread_id)
+                except discord.NotFound:
+                    thread = None
+            if thread is None:
+                forum = await self._channel(channel_id)
+                if not isinstance(forum, discord.ForumChannel):
+                    raise PermanentOutboxError("application review channel is not a forum")
+                thread_name = f"reviewer-application-{application_id}-{int(application['applicant_id'])}"[:100]
+                existing = next((item for item in getattr(forum, "threads", ()) if str(getattr(item, "name", "")) == thread_name), None)
+                if existing is not None:
+                    thread = existing
+                else:
+                    created = await forum.create_thread(
+                        name=thread_name,
+                        content=f"Reviewer application **#{application_id}** from <@{int(application['applicant_id'])}>",
+                        allowed_mentions=no_mentions(),
+                        reason=f"Reviewer application #{application_id} submitted",
+                    )
+                    thread = getattr(created, "thread", created)
+                thread_id = int(getattr(thread, "id", 0) or 0)
+                if not thread_id:
+                    raise RuntimeError("Discord did not return the application thread")
+                await self.bot.db.execute(
+                    "UPDATE staff_applications SET review_thread_id=?,updated_ts=? WHERE id=?",
+                    (thread_id, int(time.time()), application_id),
+                )
+            for index, response in enumerate(payload.get("responses") or []):
+                if not isinstance(response, dict):
+                    continue
+                question = str(response.get("question") or "Question")[:500]
+                answer = str(response.get("answer") or "No answer provided")
+                chunks = [answer[start:start + 1750] for start in range(0, len(answer), 1750)] or ["No answer provided"]
+                for chunk_index, chunk in enumerate(chunks):
+                    label = f"**{question}**\n" if chunk_index == 0 else f"**{question} (continued)**\n"
+                    answer_nonce = hashlib.sha256(f"application:{application_id}:{index}:{chunk_index}".encode()).hexdigest()[:24]
+                    await thread.send(
+                        content=f"{label}{chunk}"[:2000],
+                        allowed_mentions=no_mentions(),
+                        nonce=answer_nonce,
+                        enforce_nonce=True,
+                    )
+            return thread_id
+
+        if action == "create_interview_ticket":
+            application_id = int(payload.get("application_id") or 0)
+            application = await self.bot.db.fetchone(
+                "SELECT applicant_id,interview_ticket_channel_id FROM staff_applications WHERE id=? AND guild_id=?",
+                (application_id, int(row["guild_id"] or 0)),
+            )
+            if application is None:
+                raise PermanentOutboxError("application no longer exists")
+            saved_channel_id = int(application["interview_ticket_channel_id"] or 0)
+            guild = await self._guild(int(row["guild_id"] or 0))
+            applicant_id = int(application["applicant_id"])
+            member = guild.get_member(applicant_id)
+            if member is None:
+                member = await guild.fetch_member(applicant_id)
+            category_id = self.bot.config.get_int("tickets", "ticket_category_id", default=0)
+            category = guild.get_channel(category_id)
+            if not isinstance(category, discord.CategoryChannel):
+                raise PermanentOutboxError("ticket category is unavailable")
+            marker = f"avenue-application-interview:{application_id}"
+            interview = guild.get_channel(saved_channel_id) if saved_channel_id else None
+            if interview is None and saved_channel_id:
+                try:
+                    interview = await self.bot.fetch_channel(saved_channel_id)
+                except discord.NotFound:
+                    interview = None
+            if interview is None:
+                interview = next((item for item in getattr(guild, "channels", ()) if str(getattr(item, "topic", "")) == marker), None)
+            if interview is None:
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                }
+                for role_id in {
+                    *self.bot.config.get_int_list("staff_portal", "judge_role_ids"),
+                    *self.bot.config.get_int_list("staff_portal", "head_judge_role_ids"),
+                    *self.bot.config.get_int_list("staff_portal", "admin_role_ids"),
+                }:
+                    role = guild.get_role(role_id)
+                    if role is not None:
+                        overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+                interview = await guild.create_text_channel(
+                    name=f"interview-{application_id}-{getattr(member, 'name', 'applicant')}"[:90],
+                    category=category,
+                    topic=marker,
+                    overwrites=overwrites,
+                    reason=f"Reviewer application #{application_id} interview",
+                )
+            now = int(time.time())
+            ticket = await self.bot.db.fetchone("SELECT ticket_id,opening_message_id FROM tickets WHERE channel_id=?", (int(interview.id),))
+            if ticket is None:
+                ticket_id = await self.bot.db.next_ticket_id(int(row["guild_id"] or 0))
+                await self.bot.db.execute(
+                    "INSERT INTO tickets(guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,ticket_id,status_tag,correlation_id) "
+                    "VALUES(?,?,?,?,?,'open',?,'waiting_staff',?)",
+                    (int(row["guild_id"] or 0), int(interview.id), applicant_id, now, now, ticket_id, f"staff-application:{application_id}"),
+                )
+                opening_message_id = 0
+            else:
+                opening_message_id = int(ticket["opening_message_id"] or 0)
+            if not opening_message_id:
+                opening = await interview.send(
+                    content=f"Welcome {member.mention}. This private channel is your GD Avenue Reviewer interview for application **#{application_id}**.\nStatus: **Waiting for staff**",
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
+                    nonce=hashlib.sha256(f"application:{application_id}:interview-opening".encode()).hexdigest()[:24],
+                    enforce_nonce=True,
+                )
+                await self.bot.db.execute(
+                    "UPDATE tickets SET opening_message_id=? WHERE channel_id=?",
+                    (int(opening.id), int(interview.id)),
+                )
+            await self.bot.db.execute(
+                "UPDATE staff_applications SET interview_ticket_channel_id=?,updated_ts=? WHERE id=?",
+                (int(interview.id), now, application_id),
+            )
+            await self.enqueue(
+                "send_dm",
+                guild_id=int(row["guild_id"] or 0),
+                user_id=applicant_id,
+                payload={"content": f"Your GD Avenue Reviewer application is moving to an interview: {interview.mention}"},
+                correlation_id=f"staff-application:{application_id}",
+                idempotency_key=f"staff-application:{application_id}:interview-dm",
+            )
+            help_cog = self.bot.get_cog("HelpCog")
+            if help_cog is not None and hasattr(help_cog, "_active_ticket_channels"):
+                help_cog._active_ticket_channels.add(int(interview.id))
+            return int(interview.id)
 
         if action == "send_channel":
             channel = await self._channel(channel_id)

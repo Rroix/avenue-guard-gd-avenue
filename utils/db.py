@@ -204,16 +204,22 @@ _USER_SNOWFLAKE_COLUMNS = {
     "assignee_id",
     "author_id",
     "claimed_by",
+    "completed_by",
     "created_by",
     "creator_id",
     "decided_by",
     "disabled_by",
+    "ended_by",
     "handled_by",
+    "new_owner_id",
+    "previous_owner_id",
+    "qa_by",
     "requested_by",
     "requester_id",
     "released_by",
     "responded_by",
     "reviewed_by",
+    "reviewer_id",
     "started_by",
     "updated_by",
     "satisfaction_user_id",
@@ -256,11 +262,19 @@ _SNOWFLAKE_REPAIR_TABLES = {
     "staff_application_notes",
     "staff_applications",
     "staff_members",
+    "staff_milestones",
     "staff_notes",
+    "staff_outreach_episodes",
+    "staff_portal_nickname_history",
+    "staff_portal_profiles",
     "staff_queue_claim_events",
     "staff_queue_claims",
+    "staff_review_qa",
     "staff_tasks",
     "staff_web_sessions",
+    "level_outreach_attempts",
+    "level_outreach_cp_snapshots",
+    "level_outreach_cycles",
     "ticket_cooldowns",
     "ticket_sequences",
     "ticket_transcripts",
@@ -856,6 +870,7 @@ class Database:
             {**expected, "database": 7},
             {**expected, "database": 8},
             {**expected, "database": 9},
+            {**expected, "database": 10},
         ):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -883,6 +898,7 @@ class Database:
                 )
                 for stmt in PRIORITY_SCHEMA:
                     self._conn.execute(stmt)
+                self._ensure_column_sync("level_outreach_queue", "hidden_from_state", "TEXT")
                 self._ensure_column_sync("level_outreach_attempts", "episode_id", "INTEGER")
                 self._ensure_column_sync(
                     "level_outreach_attempts", "private_target_key", "TEXT NOT NULL DEFAULT ''"
@@ -890,6 +906,11 @@ class Database:
                 self._ensure_column_sync("level_outreach_attempts", "event_ts", "INTEGER")
                 for stmt in STAFF_PORTAL_SCHEMA:
                     self._conn.execute(stmt)
+                self._ensure_column_sync("staff_applications", "review_prompt_key", "TEXT")
+                self._ensure_column_sync("staff_applications", "review_thread_outbox_id", "INTEGER")
+                self._ensure_column_sync("staff_applications", "review_thread_id", "INTEGER")
+                self._ensure_column_sync("staff_applications", "interview_ticket_outbox_id", "INTEGER")
+                self._ensure_column_sync("staff_applications", "interview_ticket_channel_id", "INTEGER")
                 self._execute_sync("UPDATE schema_metadata SET schema_version=?,updated_ts=? WHERE component='database'", (DATABASE_SCHEMA_VERSION, int(time.time())))
                 self._commit_and_sync_sync()
             except Exception:
@@ -1580,6 +1601,7 @@ class Database:
             self._conn.execute(stmt)
         for stmt in PRIORITY_SCHEMA:
             self._conn.execute(stmt)
+        self._ensure_column_sync("level_outreach_queue", "hidden_from_state", "TEXT")
         self._ensure_column_sync("level_outreach_attempts", "episode_id", "INTEGER")
         self._ensure_column_sync(
             "level_outreach_attempts", "private_target_key", "TEXT NOT NULL DEFAULT ''"
@@ -1587,6 +1609,11 @@ class Database:
         self._ensure_column_sync("level_outreach_attempts", "event_ts", "INTEGER")
         for stmt in STAFF_PORTAL_SCHEMA:
             self._conn.execute(stmt)
+        self._ensure_column_sync("staff_applications", "review_prompt_key", "TEXT")
+        self._ensure_column_sync("staff_applications", "review_thread_outbox_id", "INTEGER")
+        self._ensure_column_sync("staff_applications", "review_thread_id", "INTEGER")
+        self._ensure_column_sync("staff_applications", "interview_ticket_outbox_id", "INTEGER")
+        self._ensure_column_sync("staff_applications", "interview_ticket_channel_id", "INTEGER")
         for stmt in index_stmts:
             self._conn.execute(stmt)
         self._commit_and_sync_sync()
@@ -1821,6 +1848,7 @@ class Database:
                 "conflicts": 0,
                 "ambiguous": 0,
                 "feedback_requeued": 0,
+                "audited": 0,
             }
 
         def _mapping(values: Sequence[int]) -> tuple[dict[int, int], int]:
@@ -1851,6 +1879,7 @@ class Database:
             "conflicts": 0,
             "ambiguous": guild_ambiguous + user_ambiguous + channel_ambiguous,
             "feedback_requeued": 0,
+            "audited": 0,
         }
 
         # Plan from the read-only local replica. The old implementation scanned
@@ -1860,11 +1889,12 @@ class Database:
         table_rows = await self.fetchall_local(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
+        available_tables = {
+            str(_row_get(row, "name", index=0, default="")) for row in table_rows
+        }
+        audit_enabled = "staff_snowflake_repairs" in available_tables
         tables = sorted(
-            str(_row_get(row, "name", index=0, default=""))
-            for row in table_rows
-            if str(_row_get(row, "name", index=0, default=""))
-            in _SNOWFLAKE_REPAIR_TABLES
+            table for table in available_tables if table in _SNOWFLAKE_REPAIR_TABLES
         )
         repairs: list[tuple[str, str, int, int]] = []
         for table in tables:
@@ -1908,7 +1938,12 @@ class Database:
 
             def _run_batch(batch=batch) -> dict[str, int]:
                 assert self._conn is not None
-                batch_result = {"updated": 0, "conflicts": 0, "feedback_requeued": 0}
+                batch_result = {
+                    "updated": 0,
+                    "conflicts": 0,
+                    "feedback_requeued": 0,
+                    "audited": 0,
+                }
                 try:
                     self._conn.execute("BEGIN IMMEDIATE")
                     for table, column, stored, exact in batch:
@@ -1935,9 +1970,31 @@ class Database:
                             f"SELECT COUNT(*) FROM {table} WHERE {column}=?",  # nosec B608
                             (str(stored),),
                         ).fetchone()
-                        batch_result["conflicts"] += int(
+                        remaining_count = int(
                             _row_get(remaining, "COUNT(*)", index=0, default=0) or 0
                         )
+                        batch_result["conflicts"] += remaining_count
+                        if audit_enabled:
+                            self._conn.execute(
+                                "INSERT INTO staff_snowflake_repairs("
+                                "table_name,column_name,old_id,repaired_id,status,source,"
+                                "rows_changed,checked_ts) VALUES(?,?,?,?,?,?,?,?) "
+                                "ON CONFLICT(table_name,column_name,old_id) DO UPDATE SET "
+                                "repaired_id=excluded.repaired_id,status=excluded.status,"
+                                "source=excluded.source,rows_changed=excluded.rows_changed,"
+                                "checked_ts=excluded.checked_ts",
+                                (
+                                    table,
+                                    column,
+                                    str(stored),
+                                    str(exact),
+                                    "conflict" if remaining_count else "repaired",
+                                    "turso_libsql_f64_backfill",
+                                    changed,
+                                    int(time.time()),
+                                ),
+                            )
+                            batch_result["audited"] += 1
                     self._commit_and_sync_sync()
                 except Exception:
                     try:
@@ -1954,7 +2011,7 @@ class Database:
                 queue_timeout=2.0,
                 operation_label="maintenance.snowflake_repair",
             )
-            for key in ("updated", "conflicts", "feedback_requeued"):
+            for key in ("updated", "conflicts", "feedback_requeued", "audited"):
                 result[key] += int(batch_result.get(key, 0) or 0)
             await asyncio.sleep(0)
         return result

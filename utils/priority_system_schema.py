@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 PRIORITY_TABLES = {
     "level_outreach_queue",
     "level_outreach_cycles",
@@ -38,6 +37,7 @@ PRIORITY_SCHEMA = (
         priority_complete INTEGER NOT NULL DEFAULT 0,
         model_version TEXT NOT NULL,
         queue_state TEXT NOT NULL DEFAULT 'queued',
+        hidden_from_state TEXT,
         submitted_to_mod_ts INTEGER,
         rated_observed_ts INTEGER,
         outcome_window_due_ts INTEGER,

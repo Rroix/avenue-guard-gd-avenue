@@ -201,14 +201,21 @@ async def _repair_legacy_turso_snowflakes(bot: discord.Bot, guild: discord.Guild
     bot._legacy_snowflake_repair_complete = True
     if any(
         repair.get(key)
-        for key in ("updated", "conflicts", "ambiguous", "feedback_requeued")
+        for key in (
+            "updated",
+            "conflicts",
+            "ambiguous",
+            "feedback_requeued",
+            "audited",
+        )
     ):
         startup_log(
             "Legacy Turso snowflake repair: "
             f"updated={repair.get('updated', 0)} "
             f"conflicts={repair.get('conflicts', 0)} "
             f"ambiguous={repair.get('ambiguous', 0)} "
-            f"feedback_requeued={repair.get('feedback_requeued', 0)}"
+            f"feedback_requeued={repair.get('feedback_requeued', 0)} "
+            f"audited={repair.get('audited', 0)}"
         )
 
 
