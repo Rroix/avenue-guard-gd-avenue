@@ -107,6 +107,10 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     }
     queue_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(level_outreach_queue)")}
     application_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(staff_applications)")}
+    cooldown_columns = {
+        str(row["name"])
+        for row in await db.fetchall("PRAGMA table_info(staff_application_cooldowns)")
+    }
     assert "hidden_from_state" in queue_columns
     assert {
         "review_prompt_key",
@@ -115,6 +119,13 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         "interview_ticket_outbox_id",
         "interview_ticket_channel_id",
     } <= application_columns
+    assert {
+        "guild_id",
+        "applicant_id",
+        "application_type",
+        "cooldown_until_ts",
+        "source",
+    } <= cooldown_columns
 
     weekly_claim_columns = {
         str(row["name"]) for row in await db.fetchall("PRAGMA table_info(weekly_claims)")

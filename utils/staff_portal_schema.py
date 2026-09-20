@@ -9,6 +9,7 @@ STAFF_PORTAL_TABLES = {
     "staff_notes",
     "staff_review_qa",
     "staff_applications",
+    "staff_application_cooldowns",
     "staff_application_events",
     "staff_application_notes",
     "staff_members",
@@ -146,6 +147,16 @@ STAFF_PORTAL_SCHEMA = (
         created_ts INTEGER NOT NULL,
         correlation_id TEXT NOT NULL
     );""",
+    """CREATE TABLE IF NOT EXISTS staff_application_cooldowns(
+        guild_id INTEGER NOT NULL,
+        applicant_id INTEGER NOT NULL,
+        application_type TEXT NOT NULL,
+        cooldown_until_ts INTEGER NOT NULL,
+        source TEXT NOT NULL DEFAULT 'application_data_reset',
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL,
+        PRIMARY KEY(guild_id,applicant_id,application_type)
+    );""",
     """CREATE TABLE IF NOT EXISTS staff_application_notes(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         application_id INTEGER NOT NULL,
@@ -240,6 +251,8 @@ STAFF_PORTAL_SCHEMA = (
     """CREATE UNIQUE INDEX IF NOT EXISTS idx_staff_applications_one_active
         ON staff_applications(guild_id,applicant_id,application_type)
         WHERE status IN('draft','submitted','under_review','interview','hold','accepted_pending_role');""",
+    """CREATE INDEX IF NOT EXISTS idx_staff_application_cooldowns_expiry
+        ON staff_application_cooldowns(cooldown_until_ts);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_application_events
         ON staff_application_events(application_id,created_ts);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_idempotency_expiry

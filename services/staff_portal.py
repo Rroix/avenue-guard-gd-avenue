@@ -2409,7 +2409,8 @@ class StaffPortalService:
             )
         async with self._application_lock:
             rows = await self.db.fetchall(
-                "SELECT id,status,review_thread_outbox_id,review_thread_id,"
+                "SELECT id,application_type,status,submitted_ts,"
+                "review_thread_outbox_id,review_thread_id,"
                 "interview_ticket_outbox_id,interview_ticket_channel_id "
                 "FROM staff_applications WHERE guild_id=? AND applicant_id=?",
                 (principal.guild_id, principal.user_id),
@@ -2449,6 +2450,14 @@ class StaffPortalService:
             )
             statements: list[tuple[str, tuple[Any, ...]]] = []
             now = int(time.time())
+            regular_cooldown_seconds = self._application_cooldown_days() * 86400
+            reset_cooldown_types = {
+                str(row["application_type"])
+                for row in rows
+                if row["submitted_ts"] is not None
+                and int(row["submitted_ts"]) + regular_cooldown_seconds > now
+            }
+            reset_cooldown_until = now + 86400
             for outbox_id in sorted(outbox_ids):
                 statements.append(
                     (
@@ -2484,6 +2493,27 @@ class StaffPortalService:
                         (str(idempotency_row["idempotency_key"]),),
                     )
                 )
+            for application_type in sorted(reset_cooldown_types):
+                statements.append(
+                    (
+                        (
+                            "INSERT INTO staff_application_cooldowns("
+                            "guild_id,applicant_id,application_type,cooldown_until_ts,"
+                            "source,created_ts,updated_ts) VALUES(?,?,?,?,'application_data_reset',?,?) "
+                            "ON CONFLICT(guild_id,applicant_id,application_type) DO UPDATE SET "
+                            "cooldown_until_ts=MAX(cooldown_until_ts,excluded.cooldown_until_ts),"
+                            "source=excluded.source,updated_ts=excluded.updated_ts"
+                        ),
+                        (
+                            principal.guild_id,
+                            principal.user_id,
+                            application_type,
+                            reset_cooldown_until,
+                            now,
+                            now,
+                        ),
+                    )
+                )
             statements.append(
                 (
                     (
@@ -2500,6 +2530,7 @@ class StaffPortalService:
                             {
                                 "applications_removed": len(application_ids),
                                 "external_records_preserved": external_records,
+                                "cooldown_types_preserved": sorted(reset_cooldown_types),
                             },
                             separators=(",", ":"),
                         ),
@@ -2512,6 +2543,7 @@ class StaffPortalService:
             "ok": True,
             "applications_removed": len(application_ids),
             "external_records_preserved": external_records,
+            "cooldown_types_preserved": sorted(reset_cooldown_types),
         }
 
     def _configured_application_types(self) -> list[str]:
@@ -2575,38 +2607,57 @@ class StaffPortalService:
             ),
         )
 
-    async def _application_cooldown(self, principal: StaffPrincipal) -> dict[str, Any]:
+    async def _application_cooldown(
+        self, principal: StaffPrincipal, application_type: str
+    ) -> dict[str, Any]:
         latest = await self.db.fetchone(
             "SELECT id,application_type,status,submitted_ts FROM staff_applications "
-            "WHERE guild_id=? AND applicant_id=? AND submitted_ts IS NOT NULL "
+            "WHERE guild_id=? AND applicant_id=? AND application_type=? "
+            "AND submitted_ts IS NOT NULL "
             "ORDER BY submitted_ts DESC,id DESC LIMIT 1",
-            (principal.guild_id, principal.user_id),
+            (principal.guild_id, principal.user_id, application_type),
+        )
+        reset = await self.db.fetchone(
+            "SELECT cooldown_until_ts FROM staff_application_cooldowns "
+            "WHERE guild_id=? AND applicant_id=? AND application_type=?",
+            (principal.guild_id, principal.user_id, application_type),
         )
         days = self._application_cooldown_days()
         now = int(time.time())
         submitted_ts = int(latest["submitted_ts"] or 0) if latest else 0
-        until_ts = submitted_ts + days * 86400 if submitted_ts else 0
+        submission_until_ts = submitted_ts + days * 86400 if submitted_ts else 0
+        reset_until_ts = int(reset["cooldown_until_ts"] or 0) if reset else 0
+        until_ts = max(submission_until_ts, reset_until_ts)
         return {
             "days": days,
             "active": bool(until_ts > now),
             "until_ts": until_ts or None,
             "remaining_seconds": max(0, until_ts - now),
             "source_application_id": int(latest["id"]) if latest else None,
+            "source": "application_data_reset"
+            if reset_until_ts >= submission_until_ts and reset_until_ts > now
+            else "submission"
+            if submission_until_ts > now
+            else None,
         }
 
     async def application_options(self, principal: StaffPrincipal) -> dict[str, Any]:
         configured_types = self._configured_application_types()
         forms = []
+        cooldowns: dict[str, dict[str, Any]] = {}
         for application_type in configured_types:
             config = self._application_form_config(application_type)
             if not config:
                 continue
+            cooldown = await self._application_cooldown(principal, application_type)
+            cooldowns[application_type] = cooldown
             forms.append(
                 {
                     "application_type": application_type,
                     "label": self._application_label(application_type),
                     "description": str(config.get("description") or "").strip()[:500],
                     "enabled": True,
+                    "cooldown": cooldown,
                 }
             )
         if "appeal" not in configured_types:
@@ -2618,19 +2669,22 @@ class StaffPortalService:
                     "enabled": False,
                 }
             )
-        active = await self.db.fetchone(
+        active_rows = await self.db.fetchall(
             "SELECT id,application_type,status FROM staff_applications "
             "WHERE guild_id=? AND applicant_id=? AND status IN"
             "('draft','submitted','under_review','interview','hold','accepted_pending_role') "
-            "ORDER BY updated_ts DESC,id DESC LIMIT 1",
+            "ORDER BY updated_ts DESC,id DESC",
             (principal.guild_id, principal.user_id),
         )
+        active_applications = [_row_dict(row) for row in active_rows]
         configuration = (await self.safe_configuration())["configuration"]
         return {
             "items": forms,
             "applications_open": bool(configuration["applications_open"]),
-            "cooldown": await self._application_cooldown(principal),
-            "active_application": _row_dict(active) if active else None,
+            "cooldown": {"days": self._application_cooldown_days(), "active": False},
+            "cooldowns": cooldowns,
+            "active_applications": active_applications,
+            "active_application": active_applications[0] if active_applications else None,
         }
 
     def _application_questions(
@@ -2729,25 +2783,13 @@ class StaffPortalService:
                 (principal.guild_id, principal.user_id, application_type),
             )
             if row is None:
-                other_active = await self.db.fetchone(
-                    "SELECT id,application_type,status FROM staff_applications "
-                    "WHERE guild_id=? AND applicant_id=? AND status IN"
-                    "('draft','submitted','under_review','interview','hold','accepted_pending_role') "
-                    "ORDER BY updated_ts DESC,id DESC LIMIT 1",
-                    (principal.guild_id, principal.user_id),
-                )
-                if other_active is not None:
-                    raise PortalError(
-                        409,
-                        "application_active",
-                        "Finish or remove your current application before starting another",
-                    )
-                cooldown = await self._application_cooldown(principal)
+                cooldown = await self._application_cooldown(principal, application_type)
                 if cooldown["active"]:
                     raise PortalError(
                         429,
                         "application_cooldown",
-                        f"You can submit one staff application every {cooldown['days']} days",
+                        f"That {self._application_label(application_type)} is still on cooldown. "
+                        "Check the application chooser for its availability time.",
                     )
                 uses_review_prompt = any(
                     bool(question.get("uses_review_prompt"))
@@ -2983,17 +3025,12 @@ class StaffPortalService:
             if row is None:
                 active = await self.db.fetchone(
                     "SELECT * FROM staff_applications WHERE guild_id=? AND applicant_id=? "
+                    "AND application_type=? "
                     "AND status IN('submitted','under_review','interview','hold','accepted_pending_role') "
                     "ORDER BY id DESC LIMIT 1",
-                    (principal.guild_id, principal.user_id),
+                    (principal.guild_id, principal.user_id, app_type),
                 )
             if active is not None:
-                if str(active["application_type"]) != app_type:
-                    raise PortalError(
-                        409,
-                        "application_active",
-                        "Finish your current application before starting another",
-                    )
                 if submit:
                     application_id = int(active["id"])
                     result = {"application": _row_dict(active)}
@@ -3005,12 +3042,13 @@ class StaffPortalService:
             if active_retry:
                 pass
             else:
-                cooldown = await self._application_cooldown(principal)
+                cooldown = await self._application_cooldown(principal, app_type)
                 if cooldown["active"]:
                     raise PortalError(
                         429,
                         "application_cooldown",
-                        f"You can submit one staff application every {cooldown['days']} days",
+                        f"That {self._application_label(app_type)} is still on cooldown. "
+                        "Check the application chooser for its availability time.",
                     )
                 prompt_key = str(row["review_prompt_key"] or "") if row else ""
                 prompt = next((item for item in self._application_review_levels() if item["key"] == prompt_key), None)

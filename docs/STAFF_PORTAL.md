@@ -104,13 +104,13 @@ Application acceptance persists `accepted_pending_role` before requesting the Di
 
 Private session responses include a versioned API contract and explicit feature keys. The website gates newer controls against those keys, so deploying the website before its matching Avenue Guard release leaves the affected Dev controls visibly disabled instead of calling a backend route that does not exist.
 
-Application forms are configured by type through `staff_portal.application_forms`. Reviewer (`judge`) and Mod (`mod`) applications share the same typed question engine, server-side validation, durable state machine, Discord review channel, notes, interviews, and decisions. Short text, long text, and single-choice questions are supported. A question marked `uses_review_prompt` receives one weighted entry from `staff_portal.application_review_levels`; the chosen key is persisted with the Reviewer draft so refreshes cannot reroll it. The applicant browser suggests its local IANA timezone only when the saved timezone answer is blank. Avenue Guard enforces one active application and a global five-day cooldown from the latest submission, regardless of application type.
+Application forms are configured by type through `staff_portal.application_forms`. Reviewer (`judge`) and Mod (`mod`) applications share the same typed question engine, server-side validation, durable state machine, Discord review channel, notes, interviews, and decisions. Short text, long text, and single-choice questions are supported. A question marked `uses_review_prompt` receives one weighted entry from `staff_portal.application_review_levels`; the chosen key is persisted with the Reviewer draft so refreshes cannot reroll it. The applicant browser suggests its local IANA timezone only when the saved timezone answer is blank. Avenue Guard permits one active application per type and applies the five-day cooldown only to repeat submissions of that same type.
 
 On submission, the outbox creates one review discussion in `application_review_channel_id` containing the application type, applicant, Staff Portal link, and a stable snapshot of every question, answer, and selected showcase. Forum channels receive a forum post; normal text channels receive a notification with a public thread attached. Head Reviewers can review Reviewer applications; Admins can additionally review Mod applications; Owner and Dev capabilities can review every stored type. Mod role delivery is optional through `staff_portal.mod_role_ids`; when it is empty, acceptance is recorded without ever substituting the Reviewer role.
 
 Application delivery is restart-safe. A submitted application keeps its outbox identity and Discord thread identity in Turso. Startup reconciliation revives a dead or missing application delivery, while the outbox reuses an existing stored thread before sending the answer snapshot. Dead-letter logs include the outbox ID, action, channel, target user, attempt count, and terminal error so a configuration or permission problem is diagnosable without database access.
 
-A Dev can use `DELETE /api/apply/mine` with the exact confirmation value `DELETE` to remove their own stale application data. The operation atomically removes application rows, child events and notes, retires pending application deliveries, and clears application idempotency cache entries. Existing Discord threads or interview channels are preserved for audit safety and reported in the response rather than silently deleted.
+A Dev can use `DELETE /api/apply/mine` with the exact confirmation value `DELETE` to remove their own stale application data. The operation atomically removes application rows, child events and notes, retires pending application deliveries, and clears application idempotency cache entries. Existing Discord threads or interview channels are preserved for audit safety and reported in the response rather than silently deleted. If a deleted submission was still within its normal five-day cooldown, Avenue Guard retains only a minimal per-type cooldown receipt and replaces the remaining delay with 24 hours from deletion; deleting application content can therefore never remove the cooldown entirely.
 
 The interview decision persists before side effects. Its outbox action creates or reuses a private ticket, records it in the normal `tickets` table, posts the opening status, and enqueues a separate durable applicant DM. Accept-without-interview uses the existing role outbox; rejection also uses a durable DM. Retries use stable keys and stored Discord IDs to avoid creating duplicate threads, tickets, or notifications.
 
@@ -167,7 +167,7 @@ All private endpoints require the service key. Except for OAuth session creation
 | `GET /api/staff/statistics` | Real activity aggregates and median turnaround |
 | `GET/POST /api/staff/qa...` | Head/owner review QA |
 | `GET/POST /api/staff/applications...` | Application management and decisions |
-| `GET /api/apply/options` | Enabled application types, active application, and cooldown state |
+| `GET /api/apply/options` | Enabled application types plus per-type active application and cooldown state |
 | `GET /api/apply/form/<type>` | Server-defined typed application form and resumable draft |
 | `GET/POST /api/staff/staff...` | Capability-gated staff access, Dev profile creation/removal, and nickname management |
 | `GET /api/staff/operations` | Structured runtime, database, worker, provider, outbox, and incident summaries |
@@ -248,7 +248,7 @@ If the bot is unavailable, Netlify returns a concise 503 and does not fall back 
 - Create, complete, and inspect a personal task; verify generated attention tasks are not duplicated by refreshes.
 - Create each permitted note scope and verify a different Reviewer cannot read a private note.
 - Perform a QA action and confirm a post-submission tier correction is owner-only.
-- Save and submit an application; retry the request and verify only one active application exists.
+- Save and submit an application; retry the request and verify only one active application exists for that type.
 - Verify the application keeps the same weighted review prompt across refreshes and that its Discord review thread contains every configured question, answer, and showcase link.
 - Proceed with interview and verify one private ticket, one opening status, one ticket database row, and one applicant DM.
 - Accept a test application and confirm `accepted_pending_role` changes only after the outbox delivers the Reviewer role.

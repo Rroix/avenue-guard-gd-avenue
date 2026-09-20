@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -1069,6 +1070,42 @@ async def test_applicant_cannot_erase_an_active_submitted_application(portal):
 
 
 @pytest.mark.asyncio
+async def test_application_data_reset_preserves_one_day_type_cooldown(portal):
+    service, _guild = portal
+    now = int(time.time())
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,"
+        "answers_json,created_ts,updated_ts,submitted_ts) "
+        "VALUES(?,999,'judge','rejected','{}',?,?,?)",
+        (GUILD_ID, now, now, now),
+    )
+
+    result = await service.reset_own_application_data(
+        principal(999, "applicant"), {"confirmation": "DELETE"}
+    )
+
+    assert result["cooldown_types_preserved"] == ["judge"]
+    assert await service.db.fetchone(
+        "SELECT 1 FROM staff_applications WHERE id=?", (application_id,)
+    ) is None
+    receipt = await service.db.fetchone(
+        "SELECT cooldown_until_ts,source FROM staff_application_cooldowns "
+        "WHERE guild_id=? AND applicant_id=999 AND application_type='judge'",
+        (GUILD_ID,),
+    )
+    assert receipt["source"] == "application_data_reset"
+    assert now + 86399 <= int(receipt["cooldown_until_ts"]) <= now + 86401
+
+    options = await service.application_options(principal(999, "applicant"))
+    assert options["cooldowns"]["judge"]["active"] is True
+    assert options["cooldowns"]["judge"]["source"] == "application_data_reset"
+    assert options["cooldowns"]["mod"]["active"] is False
+    with pytest.raises(PortalError) as caught:
+        await service.application_form(principal(999, "applicant"), "judge")
+    assert caught.value.code == "application_cooldown"
+
+
+@pytest.mark.asyncio
 async def test_hidden_queue_is_reversible_and_excluded_from_normal_views(portal):
     service, _guild = portal
     queue_id = await insert_queue(service, level_id="565656565", message_id=56, priority=5)
@@ -1170,7 +1207,8 @@ async def test_application_catalog_and_mod_form_are_server_defined(portal):
     assert by_type["judge"]["enabled"] is True
     assert by_type["mod"]["label"] == "Mod application"
     assert by_type["appeal"]["enabled"] is False
-    assert options["cooldown"]["days"] == 5
+    assert options["cooldowns"]["judge"]["days"] == 5
+    assert options["cooldowns"]["mod"]["active"] is False
 
     form = await service.application_form(applicant, "mod")
     questions = {item["key"]: item for item in form["questions"]}
@@ -1182,7 +1220,7 @@ async def test_application_catalog_and_mod_form_are_server_defined(portal):
 
 
 @pytest.mark.asyncio
-async def test_application_cooldown_is_global_across_application_types(portal):
+async def test_application_cooldown_is_exclusive_to_application_type(portal):
     service, _guild = portal
     applicant = principal(999, "applicant")
     answers = {
@@ -1197,15 +1235,26 @@ async def test_application_cooldown_is_global_across_application_types(portal):
     result = await service.save_application(
         applicant, {"application_type": "mod", "answers": answers}, submit=True
     )
+    options = await service.application_options(applicant)
+    assert options["cooldowns"]["mod"]["active"] is True
+    assert options["cooldowns"]["judge"]["active"] is False
+
+    judge_form = await service.application_form(applicant, "judge")
+    assert judge_form["application"]["application_type"] == "judge"
+
+    concurrent = await service.application_options(applicant)
+    assert {item["application_type"] for item in concurrent["active_applications"]} == {
+        "judge",
+        "mod",
+    }
+
     await service.db.execute(
         "UPDATE staff_applications SET status='rejected' WHERE id=?",
         (int(result["application"]["id"]),),
     )
 
-    options = await service.application_options(applicant)
-    assert options["cooldown"]["active"] is True
     with pytest.raises(PortalError) as caught:
-        await service.application_form(applicant, "judge")
+        await service.application_form(applicant, "mod")
     assert caught.value.status == 429
     assert caught.value.code == "application_cooldown"
 

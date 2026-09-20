@@ -260,6 +260,7 @@ _SNOWFLAKE_REPAIR_TABLES = {
     "sticky_state",
     "staff_application_events",
     "staff_application_notes",
+    "staff_application_cooldowns",
     "staff_applications",
     "staff_members",
     "staff_milestones",
