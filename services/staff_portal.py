@@ -37,12 +37,15 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 3
+PORTAL_API_VERSION = 4
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
+    "application_repeat_interviews",
     "application_review_embeds",
     "application_review_threads",
+    "application_staff_dm",
+    "application_state_actions",
     "application_cooldown",
     "multi_type_applications",
     "hidden_queue_entries",
@@ -2596,6 +2599,26 @@ class StaffPortalService:
             return principal.can("applications.review_standard")
         return False
 
+    @staticmethod
+    def _application_actions_for_status(
+        status: str, *, interview_delivery_pending: bool = False
+    ) -> list[str]:
+        """Return the server-authoritative actions for an application state."""
+        actions = {
+            "submitted": ["claim", "interview", "hold", "accept", "reject", "message"],
+            "under_review": ["interview", "hold", "accept", "reject", "message"],
+            "hold": ["claim", "interview", "accept", "reject", "message"],
+            "interview": ["interview", "hold", "accept", "reject", "message"],
+            "accepted_pending_role": ["accept", "message"],
+            "accepted": ["message"],
+            "rejected": ["message"],
+            "withdrawn": ["message"],
+        }
+        available = list(actions.get(str(status or "").strip().casefold(), ()))
+        if interview_delivery_pending and "interview" in available:
+            available.remove("interview")
+        return available
+
     def _application_cooldown_days(self) -> int:
         return max(
             1,
@@ -3184,7 +3207,9 @@ class StaffPortalService:
             conditions.append("claimed_by=?")
             params.append(principal.user_id)
         rows = await self.db.fetchall(
-            "SELECT * FROM staff_applications WHERE "
+            "SELECT staff_applications.*,"
+            "(SELECT status FROM discord_outbox WHERE id=staff_applications.interview_ticket_outbox_id) "
+            "AS interview_delivery_status FROM staff_applications WHERE "
             + " AND ".join(conditions)  # nosec B608
             + " "
             "ORDER BY CASE status WHEN 'submitted' THEN 0 WHEN 'under_review' THEN 1 "
@@ -3251,6 +3276,13 @@ class StaffPortalService:
                     "answers": _json_object(row["answers_json"]),
                     "internal_notes": notes_by_application[int(row["id"])],
                     "timeline": events_by_application[int(row["id"])],
+                    "available_actions": self._application_actions_for_status(
+                        str(row["status"]),
+                        interview_delivery_pending=str(
+                            row["interview_delivery_status"] or ""
+                        )
+                        in {"pending", "processing", "failed"},
+                    ),
                 }
                 for row in rows
             ],
@@ -3259,13 +3291,22 @@ class StaffPortalService:
 
     async def application_action(self, principal, application_id, payload):
         action = str(payload.get("action") or "").casefold()
-        targets = {"claim": "under_review", "interview": "interview", "hold": "hold", "accept": "accepted_pending_role", "reject": "rejected"}
-        target = targets.get(action)
-        if target is None:
+        targets = {
+            "claim": "under_review",
+            "interview": "interview",
+            "hold": "hold",
+            "accept": "accepted_pending_role",
+            "reject": "rejected",
+        }
+        if action not in {*targets, "message"}:
             raise PortalError(400, "invalid_application_action", "Choose a valid application action")
         if action in {"interview", "accept", "reject"} and payload.get("confirmed") is not True:
             raise PortalError(400, "confirmation_required", "Confirm the final application decision")
-        reason = _bounded_text(payload.get("reason"), 1000, required=action in {"hold", "accept", "reject"})
+        reason = _bounded_text(
+            payload.get("reason"),
+            1000,
+            required=action in {"hold", "accept", "reject"},
+        )
         async with self._application_lock:
             row = await self.db.fetchone("SELECT * FROM staff_applications WHERE id=? AND guild_id=?", (application_id, principal.guild_id))
             if row is None:
@@ -3275,12 +3316,71 @@ class StaffPortalService:
                 raise PortalError(403, "application_scope_denied", "You cannot manage that application type")
             application_label = self._application_label(application_type)
             old = str(row["status"])
-            if old in {"accepted", "rejected", "withdrawn"}:
-                raise PortalError(409, "application_final", "That application already has a final decision")
+            interview_delivery_pending = False
+            if old == "interview" and row["interview_ticket_outbox_id"] is not None:
+                delivery = await self.db.fetchone(
+                    "SELECT status FROM discord_outbox WHERE id=?",
+                    (int(row["interview_ticket_outbox_id"]),),
+                )
+                interview_delivery_pending = bool(
+                    delivery
+                    and str(delivery["status"] or "")
+                    in {"pending", "processing", "failed"}
+                )
+            if action not in self._application_actions_for_status(old):
+                raise PortalError(
+                    409,
+                    "application_action_unavailable",
+                    "That action is not available at this stage of the application",
+                )
+            if action == "interview" and interview_delivery_pending:
+                raise PortalError(
+                    409,
+                    "interview_delivery_pending",
+                    "The current interview is still being created. Try again after delivery completes",
+                )
+            now = int(time.time())
+            correlation = new_correlation_id("application")
+            if action == "message":
+                message = _bounded_text(payload.get("message"), 1800, required=True)
+                await self.db.execute(
+                    "INSERT INTO staff_application_events("
+                    "application_id,actor_id,event,from_status,to_status,"
+                    "detail_json,created_ts,correlation_id) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        application_id,
+                        principal.user_id,
+                        "message",
+                        old,
+                        old,
+                        json.dumps({"message": message}, separators=(",", ":")),
+                        now,
+                        correlation,
+                    ),
+                )
+                outbox_id = await self.bot.outbox.enqueue(
+                    "send_dm",
+                    guild_id=principal.guild_id,
+                    user_id=int(row["applicant_id"]),
+                    payload={
+                        "content": (
+                            f"GD Avenue staff sent you a message about your "
+                            f"{application_label} #{application_id}:\n\n{message}"
+                        )
+                    },
+                    correlation_id=correlation,
+                    idempotency_key=f"{correlation}:applicant-dm",
+                )
+                return {
+                    "ok": True,
+                    "status": old,
+                    "message_delivery": "pending",
+                    "outbox_id": outbox_id,
+                }
             if old == "accepted_pending_role" and action == "accept":
                 await self._reconcile_application_roles()
                 return {"ok": True, "status": old, "role_delivery": "pending"}
-            now = int(time.time())
+            target = targets[action]
             role_ids: list[int] = []
             if action == "accept":
                 role_ids = self._application_role_ids(application_type)
@@ -3288,7 +3388,6 @@ class StaffPortalService:
                     raise PortalError(503, "reviewer_role_missing", "The Reviewer role is not configured")
                 if not role_ids:
                     target = "accepted"
-            correlation = new_correlation_id("application")
             await self.db.execute_transaction(
                 [
                     (
@@ -3370,6 +3469,7 @@ class StaffPortalService:
                     idempotency_key=f"staff-application:{application_id}:rejected-dm",
                 )
             elif action == "interview":
+                repeat_interview = bool(row["interview_ticket_channel_id"])
                 interview_outbox_id = await self.bot.outbox.enqueue(
                     "create_interview_ticket",
                     guild_id=principal.guild_id,
@@ -3378,9 +3478,11 @@ class StaffPortalService:
                         "application_id": application_id,
                         "application_type": application_type,
                         "application_label": application_label,
+                        "interview_run_id": correlation,
+                        "repeat_interview": repeat_interview,
                     },
-                    correlation_id=f"staff-application:{application_id}",
-                    idempotency_key=f"staff-application:{application_id}:interview-ticket",
+                    correlation_id=correlation,
+                    idempotency_key=f"{correlation}:interview-ticket",
                 )
                 await self.db.execute(
                     "UPDATE staff_applications SET interview_ticket_outbox_id=?,updated_ts=? WHERE id=?",

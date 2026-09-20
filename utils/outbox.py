@@ -366,6 +366,8 @@ class DiscordOutbox:
                 payload.get("application_label")
                 or ("Reviewer application" if application_type == "judge" else f"{application_type.replace('_', ' ').title()} application")
             )[:100]
+            interview_run_id = str(payload.get("interview_run_id") or "").strip()[:80]
+            repeat_interview = payload.get("repeat_interview") is True
             member = guild.get_member(applicant_id)
             if member is None:
                 member = await guild.fetch_member(applicant_id)
@@ -374,8 +376,14 @@ class DiscordOutbox:
             if not isinstance(category, discord.CategoryChannel):
                 raise PermanentOutboxError("ticket category is unavailable")
             marker = f"avenue-application-interview:{application_id}"
-            interview = guild.get_channel(saved_channel_id) if saved_channel_id else None
-            if interview is None and saved_channel_id:
+            if interview_run_id:
+                marker = f"{marker}:{interview_run_id}"
+            interview = (
+                guild.get_channel(saved_channel_id)
+                if saved_channel_id and not repeat_interview
+                else None
+            )
+            if interview is None and saved_channel_id and not repeat_interview:
                 try:
                     interview = await self.bot.fetch_channel(saved_channel_id)
                 except discord.NotFound:
@@ -410,7 +418,15 @@ class DiscordOutbox:
                 await self.bot.db.execute(
                     "INSERT INTO tickets(guild_id,channel_id,creator_id,created_ts,last_user_activity_ts,status,ticket_id,status_tag,correlation_id) "
                     "VALUES(?,?,?,?,?,'open',?,'waiting_staff',?)",
-                    (int(row["guild_id"] or 0), int(interview.id), applicant_id, now, now, ticket_id, f"staff-application:{application_id}"),
+                    (
+                        int(row["guild_id"] or 0),
+                        int(interview.id),
+                        applicant_id,
+                        now,
+                        now,
+                        ticket_id,
+                        interview_run_id or f"staff-application:{application_id}",
+                    ),
                 )
                 opening_message_id = 0
             else:
@@ -419,7 +435,9 @@ class DiscordOutbox:
                 opening = await interview.send(
                     content=f"Welcome {member.mention}. This private channel is your GD Avenue {application_label} interview for application **#{application_id}**.\nStatus: **Waiting for staff**",
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
-                    nonce=hashlib.sha256(f"application:{application_id}:interview-opening".encode()).hexdigest()[:24],
+                    nonce=hashlib.sha256(
+                        f"application:{application_id}:{interview_run_id or 'initial'}:interview-opening".encode()
+                    ).hexdigest()[:24],
                     enforce_nonce=True,
                 )
                 await self.bot.db.execute(
@@ -434,9 +452,18 @@ class DiscordOutbox:
                 "send_dm",
                 guild_id=int(row["guild_id"] or 0),
                 user_id=applicant_id,
-                payload={"content": f"Your GD Avenue {application_label} is moving to an interview: {interview.mention}"},
-                correlation_id=f"staff-application:{application_id}",
-                idempotency_key=f"staff-application:{application_id}:interview-dm",
+                payload={
+                    "content": (
+                        f"Your GD Avenue {application_label} is moving to "
+                        f"{'another ' if repeat_interview else 'an '}interview: {interview.mention}"
+                    )
+                },
+                correlation_id=interview_run_id or f"staff-application:{application_id}",
+                idempotency_key=(
+                    f"{interview_run_id}:interview-dm"
+                    if interview_run_id
+                    else f"staff-application:{application_id}:interview-dm"
+                ),
             )
             help_cog = self.bot.get_cog("HelpCog")
             if help_cog is not None and hasattr(help_cog, "_active_ticket_channels"):

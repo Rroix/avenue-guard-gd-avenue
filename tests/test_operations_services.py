@@ -396,11 +396,10 @@ async def test_interview_delivery_creates_ticket_and_durable_dm(tmp_path, monkey
         mention = "<@99>"
 
     class Interview:
-        id = 789
-        mention = "<#789>"
-        topic = f"avenue-application-interview:{application_id}"
-
-        def __init__(self):
+        def __init__(self, channel_id, topic):
+            self.id = channel_id
+            self.mention = f"<#{channel_id}>"
+            self.topic = topic
             self.messages = []
 
         async def send(self, **kwargs):
@@ -437,8 +436,8 @@ async def test_interview_delivery_creates_ticket_and_durable_dm(tmp_path, monkey
         def get_role(self, _role_id):
             return None
 
-        async def create_text_channel(self, **_kwargs):
-            interview = Interview()
+        async def create_text_channel(self, **kwargs):
+            interview = Interview(789 + len(self.channels), kwargs.get("topic", ""))
             self.channels.append(interview)
             return interview
 
@@ -494,6 +493,30 @@ async def test_interview_delivery_creates_ticket_and_durable_dm(tmp_path, monkey
     assert ticket["status_tag"] == "waiting_staff"
     assert int(application["interview_ticket_channel_id"]) == 789
     assert "<#789>" in user.messages[0]["content"]
+
+    await outbox.enqueue(
+        "create_interview_ticket",
+        guild_id=1,
+        user_id=99,
+        payload={
+            "application_id": application_id,
+            "interview_run_id": "application-repeat-test",
+            "repeat_interview": True,
+        },
+        correlation_id="application-repeat-test",
+        idempotency_key="application-repeat-test:interview-ticket",
+    )
+    assert await outbox.process_once() == {"delivered": 1, "retried": 0, "dead": 0}
+    assert await outbox.process_once() == {"delivered": 1, "retried": 0, "dead": 0}
+    repeated = await database.fetchone("SELECT * FROM tickets WHERE channel_id=790")
+    application = await database.fetchone(
+        "SELECT interview_ticket_channel_id FROM staff_applications WHERE id=?",
+        (application_id,),
+    )
+    assert repeated["status_tag"] == "waiting_staff"
+    assert int(application["interview_ticket_channel_id"]) == 790
+    assert guild.channels[1].topic.endswith(":application-repeat-test")
+    assert "another interview" in user.messages[1]["content"]
     await database.close()
 
 

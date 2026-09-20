@@ -1286,6 +1286,128 @@ async def test_mod_application_scope_and_acceptance_never_grant_reviewer_role(po
 
 
 @pytest.mark.asyncio
+async def test_application_actions_follow_status_and_staff_dm_preserves_state(portal):
+    service, _guild = portal
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,"
+        "answers_json,created_ts,updated_ts,submitted_ts) "
+        "VALUES(?,?,'judge','accepted','{}',100,100,100)",
+        (GUILD_ID, 999),
+    )
+
+    listing = await service.applications(principal(HEAD_ID, "head_reviewer"), {"status": "all"})
+    application = next(item for item in listing["items"] if int(item["id"]) == application_id)
+    assert application["available_actions"] == ["message"]
+
+    result = await service.application_action(
+        principal(HEAD_ID, "head_reviewer"),
+        application_id,
+        {"action": "message", "message": "Please check your Discord roles."},
+    )
+    assert result["status"] == "accepted"
+    assert result["message_delivery"] == "pending"
+    row = await service.db.fetchone(
+        "SELECT status FROM staff_applications WHERE id=?", (application_id,)
+    )
+    assert row["status"] == "accepted"
+    kind, call = service.bot.outbox.calls[-1]
+    assert kind == "send_dm"
+    assert call["user_id"] == 999
+    assert "Please check your Discord roles." in call["payload"]["content"]
+
+    event = await service.db.fetchone(
+        "SELECT event,from_status,to_status,detail_json FROM staff_application_events "
+        "WHERE application_id=? ORDER BY id DESC LIMIT 1",
+        (application_id,),
+    )
+    assert (event["event"], event["from_status"], event["to_status"]) == (
+        "message",
+        "accepted",
+        "accepted",
+    )
+    assert json.loads(event["detail_json"])["message"] == "Please check your Discord roles."
+
+    with pytest.raises(PortalError) as caught:
+        await service.application_action(
+            principal(HEAD_ID, "head_reviewer"),
+            application_id,
+            {"action": "reject", "reason": "Too late", "confirmed": True},
+        )
+    assert caught.value.status == 409
+    assert caught.value.code == "application_action_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_repeat_interview_queues_a_distinct_interview_run(portal):
+    service, _guild = portal
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,"
+        "answers_json,created_ts,updated_ts,submitted_ts,interview_ticket_channel_id) "
+        "VALUES(?,?,'judge','interview','{}',100,100,100,777)",
+        (GUILD_ID, 999),
+    )
+
+    for attempt in range(2):
+        if attempt:
+            await service.db.execute(
+                "UPDATE staff_applications SET status='hold' WHERE id=?",
+                (application_id,),
+            )
+        result = await service.application_action(
+            principal(HEAD_ID, "head_reviewer"),
+            application_id,
+            {"action": "interview", "confirmed": True},
+        )
+        assert result["status"] == "interview"
+
+    calls = [call for kind, call in service.bot.outbox.calls if kind == "create_interview_ticket"]
+    assert len(calls) == 2
+    assert all(call["payload"]["repeat_interview"] is True for call in calls)
+    assert all(call["payload"]["interview_run_id"] for call in calls)
+    assert calls[0]["idempotency_key"] != calls[1]["idempotency_key"]
+    assert all(
+        call["idempotency_key"].endswith(":interview-ticket") for call in calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_interview_delivery_cannot_spawn_a_duplicate(portal):
+    service, _guild = portal
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,"
+        "answers_json,created_ts,updated_ts,submitted_ts) "
+        "VALUES(?,?,'judge','interview','{}',100,100,100)",
+        (GUILD_ID, 999),
+    )
+    outbox_id = await service.db.execute_insert(
+        "INSERT INTO discord_outbox(correlation_id,idempotency_key,action_type,guild_id,"
+        "channel_id,user_id,message_id,payload_json,status,attempts,next_attempt_ts,created_ts,updated_ts) "
+        "VALUES('pending-interview','pending-interview:key','create_interview_ticket',?,"
+        "0,999,0,'{}','pending',0,100,100,100)",
+        (GUILD_ID,),
+    )
+    await service.db.execute(
+        "UPDATE staff_applications SET interview_ticket_outbox_id=? WHERE id=?",
+        (outbox_id, application_id),
+    )
+
+    listing = await service.applications(principal(HEAD_ID, "head_reviewer"), {})
+    application = next(item for item in listing["items"] if int(item["id"]) == application_id)
+    assert application["interview_delivery_status"] == "pending"
+    assert "interview" not in application["available_actions"]
+    assert "message" in application["available_actions"]
+
+    with pytest.raises(PortalError) as caught:
+        await service.application_action(
+            principal(HEAD_ID, "head_reviewer"),
+            application_id,
+            {"action": "interview", "confirmed": True},
+        )
+    assert caught.value.status == 409
+    assert caught.value.code == "interview_delivery_pending"
+
+
+@pytest.mark.asyncio
 async def test_application_delivery_reconciliation_revives_dead_outbox(portal):
     service, _guild = portal
     now = 100

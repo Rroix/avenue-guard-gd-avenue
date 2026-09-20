@@ -112,7 +112,7 @@ Application delivery is restart-safe. A submitted application keeps its outbox i
 
 A Dev can use `DELETE /api/apply/mine` with the exact confirmation value `DELETE` to remove their own stale application data. The operation atomically removes application rows, child events and notes, retires pending application deliveries, and clears application idempotency cache entries. Existing Discord threads or interview channels are preserved for audit safety and reported in the response rather than silently deleted. If a deleted submission was still within its normal five-day cooldown, Avenue Guard retains only a minimal per-type cooldown receipt and replaces the remaining delay with 24 hours from deletion; deleting application content can therefore never remove the cooldown entirely.
 
-The interview decision persists before side effects. Its outbox action creates or reuses a private ticket, records it in the normal `tickets` table, posts the opening status, and enqueues a separate durable applicant DM. Accept-without-interview uses the existing role outbox; rejection also uses a durable DM. Retries use stable keys and stored Discord IDs to avoid creating duplicate threads, tickets, or notifications.
+The interview decision persists before side effects. Its outbox action creates or reuses a private ticket, records it in the normal `tickets` table, posts the opening status, and enqueues a separate durable applicant DM. If an application is already in the interview state, **Do another interview** creates a distinct, restart-safe interview run with its own marker and delivery keys. Accept-without-interview uses the existing role outbox; rejection also uses a durable DM. Staff can send an audited private message to the applicant at every visible application stage without changing the application status. Retries use stable per-run keys and stored Discord IDs to avoid creating duplicate threads, tickets, or notifications.
 
 The `hidden` queue state is Dev-only and reversible. Normal queue reads, counts, public caches, priority statistics, and maintenance workflows exclude hidden rows. The previous queue state is retained in `hidden_from_state` and restored explicitly, with both actions recorded in `workflow_events`.
 
@@ -251,6 +251,8 @@ If the bot is unavailable, Netlify returns a concise 503 and does not fall back 
 - Save and submit an application; retry the request and verify only one active application exists for that type.
 - Verify the application keeps the same weighted review prompt across refreshes and that its Discord review thread contains every configured question, answer, and showcase link.
 - Proceed with interview and verify one private ticket, one opening status, one ticket database row, and one applicant DM.
+- From the interview state, choose **Do another interview** and verify a second ticket and DM are created without reusing the first run.
+- Send a staff DM from an active and a completed application; verify delivery is queued and neither application status changes.
 - Accept a test application and confirm `accepted_pending_role` changes only after the outbox delivers the Reviewer role.
 - Add a test team member by Discord ID, verify the profile appears before first web sign-in, then remove it and verify managed roles are removed.
 - Hide a test level and verify it disappears from public and normal internal data, then restore it to its previous state.
