@@ -63,57 +63,116 @@
     "session_ttl_hours": 8,
     "claim_stale_hours": 48,
     "application_types": [
-      "judge"
+      "judge",
+      "mod"
     ],
+    "application_cooldown_days": 5,
     "application_review_channel_id": "1461483580197703832",
-    "application_questions": [
-      {
-        "key": "age",
-        "label": "How old are you?",
-        "type": "single_choice",
-        "required": true,
-        "options": ["12 or under", "13 to 15", "16 to 18", "19 or above"]
+    "mod_role_ids": [],
+    "application_forms": {
+      "judge": {
+        "label": "Reviewer application",
+        "description": "Apply to review Geometry Dash levels and recommend suitable rating tiers.",
+        "questions": [
+          {
+            "key": "age",
+            "label": "How old are you?",
+            "type": "single_choice",
+            "required": true,
+            "options": ["12 or under", "13 to 15", "16 to 18", "19 or above"]
+          },
+          {
+            "key": "motivation",
+            "label": "Why do you want to be a reviewer?",
+            "type": "long_text",
+            "required": true
+          },
+          {
+            "key": "experience",
+            "label": "Tell us a bit about your experience reviewing levels across different servers",
+            "type": "long_text",
+            "required": true
+          },
+          {
+            "key": "improvements",
+            "label": "What do you think GD Avenue can improve on? It doesn't have to be a big change, just something you think might enhance the server experience",
+            "type": "long_text",
+            "required": true
+          },
+          {
+            "key": "weekly_capacity",
+            "label": "How many levels can you review per week? This will create an expectation, so please be honest",
+            "type": "single_choice",
+            "required": true,
+            "options": ["1-2", "3-6", "7-9", "10 or more"]
+          },
+          {
+            "key": "timezone",
+            "label": "What is your timezone?",
+            "type": "short_text",
+            "required": true,
+            "help_url": "https://www.checkmytimezone.com/"
+          },
+          {
+            "key": "level_review",
+            "label": "Review this level",
+            "type": "long_text",
+            "required": true,
+            "uses_review_prompt": true
+          }
+        ]
       },
-      {
-        "key": "motivation",
-        "label": "Why do you want to be a judge?",
-        "type": "long_text",
-        "required": true
-      },
-      {
-        "key": "experience",
-        "label": "Tell us a bit about your experience reviewing levels across different servers",
-        "type": "long_text",
-        "required": true
-      },
-      {
-        "key": "improvements",
-        "label": "What do you think GD Avenue can improve on? It doesn't have to be a big change, just something you think might enhance the server experience",
-        "type": "long_text",
-        "required": true
-      },
-      {
-        "key": "weekly_capacity",
-        "label": "How many levels can you review per week? This will create an expectation, so please be honest",
-        "type": "single_choice",
-        "required": true,
-        "options": ["1-2", "3-6", "7-9", "10 or more"]
-      },
-      {
-        "key": "timezone",
-        "label": "What is your timezone?",
-        "type": "short_text",
-        "required": true,
-        "help_url": "https://www.checkmytimezone.com/"
-      },
-      {
-        "key": "level_review",
-        "label": "Review this level",
-        "type": "long_text",
-        "required": true,
-        "uses_review_prompt": true
+      "mod": {
+        "label": "Mod application",
+        "description": "Apply to help moderate GD Avenue and support a safe, welcoming community.",
+        "questions": [
+          {
+            "key": "age",
+            "label": "How old are you?",
+            "type": "single_choice",
+            "required": true,
+            "options": ["12 or under", "13 to 15", "16 to 18", "19 or above"]
+          },
+          {
+            "key": "motivation",
+            "label": "Why do you want to be a mod?",
+            "type": "long_text",
+            "required": true
+          },
+          {
+            "key": "experience",
+            "label": "Tell us a bit about your experience moderating servers",
+            "type": "long_text",
+            "required": true
+          },
+          {
+            "key": "improvements",
+            "label": "What do you think GD Avenue can improve on? It doesn't have to be a big change, just something you think might enhance the server experience",
+            "type": "long_text",
+            "required": true
+          },
+          {
+            "key": "availability",
+            "label": "How much time can you dedicate to moderating the server?",
+            "type": "long_text",
+            "required": true
+          },
+          {
+            "key": "timezone",
+            "label": "What is your timezone?",
+            "type": "short_text",
+            "required": true,
+            "help_url": "https://www.checkmytimezone.com/"
+          },
+          {
+            "key": "moderation_scenario",
+            "label": "Imagine that a suspicious member starts harassing other members and breaking several server rules. What would you do in this situation?",
+            "type": "long_text",
+            "required": true
+          }
+        ]
       }
-    ],
+    },
     "application_review_levels": [
       {
         "key": "synergy-101935961",

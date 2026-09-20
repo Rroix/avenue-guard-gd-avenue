@@ -45,6 +45,7 @@ Discord roles are mapped in `config.json` under `staff_portal`.
 | Applicant | Save, submit, track, and withdraw their own application |
 | Reviewer | Portal access, queue view, own claim/release, outreach attempts/submissions/follow-ups, own tasks, private/team notes |
 | Head Reviewer | Reviewer capabilities plus reassignment, stale release, queue state operations, team tasks, review QA, tier adjustment before submission, Reviewer applications |
+| Admin | Head Reviewer capabilities plus Mod applications and standard administration |
 | Admin | Normal request, PPS, tracking, forum, support, staff, and operations management; summarized incidents |
 | Owner | Admin capabilities plus higher staff access, overrides, backups, restore drills, releases, full audit, and safe configuration |
 | Dev | Owner capabilities plus sanitized runtime, schema, outbox, worker, provider, incident, and recovery diagnostics |
@@ -103,7 +104,9 @@ Application acceptance persists `accepted_pending_role` before requesting the Di
 
 Private session responses include a versioned API contract and explicit feature keys. The website gates newer controls against those keys, so deploying the website before its matching Avenue Guard release leaves the affected Dev controls visibly disabled instead of calling a backend route that does not exist.
 
-Application forms are configured through `staff_portal.application_questions`. They support short text, long text, and single-choice questions. A question marked `uses_review_prompt` receives one weighted entry from `staff_portal.application_review_levels`; the chosen key is persisted with the draft so refreshes cannot reroll it. On submission, Avenue Guard validates the configured choices and required fields server-side, then the outbox creates one review discussion in `application_review_channel_id` containing the applicant, Staff Portal link, and a stable snapshot of every question, answer, and selected showcase. Forum channels receive a forum post; normal text channels receive a notification with a public thread attached.
+Application forms are configured by type through `staff_portal.application_forms`. Reviewer (`judge`) and Mod (`mod`) applications share the same typed question engine, server-side validation, durable state machine, Discord review channel, notes, interviews, and decisions. Short text, long text, and single-choice questions are supported. A question marked `uses_review_prompt` receives one weighted entry from `staff_portal.application_review_levels`; the chosen key is persisted with the Reviewer draft so refreshes cannot reroll it. The applicant browser suggests its local IANA timezone only when the saved timezone answer is blank. Avenue Guard enforces one active application and a global five-day cooldown from the latest submission, regardless of application type.
+
+On submission, the outbox creates one review discussion in `application_review_channel_id` containing the application type, applicant, Staff Portal link, and a stable snapshot of every question, answer, and selected showcase. Forum channels receive a forum post; normal text channels receive a notification with a public thread attached. Head Reviewers can review Reviewer applications; Admins can additionally review Mod applications; Owner and Dev capabilities can review every stored type. Mod role delivery is optional through `staff_portal.mod_role_ids`; when it is empty, acceptance is recorded without ever substituting the Reviewer role.
 
 Application delivery is restart-safe. A submitted application keeps its outbox identity and Discord thread identity in Turso. Startup reconciliation revives a dead or missing application delivery, while the outbox reuses an existing stored thread before sending the answer snapshot. Dead-letter logs include the outbox ID, action, channel, target user, attempt count, and terminal error so a configuration or permission problem is diagnosable without database access.
 
@@ -117,7 +120,7 @@ Assigned staff tasks enqueue a private Avenue Guard notification after the task 
 
 ### Application configuration
 
-`application_questions` is ordered exactly as it appears on `/apply`. Supported types are `short_text`, `long_text`, and `single_choice`; choice options are validated on the server, not only in HTML. Set `uses_review_prompt: true` on the level-review question.
+Each `application_forms.<type>.questions` list is ordered exactly as it appears on `/apply`. Supported types are `short_text`, `long_text`, and `single_choice`; choice options are validated on the server, not only in HTML. Set `uses_review_prompt: true` only on a form that needs a randomly selected level-review showcase. `application_types` controls the enabled types, while the public Appeal application remains disabled until its form and workflow are intentionally configured.
 
 Each `application_review_levels` entry has a stable key, display name, Geometry Dash level ID, HTTPS YouTube URL, and positive integer `weight`. Selection probability is relative: weights `1`, `2`, and `7` produce approximately 10%, 20%, and 70% over many new drafts. The selected key is written to the draft once, so saving, refreshing, or submitting cannot reroll the level.
 
@@ -164,6 +167,8 @@ All private endpoints require the service key. Except for OAuth session creation
 | `GET /api/staff/statistics` | Real activity aggregates and median turnaround |
 | `GET/POST /api/staff/qa...` | Head/owner review QA |
 | `GET/POST /api/staff/applications...` | Application management and decisions |
+| `GET /api/apply/options` | Enabled application types, active application, and cooldown state |
+| `GET /api/apply/form/<type>` | Server-defined typed application form and resumable draft |
 | `GET/POST /api/staff/staff...` | Capability-gated staff access, Dev profile creation/removal, and nickname management |
 | `GET /api/staff/operations` | Structured runtime, database, worker, provider, outbox, and incident summaries |
 | `GET /api/staff/operations/incidents/{fingerprint}` | Sanitized full trace for Owner/Dev |

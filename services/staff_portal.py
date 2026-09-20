@@ -37,12 +37,14 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 2
+PORTAL_API_VERSION = 3
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
     "application_review_embeds",
     "application_review_threads",
+    "application_cooldown",
+    "multi_type_applications",
     "hidden_queue_entries",
     "staff_manual_management",
     "task_assignment_dm",
@@ -2357,12 +2359,28 @@ class StaffPortalService:
         return {"ok": True, "status": status}
 
     async def _handle_apply(self, method, path, principal, payload):
+        if path == "/api/apply/options" and method == "GET":
+            return 200, await self.application_options(principal)
         if path == "/api/apply/form" and method == "GET":
             return 200, await self.application_form(principal)
+        form_match = re.fullmatch(r"/api/apply/form/([a-z][a-z0-9_]{1,39})", path)
+        if form_match and method == "GET":
+            return 200, await self.application_form(principal, form_match.group(1))
         if path == "/api/apply/mine" and method == "GET":
             await self._reconcile_application_roles()
             rows = await self.db.fetchall("SELECT id,application_type,status,answers_json,created_ts,updated_ts,submitted_ts,decided_ts,decision_reason FROM staff_applications WHERE guild_id=? AND applicant_id=? ORDER BY updated_ts DESC LIMIT 20", (principal.guild_id, principal.user_id))
-            return 200, {"items": [{**_row_dict(row), "answers": _json_object(row["answers_json"])} for row in rows]}
+            return 200, {
+                "items": [
+                    {
+                        **_row_dict(row),
+                        "application_label": self._application_label(
+                            str(row["application_type"])
+                        ),
+                        "answers": _json_object(row["answers_json"]),
+                    }
+                    for row in rows
+                ]
+            }
         if path == "/api/apply/mine" and method == "DELETE":
             return 200, await self.reset_own_application_data(principal, payload)
         if path == "/api/apply/save" and method == "POST":
@@ -2496,8 +2514,132 @@ class StaffPortalService:
             "external_records_preserved": external_records,
         }
 
-    def _application_questions(self, review_prompt: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        raw_questions = self.bot.config.get("staff_portal", "application_questions", default=[])
+    def _configured_application_types(self) -> list[str]:
+        configured = self.bot.config.get(
+            "staff_portal", "application_types", default=["judge"]
+        )
+        if not isinstance(configured, list):
+            return ["judge"]
+        return list(
+            dict.fromkeys(
+                str(value).strip().casefold()
+                for value in configured
+                if str(value).strip()
+            )
+        )
+
+    def _application_form_config(self, application_type: str) -> dict[str, Any]:
+        application_type = str(application_type or "judge").strip().casefold()
+        forms = self.bot.config.get("staff_portal", "application_forms", default={})
+        if isinstance(forms, dict) and isinstance(forms.get(application_type), dict):
+            return dict(forms[application_type])
+        if application_type == "judge":
+            return {
+                "label": "Reviewer application",
+                "description": "Apply to join the GD Avenue review team.",
+                "questions": self.bot.config.get(
+                    "staff_portal", "application_questions", default=[]
+                ),
+            }
+        return {}
+
+    def _application_label(self, application_type: str) -> str:
+        configured = self._application_form_config(application_type)
+        label = str(configured.get("label") or "").strip()
+        if label:
+            return label
+        return f"{str(application_type or 'staff').replace('_', ' ').title()} application"
+
+    def _application_role_ids(self, application_type: str) -> list[int]:
+        key = "judge_role_ids" if application_type == "judge" else f"{application_type}_role_ids"
+        return self.bot.config.get_int_list("staff_portal", key)
+
+    @staticmethod
+    def _can_review_application_type(principal: StaffPrincipal, application_type: str) -> bool:
+        if principal.can("applications.review_all"):
+            return True
+        if application_type == "judge":
+            return principal.can("applications.review_judge")
+        if application_type == "mod":
+            return principal.can("applications.review_standard")
+        return False
+
+    def _application_cooldown_days(self) -> int:
+        return max(
+            1,
+            min(
+                365,
+                self.bot.config.get_int(
+                    "staff_portal", "application_cooldown_days", default=5
+                ),
+            ),
+        )
+
+    async def _application_cooldown(self, principal: StaffPrincipal) -> dict[str, Any]:
+        latest = await self.db.fetchone(
+            "SELECT id,application_type,status,submitted_ts FROM staff_applications "
+            "WHERE guild_id=? AND applicant_id=? AND submitted_ts IS NOT NULL "
+            "ORDER BY submitted_ts DESC,id DESC LIMIT 1",
+            (principal.guild_id, principal.user_id),
+        )
+        days = self._application_cooldown_days()
+        now = int(time.time())
+        submitted_ts = int(latest["submitted_ts"] or 0) if latest else 0
+        until_ts = submitted_ts + days * 86400 if submitted_ts else 0
+        return {
+            "days": days,
+            "active": bool(until_ts > now),
+            "until_ts": until_ts or None,
+            "remaining_seconds": max(0, until_ts - now),
+            "source_application_id": int(latest["id"]) if latest else None,
+        }
+
+    async def application_options(self, principal: StaffPrincipal) -> dict[str, Any]:
+        configured_types = self._configured_application_types()
+        forms = []
+        for application_type in configured_types:
+            config = self._application_form_config(application_type)
+            if not config:
+                continue
+            forms.append(
+                {
+                    "application_type": application_type,
+                    "label": self._application_label(application_type),
+                    "description": str(config.get("description") or "").strip()[:500],
+                    "enabled": True,
+                }
+            )
+        if "appeal" not in configured_types:
+            forms.append(
+                {
+                    "application_type": "appeal",
+                    "label": "Appeal application",
+                    "description": "This application will be added in a future update.",
+                    "enabled": False,
+                }
+            )
+        active = await self.db.fetchone(
+            "SELECT id,application_type,status FROM staff_applications "
+            "WHERE guild_id=? AND applicant_id=? AND status IN"
+            "('draft','submitted','under_review','interview','hold','accepted_pending_role') "
+            "ORDER BY updated_ts DESC,id DESC LIMIT 1",
+            (principal.guild_id, principal.user_id),
+        )
+        configuration = (await self.safe_configuration())["configuration"]
+        return {
+            "items": forms,
+            "applications_open": bool(configuration["applications_open"]),
+            "cooldown": await self._application_cooldown(principal),
+            "active_application": _row_dict(active) if active else None,
+        }
+
+    def _application_questions(
+        self,
+        review_prompt: dict[str, Any] | None = None,
+        application_type: str = "judge",
+    ) -> list[dict[str, Any]]:
+        form_config = self._application_form_config(application_type)
+        raw_questions = form_config.get("questions", [])
         questions: list[dict[str, Any]] = []
         for raw in raw_questions if isinstance(raw_questions, list) else []:
             if not isinstance(raw, dict):
@@ -2570,26 +2712,72 @@ class StaffPortalService:
             pick -= level["weight"]
         return levels[-1]
 
-    async def application_form(self, principal) -> dict[str, Any]:
+    async def application_form(
+        self, principal: StaffPrincipal, application_type: str = "judge"
+    ) -> dict[str, Any]:
+        application_type = str(application_type or "judge").strip().casefold()
+        if (
+            application_type not in self._configured_application_types()
+            or not self._application_form_config(application_type)
+        ):
+            raise PortalError(404, "application_closed", "That application is not available")
         async with self._application_lock:
             row = await self.db.fetchone(
-                "SELECT * FROM staff_applications WHERE guild_id=? AND applicant_id=? AND application_type='judge' "
+                "SELECT * FROM staff_applications WHERE guild_id=? AND applicant_id=? AND application_type=? "
                 "AND status IN('draft','submitted','under_review','interview','hold','accepted_pending_role') "
                 "ORDER BY id DESC LIMIT 1",
-                (principal.guild_id, principal.user_id),
+                (principal.guild_id, principal.user_id, application_type),
             )
             if row is None:
-                prompt = self._choose_application_review_prompt()
+                other_active = await self.db.fetchone(
+                    "SELECT id,application_type,status FROM staff_applications "
+                    "WHERE guild_id=? AND applicant_id=? AND status IN"
+                    "('draft','submitted','under_review','interview','hold','accepted_pending_role') "
+                    "ORDER BY updated_ts DESC,id DESC LIMIT 1",
+                    (principal.guild_id, principal.user_id),
+                )
+                if other_active is not None:
+                    raise PortalError(
+                        409,
+                        "application_active",
+                        "Finish or remove your current application before starting another",
+                    )
+                cooldown = await self._application_cooldown(principal)
+                if cooldown["active"]:
+                    raise PortalError(
+                        429,
+                        "application_cooldown",
+                        f"You can submit one staff application every {cooldown['days']} days",
+                    )
+                uses_review_prompt = any(
+                    bool(question.get("uses_review_prompt"))
+                    for question in self._application_questions(
+                        application_type=application_type
+                    )
+                )
+                prompt = self._choose_application_review_prompt() if uses_review_prompt else None
                 now = int(time.time())
                 application_id = await self.db.execute_insert(
                     "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,answers_json,created_ts,updated_ts,review_prompt_key) "
-                    "VALUES(?,?,'judge','draft','{}',?,?,?)",
-                    (principal.guild_id, principal.user_id, now, now, prompt["key"] if prompt else None),
+                    "VALUES(?,?,?,'draft','{}',?,?,?)",
+                    (
+                        principal.guild_id,
+                        principal.user_id,
+                        application_type,
+                        now,
+                        now,
+                        prompt["key"] if prompt else None,
+                    ),
                 )
                 row = await self.db.fetchone("SELECT * FROM staff_applications WHERE id=?", (application_id,))
             prompt_key = str(row["review_prompt_key"] or "")
             prompt = next((item for item in self._application_review_levels() if item["key"] == prompt_key), None)
-            if not prompt and any(question.get("uses_review_prompt") for question in self.bot.config.get("staff_portal", "application_questions", default=[])):
+            if not prompt and any(
+                question.get("uses_review_prompt")
+                for question in self._application_questions(
+                    application_type=application_type
+                )
+            ):
                 prompt = self._choose_application_review_prompt()
                 if prompt and str(row["status"]) == "draft":
                     await self.db.execute(
@@ -2604,11 +2792,26 @@ class StaffPortalService:
                     **_row_dict(row),
                     "answers": _json_object(row["answers_json"]),
                 },
-                "questions": self._application_questions(prompt),
+                "form": {
+                    "application_type": application_type,
+                    "label": self._application_label(application_type),
+                    "description": str(
+                        self._application_form_config(application_type).get("description")
+                        or ""
+                    )[:500],
+                },
+                "questions": self._application_questions(prompt, application_type),
             }
 
-    def _validate_application_answers(self, answers: dict[str, Any], prompt: dict[str, Any] | None, *, submit: bool) -> dict[str, str]:
-        questions = self._application_questions(prompt)
+    def _validate_application_answers(
+        self,
+        answers: dict[str, Any],
+        prompt: dict[str, Any] | None,
+        application_type: str,
+        *,
+        submit: bool,
+    ) -> dict[str, str]:
+        questions = self._application_questions(prompt, application_type)
         if not questions:
             raise PortalError(503, "application_form_missing", "The application form is not configured")
         safe: dict[str, str] = {}
@@ -2646,6 +2849,7 @@ class StaffPortalService:
         return "https://gdavenue.netlify.app/staff/#team/applications"
 
     def _application_thread_payload(self, row) -> dict[str, Any]:
+        application_type = str(row["application_type"] or "judge")
         prompt_key = str(row["review_prompt_key"] or "")
         prompt = next(
             (
@@ -2657,7 +2861,7 @@ class StaffPortalService:
         )
         answers = _json_object(row["answers_json"])
         responses = []
-        for question in self._application_questions(prompt):
+        for question in self._application_questions(prompt, application_type):
             label = question["label"]
             if question["uses_review_prompt"] and prompt:
                 label = f"{label} - {prompt['youtube_url']}"
@@ -2666,7 +2870,8 @@ class StaffPortalService:
             )
         return {
             "application_id": int(row["id"]),
-            "application_type": str(row["application_type"]),
+            "application_type": application_type,
+            "application_label": self._application_label(application_type),
             "submitted_ts": int(row["submitted_ts"] or row["updated_ts"] or 0),
             "responses": responses,
             "review_prompt": prompt,
@@ -2753,7 +2958,7 @@ class StaffPortalService:
             except Exception as exc:  # noqa: BLE001 - another startup may retry it.
                 await log_error(
                     self.bot,
-                    "Reviewer application delivery reconciliation deferred "
+                    "Staff application delivery reconciliation deferred "
                     f"application_id={application_id}: {exc!r}",
                 )
         return repaired
@@ -2763,8 +2968,10 @@ class StaffPortalService:
         if submit and not configuration["applications_open"]:
             raise PortalError(409, "applications_closed", "Applications are currently closed")
         app_type = str(payload.get("application_type") or "judge").casefold()
-        allowed = self.bot.config.get("staff_portal", "application_types", default=["judge"])
-        if app_type not in allowed:
+        if (
+            app_type not in self._configured_application_types()
+            or not self._application_form_config(app_type)
+        ):
             raise PortalError(400, "application_closed", "That application is not available")
         answers = payload.get("answers")
         if not isinstance(answers, dict):
@@ -2775,12 +2982,18 @@ class StaffPortalService:
             active = None
             if row is None:
                 active = await self.db.fetchone(
-                    "SELECT * FROM staff_applications WHERE guild_id=? AND applicant_id=? AND application_type=? "
+                    "SELECT * FROM staff_applications WHERE guild_id=? AND applicant_id=? "
                     "AND status IN('submitted','under_review','interview','hold','accepted_pending_role') "
                     "ORDER BY id DESC LIMIT 1",
-                    (principal.guild_id, principal.user_id, app_type),
+                    (principal.guild_id, principal.user_id),
                 )
             if active is not None:
+                if str(active["application_type"]) != app_type:
+                    raise PortalError(
+                        409,
+                        "application_active",
+                        "Finish your current application before starting another",
+                    )
                 if submit:
                     application_id = int(active["id"])
                     result = {"application": _row_dict(active)}
@@ -2792,12 +3005,27 @@ class StaffPortalService:
             if active_retry:
                 pass
             else:
+                cooldown = await self._application_cooldown(principal)
+                if cooldown["active"]:
+                    raise PortalError(
+                        429,
+                        "application_cooldown",
+                        f"You can submit one staff application every {cooldown['days']} days",
+                    )
                 prompt_key = str(row["review_prompt_key"] or "") if row else ""
                 prompt = next((item for item in self._application_review_levels() if item["key"] == prompt_key), None)
                 if row is None:
-                    prompt = self._choose_application_review_prompt()
+                    uses_review_prompt = any(
+                        question.get("uses_review_prompt")
+                        for question in self._application_questions(
+                            application_type=app_type
+                        )
+                    )
+                    prompt = self._choose_application_review_prompt() if uses_review_prompt else None
                     prompt_key = prompt["key"] if prompt else ""
-                safe_answers = self._validate_application_answers(answers, prompt, submit=submit)
+                safe_answers = self._validate_application_answers(
+                    answers, prompt, app_type, submit=submit
+                )
                 target_status = "submitted" if submit else "draft"
                 if row:
                     application_id = int(row["id"])
@@ -2818,12 +3046,21 @@ class StaffPortalService:
 
     async def _reconcile_application_roles(self):
         pending = await self.db.fetchall(
-            "SELECT id,guild_id,applicant_id,role_outbox_id FROM staff_applications "
+            "SELECT id,guild_id,applicant_id,application_type,role_outbox_id FROM staff_applications "
             "WHERE status='accepted_pending_role' LIMIT 50"
         )
-        judge_roles = self.bot.config.get_int_list("staff_portal", "judge_role_ids")
         for row in pending:
-            if row["role_outbox_id"] is not None or not judge_roles:
+            application_type = str(row["application_type"] or "judge")
+            role_ids = self._application_role_ids(application_type)
+            if row["role_outbox_id"] is not None:
+                continue
+            if not role_ids:
+                if application_type != "judge":
+                    await self.db.execute(
+                        "UPDATE staff_applications SET status='accepted',updated_ts=? "
+                        "WHERE id=? AND status='accepted_pending_role'",
+                        (int(time.time()), int(row["id"])),
+                    )
                 continue
             try:
                 outbox_id = await self.bot.outbox.enqueue(
@@ -2831,11 +3068,11 @@ class StaffPortalService:
                     guild_id=int(row["guild_id"]),
                     user_id=int(row["applicant_id"]),
                     payload={
-                        "role_id": judge_roles[0],
-                        "reason": f"Reviewer application #{int(row['id'])} accepted",
+                        "role_id": role_ids[0],
+                        "reason": f"{self._application_label(application_type)} #{int(row['id'])} accepted",
                     },
                     correlation_id=f"staff-application:{int(row['id'])}",
-                    idempotency_key=f"staff-application:{int(row['id'])}:judge-role",
+                    idempotency_key=f"staff-application:{int(row['id'])}:{application_type}-role",
                 )
                 await self.db.execute(
                     "UPDATE staff_applications SET role_outbox_id=?,updated_ts=? "
@@ -2845,7 +3082,7 @@ class StaffPortalService:
             except Exception as exc:  # noqa: BLE001 - keep the durable pending state retryable.
                 await log_error(
                     self.bot,
-                    f"Reviewer application role outbox reconciliation deferred application_id={int(row['id'])}: {exc!r}",
+                    f"Staff application role outbox reconciliation deferred application_id={int(row['id'])}: {exc!r}",
                 )
         rows = await self.db.fetchall("SELECT a.id,a.role_outbox_id,o.status FROM staff_applications a JOIN discord_outbox o ON o.id=a.role_outbox_id WHERE a.status='accepted_pending_role' LIMIT 50")
         for row in rows:
@@ -2854,17 +3091,71 @@ class StaffPortalService:
 
     async def applications(self, principal, query):
         await self._reconcile_application_roles()
-        type_filter = "" if principal.can("applications.review_all") else " AND application_type='judge'"
+        configured_types = self._configured_application_types()
+        allowed_types = [
+            application_type
+            for application_type in configured_types
+            if self._can_review_application_type(principal, application_type)
+        ]
+        review_all = principal.can("applications.review_all")
+        visible_types = configured_types if review_all else allowed_types
+        if not allowed_types and not review_all:
+            raise PortalError(403, "application_scope_denied", "You cannot review staff applications")
+
+        requested_type = str(query.get("type") or "all").strip().casefold()
+        if requested_type != "all" and not self._can_review_application_type(
+            principal, requested_type
+        ):
+            raise PortalError(403, "application_scope_denied", "You cannot review that application type")
+        status_filter = str(query.get("status") or "all").strip().casefold()
+        valid_statuses = {
+            "submitted",
+            "under_review",
+            "interview",
+            "hold",
+            "accepted_pending_role",
+            "accepted",
+            "rejected",
+            "withdrawn",
+        }
+        if status_filter not in {"all", "active", *valid_statuses}:
+            raise PortalError(400, "invalid_application_filter", "Choose a valid application status")
+        claim_filter = str(query.get("claim") or "all").strip().casefold()
+        if claim_filter not in {"all", "claimed", "unclaimed", "mine"}:
+            raise PortalError(400, "invalid_application_filter", "Choose a valid claim filter")
+
+        conditions = ["guild_id=?", "status!='draft'"]
+        params: list[Any] = [principal.guild_id]
+        if requested_type != "all":
+            conditions.append("application_type=?")
+            params.append(requested_type)
+        elif not review_all:
+            placeholders = ",".join("?" for _ in allowed_types)
+            conditions.append(f"application_type IN ({placeholders})")
+            params.extend(allowed_types)
+        if status_filter == "active":
+            conditions.append("status IN('submitted','under_review','interview','hold','accepted_pending_role')")
+        elif status_filter != "all":
+            conditions.append("status=?")
+            params.append(status_filter)
+        if claim_filter == "claimed":
+            conditions.append("claimed_by IS NOT NULL")
+        elif claim_filter == "unclaimed":
+            conditions.append("claimed_by IS NULL")
+        elif claim_filter == "mine":
+            conditions.append("claimed_by=?")
+            params.append(principal.user_id)
         rows = await self.db.fetchall(
-            "SELECT * FROM staff_applications WHERE guild_id=? AND status!='draft'"
-            f"{type_filter} "  # nosec B608
+            "SELECT * FROM staff_applications WHERE "
+            + " AND ".join(conditions)  # nosec B608
+            + " "
             "ORDER BY CASE status WHEN 'submitted' THEN 0 WHEN 'under_review' THEN 1 "
             "WHEN 'interview' THEN 2 WHEN 'hold' THEN 3 ELSE 4 END,"
             "COALESCE(submitted_ts,created_ts) LIMIT 200",
-            (principal.guild_id,),
+            params,
         )
         if not rows:
-            return {"items": []}
+            return {"items": [], "application_types": visible_types}
         application_ids = [int(row["id"]) for row in rows]
         placeholders = ",".join("?" for _ in application_ids)
         notes = await self.db.fetchall(
@@ -2885,6 +3176,11 @@ class StaffPortalService:
             for row in rows
             if row["applicant_id"] is not None
         }
+        for row in rows:
+            if row["claimed_by"] is not None:
+                identity_ids.add(int(row["claimed_by"]))
+            if row["decided_by"] is not None:
+                identity_ids.add(int(row["decided_by"]))
         for note in notes:
             identity_ids.add(int(note["author_id"]))
             notes_by_application[int(note["application_id"])].append(_row_dict(note))
@@ -2905,12 +3201,22 @@ class StaffPortalService:
                 {
                     **_row_dict(row),
                     "applicant": identities.get(int(row["applicant_id"])),
+                    "application_label": self._application_label(
+                        str(row["application_type"])
+                    ),
+                    "claimed_by_identity": identities.get(int(row["claimed_by"]))
+                    if row["claimed_by"] is not None
+                    else None,
+                    "decided_by_identity": identities.get(int(row["decided_by"]))
+                    if row["decided_by"] is not None
+                    else None,
                     "answers": _json_object(row["answers_json"]),
                     "internal_notes": notes_by_application[int(row["id"])],
                     "timeline": events_by_application[int(row["id"])],
                 }
                 for row in rows
-            ]
+            ],
+            "application_types": visible_types,
         }
 
     async def application_action(self, principal, application_id, payload):
@@ -2926,8 +3232,10 @@ class StaffPortalService:
             row = await self.db.fetchone("SELECT * FROM staff_applications WHERE id=? AND guild_id=?", (application_id, principal.guild_id))
             if row is None:
                 raise PortalError(404, "application_not_found", "Application not found")
-            if str(row["application_type"]) != "judge" and not principal.can("applications.review_all"):
-                raise PortalError(403, "application_scope_denied", "Only the owner can manage that application type")
+            application_type = str(row["application_type"] or "judge")
+            if not self._can_review_application_type(principal, application_type):
+                raise PortalError(403, "application_scope_denied", "You cannot manage that application type")
+            application_label = self._application_label(application_type)
             old = str(row["status"])
             if old in {"accepted", "rejected", "withdrawn"}:
                 raise PortalError(409, "application_final", "That application already has a final decision")
@@ -2935,11 +3243,13 @@ class StaffPortalService:
                 await self._reconcile_application_roles()
                 return {"ok": True, "status": old, "role_delivery": "pending"}
             now = int(time.time())
-            judge_roles = []
+            role_ids: list[int] = []
             if action == "accept":
-                judge_roles = self.bot.config.get_int_list("staff_portal", "judge_role_ids")
-                if not judge_roles:
+                role_ids = self._application_role_ids(application_type)
+                if application_type == "judge" and not role_ids:
                     raise PortalError(503, "reviewer_role_missing", "The Reviewer role is not configured")
+                if not role_ids:
+                    target = "accepted"
             correlation = new_correlation_id("application")
             await self.db.execute_transaction(
                 [
@@ -2984,32 +3294,33 @@ class StaffPortalService:
             )
             outbox_id = None
             if action == "accept":
-                outbox_id = await self.bot.outbox.enqueue(
-                    "add_role",
-                    guild_id=principal.guild_id,
-                    user_id=int(row["applicant_id"]),
-                    payload={
-                        "role_id": judge_roles[0],
-                        "reason": f"Reviewer application #{application_id} accepted",
-                    },
-                    correlation_id=f"staff-application:{application_id}",
-                    idempotency_key=f"staff-application:{application_id}:judge-role",
-                )
-                await self.db.execute(
-                    "UPDATE staff_applications SET role_outbox_id=?,updated_ts=? "
-                    "WHERE id=? AND status='accepted_pending_role'",
-                    (outbox_id, int(time.time()), application_id),
-                )
+                if role_ids:
+                    outbox_id = await self.bot.outbox.enqueue(
+                        "add_role",
+                        guild_id=principal.guild_id,
+                        user_id=int(row["applicant_id"]),
+                        payload={
+                            "role_id": role_ids[0],
+                            "reason": f"{application_label} #{application_id} accepted",
+                        },
+                        correlation_id=f"staff-application:{application_id}",
+                        idempotency_key=f"staff-application:{application_id}:{application_type}-role",
+                    )
+                    await self.db.execute(
+                        "UPDATE staff_applications SET role_outbox_id=?,updated_ts=? "
+                        "WHERE id=? AND status='accepted_pending_role'",
+                        (outbox_id, int(time.time()), application_id),
+                    )
                 await self.bot.outbox.enqueue(
                     "send_dm",
                     guild_id=principal.guild_id,
                     user_id=int(row["applicant_id"]),
-                    payload={"content": f"Your GD Avenue Reviewer application #{application_id} was accepted. Welcome to the team."},
+                    payload={"content": f"Your GD Avenue {application_label} #{application_id} was accepted. Welcome to the team."},
                     correlation_id=f"staff-application:{application_id}",
                     idempotency_key=f"staff-application:{application_id}:accepted-dm",
                 )
             elif action == "reject":
-                message = f"Your GD Avenue Reviewer application #{application_id} was not accepted."
+                message = f"Your GD Avenue {application_label} #{application_id} was not accepted."
                 if reason:
                     message += f"\n\nReason: {reason}"
                 await self.bot.outbox.enqueue(
@@ -3025,7 +3336,11 @@ class StaffPortalService:
                     "create_interview_ticket",
                     guild_id=principal.guild_id,
                     user_id=int(row["applicant_id"]),
-                    payload={"application_id": application_id},
+                    payload={
+                        "application_id": application_id,
+                        "application_type": application_type,
+                        "application_label": application_label,
+                    },
                     correlation_id=f"staff-application:{application_id}",
                     idempotency_key=f"staff-application:{application_id}:interview-ticket",
                 )
@@ -3036,7 +3351,10 @@ class StaffPortalService:
         return {
             "ok": True,
             "status": target,
-            "role_delivery": "pending" if action == "accept" else None,
+            "role_delivery": (
+                "pending" if action == "accept" and outbox_id else
+                "manual" if action == "accept" else None
+            ),
             "interview_delivery": "pending" if action == "interview" else None,
         }
 
@@ -3045,8 +3363,10 @@ class StaffPortalService:
         exists = await self.db.fetchone("SELECT application_type FROM staff_applications WHERE id=? AND guild_id=?", (application_id, principal.guild_id))
         if exists is None:
             raise PortalError(404, "application_not_found", "Application not found")
-        if str(exists["application_type"]) != "judge" and not principal.can("applications.review_all"):
-            raise PortalError(403, "application_scope_denied", "Only the owner can note that application")
+        if not self._can_review_application_type(
+            principal, str(exists["application_type"] or "judge")
+        ):
+            raise PortalError(403, "application_scope_denied", "You cannot note that application")
         now = int(time.time())
         note_id = await self.db.execute_insert("INSERT INTO staff_application_notes(application_id,author_id,body,created_ts,updated_ts) VALUES(?,?,?,?,?)", (application_id, principal.user_id, body, now, now))
         return {"note": {"id": note_id, "body": body, "author_id": str(principal.user_id), "created_ts": now}}

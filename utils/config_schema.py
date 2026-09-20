@@ -454,14 +454,76 @@ def validate_config(data: Any) -> list[ConfigIssue]:
                     "must be a Discord forum or text channel ID",
                 )
             )
-        questions = staff_portal.get("application_questions", [])
+        application_types = staff_portal.get("application_types", ["judge"])
+        normalized_types = (
+            [str(value).strip().casefold() for value in application_types]
+            if isinstance(application_types, list)
+            else []
+        )
+        if (
+            portal_enabled
+            and (
+                not normalized_types
+                or any(not re.fullmatch(r"[a-z][a-z0-9_]{1,39}", value) for value in normalized_types)
+                or len(set(normalized_types)) != len(normalized_types)
+            )
+        ):
+            issues.append(
+                ConfigIssue(
+                    "staff_portal.application_types",
+                    "must contain unique application type keys",
+                )
+            )
+        cooldown_days = staff_portal.get("application_cooldown_days", 5)
+        if (
+            isinstance(cooldown_days, bool)
+            or not isinstance(cooldown_days, int)
+            or not 1 <= cooldown_days <= 365
+        ):
+            issues.append(
+                ConfigIssue(
+                    "staff_portal.application_cooldown_days",
+                    "must be an integer from 1 to 365",
+                )
+            )
+
+        forms = staff_portal.get("application_forms", {})
+        question_sets: list[tuple[str, object]] = []
+        if isinstance(forms, dict) and forms:
+            for application_type in normalized_types:
+                form_path = f"staff_portal.application_forms.{application_type}"
+                form = forms.get(application_type)
+                if not isinstance(form, dict):
+                    issues.append(ConfigIssue(form_path, "must be an object"))
+                    continue
+                if not str(form.get("label") or "").strip():
+                    issues.append(ConfigIssue(f"{form_path}.label", "must not be empty"))
+                if not str(form.get("description") or "").strip():
+                    issues.append(ConfigIssue(f"{form_path}.description", "must not be empty"))
+                question_sets.append((f"{form_path}.questions", form.get("questions", [])))
+        else:
+            question_sets.append(
+                (
+                    "staff_portal.application_questions",
+                    staff_portal.get("application_questions", []),
+                )
+            )
+
         needs_review_prompt = False
-        if portal_enabled and (not isinstance(questions, list) or not questions):
-            issues.append(ConfigIssue("staff_portal.application_questions", "must contain at least one application question"))
-        elif portal_enabled:
+        for questions_path, questions in question_sets:
+            if portal_enabled and (not isinstance(questions, list) or not questions):
+                issues.append(
+                    ConfigIssue(
+                        questions_path,
+                        "must contain at least one application question",
+                    )
+                )
+                continue
+            if not portal_enabled:
+                continue
             seen_keys: set[str] = set()
             for index, question in enumerate(questions):
-                path = f"staff_portal.application_questions[{index}]"
+                path = f"{questions_path}[{index}]"
                 if not isinstance(question, dict):
                     issues.append(ConfigIssue(path, "must be an object"))
                     continue

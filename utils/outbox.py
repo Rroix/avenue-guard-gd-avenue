@@ -255,7 +255,7 @@ class DiscordOutbox:
         if action == "create_application_thread":
             application_id = int(payload.get("application_id") or 0)
             application = await self.bot.db.fetchone(
-                "SELECT review_thread_id,applicant_id FROM staff_applications WHERE id=? AND guild_id=?",
+                "SELECT review_thread_id,applicant_id,application_type FROM staff_applications WHERE id=? AND guild_id=?",
                 (application_id, int(row["guild_id"] or 0)),
             )
             if application is None:
@@ -269,7 +269,12 @@ class DiscordOutbox:
                     thread = None
             if thread is None:
                 destination = await self._channel(channel_id)
-                thread_name = f"reviewer-application-{application_id}-{int(application['applicant_id'])}"[:100]
+                application_type = str(application["application_type"] or "judge")
+                application_label = str(
+                    payload.get("application_label")
+                    or ("Reviewer application" if application_type == "judge" else f"{application_type.replace('_', ' ').title()} application")
+                )[:100]
+                thread_name = f"{application_type}-application-{application_id}-{int(application['applicant_id'])}"[:100]
                 existing = next(
                     (
                         item
@@ -285,7 +290,7 @@ class DiscordOutbox:
                     review_url = str(payload.get("review_url") or "").strip()
                     submitted_ts = int(payload.get("submitted_ts") or 0)
                     starter_parts = [
-                        f"## New reviewer application by <@{applicant_id}>",
+                        f"## New {application_label.lower()} by <@{applicant_id}>",
                         f"**Application:** #{application_id}",
                     ]
                     if submitted_ts:
@@ -294,7 +299,7 @@ class DiscordOutbox:
                         starter_parts.append(f"[Open this application in the Staff Portal](<{review_url}>)")
                     starter_parts.append("The submitted questions and answers are copied below.")
                     starter = "\n".join(starter_parts)[:2000]
-                    reason = f"Reviewer application #{application_id} submitted"
+                    reason = f"{application_label} #{application_id} submitted"
                     if isinstance(destination, discord.ForumChannel):
                         created = await destination.create_thread(
                             name=thread_name,
@@ -348,7 +353,7 @@ class DiscordOutbox:
         if action == "create_interview_ticket":
             application_id = int(payload.get("application_id") or 0)
             application = await self.bot.db.fetchone(
-                "SELECT applicant_id,interview_ticket_channel_id FROM staff_applications WHERE id=? AND guild_id=?",
+                "SELECT applicant_id,application_type,interview_ticket_channel_id FROM staff_applications WHERE id=? AND guild_id=?",
                 (application_id, int(row["guild_id"] or 0)),
             )
             if application is None:
@@ -356,6 +361,11 @@ class DiscordOutbox:
             saved_channel_id = int(application["interview_ticket_channel_id"] or 0)
             guild = await self._guild(int(row["guild_id"] or 0))
             applicant_id = int(application["applicant_id"])
+            application_type = str(application["application_type"] or "judge")
+            application_label = str(
+                payload.get("application_label")
+                or ("Reviewer application" if application_type == "judge" else f"{application_type.replace('_', ' ').title()} application")
+            )[:100]
             member = guild.get_member(applicant_id)
             if member is None:
                 member = await guild.fetch_member(applicant_id)
@@ -381,16 +391,17 @@ class DiscordOutbox:
                     *self.bot.config.get_int_list("staff_portal", "judge_role_ids"),
                     *self.bot.config.get_int_list("staff_portal", "head_judge_role_ids"),
                     *self.bot.config.get_int_list("staff_portal", "admin_role_ids"),
+                    *self.bot.config.get_int_list("staff_portal", "mod_role_ids"),
                 }:
                     role = guild.get_role(role_id)
                     if role is not None:
                         overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
                 interview = await guild.create_text_channel(
-                    name=f"interview-{application_id}-{getattr(member, 'name', 'applicant')}"[:90],
+                    name=f"{application_type}-interview-{application_id}-{getattr(member, 'name', 'applicant')}"[:90],
                     category=category,
                     topic=marker,
                     overwrites=overwrites,
-                    reason=f"Reviewer application #{application_id} interview",
+                    reason=f"{application_label} #{application_id} interview",
                 )
             now = int(time.time())
             ticket = await self.bot.db.fetchone("SELECT ticket_id,opening_message_id FROM tickets WHERE channel_id=?", (int(interview.id),))
@@ -406,7 +417,7 @@ class DiscordOutbox:
                 opening_message_id = int(ticket["opening_message_id"] or 0)
             if not opening_message_id:
                 opening = await interview.send(
-                    content=f"Welcome {member.mention}. This private channel is your GD Avenue Reviewer interview for application **#{application_id}**.\nStatus: **Waiting for staff**",
+                    content=f"Welcome {member.mention}. This private channel is your GD Avenue {application_label} interview for application **#{application_id}**.\nStatus: **Waiting for staff**",
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
                     nonce=hashlib.sha256(f"application:{application_id}:interview-opening".encode()).hexdigest()[:24],
                     enforce_nonce=True,
@@ -423,7 +434,7 @@ class DiscordOutbox:
                 "send_dm",
                 guild_id=int(row["guild_id"] or 0),
                 user_id=applicant_id,
-                payload={"content": f"Your GD Avenue Reviewer application is moving to an interview: {interview.mention}"},
+                payload={"content": f"Your GD Avenue {application_label} is moving to an interview: {interview.mention}"},
                 correlation_id=f"staff-application:{application_id}",
                 idempotency_key=f"staff-application:{application_id}:interview-dm",
             )

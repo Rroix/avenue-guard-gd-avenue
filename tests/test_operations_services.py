@@ -38,14 +38,14 @@ def test_typed_config_validation_and_operation_bounds():
     issues = validate_config(config)
     assert any(issue.path == "level_requests.sent_result_embed" for issue in issues)
 
-    config["staff_portal"]["application_questions"][0]["options"] = []
+    config["staff_portal"]["application_forms"]["judge"]["questions"][0]["options"] = []
     config["staff_portal"]["application_review_levels"][0]["level_id"] = "123"
     config["staff_portal"]["application_review_levels"][1]["youtube_url"] = (
         "https://youtu.be/too-short"
     )
     issues = validate_config(config)
     assert any(
-        issue.path == "staff_portal.application_questions[0].options"
+        issue.path == "staff_portal.application_forms.judge.questions[0].options"
         for issue in issues
     )
     assert any(

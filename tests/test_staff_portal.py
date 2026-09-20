@@ -891,6 +891,31 @@ async def test_application_scope_and_applicant_payload_hide_internal_notes(porta
 
 
 @pytest.mark.asyncio
+async def test_application_filters_cover_type_status_and_claim_state(portal):
+    service, _guild = portal
+    claimed = await service.db.execute_insert(
+        "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,"
+        "answers_json,claimed_by,created_ts,updated_ts,submitted_ts) "
+        "VALUES(?,?,'mod','interview','{}',?,100,100,100)",
+        (GUILD_ID, 997, ADMIN_ID),
+    )
+    unclaimed = await service.db.execute_insert(
+        "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,"
+        "answers_json,created_ts,updated_ts,submitted_ts) "
+        "VALUES(?,?,'mod','interview','{}',100,100,100)",
+        (GUILD_ID, 998),
+    )
+
+    result = await service.applications(
+        principal(ADMIN_ID, "admin"),
+        {"type": "mod", "status": "interview", "claim": "unclaimed"},
+    )
+    assert {int(item["id"]) for item in result["items"]} == {unclaimed}
+    assert claimed not in {int(item["id"]) for item in result["items"]}
+    assert result["application_types"] == ["judge", "mod"]
+
+
+@pytest.mark.asyncio
 async def test_inactive_staff_remains_visible_for_restore(portal):
     service, _guild = portal
     await service.db.execute(
@@ -1133,6 +1158,82 @@ async def test_application_form_persists_prompt_and_submission_enqueues_thread(p
     )
     assert result["application"]["review_prompt_key"] == selected_prompt["key"]
     assert service.bot.outbox.calls[-1][0] == "create_application_thread"
+
+
+@pytest.mark.asyncio
+async def test_application_catalog_and_mod_form_are_server_defined(portal):
+    service, _guild = portal
+    applicant = principal(999, "applicant")
+
+    options = await service.application_options(applicant)
+    by_type = {item["application_type"]: item for item in options["items"]}
+    assert by_type["judge"]["enabled"] is True
+    assert by_type["mod"]["label"] == "Mod application"
+    assert by_type["appeal"]["enabled"] is False
+    assert options["cooldown"]["days"] == 5
+
+    form = await service.application_form(applicant, "mod")
+    questions = {item["key"]: item for item in form["questions"]}
+    assert form["form"]["label"] == "Mod application"
+    assert questions["motivation"]["label"] == "Why do you want to be a mod?"
+    assert questions["timezone"]["type"] == "short_text"
+    assert "moderation_scenario" in questions
+    assert all(item.get("review_prompt") is None for item in form["questions"])
+
+
+@pytest.mark.asyncio
+async def test_application_cooldown_is_global_across_application_types(portal):
+    service, _guild = portal
+    applicant = principal(999, "applicant")
+    answers = {
+        "age": "19 or above",
+        "motivation": "I want to help",
+        "experience": "I have moderation experience",
+        "improvements": "Clearer onboarding",
+        "availability": "Several evenings each week",
+        "timezone": "Europe/Madrid",
+        "moderation_scenario": "Stop the behavior, preserve evidence, and escalate",
+    }
+    result = await service.save_application(
+        applicant, {"application_type": "mod", "answers": answers}, submit=True
+    )
+    await service.db.execute(
+        "UPDATE staff_applications SET status='rejected' WHERE id=?",
+        (int(result["application"]["id"]),),
+    )
+
+    options = await service.application_options(applicant)
+    assert options["cooldown"]["active"] is True
+    with pytest.raises(PortalError) as caught:
+        await service.application_form(applicant, "judge")
+    assert caught.value.status == 429
+    assert caught.value.code == "application_cooldown"
+
+
+@pytest.mark.asyncio
+async def test_mod_application_scope_and_acceptance_never_grant_reviewer_role(portal):
+    service, _guild = portal
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,"
+        "answers_json,created_ts,updated_ts,submitted_ts) "
+        "VALUES(?,?,'mod','submitted','{}',100,100,100)",
+        (GUILD_ID, 999),
+    )
+
+    head_view = await service.applications(principal(HEAD_ID, "head_reviewer"), {})
+    admin_view = await service.applications(principal(ADMIN_ID, "admin"), {})
+    assert application_id not in {int(item["id"]) for item in head_view["items"]}
+    assert application_id in {int(item["id"]) for item in admin_view["items"]}
+
+    result = await service.application_action(
+        principal(ADMIN_ID, "admin"),
+        application_id,
+        {"action": "accept", "reason": "Strong application", "confirmed": True},
+    )
+    assert result["status"] == "accepted"
+    assert result["role_delivery"] == "manual"
+    assert all(kind != "add_role" for kind, _payload in service.bot.outbox.calls)
+    assert any(kind == "send_dm" for kind, _payload in service.bot.outbox.calls)
 
 
 @pytest.mark.asyncio
