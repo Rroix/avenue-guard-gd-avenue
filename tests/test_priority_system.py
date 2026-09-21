@@ -1148,6 +1148,13 @@ async def test_owner_access_is_fail_closed_for_pps_management():
     assert await cog._prepare(allowed) == GUILD_ID
 
 
+def test_pps_score_display_uses_at_most_two_decimal_places():
+    assert PrioritySystemCog._score(None) == "CP pending"
+    assert PrioritySystemCog._score(8.062998208338442) == "8.06"
+    assert PrioritySystemCog._score(17.9) == "17.9"
+    assert PrioritySystemCog._score(0) == "0"
+
+
 def test_priority_config_is_validated_and_does_not_accept_arbitrary_model_code():
     settings = priority_settings(PriorityConfig().data)
     assert settings.model_version == "pps_v1"

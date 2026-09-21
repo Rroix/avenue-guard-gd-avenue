@@ -430,6 +430,41 @@
         "level_id": "107166460",
         "youtube_url": "https://youtu.be/SHkoSRJe22c?si=P2_w9aqC8GXBdHiM",
         "weight": 1
+      },
+      {
+        "key": "foggy-morning-82599323",
+        "name": "Foggy Morning",
+        "level_id": "82599323",
+        "youtube_url": "https://youtu.be/2pu9Fw4DJU4?si=zHOVX523oqKOpuYP",
+        "weight": 1
+      },
+      {
+        "key": "somewhere-144535118",
+        "name": "Somewhere",
+        "level_id": "144535118",
+        "youtube_url": "https://www.youtube.com/watch?v=htH5_mRRFqg",
+        "weight": 1
+      },
+      {
+        "key": "voice-88350599",
+        "name": "VOICE",
+        "level_id": "88350599",
+        "youtube_url": "https://www.youtube.com/watch?v=_F1S4LCYKKA",
+        "weight": 1
+      },
+      {
+        "key": "pillows-110359686",
+        "name": "Pillows",
+        "level_id": "110359686",
+        "youtube_url": "https://www.youtube.com/watch?v=OU8v8D_CNw8&list=RDOU8v8D_CNw8&start_radio=1",
+        "weight": 1
+      },
+      {
+        "key": "not-my-style-91281165",
+        "name": "Not My Style",
+        "level_id": "91281165",
+        "youtube_url": "https://www.youtube.com/watch?v=2NJuKIRDOPs",
+        "weight": 1
       }
     ],
     "allowed_origins": [

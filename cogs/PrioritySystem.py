@@ -134,7 +134,10 @@ class PrioritySystemCog(commands.Cog):
 
     @staticmethod
     def _score(value) -> str:
-        return "CP pending" if value is None else f"{float(value):.2f}"
+        if value is None:
+            return "CP pending"
+        number = round(float(value), 2)
+        return f"{number:.2f}".rstrip("0").rstrip(".")
 
     @staticmethod
     def _age(ts: int | None) -> str:
@@ -329,9 +332,9 @@ class PrioritySystemCog(commands.Cog):
         embed.add_field(
             name="Score",
             value=(
-                f"F {float(row['prestige_component_f']):.2f} + "
+                f"F {self._score(row['prestige_component_f'])} + "
                 f"G {self._score(row['creator_component_g'])} + "
-                f"H {float(row['waiting_component_h']):.2f} = "
+                f"H {self._score(row['waiting_component_h'])} = "
                 f"**{self._score(row['priority_points'])}**\nW: {int(row['waiting_cycles'] or 0)}"
             ),
             inline=False,

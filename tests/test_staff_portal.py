@@ -1356,6 +1356,11 @@ async def test_application_form_persists_prompt_and_submission_enqueues_thread(p
         "94859569",
         "100117857",
         "107166460",
+        "82599323",
+        "144535118",
+        "88350599",
+        "110359686",
+        "91281165",
     }
     assert selected_prompt["youtube_embed_url"].startswith(
         "https://www.youtube-nocookie.com/embed/"
@@ -1695,6 +1700,11 @@ def test_application_review_pool_and_youtube_embed_urls_are_valid(portal):
         ("V I B E", "94859569", 1),
         ("Speed", "100117857", 1),
         ("Distimia", "107166460", 1),
+        ("Foggy Morning", "82599323", 1),
+        ("Somewhere", "144535118", 1),
+        ("VOICE", "88350599", 1),
+        ("Pillows", "110359686", 1),
+        ("Not My Style", "91281165", 1),
     ]
     assert _youtube_embed_url("https://youtu.be/v5tr0Tg9-9c?si=test") == (
         "https://www.youtube-nocookie.com/embed/v5tr0Tg9-9c"
@@ -1702,6 +1712,9 @@ def test_application_review_pool_and_youtube_embed_urls_are_valid(portal):
     assert _youtube_embed_url("https://www.youtube.com/watch?v=bfQj4ZU2nQM") == (
         "https://www.youtube-nocookie.com/embed/bfQj4ZU2nQM"
     )
+    assert _youtube_embed_url(
+        "https://www.youtube.com/watch?v=OU8v8D_CNw8&list=RDOU8v8D_CNw8&start_radio=1"
+    ) == "https://www.youtube-nocookie.com/embed/OU8v8D_CNw8"
     assert _youtube_embed_url("https://example.com/watch?v=bfQj4ZU2nQM") == ""
 
 
