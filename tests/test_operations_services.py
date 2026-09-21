@@ -294,6 +294,76 @@ async def test_appeal_unban_delivery_uses_discord_and_updates_durable_state(tmp_
 
 
 @pytest.mark.asyncio
+async def test_appeal_timeout_removal_updates_discord_and_durable_state(tmp_path):
+    database = Database(str(tmp_path / "appeal-timeout.db"))
+    await database.connect()
+    now = 1_789_000_000
+    punishment_id = await database.execute_insert(
+        "INSERT INTO moderation_punishments("
+        "guild_id,user_id,punishment_type,source_key,active,reason,reason_source,"
+        "reason_conflict,source_detail_json,checked_ts,lookup_status,created_ts,updated_ts"
+        ") VALUES(1,42,'timeout','timeout:future',1,'Original reason','discord_audit_log',0,'{}',"
+        "?, 'found',?,?)",
+        (now, now, now),
+    )
+    appeal_id = await database.execute_insert(
+        "INSERT INTO punishment_appeals("
+        "guild_id,appellant_id,punishment_id,status,answers_json,created_ts,updated_ts"
+        ") VALUES(1,42,?,'decided','{}',?,?)",
+        (punishment_id, now, now),
+    )
+
+    class Member:
+        def __init__(self):
+            self.calls = []
+
+        async def timeout(self, until, *, reason):
+            self.calls.append((until, reason))
+
+    member = Member()
+    guild = SimpleNamespace(
+        get_member=lambda user_id: member if user_id == 42 else None,
+        fetch_member=AsyncMock(return_value=member),
+    )
+    bot = SimpleNamespace(
+        db=database,
+        get_guild=lambda guild_id: guild if guild_id == 1 else None,
+        fetch_guild=AsyncMock(return_value=guild),
+    )
+    outbox = DiscordOutbox(bot)
+    await outbox.enqueue(
+        "clear_timeout",
+        guild_id=1,
+        user_id=42,
+        payload={
+            "appeal_id": appeal_id,
+            "punishment_id": punishment_id,
+            "reason": "Punishment appeal approved by staff",
+        },
+        idempotency_key="appeal:1:timeout",
+    )
+
+    assert await outbox.process_once() == {
+        "delivered": 1,
+        "retried": 0,
+        "dead": 0,
+    }
+    assert member.calls == [(None, "Punishment appeal approved by staff")]
+    punishment = await database.fetchone(
+        "SELECT active,lookup_status FROM moderation_punishments WHERE id=?",
+        (punishment_id,),
+    )
+    event = await database.fetchone(
+        "SELECT event FROM punishment_appeal_events WHERE appeal_id=?",
+        (appeal_id,),
+    )
+    assert punishment["active"] == 0
+    assert punishment["lookup_status"] == "removed_by_appeal"
+    assert event["event"] == "punishment_removal_delivered"
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_application_thread_delivery_persists_thread_and_review_link(
     tmp_path, monkeypatch
 ):

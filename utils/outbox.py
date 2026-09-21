@@ -18,6 +18,7 @@ SUPPORTED_ACTIONS = {
     "delete_message",
     "add_role",
     "remove_role",
+    "clear_timeout",
     "unban_member",
     "create_application_thread",
     "create_interview_ticket",
@@ -551,6 +552,29 @@ class DiscordOutbox:
                     (appeal_id, now, str(row["correlation_id"] or "")),
                 )
             return 0
+        if action == "clear_timeout":
+            guild = await self._guild(int(row["guild_id"] or 0))
+            member = guild.get_member(user_id)
+            if member is None:
+                member = await guild.fetch_member(user_id)
+            reason = str(payload.get("reason") or "Punishment appeal approved")[:512]
+            await member.timeout(None, reason=reason)
+            punishment_id = int(payload.get("punishment_id") or 0)
+            appeal_id = int(payload.get("appeal_id") or 0)
+            now = int(time.time())
+            if punishment_id:
+                await self.bot.db.execute(
+                    "UPDATE moderation_punishments SET active=0,checked_ts=?,lookup_status='removed_by_appeal',"
+                    "lookup_error=NULL,updated_ts=? WHERE id=?",
+                    (now, now, punishment_id),
+                )
+            if appeal_id:
+                await self.bot.db.execute(
+                    "INSERT INTO punishment_appeal_events(appeal_id,actor_id,event,from_status,to_status,"
+                    "detail_json,created_ts,correlation_id) VALUES(?,NULL,'punishment_removal_delivered','decided','decided','{}',?,?)",
+                    (appeal_id, now, str(row["correlation_id"] or "")),
+                )
+            return 0
         if action in {"edit_message", "delete_message"}:
             guard = payload.get("request_validation_guard")
             if action == "edit_message" and isinstance(guard, dict):
@@ -614,4 +638,19 @@ class DiscordOutbox:
             await member.add_roles(role, reason=reason)
         elif action == "remove_role":
             await member.remove_roles(role, reason=reason)
+            punishment_id = int(payload.get("punishment_id") or 0)
+            appeal_id = int(payload.get("appeal_id") or 0)
+            if punishment_id:
+                now = int(time.time())
+                await self.bot.db.execute(
+                    "UPDATE moderation_punishments SET active=0,checked_ts=?,lookup_status='removed_by_appeal',"
+                    "lookup_error=NULL,updated_ts=? WHERE id=?",
+                    (now, now, punishment_id),
+                )
+                if appeal_id:
+                    await self.bot.db.execute(
+                        "INSERT INTO punishment_appeal_events(appeal_id,actor_id,event,from_status,to_status,"
+                        "detail_json,created_ts,correlation_id) VALUES(?,NULL,'punishment_removal_delivered','decided','decided','{}',?,?)",
+                        (appeal_id, now, str(row["correlation_id"] or "")),
+                    )
         return 0

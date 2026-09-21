@@ -3163,7 +3163,7 @@ class StaffPortalService:
                 {
                     "application_type": "appeal",
                     "label": "Punishment appeal",
-                    "description": "Ask GD Avenue to review an active server ban and its supporting evidence.",
+                    "description": "Ask GD Avenue to review a ban, timeout, mute, or configured access restriction.",
                     "enabled": True,
                     "open": bool(configuration.get("appeals_open", True)),
                     "cooldown": {"active": False, "days": 30},

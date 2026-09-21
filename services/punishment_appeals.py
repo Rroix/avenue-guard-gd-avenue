@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import discord
@@ -45,6 +46,7 @@ DECISIONS = {
     "ineligible",
     "duplicate",
 }
+MANUAL_PUNISHMENT_TYPES = {"ban", "timeout", "restriction_role", "other"}
 
 
 def _row(row: Any) -> dict[str, Any]:
@@ -174,16 +176,166 @@ class PunishmentAppealService:
             },
         ]
 
+    def _restriction_role_ids(self) -> list[int]:
+        configured = self.bot.config.get_int_list(
+            "staff_portal", "appeal_restriction_role_ids", default=[]
+        )
+        fallback = self.bot.config.get_int(
+            "roles", "restriction_role_ID", default=0
+        )
+        return list(dict.fromkeys([*configured, *([fallback] if fallback else [])]))
+
+    def _restriction_role_options(self, guild: Any) -> list[dict[str, Any]]:
+        options = []
+        for role_id in self._restriction_role_ids():
+            role = guild.get_role(role_id) if hasattr(guild, "get_role") else None
+            options.append(
+                {
+                    "id": str(role_id),
+                    "label": str(getattr(role, "name", "") or f"Restriction role {role_id}"),
+                }
+            )
+        return options
+
+    @staticmethod
+    def _member_timeout(member: Any) -> datetime | None:
+        until = getattr(member, "timed_out_until", None)
+        if until is None:
+            until = getattr(member, "communication_disabled_until", None)
+        if until is None:
+            return None
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return until if until > datetime.now(timezone.utc) else None
+
+    async def _audit_evidence(
+        self, guild: Any, user_id: int, punishment_type: str, *, role_id: int = 0
+    ) -> dict[str, Any]:
+        action = (
+            discord.AuditLogAction.member_role_update
+            if punishment_type == "restriction_role"
+            else discord.AuditLogAction.member_update
+        )
+        try:
+            async for entry in guild.audit_logs(limit=500, action=action):
+                if int(getattr(getattr(entry, "target", None), "id", 0) or 0) != user_id:
+                    continue
+                if punishment_type == "restriction_role":
+                    before = {
+                        int(getattr(role, "id", 0) or 0)
+                        for role in getattr(getattr(entry, "before", None), "roles", ()) or ()
+                    }
+                    after = {
+                        int(getattr(role, "id", 0) or 0)
+                        for role in getattr(getattr(entry, "after", None), "roles", ()) or ()
+                    }
+                    if role_id not in after or role_id in before:
+                        continue
+                else:
+                    after_until = getattr(
+                        getattr(entry, "after", None),
+                        "communication_disabled_until",
+                        None,
+                    )
+                    if after_until is None:
+                        continue
+                created_at = getattr(entry, "created_at", None)
+                return {
+                    "audit_log_entry_id": int(entry.id),
+                    "issued_ts": int(created_at.timestamp()) if created_at else None,
+                    "issued_by_id": int(
+                        getattr(getattr(entry, "user", None), "id", 0) or 0
+                    )
+                    or None,
+                    "reason": str(getattr(entry, "reason", "") or "").strip()
+                    or None,
+                }
+        except (discord.Forbidden, discord.HTTPException, AttributeError):
+            pass
+        return {}
+
+    async def _store_snapshot(
+        self,
+        principal: Any,
+        *,
+        punishment_type: str,
+        source_key: str,
+        active: bool,
+        reason: str | None,
+        reason_source: str,
+        issued_ts: int | None,
+        issued_by_id: int | None,
+        audit_log_entry_id: int | None,
+        source_detail: dict[str, Any],
+        lookup_status: str,
+        lookup_error: str | None = None,
+        external_source: str = "discord_observed",
+    ) -> dict[str, Any]:
+        now = int(time.time())
+        await self.db.execute(
+            "INSERT INTO moderation_punishments(guild_id,user_id,punishment_type,source_key,active,reason,"
+            "reason_source,reason_conflict,issued_ts,issued_by_id,audit_log_entry_id,external_source,"
+            "source_detail_json,checked_ts,lookup_status,lookup_error,created_ts,updated_ts) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(guild_id,user_id,punishment_type,source_key) DO UPDATE SET "
+            "active=excluded.active,reason=excluded.reason,reason_source=excluded.reason_source,"
+            "issued_ts=excluded.issued_ts,issued_by_id=excluded.issued_by_id,"
+            "audit_log_entry_id=excluded.audit_log_entry_id,source_detail_json=excluded.source_detail_json,"
+            "checked_ts=excluded.checked_ts,lookup_status=excluded.lookup_status,"
+            "lookup_error=excluded.lookup_error,updated_ts=excluded.updated_ts",
+            (
+                principal.guild_id,
+                principal.user_id,
+                punishment_type,
+                source_key,
+                1 if active else 0,
+                reason,
+                reason_source,
+                0,
+                issued_ts,
+                issued_by_id,
+                audit_log_entry_id,
+                external_source,
+                json.dumps(source_detail, separators=(",", ":"), ensure_ascii=False),
+                now,
+                lookup_status,
+                lookup_error,
+                now,
+                now,
+            ),
+        )
+        return _row(
+            await self.db.fetchone(
+                "SELECT * FROM moderation_punishments WHERE guild_id=? AND user_id=? "
+                "AND punishment_type=? AND source_key=?",
+                (
+                    principal.guild_id,
+                    principal.user_id,
+                    punishment_type,
+                    source_key,
+                ),
+            )
+        )
+
     async def snapshot_punishment(self, principal, *, force: bool = False) -> dict[str, Any]:
         now = int(time.time())
+        cached_active = await self.db.fetchone(
+            "SELECT * FROM moderation_punishments WHERE guild_id=? AND user_id=? "
+            "AND active=1 AND lookup_status='found' AND external_source='discord_observed' "
+            "ORDER BY checked_ts DESC,id DESC LIMIT 1",
+            (principal.guild_id, principal.user_id),
+        )
+        if (
+            cached_active
+            and not force
+            and int(cached_active["checked_ts"] or 0) >= now - self.snapshot_ttl
+        ):
+            return _row(cached_active)
         cached = await self.db.fetchone(
             "SELECT * FROM moderation_punishments WHERE guild_id=? AND user_id=? "
             "AND punishment_type='ban' ORDER BY checked_ts DESC,id DESC LIMIT 1",
             (principal.guild_id, principal.user_id),
         )
-        if cached and not force and int(cached["checked_ts"] or 0) >= now - self.snapshot_ttl:
-            return _row(cached)
-
         guild = self.bot.get_guild(principal.guild_id)
         if guild is None:
             raise self._error(503, "guild_unavailable", "GD Avenue is temporarily unavailable")
@@ -308,23 +460,180 @@ class PunishmentAppealService:
                 now,
             ),
         )
-        return _row(
+        ban_snapshot = _row(
             await self.db.fetchone(
                 "SELECT * FROM moderation_punishments WHERE guild_id=? AND user_id=? "
                 "AND punishment_type='ban' AND source_key=?",
                 (principal.guild_id, principal.user_id, source_key),
             )
         )
+        if status == "found":
+            await self.db.execute(
+                "UPDATE moderation_punishments SET active=0,updated_ts=? WHERE guild_id=? AND user_id=? "
+                "AND external_source='discord_observed' AND id!=? AND active=1",
+                (now, principal.guild_id, principal.user_id, int(ban_snapshot["id"])),
+            )
+            return ban_snapshot
+
+        member = guild.get_member(principal.user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(principal.user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+        if member is None:
+            return ban_snapshot
+
+        timeout_until = self._member_timeout(member)
+        if timeout_until is not None:
+            evidence = await self._audit_evidence(
+                guild, principal.user_id, "timeout"
+            )
+            await self.db.execute(
+                "UPDATE moderation_punishments SET active=0,updated_ts=? WHERE guild_id=? AND user_id=? "
+                "AND external_source='discord_observed' AND active=1",
+                (now, principal.guild_id, principal.user_id),
+            )
+            return await self._store_snapshot(
+                principal,
+                punishment_type="timeout",
+                source_key=f"timeout:{int(timeout_until.timestamp())}",
+                active=True,
+                reason=evidence.get("reason"),
+                reason_source="discord_audit_log" if evidence.get("reason") else "unknown",
+                issued_ts=evidence.get("issued_ts"),
+                issued_by_id=evidence.get("issued_by_id"),
+                audit_log_entry_id=evidence.get("audit_log_entry_id"),
+                source_detail={
+                    "timeout_until_ts": int(timeout_until.timestamp()),
+                    "audit_log_entry_found": bool(evidence.get("audit_log_entry_id")),
+                },
+                lookup_status="found",
+            )
+
+        member_role_ids = {
+            int(getattr(role, "id", 0) or 0) for role in getattr(member, "roles", ())
+        }
+        for role_id in self._restriction_role_ids():
+            if role_id not in member_role_ids:
+                continue
+            role = guild.get_role(role_id) if hasattr(guild, "get_role") else None
+            evidence = await self._audit_evidence(
+                guild, principal.user_id, "restriction_role", role_id=role_id
+            )
+            await self.db.execute(
+                "UPDATE moderation_punishments SET active=0,updated_ts=? WHERE guild_id=? AND user_id=? "
+                "AND external_source='discord_observed' AND active=1",
+                (now, principal.guild_id, principal.user_id),
+            )
+            return await self._store_snapshot(
+                principal,
+                punishment_type="restriction_role",
+                source_key=f"role:{role_id}",
+                active=True,
+                reason=evidence.get("reason"),
+                reason_source="discord_audit_log" if evidence.get("reason") else "unknown",
+                issued_ts=evidence.get("issued_ts"),
+                issued_by_id=evidence.get("issued_by_id"),
+                audit_log_entry_id=evidence.get("audit_log_entry_id"),
+                source_detail={
+                    "role_id": str(role_id),
+                    "role_name": str(
+                        getattr(role, "name", "") or f"Restriction role {role_id}"
+                    ),
+                    "audit_log_entry_found": bool(evidence.get("audit_log_entry_id")),
+                },
+                lookup_status="found",
+            )
+        await self.db.execute(
+            "UPDATE moderation_punishments SET active=0,updated_ts=? WHERE guild_id=? AND user_id=? "
+            "AND external_source='discord_observed' AND active=1",
+            (now, principal.guild_id, principal.user_id),
+        )
+        return ban_snapshot
+
+    def _validate_manual_punishment(
+        self, value: Any, *, required: bool, guild: Any
+    ) -> dict[str, Any]:
+        raw = value if isinstance(value, dict) else {}
+        punishment_type = str(raw.get("type") or "").strip().casefold()
+        reason = _text(raw.get("reason"), 1000)
+        issued_date = _text(raw.get("issued_date"), 10)
+        details = _text(raw.get("details"), 2000)
+        role_id = str(raw.get("role_id") or "").strip()
+        if punishment_type and punishment_type not in MANUAL_PUNISHMENT_TYPES:
+            raise self._error(400, "invalid_punishment_type", "Choose a valid punishment type")
+        allowed_roles = {str(item) for item in self._restriction_role_ids()}
+        if role_id and role_id not in allowed_roles:
+            raise self._error(400, "invalid_restriction_role", "Choose a configured restriction role")
+        if punishment_type == "restriction_role" and required and not role_id:
+            raise self._error(400, "restriction_role_required", "Choose the restriction role you received")
+        issued_ts = None
+        if issued_date:
+            try:
+                issued_ts = int(
+                    datetime.strptime(issued_date, "%Y-%m-%d")
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp()
+                )
+            except ValueError as exc:
+                raise self._error(400, "invalid_punishment_date", "Use a valid punishment date") from exc
+        if required and (not punishment_type or not reason):
+            raise self._error(
+                400,
+                "manual_punishment_incomplete",
+                "Choose the punishment type and describe the reason shown or given to you",
+            )
+        role = guild.get_role(int(role_id)) if role_id and hasattr(guild, "get_role") else None
+        return {
+            "type": punishment_type,
+            "reason": reason,
+            "issued_date": issued_date,
+            "issued_ts": issued_ts,
+            "details": details,
+            "role_id": role_id,
+            "role_name": str(getattr(role, "name", "") or "") or None,
+            "complete": bool(
+                punishment_type
+                and reason
+                and (punishment_type != "restriction_role" or role_id)
+            ),
+        }
+
+    async def _store_manual_punishment(
+        self, principal: Any, manual: dict[str, Any]
+    ) -> dict[str, Any]:
+        punishment_type = manual.get("type") or "other"
+        await self.db.execute(
+            "UPDATE moderation_punishments SET active=0,updated_ts=? WHERE guild_id=? AND user_id=? "
+            "AND external_source='applicant_reported' AND punishment_type!=? AND active=1",
+            (int(time.time()), principal.guild_id, principal.user_id, punishment_type),
+        )
+        return await self._store_snapshot(
+            principal,
+            punishment_type=punishment_type,
+            source_key=f"applicant-reported:{principal.user_id}",
+            active=True,
+            reason=manual.get("reason") or None,
+            reason_source="applicant_reported",
+            issued_ts=manual.get("issued_ts"),
+            issued_by_id=None,
+            audit_log_entry_id=None,
+            source_detail={"reported": manual, "verified": False},
+            lookup_status="applicant_reported",
+            external_source="applicant_reported",
+        )
 
     @staticmethod
     def applicant_punishment(row: Any) -> dict[str, Any]:
         data = _row(row)
         lookup_status = data.get("lookup_status")
+        detail = _object(data.get("source_detail_json"))
         return {
             "id": data.get("id"),
             "type": data.get("punishment_type"),
             "active": bool(data.get("active"))
-            if lookup_status in {"found", "not_banned", "unbanned_by_appeal"}
+            if lookup_status in {"found", "not_banned", "unbanned_by_appeal", "removed_by_appeal", "applicant_reported"}
             else None,
             "reason": data.get("reason"),
             "reason_known": bool(data.get("reason")),
@@ -334,6 +643,11 @@ class PunishmentAppealService:
             "checked_ts": data.get("checked_ts"),
             "lookup_status": lookup_status,
             "lookup_error": data.get("lookup_error"),
+            "source_detail": detail,
+            "verified": lookup_status == "found",
+            "display_name": detail.get("role_name")
+            or (detail.get("reported") or {}).get("role_name"),
+            "ends_ts": detail.get("timeout_until_ts"),
         }
 
     def _validate_answers(self, value: Any, *, submit: bool) -> dict[str, str]:
@@ -369,25 +683,40 @@ class PunishmentAppealService:
         configuration = (await self.portal.safe_configuration())["configuration"]
         if not self.enabled or not configuration.get("appeals_open", True):
             raise self._error(409, "appeals_closed", "Punishment appeals are currently closed")
-        punishment = await self.snapshot_punishment(principal)
+        observed_punishment = await self.snapshot_punishment(principal)
         draft = await self.db.fetchone(
-            "SELECT * FROM punishment_appeals WHERE guild_id=? AND appellant_id=? AND punishment_id=? "
+            "SELECT * FROM punishment_appeals WHERE guild_id=? AND appellant_id=? "
             "AND status IN('draft','submitted','triage','under_review','awaiting_information','second_review') "
             "ORDER BY id DESC LIMIT 1",
-            (principal.guild_id, principal.user_id, int(punishment["id"])),
+            (principal.guild_id, principal.user_id),
         )
+        punishment = observed_punishment
+        if draft:
+            linked = await self.db.fetchone(
+                "SELECT * FROM moderation_punishments WHERE id=?",
+                (int(draft["punishment_id"]),),
+            )
+            if linked and str(linked["lookup_status"]) == "applicant_reported":
+                punishment = _row(linked)
         cooldown = await self.db.fetchone(
             "SELECT cooldown_until_ts FROM punishment_appeal_cooldowns WHERE guild_id=? AND appellant_id=? "
             "AND punishment_id=? AND cooldown_until_ts>?",
             (principal.guild_id, principal.user_id, int(punishment["id"]), int(time.time())),
         )
-        eligible = bool(punishment.get("active")) and punishment.get("lookup_status") == "found"
+        verified = bool(observed_punishment.get("active")) and observed_punishment.get("lookup_status") == "found"
+        detail = _object(punishment.get("source_detail_json"))
+        reported = detail.get("reported") if isinstance(detail.get("reported"), dict) else {}
+        manual_complete = bool(reported.get("complete"))
+        eligible = verified or (
+            punishment.get("lookup_status") == "applicant_reported" and manual_complete
+        )
+        guild = self.bot.get_guild(principal.guild_id)
         return {
             "application": self.applicant_appeal(draft) if draft else None,
             "form": {
                 "application_type": "appeal",
                 "label": "Punishment appeal",
-                "description": "Ask GD Avenue to review the evidence and decision behind your current server ban.",
+                "description": "Ask GD Avenue to review a ban, timeout, mute, or configured access restriction.",
                 "version": APPEAL_VERSION,
                 "estimated_minutes": 12,
                 "sections": ["Grounds", "Your account", "Evidence", "Requested outcome", "Confirmation"],
@@ -395,9 +724,29 @@ class PunishmentAppealService:
             },
             "questions": self.form_questions(),
             "punishment": self.applicant_punishment(punishment),
+            "manual_entry": {
+                "allowed": True,
+                "required": not verified,
+                "reason_missing": not bool(punishment.get("reason")),
+                "issued_date_missing": not bool(punishment.get("issued_ts")),
+                "role_options": self._restriction_role_options(guild),
+                "value": reported,
+                "notice": (
+                    "Avenue Guard did not find a current Discord punishment. You may enter it manually; staff will verify it before taking action."
+                    if not verified
+                    else "You may add missing context without replacing the Discord-observed record."
+                ),
+            },
             "eligibility": {
-                "eligible": eligible and cooldown is None,
-                "reason": "active_ban" if eligible else str(punishment.get("lookup_status") or "unavailable"),
+                "eligible": (eligible or not verified) and cooldown is None,
+                "verified": verified,
+                "reason": (
+                    "active_punishment"
+                    if verified
+                    else "applicant_reported"
+                    if manual_complete
+                    else "manual_entry_required"
+                ),
                 "cooldown_until_ts": int(cooldown["cooldown_until_ts"]) if cooldown else None,
             },
         }
@@ -426,7 +775,7 @@ class PunishmentAppealService:
     async def mine(self, principal) -> list[dict[str, Any]]:
         rows = await self.db.fetchall(
             "SELECT a.*,p.punishment_type,p.active AS punishment_active,p.reason,p.reason_source,"
-            "p.issued_ts,p.checked_ts,p.lookup_status,o.status AS unban_status "
+            "p.issued_ts,p.checked_ts,p.lookup_status,p.source_detail_json,o.status AS unban_status "
             "FROM punishment_appeals a JOIN moderation_punishments p ON p.id=a.punishment_id "
             "LEFT JOIN discord_outbox o ON o.id=a.unban_outbox_id "
             "WHERE a.guild_id=? AND a.appellant_id=? ORDER BY a.updated_ts DESC LIMIT 20",
@@ -440,13 +789,14 @@ class PunishmentAppealService:
                 "type": row["punishment_type"],
                 "active": bool(row["punishment_active"])
                 if lookup_status
-                in {"found", "not_banned", "unbanned_by_appeal"}
+                in {"found", "not_banned", "unbanned_by_appeal", "removed_by_appeal", "applicant_reported"}
                 else None,
                 "reason": row["reason"],
                 "reason_source": row["reason_source"],
                 "issued_ts": row["issued_ts"],
                 "checked_ts": row["checked_ts"],
                 "lookup_status": lookup_status,
+                "source_detail": _object(row["source_detail_json"]),
             }
             item["unban_status"] = row["unban_status"]
             item["messages"] = await self.applicant_messages(int(row["id"]), principal.user_id)
@@ -458,9 +808,15 @@ class PunishmentAppealService:
         if submit and (not self.enabled or not configuration.get("appeals_open", True)):
             raise self._error(409, "appeals_closed", "Punishment appeals are currently closed")
         async with self._lock(principal.user_id):
-            punishment = await self.snapshot_punishment(principal, force=submit)
-            if not punishment.get("active") or punishment.get("lookup_status") != "found":
-                raise self._error(409, "no_active_ban", "No active GD Avenue ban could be verified for this Discord account")
+            observed = await self.snapshot_punishment(principal, force=submit)
+            verified = bool(observed.get("active")) and observed.get("lookup_status") == "found"
+            guild = self.bot.get_guild(principal.guild_id)
+            manual = self._validate_manual_punishment(
+                payload.get("manual_punishment"), required=submit and not verified, guild=guild
+            )
+            punishment = observed
+            if not verified:
+                punishment = await self._store_manual_punishment(principal, manual)
             cooldown = await self.db.fetchone(
                 "SELECT cooldown_until_ts FROM punishment_appeal_cooldowns WHERE guild_id=? AND appellant_id=? "
                 "AND punishment_id=? AND cooldown_until_ts>?",
@@ -470,10 +826,10 @@ class PunishmentAppealService:
                 raise self._error(429, "appeal_cooldown", "This punishment is still on appeal cooldown")
             answers = self._validate_answers(payload.get("answers"), submit=submit)
             existing = await self.db.fetchone(
-                "SELECT * FROM punishment_appeals WHERE guild_id=? AND appellant_id=? AND punishment_id=? "
+                "SELECT * FROM punishment_appeals WHERE guild_id=? AND appellant_id=? "
                 "AND status IN('draft','submitted','triage','under_review','awaiting_information','second_review') "
                 "ORDER BY id DESC LIMIT 1",
-                (principal.guild_id, principal.user_id, int(punishment["id"])),
+                (principal.guild_id, principal.user_id),
             )
             if existing and str(existing["status"]) != "draft":
                 if submit:
@@ -482,17 +838,20 @@ class PunishmentAppealService:
             now = int(time.time())
             encoded = json.dumps(answers, separators=(",", ":"), ensure_ascii=False)
             status = "submitted" if submit else "draft"
-            snapshot = json.dumps(
-                self.applicant_punishment(punishment), separators=(",", ":"), ensure_ascii=False
-            )
+            submitted_snapshot = self.applicant_punishment(punishment)
+            if verified and any(
+                manual.get(key) for key in ("reason", "issued_date", "details")
+            ):
+                submitted_snapshot["applicant_supplied_context"] = manual
+            snapshot = json.dumps(submitted_snapshot, separators=(",", ":"), ensure_ascii=False)
             if existing:
                 appeal_id = int(existing["id"])
                 await self.db.execute(
-                    "UPDATE punishment_appeals SET answers_json=?,status=?,primary_ground=?,requested_outcome=?,"
+                    "UPDATE punishment_appeals SET punishment_id=?,answers_json=?,status=?,primary_ground=?,requested_outcome=?,"
                     "submitted_snapshot_json=CASE WHEN ? THEN ? ELSE submitted_snapshot_json END,"
                     "submitted_ts=CASE WHEN ? THEN ? ELSE submitted_ts END,updated_ts=? "
                     "WHERE id=? AND status='draft'",
-                    (encoded, status, answers["primary_ground"], answers["requested_outcome"], 1 if submit else 0, snapshot, 1 if submit else 0, now, now, appeal_id),
+                    (int(punishment["id"]), encoded, status, answers["primary_ground"], answers["requested_outcome"], 1 if submit else 0, snapshot, 1 if submit else 0, now, now, appeal_id),
                 )
             else:
                 appeal_id = await self.db.execute_insert(
@@ -747,7 +1106,8 @@ class PunishmentAppealService:
     async def action(self, principal, appeal_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         principal.require("appeals.review")
         appeal = await self.db.fetchone(
-            "SELECT a.*,p.issued_by_id,p.active AS punishment_active FROM punishment_appeals a "
+            "SELECT a.*,p.issued_by_id,p.active AS punishment_active,p.punishment_type,p.lookup_status,p.source_detail_json "
+            "FROM punishment_appeals a "
             "JOIN moderation_punishments p ON p.id=a.punishment_id WHERE a.id=? AND a.guild_id=?",
             (appeal_id, principal.guild_id),
         )
@@ -851,18 +1211,41 @@ class PunishmentAppealService:
         ]
         ready = self._decision_ready(appeal, assessments)
         if not ready["ready"]:
-            raise self._error(409, "second_review_required", "Two independent non-conflicted assessments are required before deciding a ban appeal")
+            raise self._error(409, "second_review_required", "Two independent non-conflicted assessments are required before deciding a punishment appeal")
         if int(appeal["issued_by_id"] or 0) == principal.user_id:
-            raise self._error(409, "issuer_conflict", "The staff member who issued the ban cannot make the final appeal decision")
+            raise self._error(409, "issuer_conflict", "The staff member who issued the punishment cannot make the final appeal decision")
         unban_outbox_id = int(appeal["unban_outbox_id"] or 0) or None
-        if outcome == "removed" and payload.get("execute_unban") is True:
+        execute_removal = payload.get("execute_removal") is True or payload.get("execute_unban") is True
+        if outcome == "removed" and execute_removal:
+            if str(appeal["lookup_status"]) != "found":
+                raise self._error(
+                    409,
+                    "unverified_punishment",
+                    "Applicant-reported punishment details must be verified in Discord before Avenue Guard can remove anything",
+                )
+            punishment_type = str(appeal["punishment_type"])
+            source_detail = _object(appeal["source_detail_json"])
+            if punishment_type == "ban":
+                action_type = "unban_member"
+                action_payload = {}
+            elif punishment_type == "timeout":
+                action_type = "clear_timeout"
+                action_payload = {}
+            elif punishment_type == "restriction_role":
+                role_id = int(source_detail.get("role_id") or 0)
+                if role_id not in self._restriction_role_ids():
+                    raise self._error(409, "unsafe_role_removal", "That role is not a configured appeal restriction role")
+                action_type = "remove_role"
+                action_payload = {"role_id": role_id}
+            else:
+                raise self._error(409, "manual_removal_required", "This punishment type must be resolved manually")
             unban_outbox_id = await self.bot.outbox.enqueue(
-                "unban_member",
+                action_type,
                 guild_id=principal.guild_id,
                 user_id=int(appeal["appellant_id"]),
-                payload={"appeal_id": appeal_id, "punishment_id": int(appeal["punishment_id"]), "reason": f"Punishment appeal approved by staff ({appeal_id})"},
+                payload={**action_payload, "appeal_id": appeal_id, "punishment_id": int(appeal["punishment_id"]), "reason": f"Punishment appeal approved by staff ({appeal_id})"},
                 correlation_id=f"punishment-appeal:{appeal_id}",
-                idempotency_key=f"punishment-appeal:{appeal_id}:unban",
+                idempotency_key=f"punishment-appeal:{appeal_id}:remove:{punishment_type}",
             )
         await self.db.execute(
             "UPDATE punishment_appeals SET status='decided',outcome=?,internal_rationale=?,applicant_explanation=?,"
@@ -880,7 +1263,7 @@ class PunishmentAppealService:
                 "cooldown_until_ts=excluded.cooldown_until_ts,source=excluded.source,updated_ts=excluded.updated_ts",
                 (principal.guild_id, int(appeal["appellant_id"]), int(appeal["punishment_id"]), now + 30 * 86400, now, now),
             )
-        await self.event(appeal_id, principal.user_id, "decided", old, "decided", {"outcome": outcome, "unban_queued": bool(unban_outbox_id)})
+        await self.event(appeal_id, principal.user_id, "decided", old, "decided", {"outcome": outcome, "removal_queued": bool(unban_outbox_id)})
         return {"ok": True, "outcome": outcome, "unban_outbox_id": unban_outbox_id}
 
     async def event(self, appeal_id: int, actor_id: int | None, event: str, old: str | None, new: str | None, detail: dict[str, Any]) -> None:

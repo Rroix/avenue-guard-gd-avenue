@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -86,6 +86,7 @@ class FakeMember:
         self.display_name = f"Member {user_id}"
         self.name = self.display_name
         self.display_avatar = SimpleNamespace(url=f"https://cdn.example/{user_id}.png")
+        self.timed_out_until = None
 
 
 class FakeGuild:
@@ -97,6 +98,9 @@ class FakeGuild:
 
     async def fetch_member(self, user_id):
         return self.get_member(user_id)
+
+    def get_role(self, role_id):
+        return SimpleNamespace(id=role_id, name=f"Role {role_id}")
 
 
 class FakeOutbox:
@@ -2132,7 +2136,118 @@ async def test_appeal_lookup_failure_keeps_prior_evidence_but_blocks_submission(
             },
             submit=True,
         )
-    assert blocked.value.code == "no_active_ban"
+    assert blocked.value.code == "manual_punishment_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_appeal_discovers_timeout_and_configured_restriction_roles(portal):
+    service, guild = portal
+    response = SimpleNamespace(status=404, reason="Not Found", headers={})
+    guild.fetch_ban = AsyncMock(
+        side_effect=discord.NotFound(response, {"message": "Unknown Ban", "code": 10026})
+    )
+
+    async def no_audit_logs(**_kwargs):
+        if False:
+            yield None
+
+    guild.audit_logs = no_audit_logs
+    member = guild.get_member(999)
+    member.timed_out_until = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(hours=2)
+    timeout = await service.appeals.snapshot_punishment(
+        principal(999, "applicant"), force=True
+    )
+    assert timeout["punishment_type"] == "timeout"
+    assert timeout["lookup_status"] == "found"
+    assert json.loads(timeout["source_detail_json"])["timeout_until_ts"] > int(time.time())
+
+    member.timed_out_until = None
+    restriction_role = service.bot.config.get_int_list(
+        "staff_portal", "appeal_restriction_role_ids"
+    )[0]
+    member.roles.append(SimpleNamespace(id=restriction_role))
+    restriction = await service.appeals.snapshot_punishment(
+        principal(999, "applicant"), force=True
+    )
+    assert restriction["punishment_type"] == "restriction_role"
+    assert json.loads(restriction["source_detail_json"])["role_id"] == str(
+        restriction_role
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_punishment_can_open_appeal_but_cannot_auto_remove(portal):
+    service, guild = portal
+    response = SimpleNamespace(status=404, reason="Not Found", headers={})
+    guild.fetch_ban = AsyncMock(
+        side_effect=discord.NotFound(response, {"message": "Unknown Ban", "code": 10026})
+    )
+
+    async def no_audit_logs(**_kwargs):
+        if False:
+            yield None
+
+    guild.audit_logs = no_audit_logs
+    answers = {
+        "primary_ground": "Other",
+        "chronology": "This is a complete chronological account with enough detail for staff review.",
+        "disputed_detail": "",
+        "reconsideration": "",
+        "evidence_links": "",
+        "requested_outcome": "Remove the punishment",
+        "confirmation": "I confirm",
+    }
+    result = await service.appeals.save(
+        principal(999, "applicant"),
+        {
+            "answers": answers,
+            "manual_punishment": {
+                "type": "timeout",
+                "reason": "The reason shown to me",
+                "issued_date": "2026-09-20",
+                "details": "The Discord record was unavailable.",
+            },
+        },
+        submit=True,
+    )
+    appeal_id = int(result["application"]["id"])
+    punishment = await service.db.fetchone(
+        "SELECT p.* FROM moderation_punishments p JOIN punishment_appeals a ON a.punishment_id=p.id WHERE a.id=?",
+        (appeal_id,),
+    )
+    assert punishment["lookup_status"] == "applicant_reported"
+    assert punishment["reason_source"] == "applicant_reported"
+
+    await service.db.execute(
+        "UPDATE punishment_appeals SET status='under_review' WHERE id=?", (appeal_id,)
+    )
+    findings = {
+        "factual_accuracy": "Reviewed",
+        "rule_applicability": "Reviewed",
+        "proportionality": "Reviewed",
+        "consistency": "Reviewed",
+        "new_evidence": "Reviewed",
+        "current_risk": "Reviewed",
+    }
+    for reviewer in (principal(ADMIN_ID, "admin"), principal(HEAD_ID, "admin")):
+        await service.appeals.assessment(
+            reviewer,
+            appeal_id,
+            {"findings": findings, "recommendation": "removed", "rationale": "Independent review."},
+        )
+    with pytest.raises(PortalError) as blocked:
+        await service.appeals.action(
+            principal(OWNER_ID, "owner"),
+            appeal_id,
+            {
+                "action": "decide",
+                "outcome": "removed",
+                "internal_rationale": "Decision",
+                "applicant_explanation": "Staff approved the appeal.",
+                "execute_removal": True,
+            },
+        )
+    assert blocked.value.code == "unverified_punishment"
 
 
 @pytest.mark.asyncio
