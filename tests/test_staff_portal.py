@@ -128,6 +128,18 @@ def principal(user_id, role):
     )
 
 
+def completed_form_answers(form):
+    return {
+        question["key"]: (
+            question["options"][0]
+            if question["type"] == "single_choice"
+            else "A specific answer with enough context for staff review."
+        )
+        for question in form["questions"]
+        if question["required"]
+    }
+
+
 @pytest_asyncio.fixture
 async def portal(tmp_path, monkeypatch):
     db = Database(str(tmp_path / "staff-portal.db"))
@@ -799,17 +811,10 @@ async def test_qa_tier_adjustment_preserves_original_tier(portal):
 async def test_application_submit_retry_returns_same_active_application(portal):
     service, _guild = portal
     applicant = principal(999, "applicant")
+    form = await service.application_form(applicant, "judge")
     payload = {
         "application_type": "judge",
-        "answers": {
-            "age": "16 to 18",
-            "motivation": "Motivation",
-            "experience": "Experience",
-            "improvements": "More review calibration",
-            "weekly_capacity": "3-6",
-            "timezone": "UTC+1",
-            "level_review": "A structured level review",
-        },
+        "answers": completed_form_answers(form),
     }
     first = await service.save_application(applicant, payload, submit=True)
     second = await service.save_application(applicant, payload, submit=True)
@@ -1282,7 +1287,7 @@ async def test_application_form_persists_prompt_and_submission_enqueues_thread(p
     first = await service.application_form(applicant)
     second = await service.application_form(applicant)
     assert first["application"]["id"] == second["application"]["id"]
-    review_question = next(item for item in first["questions"] if item["key"] == "level_review")
+    review_question = next(item for item in first["questions"] if item["key"] == "work_works_well")
     selected_prompt = review_question["review_prompt"]
     assert selected_prompt["level_id"] in {
         "101935961",
@@ -1295,21 +1300,17 @@ async def test_application_form_persists_prompt_and_submission_enqueues_thread(p
         "https://www.youtube-nocookie.com/embed/"
     )
     assert next(
-        item for item in second["questions"] if item["key"] == "level_review"
+        item for item in second["questions"] if item["key"] == "work_works_well"
     )["review_prompt"] == selected_prompt
-    answers = {
-        "age": "16 to 18",
-        "motivation": "I want to help creators",
-        "experience": "I review levels regularly",
-        "improvements": "More calibration sessions",
-        "weekly_capacity": "3-6",
-        "timezone": "UTC+1",
-        "level_review": "A detailed review",
-    }
+    answers = completed_form_answers(first)
     result = await service.save_application(
         applicant, {"application_type": "judge", "answers": answers}, submit=True
     )
-    assert result["application"]["review_prompt_key"] == selected_prompt["key"]
+    stored = await service.db.fetchone(
+        "SELECT review_prompt_key FROM staff_applications WHERE id=?",
+        (int(result["application"]["id"]),),
+    )
+    assert stored["review_prompt_key"] == selected_prompt["key"]
     assert service.bot.outbox.calls[-1][0] == "create_application_thread"
 
 
@@ -1335,7 +1336,8 @@ async def test_application_catalog_and_mod_form_are_server_defined(portal):
     assert form["form"]["label"] == "Mod application"
     assert questions["motivation"]["label"] == "Why do you want to be a mod?"
     assert questions["timezone"]["type"] == "short_text"
-    assert "moderation_scenario" in questions
+    assert "harassment_scenario" in questions
+    assert questions["triage_action"]["type"] == "single_choice"
     assert all(item.get("review_prompt") is None for item in form["questions"])
 
 
@@ -1379,15 +1381,8 @@ async def test_application_type_can_close_without_closing_other_forms(portal):
 async def test_application_cooldown_is_exclusive_to_application_type(portal):
     service, _guild = portal
     applicant = principal(999, "applicant")
-    answers = {
-        "age": "19 or above",
-        "motivation": "I want to help",
-        "experience": "I have moderation experience",
-        "improvements": "Clearer onboarding",
-        "availability": "Several evenings each week",
-        "timezone": "Europe/Madrid",
-        "moderation_scenario": "Stop the behavior, preserve evidence, and escalate",
-    }
+    mod_form = await service.application_form(applicant, "mod")
+    answers = completed_form_answers(mod_form)
     result = await service.save_application(
         applicant, {"application_type": "mod", "answers": answers}, submit=True
     )
@@ -1646,4 +1641,290 @@ def test_application_review_pool_and_youtube_embed_urls_are_valid(portal):
         "https://www.youtube-nocookie.com/embed/bfQj4ZU2nQM"
     )
     assert _youtube_embed_url("https://example.com/watch?v=bfQj4ZU2nQM") == ""
+
+
+@pytest.mark.asyncio
+async def test_v2_application_form_sections_wording_and_immutable_snapshot(portal):
+    service, _guild = portal
+    applicant = principal(999, "applicant")
+    form = await service.application_form(applicant, "judge")
+    assert form["form"]["version"] == "applications-v2"
+    assert form["form"]["estimated_minutes"] == 18
+    assert form["form"]["sections"] == [
+        "Basics",
+        "Experience",
+        "Scenarios",
+        "Work sample",
+        "Confirmation",
+    ]
+    tier_question = next(
+        question for question in form["questions"] if question["key"] == "rate_type"
+    )
+    assert tier_question["label"] == (
+        "What type of rate would you recommend this level for? (Rate, feature...)"
+    )
+    answers = {
+        question["key"]: (
+            question["options"][0]
+            if question["type"] == "single_choice"
+            else "A specific answer with enough context for staff review."
+        )
+        for question in form["questions"]
+        if question["required"]
+    }
+    submitted = await service.save_application(
+        applicant,
+        {"application_type": "judge", "answers": answers},
+        submit=True,
+    )
+    application_id = int(submitted["application"]["id"])
+    stored = await service.db.fetchone(
+        "SELECT form_version,answers_json,submitted_answers_json,"
+        "submitted_questions_json FROM staff_applications WHERE id=?",
+        (application_id,),
+    )
+    assert stored["form_version"] == "applications-v2"
+    submitted_answers = json.loads(stored["submitted_answers_json"])
+    assert {key: submitted_answers[key] for key in answers} == answers
+    assert submitted_answers["additional_context"] == ""
+    assert any(
+        question["key"] == "rate_type"
+        for question in json.loads(stored["submitted_questions_json"])
+    )
+    with pytest.raises(PortalError) as caught:
+        await service.save_application(
+            applicant,
+            {
+                "application_type": "judge",
+                "answers": {**answers, "motivation": "Changed after submission"},
+            },
+            submit=False,
+        )
+    assert caught.value.code == "application_active"
+    unchanged = await service.db.fetchone(
+        "SELECT submitted_answers_json FROM staff_applications WHERE id=?",
+        (application_id,),
+    )
+    assert json.loads(unchanged["submitted_answers_json"])["motivation"] == answers[
+        "motivation"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v2_assessments_calibration_and_probation_gate_final_decision(portal):
+    service, _guild = portal
+    now = int(time.time())
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications("
+        "guild_id,applicant_id,application_type,status,answers_json,form_version,"
+        "submitted_answers_json,submitted_questions_json,created_ts,updated_ts,submitted_ts"
+        ") VALUES(?,?,'judge','submitted','{}','applications-v2','{}','[]',?,?,?)",
+        (GUILD_ID, 999, now, now, now),
+    )
+    rubric = service._application_rubric("judge")
+
+    def assessment(score, recommendation):
+        return {
+            "scores": {dimension["key"]: score for dimension in rubric["dimensions"]},
+            "evidence": {
+                dimension["key"]: f"Evidence for {dimension['label']}"
+                for dimension in rubric["dimensions"]
+            },
+            "recommendation": recommendation,
+        }
+
+    await service.application_assessment(
+        principal(HEAD_ID, "head_reviewer"), application_id, assessment(3, "hold")
+    )
+    with pytest.raises(PortalError) as incomplete:
+        await service.application_action(
+            principal(OWNER_ID, "owner"),
+            application_id,
+            {
+                "action": "accept",
+                "category": "standard_probation",
+                "reason": "Private decision rationale",
+                "confirmed": True,
+            },
+        )
+    assert incomplete.value.code == "assessments_incomplete"
+
+    await service.application_assessment(
+        principal(ADMIN_ID, "admin"),
+        application_id,
+        assessment(5, "accept"),
+    )
+    with pytest.raises(PortalError) as disagreement:
+        await service.application_action(
+            principal(OWNER_ID, "owner"),
+            application_id,
+            {
+                "action": "accept",
+                "category": "standard_probation",
+                "reason": "Private decision rationale",
+                "confirmed": True,
+            },
+        )
+    assert disagreement.value.code == "calibration_required"
+
+    await service.application_action(
+        principal(OWNER_ID, "owner"),
+        application_id,
+        {
+            "action": "calibrate",
+            "reason": "The reviewers discussed the evidence and aligned on expectations.",
+            "confirmed": True,
+        },
+    )
+    accepted = await service.application_action(
+        principal(OWNER_ID, "owner"),
+        application_id,
+        {
+            "action": "accept",
+            "category": "standard_probation",
+            "reason": "Private decision rationale",
+            "applicant_message": "Thank you for the thoughtful application.",
+            "confirmed": True,
+        },
+    )
+    assert accepted["status"] == "accepted_pending_role"
+    probation = await service.db.fetchone(
+        "SELECT status,due_ts,started_ts FROM staff_application_probations "
+        "WHERE application_id=?",
+        (application_id,),
+    )
+    assert probation["status"] == "active"
+    assert int(probation["due_ts"]) - int(probation["started_ts"]) == 30 * 86400
+
+    _status, mine = await service._handle_apply(
+        "GET", "/api/apply/mine", principal(999, "applicant"), {}
+    )
+    applicant_record = next(
+        item for item in mine["items"] if int(item["id"]) == application_id
+    )
+    assert "decision_reason" not in applicant_record
+    assert applicant_record["applicant_message"] == (
+        "Thank you for the thoughtful application."
+    )
+
+
+@pytest.mark.asyncio
+async def test_v2_interview_must_be_completed_before_it_resolves_calibration(portal):
+    service, _guild = portal
+    now = int(time.time())
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications("
+        "guild_id,applicant_id,application_type,status,answers_json,form_version,"
+        "submitted_answers_json,submitted_questions_json,created_ts,updated_ts,submitted_ts"
+        ") VALUES(?,?,'judge','submitted','{}','applications-v2','{}','[]',?,?,?)",
+        (GUILD_ID, 998, now, now, now),
+    )
+    rubric = service._application_rubric("judge")
+
+    def assessment(score, recommendation):
+        return {
+            "scores": {dimension["key"]: score for dimension in rubric["dimensions"]},
+            "evidence": {
+                dimension["key"]: f"Evidence for {dimension['label']}"
+                for dimension in rubric["dimensions"]
+            },
+            "recommendation": recommendation,
+        }
+
+    await service.application_assessment(
+        principal(HEAD_ID, "head_reviewer"), application_id, assessment(2, "reject")
+    )
+    await service.application_assessment(
+        principal(ADMIN_ID, "admin"), application_id, assessment(5, "accept")
+    )
+    await service.application_action(
+        principal(OWNER_ID, "owner"),
+        application_id,
+        {
+            "action": "interview",
+            "reason": "Clarify the contradictory work-sample evidence.",
+            "clarification_questions": "Explain the recommendation.\nHow would you phrase the feedback?",
+            "recommendation": "hold",
+            "confirmed": True,
+        },
+    )
+    interview = await service.db.fetchone(
+        "SELECT id,status FROM staff_application_interviews WHERE application_id=?",
+        (application_id,),
+    )
+    assert interview["status"] == "requested"
+    await service.db.execute(
+        "UPDATE staff_application_interviews SET status='open',ticket_channel_id=777 "
+        "WHERE id=?",
+        (interview["id"],),
+    )
+    await service.db.execute(
+        "UPDATE staff_applications SET interview_ticket_channel_id=777 WHERE id=?",
+        (application_id,),
+    )
+
+    with pytest.raises(PortalError) as unresolved:
+        await service.application_action(
+            principal(OWNER_ID, "owner"),
+            application_id,
+            {
+                "action": "accept",
+                "category": "standard_probation",
+                "reason": "Private decision rationale",
+                "confirmed": True,
+            },
+        )
+    assert unresolved.value.code == "calibration_required"
+
+    completed = await service.application_interview_outcome(
+        principal(HEAD_ID, "head_reviewer"),
+        application_id,
+        {
+            "interview_id": interview["id"],
+            "notes": "The applicant explained the evidence and produced clear feedback.",
+            "recommendation": "accept",
+            "confirmed": True,
+        },
+    )
+    assert completed["calibration_resolved"] is True
+    stored = await service.db.fetchone(
+        "SELECT status,notes,recommendation,completed_by,completed_ts "
+        "FROM staff_application_interviews WHERE id=?",
+        (interview["id"],),
+    )
+    assert stored["status"] == "completed"
+    assert stored["recommendation"] == "accept"
+    assert stored["completed_by"] == HEAD_ID
+    assert stored["completed_ts"] is not None
+
+    accepted = await service.application_action(
+        principal(OWNER_ID, "owner"),
+        application_id,
+        {
+            "action": "accept",
+            "category": "standard_probation",
+            "reason": "Private decision rationale",
+            "confirmed": True,
+        },
+    )
+    assert accepted["status"] == "accepted_pending_role"
+
+
+@pytest.mark.asyncio
+async def test_application_analytics_are_aggregate_and_private(portal):
+    service, _guild = portal
+    now = int(time.time())
+    await service.db.execute(
+        "INSERT INTO staff_applications("
+        "guild_id,applicant_id,application_type,status,answers_json,created_ts,"
+        "updated_ts,submitted_ts,first_review_ts,decided_ts,decision_category"
+        ") VALUES(?,?,'mod','rejected','{}',?,?,?,?,?,'availability')",
+        (GUILD_ID, 999, now - 7200, now, now - 7200, now - 3600, now),
+    )
+    result = await service.statistics(principal(HEAD_ID, "head_reviewer"))
+    process = result["application_process"]
+    assert process["submitted"] == 1
+    assert process["average_first_review_seconds"] == 3600
+    assert process["reason_breakdown"] == {"availability": 1}
+    assert "applicant_id" not in json.dumps(process)
     assert _youtube_embed_url("https://youtu.be/too-short") == ""

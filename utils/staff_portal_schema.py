@@ -12,6 +12,9 @@ STAFF_PORTAL_TABLES = {
     "staff_application_cooldowns",
     "staff_application_events",
     "staff_application_notes",
+    "staff_application_assessments",
+    "staff_application_interviews",
+    "staff_application_probations",
     "staff_members",
     "staff_portal_profiles",
     "staff_portal_nickname_history",
@@ -122,6 +125,9 @@ STAFF_PORTAL_SCHEMA = (
         application_type TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'draft',
         answers_json TEXT NOT NULL DEFAULT '{}',
+        form_version TEXT NOT NULL DEFAULT 'legacy',
+        submitted_answers_json TEXT,
+        submitted_questions_json TEXT,
         claimed_by INTEGER,
         created_ts INTEGER NOT NULL,
         updated_ts INTEGER NOT NULL,
@@ -129,6 +135,12 @@ STAFF_PORTAL_SCHEMA = (
         decided_by INTEGER,
         decided_ts INTEGER,
         decision_reason TEXT NOT NULL DEFAULT '',
+        decision_category TEXT NOT NULL DEFAULT '',
+        applicant_message TEXT NOT NULL DEFAULT '',
+        first_review_ts INTEGER,
+        calibration_resolved_ts INTEGER,
+        calibration_resolved_by INTEGER,
+        calibration_note TEXT NOT NULL DEFAULT '',
         role_outbox_id INTEGER,
         review_prompt_key TEXT,
         review_thread_outbox_id INTEGER,
@@ -163,6 +175,47 @@ STAFF_PORTAL_SCHEMA = (
         author_id INTEGER NOT NULL,
         body TEXT NOT NULL,
         created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL
+    );""",
+    """CREATE TABLE IF NOT EXISTS staff_application_assessments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        application_id INTEGER NOT NULL,
+        reviewer_id INTEGER NOT NULL,
+        rubric_version TEXT NOT NULL,
+        scores_json TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        recommendation TEXT NOT NULL,
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL,
+        UNIQUE(application_id,reviewer_id)
+    );""",
+    """CREATE TABLE IF NOT EXISTS staff_application_interviews(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        application_id INTEGER NOT NULL,
+        requested_by INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        questions_json TEXT NOT NULL DEFAULT '[]',
+        recommendation TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'requested',
+        ticket_channel_id INTEGER,
+        created_ts INTEGER NOT NULL,
+        completed_ts INTEGER,
+        completed_by INTEGER
+    );""",
+    """CREATE TABLE IF NOT EXISTS staff_application_probations(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        application_id INTEGER NOT NULL UNIQUE,
+        guild_id INTEGER NOT NULL,
+        applicant_id INTEGER NOT NULL,
+        application_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        started_ts INTEGER NOT NULL,
+        due_ts INTEGER NOT NULL,
+        completed_ts INTEGER,
+        completed_by INTEGER,
+        outcome TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
         updated_ts INTEGER NOT NULL
     );""",
     """CREATE TABLE IF NOT EXISTS staff_members(
@@ -255,6 +308,12 @@ STAFF_PORTAL_SCHEMA = (
         ON staff_application_cooldowns(cooldown_until_ts);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_application_events
         ON staff_application_events(application_id,created_ts);""",
+    """CREATE INDEX IF NOT EXISTS idx_staff_application_assessments
+        ON staff_application_assessments(application_id,updated_ts);""",
+    """CREATE INDEX IF NOT EXISTS idx_staff_application_interviews
+        ON staff_application_interviews(application_id,created_ts);""",
+    """CREATE INDEX IF NOT EXISTS idx_staff_application_probations
+        ON staff_application_probations(guild_id,status,due_ts);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_idempotency_expiry
         ON staff_idempotency(expires_ts);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_nickname_history_user

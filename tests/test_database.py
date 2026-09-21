@@ -55,6 +55,9 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
             "staff_applications",
             "staff_application_events",
             "staff_application_notes",
+            "staff_application_assessments",
+            "staff_application_interviews",
+            "staff_application_probations",
             "staff_members",
             "staff_milestones",
             "staff_idempotency",
@@ -100,7 +103,7 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     schema_rows = await db.fetchall("SELECT component,schema_version FROM schema_metadata")
     schema_versions = {str(row["component"]): int(row["schema_version"]) for row in schema_rows}
     assert schema_versions == {
-            "database": 11,
+        "database": 12,
         "config": 2,
         "runtime_settings": 2,
         "embed_templates": 2,
@@ -118,7 +121,21 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         "review_thread_id",
         "interview_ticket_outbox_id",
         "interview_ticket_channel_id",
+        "form_version",
+        "submitted_answers_json",
+        "submitted_questions_json",
+        "decision_category",
+        "applicant_message",
+        "first_review_ts",
+        "calibration_resolved_ts",
     } <= application_columns
+    interview_columns = {
+        str(row["name"])
+        for row in await db.fetchall(
+            "PRAGMA table_info(staff_application_interviews)"
+        )
+    }
+    assert {"notes", "completed_ts", "completed_by"} <= interview_columns
     assert {
         "guild_id",
         "applicant_id",

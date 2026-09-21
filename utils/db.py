@@ -872,6 +872,7 @@ class Database:
             {**expected, "database": 8},
             {**expected, "database": 9},
             {**expected, "database": 10},
+            {**expected, "database": 11},
         ):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -912,6 +913,17 @@ class Database:
                 self._ensure_column_sync("staff_applications", "review_thread_id", "INTEGER")
                 self._ensure_column_sync("staff_applications", "interview_ticket_outbox_id", "INTEGER")
                 self._ensure_column_sync("staff_applications", "interview_ticket_channel_id", "INTEGER")
+                self._ensure_column_sync("staff_applications", "form_version", "TEXT NOT NULL DEFAULT 'legacy'")
+                self._ensure_column_sync("staff_applications", "submitted_answers_json", "TEXT")
+                self._ensure_column_sync("staff_applications", "submitted_questions_json", "TEXT")
+                self._ensure_column_sync("staff_applications", "decision_category", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column_sync("staff_applications", "applicant_message", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column_sync("staff_applications", "first_review_ts", "INTEGER")
+                self._ensure_column_sync("staff_applications", "calibration_resolved_ts", "INTEGER")
+                self._ensure_column_sync("staff_applications", "calibration_resolved_by", "INTEGER")
+                self._ensure_column_sync("staff_applications", "calibration_note", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column_sync("staff_application_interviews", "notes", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column_sync("staff_application_interviews", "completed_by", "INTEGER")
                 self._execute_sync("UPDATE schema_metadata SET schema_version=?,updated_ts=? WHERE component='database'", (DATABASE_SCHEMA_VERSION, int(time.time())))
                 self._commit_and_sync_sync()
             except Exception:
@@ -1615,6 +1627,17 @@ class Database:
         self._ensure_column_sync("staff_applications", "review_thread_id", "INTEGER")
         self._ensure_column_sync("staff_applications", "interview_ticket_outbox_id", "INTEGER")
         self._ensure_column_sync("staff_applications", "interview_ticket_channel_id", "INTEGER")
+        self._ensure_column_sync("staff_applications", "form_version", "TEXT NOT NULL DEFAULT 'legacy'")
+        self._ensure_column_sync("staff_applications", "submitted_answers_json", "TEXT")
+        self._ensure_column_sync("staff_applications", "submitted_questions_json", "TEXT")
+        self._ensure_column_sync("staff_applications", "decision_category", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column_sync("staff_applications", "applicant_message", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column_sync("staff_applications", "first_review_ts", "INTEGER")
+        self._ensure_column_sync("staff_applications", "calibration_resolved_ts", "INTEGER")
+        self._ensure_column_sync("staff_applications", "calibration_resolved_by", "INTEGER")
+        self._ensure_column_sync("staff_applications", "calibration_note", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column_sync("staff_application_interviews", "notes", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column_sync("staff_application_interviews", "completed_by", "INTEGER")
         for stmt in index_stmts:
             self._conn.execute(stmt)
         self._commit_and_sync_sync()

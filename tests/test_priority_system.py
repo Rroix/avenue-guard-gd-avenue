@@ -408,7 +408,7 @@ async def test_schema_v7_upgrade_marks_existing_state_and_submissions_legacy(tmp
                 "SELECT schema_version FROM schema_metadata WHERE component='database'"
             )
         )["schema_version"]
-    ) == 11
+    ) == 12
     assert not await upgraded.fetchall("SELECT * FROM level_outreach_queue")
     await upgraded.close()
 

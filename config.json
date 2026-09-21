@@ -67,109 +67,329 @@
       "mod"
     ],
     "application_cooldown_days": 5,
+    "application_form_version": "applications-v2",
+    "application_minimum_assessments": 2,
+    "application_disagreement_threshold": 2,
+    "application_probation_days": 30,
+    "application_decision_categories": {
+      "hold": ["needs_clarification", "awaiting_second_review", "calibration", "availability", "other"],
+      "reject": ["insufficient_experience", "weak_work_sample", "judgment_concerns", "availability", "conduct", "incomplete", "other"],
+      "accept": ["standard_probation", "experienced_candidate", "other"]
+    },
     "application_review_channel_id": "1461483580197703832",
     "mod_role_ids": [],
     "application_forms": {
       "judge": {
         "label": "Reviewer application",
         "description": "Apply to review Geometry Dash levels and recommend suitable rating tiers.",
+        "estimated_minutes": 18,
+        "sections": ["Basics", "Experience", "Scenarios", "Work sample", "Confirmation"],
         "questions": [
           {
             "key": "age",
             "label": "How old are you?",
             "type": "single_choice",
             "required": true,
+            "section": "Basics",
+            "guidance": "We use age ranges to plan safeguarding, supervision, and appropriate responsibilities. Your exact birthday is not requested.",
             "options": ["12 or under", "13 to 15", "16 to 18", "19 or above"]
-          },
-          {
-            "key": "motivation",
-            "label": "Why do you want to be a reviewer?",
-            "type": "long_text",
-            "required": true
-          },
-          {
-            "key": "experience",
-            "label": "Tell us a bit about your experience reviewing levels across different servers",
-            "type": "long_text",
-            "required": true
-          },
-          {
-            "key": "improvements",
-            "label": "What do you think GD Avenue can improve on? It doesn't have to be a big change, just something you think might enhance the server experience",
-            "type": "long_text",
-            "required": true
-          },
-          {
-            "key": "weekly_capacity",
-            "label": "How many levels can you review per week? This will create an expectation, so please be honest",
-            "type": "single_choice",
-            "required": true,
-            "options": ["1-2", "3-6", "7-9", "10 or more"]
           },
           {
             "key": "timezone",
             "label": "What is your timezone?",
             "type": "short_text",
             "required": true,
+            "section": "Basics",
+            "guidance": "Your browser suggests a timezone automatically; correct it if necessary.",
+            "recommended_words": 4,
             "help_url": "https://www.checkmytimezone.com/"
           },
           {
-            "key": "level_review",
-            "label": "Review this level",
+            "key": "weekly_capacity",
+            "label": "How many levels can you realistically review per week?",
+            "type": "single_choice",
+            "required": true,
+            "section": "Basics",
+            "guidance": "Choose a sustainable amount rather than an ideal maximum.",
+            "options": ["1-2", "3-6", "7-9", "10 or more"]
+          },
+          {
+            "key": "motivation",
+            "label": "Why do you want to be a reviewer?",
             "type": "long_text",
             "required": true,
+            "section": "Experience",
+            "recommended_words": 100
+          },
+          {
+            "key": "experience",
+            "label": "Tell us about your experience reviewing levels or giving creator feedback",
+            "type": "long_text",
+            "required": true,
+            "section": "Experience",
+            "recommended_words": 120
+          },
+          {
+            "key": "useful_feedback",
+            "label": "What separates useful level feedback from feedback that is merely negative?",
+            "type": "long_text",
+            "required": true,
+            "section": "Experience",
+            "recommended_words": 100
+          },
+          {
+            "key": "changed_opinion",
+            "label": "Describe a time evidence or another perspective changed your opinion about a level",
+            "type": "long_text",
+            "required": true,
+            "section": "Experience",
+            "recommended_words": 100
+          },
+          {
+            "key": "creator_disagreement",
+            "label": "A creator strongly disagrees with your review. How would you respond?",
+            "type": "long_text",
+            "required": true,
+            "section": "Scenarios",
+            "recommended_words": 120
+          },
+          {
+            "key": "improvements",
+            "label": "What could GD Avenue improve to make reviews more useful and fair?",
+            "type": "long_text",
+            "required": true,
+            "section": "Scenarios",
+            "recommended_words": 100
+          },
+          {
+            "key": "work_works_well",
+            "label": "What works well in this level?",
+            "type": "long_text",
+            "required": true,
+            "section": "Work sample",
+            "recommended_words": 100,
             "uses_review_prompt": true
+          },
+          {
+            "key": "work_needs_improvement",
+            "label": "What most needs improvement?",
+            "type": "long_text",
+            "required": true,
+            "section": "Work sample",
+            "recommended_words": 120
+          },
+          {
+            "key": "gameplay_readability",
+            "label": "Is the gameplay readable and fair? Explain your judgment",
+            "type": "long_text",
+            "required": true,
+            "section": "Work sample",
+            "recommended_words": 100
+          },
+          {
+            "key": "visual_consistency",
+            "label": "How consistent and effective are the visuals?",
+            "type": "long_text",
+            "required": true,
+            "section": "Work sample",
+            "recommended_words": 100
+          },
+          {
+            "key": "rate_type",
+            "label": "What type of rate would you recommend this level for? (Rate, feature...)",
+            "type": "single_choice",
+            "required": true,
+            "section": "Work sample",
+            "options": ["Rate", "Feature", "Epic", "Legendary", "Mythic", "No recommendation"]
+          },
+          {
+            "key": "rate_evidence",
+            "label": "What evidence supports that recommendation?",
+            "type": "long_text",
+            "required": true,
+            "section": "Work sample",
+            "recommended_words": 120
+          },
+          {
+            "key": "creator_feedback",
+            "label": "Write the concise feedback you would send to the creator",
+            "type": "long_text",
+            "required": true,
+            "section": "Work sample",
+            "recommended_words": 140
+          },
+          {
+            "key": "reliability_commitment",
+            "label": "Can you reliably meet the weekly capacity you selected and communicate when you cannot?",
+            "type": "single_choice",
+            "required": true,
+            "section": "Confirmation",
+            "options": ["Yes", "No", "I need to discuss accommodations"]
+          },
+          {
+            "key": "additional_context",
+            "label": "Is there any context or accommodation you want staff to consider?",
+            "type": "long_text",
+            "required": false,
+            "section": "Confirmation",
+            "recommended_words": 60
           }
         ]
       },
       "mod": {
         "label": "Mod application",
         "description": "Apply to help moderate GD Avenue and support a safe, welcoming community.",
+        "estimated_minutes": 14,
+        "sections": ["Basics", "Experience", "Scenarios", "Confirmation"],
         "questions": [
           {
             "key": "age",
             "label": "How old are you?",
             "type": "single_choice",
             "required": true,
+            "section": "Basics",
+            "guidance": "We use age ranges to plan safeguarding, supervision, and appropriate responsibilities. Your exact birthday is not requested.",
             "options": ["12 or under", "13 to 15", "16 to 18", "19 or above"]
-          },
-          {
-            "key": "motivation",
-            "label": "Why do you want to be a mod?",
-            "type": "long_text",
-            "required": true
-          },
-          {
-            "key": "experience",
-            "label": "Tell us a bit about your experience moderating servers",
-            "type": "long_text",
-            "required": true
-          },
-          {
-            "key": "improvements",
-            "label": "What do you think GD Avenue can improve on? It doesn't have to be a big change, just something you think might enhance the server experience",
-            "type": "long_text",
-            "required": true
-          },
-          {
-            "key": "availability",
-            "label": "How much time can you dedicate to moderating the server?",
-            "type": "long_text",
-            "required": true
           },
           {
             "key": "timezone",
             "label": "What is your timezone?",
             "type": "short_text",
             "required": true,
+            "section": "Basics",
+            "guidance": "Your browser suggests a timezone automatically; correct it if necessary.",
+            "recommended_words": 4,
             "help_url": "https://www.checkmytimezone.com/"
           },
           {
-            "key": "moderation_scenario",
-            "label": "Imagine that a suspicious member starts harassing other members and breaking several server rules. What would you do in this situation?",
+            "key": "availability",
+            "label": "How much time can you realistically dedicate to moderation each week?",
+            "type": "single_choice",
+            "required": true,
+            "section": "Basics",
+            "options": ["Less than 2 hours", "2-4 hours", "5-7 hours", "8 or more hours"]
+          },
+          {
+            "key": "motivation",
+            "label": "Why do you want to be a mod?",
             "type": "long_text",
-            "required": true
+            "required": true,
+            "section": "Experience",
+            "recommended_words": 100
+          },
+          {
+            "key": "experience",
+            "label": "Tell us about your experience moderating communities or resolving conflict",
+            "type": "long_text",
+            "required": true,
+            "section": "Experience",
+            "recommended_words": 120
+          },
+          {
+            "key": "moderation_goal",
+            "label": "What is the difference between stopping disruption and punishing a user?",
+            "type": "long_text",
+            "required": true,
+            "section": "Scenarios",
+            "recommended_words": 100
+          },
+          {
+            "key": "harassment_scenario",
+            "label": "A member repeatedly harasses others and breaks several rules. What would you do, in order?",
+            "type": "long_text",
+            "required": true,
+            "section": "Scenarios",
+            "recommended_words": 150
+          },
+          {
+            "key": "friend_rule",
+            "label": "A friend asks you to ignore a rule violation. How do you handle it?",
+            "type": "long_text",
+            "required": true,
+            "section": "Scenarios",
+            "recommended_words": 100
+          },
+          {
+            "key": "staff_disagreement",
+            "label": "You disagree with a decision made by higher staff. What do you do?",
+            "type": "long_text",
+            "required": true,
+            "section": "Scenarios",
+            "recommended_words": 100
+          },
+          {
+            "key": "privacy_scenario",
+            "label": "You receive private or sensitive information during an incident. What are your immediate steps?",
+            "type": "long_text",
+            "required": true,
+            "section": "Scenarios",
+            "recommended_words": 120
+          },
+          {
+            "key": "triage_action",
+            "label": "A heated argument is escalating in a public channel. What is your first action?",
+            "type": "single_choice",
+            "required": true,
+            "section": "Scenarios",
+            "options": ["Pause the disruption and assess immediate safety", "Issue the harshest available punishment", "Ignore it until someone reports it", "Move the argument elsewhere without documenting it"]
+          },
+          {
+            "key": "triage_explanation",
+            "label": "Explain why you chose that first action and what you would do next",
+            "type": "long_text",
+            "required": true,
+            "section": "Scenarios",
+            "recommended_words": 120
+          },
+          {
+            "key": "improvements",
+            "label": "What could GD Avenue improve to make the community safer or easier to moderate?",
+            "type": "long_text",
+            "required": true,
+            "section": "Scenarios",
+            "recommended_words": 100
+          },
+          {
+            "key": "reliability_commitment",
+            "label": "Can you reliably meet the availability you selected and communicate when you cannot?",
+            "type": "single_choice",
+            "required": true,
+            "section": "Confirmation",
+            "options": ["Yes", "No", "I need to discuss accommodations"]
+          },
+          {
+            "key": "additional_context",
+            "label": "Is there any context or accommodation you want staff to consider?",
+            "type": "long_text",
+            "required": false,
+            "section": "Confirmation",
+            "recommended_words": 60
           }
+        ]
+      }
+    },
+    "application_rubrics": {
+      "judge": {
+        "version": "reviewer-rubric-v1",
+        "dimensions": [
+          {"key": "review_reasoning", "label": "Review reasoning"},
+          {"key": "tier_judgment", "label": "Tier judgment"},
+          {"key": "actionable_feedback", "label": "Actionable feedback"},
+          {"key": "fairness", "label": "Fairness and open-mindedness"},
+          {"key": "communication", "label": "Communication"},
+          {"key": "reliability", "label": "Reliability and capacity"}
+        ]
+      },
+      "mod": {
+        "version": "mod-rubric-v1",
+        "dimensions": [
+          {"key": "rule_application", "label": "Rule application"},
+          {"key": "proportionality", "label": "Proportionality"},
+          {"key": "deescalation", "label": "De-escalation"},
+          {"key": "impartiality", "label": "Impartiality"},
+          {"key": "privacy_awareness", "label": "Privacy awareness"},
+          {"key": "communication", "label": "Communication"},
+          {"key": "reliability", "label": "Reliability"}
         ]
       }
     },

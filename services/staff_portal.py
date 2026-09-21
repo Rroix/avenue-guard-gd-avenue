@@ -37,7 +37,7 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 6
+PORTAL_API_VERSION = 7
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
@@ -55,6 +55,14 @@ PORTAL_FEATURES = (
     "task_assignment_dm",
     "task_recipient_dm",
     "view_role_preview",
+    "application_form_sections",
+    "application_autosave",
+    "application_submission_review",
+    "application_immutable_snapshots",
+    "application_rubrics",
+    "application_calibration",
+    "application_probation",
+    "application_process_analytics",
 )
 DISCORD_ID_FIELDS = {
     "actor_id",
@@ -127,6 +135,16 @@ def _json_object(value: Any) -> dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(str(value or "[]"))
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
 
 
 def _bounded_text(value: Any, limit: int, *, required: bool = False) -> str:
@@ -933,11 +951,26 @@ class StaffPortalService:
         if qa_match and method == "POST":
             principal.require("review.qa")
             return 200, await self.qa_action(principal, int(qa_match.group(1)), payload)
-        app_match = re.fullmatch(r"/api/staff/applications/(\d+)/(action|note)", path)
+        app_match = re.fullmatch(
+            r"/api/staff/applications/(\d+)/(action|note|assessment|interview|probation)",
+            path,
+        )
         if app_match and method == "POST":
             principal.require("applications.review_judge")
             if app_match.group(2) == "note":
                 return 201, await self.application_note(principal, int(app_match.group(1)), payload)
+            if app_match.group(2) == "assessment":
+                return 200, await self.application_assessment(
+                    principal, int(app_match.group(1)), payload
+                )
+            if app_match.group(2) == "interview":
+                return 200, await self.application_interview_outcome(
+                    principal, int(app_match.group(1)), payload
+                )
+            if app_match.group(2) == "probation":
+                return 200, await self.application_probation_action(
+                    principal, int(app_match.group(1)), payload
+                )
             return 200, await self.application_action(principal, int(app_match.group(1)), payload)
         staff_match = re.fullmatch(r"/api/staff/staff/(\d+)/action", path)
         if staff_match and method == "POST":
@@ -2408,6 +2441,74 @@ class StaffPortalService:
             "SELECT COUNT(*) AS c FROM staff_queue_claims WHERE guild_id=? AND claim_state='active' AND claimed_ts<?",
             (principal.guild_id, int(time.time()) - await self._claim_stale_seconds()),
         )
+        application_timing = await self.db.fetchone(
+            "SELECT COUNT(*) AS submitted,"
+            "SUM(CASE WHEN status IN('submitted','under_review','interview','hold',"
+            "'accepted_pending_role','accepted','rejected') THEN 1 ELSE 0 END) AS active_or_decided,"
+            "AVG(CASE WHEN first_review_ts>=submitted_ts THEN first_review_ts-submitted_ts END) "
+            "AS average_first_review_seconds,"
+            "AVG(CASE WHEN decided_ts>=submitted_ts THEN decided_ts-submitted_ts END) "
+            "AS average_decision_seconds,"
+            "SUM(CASE WHEN status IN('submitted','under_review','interview','hold',"
+            "'accepted_pending_role') THEN 1 ELSE 0 END) AS pending "
+            "FROM staff_applications WHERE guild_id=? AND submitted_ts IS NOT NULL",
+            (principal.guild_id,),
+        )
+        application_outcomes = await self.db.fetchall(
+            "SELECT application_type,status,COUNT(*) AS c FROM staff_applications "
+            "WHERE guild_id=? AND submitted_ts IS NOT NULL GROUP BY application_type,status",
+            (principal.guild_id,),
+        )
+        reason_rows = await self.db.fetchall(
+            "SELECT decision_category,COUNT(*) AS c FROM staff_applications "
+            "WHERE guild_id=? AND decision_category!='' GROUP BY decision_category "
+            "ORDER BY c DESC",
+            (principal.guild_id,),
+        )
+        interview_count = await self.db.fetchone(
+            "SELECT COUNT(DISTINCT i.application_id) AS c FROM staff_application_interviews i "
+            "JOIN staff_applications a ON a.id=i.application_id WHERE a.guild_id=?",
+            (principal.guild_id,),
+        )
+        probation_rows = await self.db.fetchall(
+            "SELECT status,COUNT(*) AS c FROM staff_application_probations "
+            "WHERE guild_id=? GROUP BY status",
+            (principal.guild_id,),
+        )
+        assessment_rows = await self.db.fetchall(
+            "SELECT a.id,a.application_type,a.calibration_resolved_ts,s.scores_json,"
+            "s.evidence_json,s.recommendation FROM staff_applications a "
+            "JOIN staff_application_assessments s ON s.application_id=a.id "
+            "WHERE a.guild_id=? ORDER BY a.id",
+            (principal.guild_id,),
+        )
+        assessments_by_application: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        application_assessment_meta: dict[int, tuple[str, bool]] = {}
+        for assessment in assessment_rows:
+            application_id = int(assessment["id"])
+            application_assessment_meta[application_id] = (
+                str(assessment["application_type"]),
+                bool(assessment["calibration_resolved_ts"]),
+            )
+            assessments_by_application[application_id].append(
+                {
+                    "scores": _json_object(assessment["scores_json"]),
+                    "evidence": _json_object(assessment["evidence_json"]),
+                    "recommendation": str(assessment["recommendation"]),
+                }
+            )
+        comparable = 0
+        disagreements = 0
+        for application_id, assessment_items in assessments_by_application.items():
+            application_type, resolved = application_assessment_meta[application_id]
+            summary = self._application_assessment_summary(
+                application_type,
+                assessment_items,
+                calibration_resolved=resolved,
+            )
+            if summary["complete"]:
+                comparable += 1
+                disagreements += int(summary["disagreement"])
         reviewer_identities = await self._resolve_identities(
             {
                 int(row["reviewed_by"])
@@ -2438,6 +2539,41 @@ class StaffPortalService:
             "stale_claims": int(stale["c"] or 0),
             "waiting_distribution": {str(row["bucket"]): int(row["c"] or 0) for row in waiting},
             "cp_distribution": {str(row["bucket"]): int(row["c"] or 0) for row in cp},
+            "pending_applications": int(application_timing["pending"] or 0),
+            "application_process": {
+                "submitted": int(application_timing["submitted"] or 0),
+                "pending": int(application_timing["pending"] or 0),
+                "average_first_review_seconds": round(
+                    float(application_timing["average_first_review_seconds"] or 0)
+                ),
+                "average_decision_seconds": round(
+                    float(application_timing["average_decision_seconds"] or 0)
+                ),
+                "interviewed": int(interview_count["c"] or 0),
+                "interview_rate_percent": round(
+                    (int(interview_count["c"] or 0) / int(application_timing["submitted"] or 1))
+                    * 100,
+                    1,
+                ),
+                "outcomes_by_type": [
+                    _row_dict(row) for row in application_outcomes
+                ],
+                "reason_breakdown": {
+                    str(row["decision_category"]): int(row["c"] or 0)
+                    for row in reason_rows
+                },
+                "rubric_comparable": comparable,
+                "rubric_disagreements": disagreements,
+                "rubric_disagreement_percent": round(
+                    (disagreements / comparable) * 100, 1
+                )
+                if comparable
+                else 0,
+                "probation": {
+                    str(row["status"]): int(row["c"] or 0)
+                    for row in probation_rows
+                },
+            },
             "scope": "team" if scope_all else "self",
         }
 
@@ -2487,7 +2623,12 @@ class StaffPortalService:
             return 200, await self.application_form(principal, form_match.group(1))
         if path == "/api/apply/mine" and method == "GET":
             await self._reconcile_application_roles()
-            rows = await self.db.fetchall("SELECT id,application_type,status,answers_json,created_ts,updated_ts,submitted_ts,decided_ts,decision_reason FROM staff_applications WHERE guild_id=? AND applicant_id=? ORDER BY updated_ts DESC LIMIT 20", (principal.guild_id, principal.user_id))
+            rows = await self.db.fetchall(
+                "SELECT id,application_type,status,answers_json,created_ts,updated_ts,"
+                "submitted_ts,decided_ts,applicant_message FROM staff_applications "
+                "WHERE guild_id=? AND applicant_id=? ORDER BY updated_ts DESC LIMIT 20",
+                (principal.guild_id, principal.user_id),
+            )
             return 200, {
                 "items": [
                     {
@@ -2600,6 +2741,18 @@ class StaffPortalService:
                             (application_id,),
                         ),
                         (
+                            "DELETE FROM staff_application_assessments WHERE application_id=?",
+                            (application_id,),
+                        ),
+                        (
+                            "DELETE FROM staff_application_interviews WHERE application_id=?",
+                            (application_id,),
+                        ),
+                        (
+                            "DELETE FROM staff_application_probations WHERE application_id=?",
+                            (application_id,),
+                        ),
+                        (
                             "DELETE FROM staff_applications WHERE id=?",
                             (application_id,),
                         ),
@@ -2694,6 +2847,88 @@ class StaffPortalService:
             }
         return {}
 
+    def _application_form_version(self) -> str:
+        value = str(
+            self.bot.config.get(
+                "staff_portal",
+                "application_form_version",
+                default="applications-v2",
+            )
+            or "applications-v2"
+        ).strip()
+        return value[:80]
+
+    def _application_rubric(self, application_type: str) -> dict[str, Any]:
+        rubrics = self.bot.config.get(
+            "staff_portal", "application_rubrics", default={}
+        )
+        raw = rubrics.get(application_type, {}) if isinstance(rubrics, dict) else {}
+        dimensions = []
+        for item in raw.get("dimensions", []) if isinstance(raw, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()[:80]
+            label = str(item.get("label") or "").strip()[:160]
+            if key and label:
+                dimensions.append({"key": key, "label": label})
+        return {
+            "version": str(raw.get("version") or f"{application_type}-rubric-v1")[:80]
+            if isinstance(raw, dict)
+            else f"{application_type}-rubric-v1",
+            "dimensions": dimensions,
+            "scale": {"min": 1, "max": 5},
+            "minimum_assessments": max(
+                1,
+                min(
+                    5,
+                    self.bot.config.get_int(
+                        "staff_portal",
+                        "application_minimum_assessments",
+                        default=2,
+                    ),
+                ),
+            ),
+        }
+
+    def _application_decision_categories(self, action: str) -> list[str]:
+        configured = self.bot.config.get(
+            "staff_portal", "application_decision_categories", default={}
+        )
+        values = configured.get(action, []) if isinstance(configured, dict) else []
+        return [
+            str(value).strip().casefold()[:80]
+            for value in values
+            if str(value).strip()
+        ]
+
+    def _application_probation_days(self) -> int:
+        return max(
+            1,
+            min(
+                365,
+                self.bot.config.get_int(
+                    "staff_portal", "application_probation_days", default=30
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _applicant_application_payload(row: Any) -> dict[str, Any]:
+        data = _row_dict(row)
+        return {
+            key: data.get(key)
+            for key in (
+                "id",
+                "application_type",
+                "status",
+                "created_ts",
+                "updated_ts",
+                "submitted_ts",
+                "decided_ts",
+                "applicant_message",
+            )
+        } | {"answers": _json_object(data.get("answers_json"))}
+
     def _application_label(self, application_type: str) -> str:
         configured = self._application_form_config(application_type)
         label = str(configured.get("label") or "").strip()
@@ -2732,10 +2967,10 @@ class StaffPortalService:
     ) -> list[str]:
         """Return the server-authoritative actions for an application state."""
         actions = {
-            "submitted": ["claim", "interview", "hold", "accept", "reject", "message"],
-            "under_review": ["interview", "hold", "accept", "reject", "message"],
-            "hold": ["claim", "interview", "accept", "reject", "message"],
-            "interview": ["interview", "hold", "accept", "reject", "message"],
+            "submitted": ["claim", "assess", "interview", "hold", "accept", "reject", "message"],
+            "under_review": ["assess", "interview", "hold", "accept", "reject", "message"],
+            "hold": ["claim", "assess", "interview", "accept", "reject", "message"],
+            "interview": ["assess", "interview", "hold", "accept", "reject", "message"],
             "accepted_pending_role": ["accept", "message"],
             "accepted": ["message"],
             "rejected": ["message"],
@@ -2869,13 +3104,12 @@ class StaffPortalService:
                 "options": options if kind == "single_choice" else [],
                 "help_url": str(raw.get("help_url") or "").strip()[:500],
                 "uses_review_prompt": bool(raw.get("uses_review_prompt")),
+                "section": str(raw.get("section") or "Application").strip()[:100],
+                "guidance": str(raw.get("guidance") or "").strip()[:500],
+                "recommended_words": int(raw.get("recommended_words") or 0),
             }
             if raw.get("uses_review_prompt"):
                 question["review_prompt"] = review_prompt or None
-                if review_prompt:
-                    question["label"] = (
-                        f"Review {review_prompt['name']} (Level ID {review_prompt['level_id']})"
-                    )[:500]
             questions.append(question)
         return questions
 
@@ -2966,12 +3200,13 @@ class StaffPortalService:
                 prompt = self._choose_application_review_prompt() if uses_review_prompt else None
                 now = int(time.time())
                 application_id = await self.db.execute_insert(
-                    "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,answers_json,created_ts,updated_ts,review_prompt_key) "
-                    "VALUES(?,?,?,'draft','{}',?,?,?)",
+                    "INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,answers_json,form_version,created_ts,updated_ts,review_prompt_key) "
+                    "VALUES(?,?,?,'draft','{}',?,?,?,?)",
                     (
                         principal.guild_id,
                         principal.user_id,
                         application_type,
+                        self._application_form_version(),
                         now,
                         now,
                         prompt["key"] if prompt else None,
@@ -2997,8 +3232,7 @@ class StaffPortalService:
                     )
             return {
                 "application": {
-                    **_row_dict(row),
-                    "answers": _json_object(row["answers_json"]),
+                    **self._applicant_application_payload(row),
                 },
                 "form": {
                     "application_type": application_type,
@@ -3007,6 +3241,26 @@ class StaffPortalService:
                         self._application_form_config(application_type).get("description")
                         or ""
                     )[:500],
+                    "version": str(row["form_version"] or self._application_form_version()),
+                    "estimated_minutes": max(
+                        1,
+                        min(
+                            120,
+                            int(
+                                self._application_form_config(application_type).get(
+                                    "estimated_minutes", 10
+                                )
+                                or 10
+                            ),
+                        ),
+                    ),
+                    "sections": [
+                        str(item)[:100]
+                        for item in self._application_form_config(application_type).get(
+                            "sections", []
+                        )
+                        if str(item).strip()
+                    ],
                 },
                 "questions": self._application_questions(prompt, application_type),
             }
@@ -3067,14 +3321,28 @@ class StaffPortalService:
             ),
             None,
         )
-        answers = _json_object(row["answers_json"])
+        answers = _json_object(
+            row["submitted_answers_json"] or row["answers_json"]
+        )
+        submitted_questions = _json_list(row["submitted_questions_json"])
+        questions = (
+            submitted_questions
+            if submitted_questions
+            else self._application_questions(prompt, application_type)
+        )
         responses = []
-        for question in self._application_questions(prompt, application_type):
-            label = question["label"]
-            if question["uses_review_prompt"] and prompt:
+        for question in questions:
+            if not isinstance(question, dict):
+                continue
+            label = str(question.get("label") or "Question")
+            if question.get("uses_review_prompt") and prompt:
                 label = f"{label} - {prompt['youtube_url']}"
             responses.append(
-                {"question": label, "answer": answers.get(question["key"], "")}
+                {
+                    "section": str(question.get("section") or "Application"),
+                    "question": label,
+                    "answer": answers.get(str(question.get("key") or ""), ""),
+                }
             )
         return {
             "application_id": int(row["id"]),
@@ -3203,7 +3471,9 @@ class StaffPortalService:
             if active is not None:
                 if submit:
                     application_id = int(active["id"])
-                    result = {"application": _row_dict(active)}
+                    result = {
+                        "application": self._applicant_application_payload(active)
+                    }
                     active_retry = True
                 else:
                     raise PortalError(409, "application_active", "You already have an active application")
@@ -3231,21 +3501,80 @@ class StaffPortalService:
                     )
                     prompt = self._choose_application_review_prompt() if uses_review_prompt else None
                     prompt_key = prompt["key"] if prompt else ""
+                questions = self._application_questions(prompt, app_type)
                 safe_answers = self._validate_application_answers(
                     answers, prompt, app_type, submit=submit
                 )
                 target_status = "submitted" if submit else "draft"
+                encoded_answers = json.dumps(
+                    safe_answers, separators=(",", ":"), ensure_ascii=False
+                )
+                encoded_questions = json.dumps(
+                    questions, separators=(",", ":"), ensure_ascii=False
+                )
+                form_version = self._application_form_version()
                 if row:
                     application_id = int(row["id"])
-                    await self.db.execute("UPDATE staff_applications SET answers_json=?,status=?,updated_ts=?,submitted_ts=?,review_prompt_key=COALESCE(review_prompt_key,?) WHERE id=? AND status='draft'", (json.dumps(safe_answers, separators=(",", ":")), target_status, now, now if submit else None, prompt_key or None, application_id))
+                    await self.db.execute(
+                        "UPDATE staff_applications SET answers_json=?,status=?,"
+                        "form_version=?,updated_ts=?,submitted_ts=?,"
+                        "submitted_answers_json=CASE WHEN ? THEN ? ELSE submitted_answers_json END,"
+                        "submitted_questions_json=CASE WHEN ? THEN ? ELSE submitted_questions_json END,"
+                        "review_prompt_key=COALESCE(review_prompt_key,?) "
+                        "WHERE id=? AND status='draft'",
+                        (
+                            encoded_answers,
+                            target_status,
+                            form_version,
+                            now,
+                            now if submit else None,
+                            1 if submit else 0,
+                            encoded_answers,
+                            1 if submit else 0,
+                            encoded_questions,
+                            prompt_key or None,
+                            application_id,
+                        ),
+                    )
                 else:
-                    application_id = await self.db.execute_insert("INSERT INTO staff_applications(guild_id,applicant_id,application_type,status,answers_json,created_ts,updated_ts,submitted_ts,review_prompt_key) VALUES(?,?,?,?,?,?,?,?,?)", (principal.guild_id, principal.user_id, app_type, target_status, json.dumps(safe_answers, separators=(",", ":")), now, now, now if submit else None, prompt_key or None))
+                    application_id = await self.db.execute_insert(
+                        "INSERT INTO staff_applications("
+                        "guild_id,applicant_id,application_type,status,answers_json,"
+                        "form_version,submitted_answers_json,submitted_questions_json,"
+                        "created_ts,updated_ts,submitted_ts,review_prompt_key"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            principal.guild_id,
+                            principal.user_id,
+                            app_type,
+                            target_status,
+                            encoded_answers,
+                            form_version,
+                            encoded_answers if submit else None,
+                            encoded_questions if submit else None,
+                            now,
+                            now,
+                            now if submit else None,
+                            prompt_key or None,
+                        ),
+                    )
                 if submit:
                     await self._application_event(application_id, principal.user_id, "submitted", "draft", "submitted", {})
-                result = {"application": _row_dict(await self.db.fetchone("SELECT * FROM staff_applications WHERE id=?", (application_id,)))}
+                result = {
+                    "application": self._applicant_application_payload(
+                        await self.db.fetchone(
+                            "SELECT * FROM staff_applications WHERE id=?",
+                            (application_id,),
+                        )
+                    )
+                }
         if submit:
             await self._ensure_application_thread_outbox(application_id)
-            result["application"] = _row_dict(await self.db.fetchone("SELECT * FROM staff_applications WHERE id=?", (application_id,)))
+            result["application"] = self._applicant_application_payload(
+                await self.db.fetchone(
+                    "SELECT * FROM staff_applications WHERE id=?", (application_id,)
+                )
+            )
         return result
 
     async def _application_event(self, application_id, actor_id, event, old, new, detail):
@@ -3296,6 +3625,68 @@ class StaffPortalService:
         for row in rows:
             if str(row["status"]) == "delivered":
                 await self.db.execute("UPDATE staff_applications SET status='accepted',updated_ts=? WHERE id=? AND status='accepted_pending_role'", (int(time.time()), int(row["id"])))
+
+    def _application_assessment_summary(
+        self,
+        application_type: str,
+        assessments: list[dict[str, Any]],
+        *,
+        calibration_resolved: bool,
+    ) -> dict[str, Any]:
+        rubric = self._application_rubric(application_type)
+        minimum = int(rubric["minimum_assessments"])
+        threshold = max(
+            1,
+            min(
+                4,
+                self.bot.config.get_int(
+                    "staff_portal",
+                    "application_disagreement_threshold",
+                    default=2,
+                ),
+            ),
+        )
+        spreads: dict[str, int] = {}
+        averages: dict[str, float] = {}
+        for dimension in rubric["dimensions"]:
+            key = dimension["key"]
+            values = [
+                int(item.get("scores", {}).get(key))
+                for item in assessments
+                if str(item.get("scores", {}).get(key, "")).isdigit()
+            ]
+            if values:
+                spreads[key] = max(values) - min(values)
+                averages[key] = round(sum(values) / len(values), 2)
+        recommendations = {
+            str(item.get("recommendation") or "")
+            for item in assessments
+            if str(item.get("recommendation") or "")
+        }
+        enough = len(assessments) >= minimum
+        disagreement = any(value >= threshold for value in spreads.values()) or len(
+            recommendations
+        ) > 1
+        calibration_required = enough and disagreement and not calibration_resolved
+        return {
+            "count": len(assessments),
+            "minimum": minimum,
+            "complete": enough,
+            "disagreement": disagreement,
+            "calibration_required": calibration_required,
+            "decision_ready": enough and not calibration_required,
+            "dimension_averages": averages,
+            "dimension_spreads": spreads,
+            "recommendations": sorted(recommendations),
+        }
+
+    @staticmethod
+    def _submitted_application_questions(row: Any) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in _json_list(row["submitted_questions_json"])
+            if isinstance(item, dict)
+        ]
 
     async def applications(self, principal, query):
         await self._reconcile_application_roles()
@@ -3379,8 +3770,25 @@ class StaffPortalService:
             "ORDER BY created_ts",
             application_ids,
         )
+        assessments = await self.db.fetchall(
+            f"SELECT * FROM staff_application_assessments WHERE application_id IN ({placeholders}) "  # nosec B608
+            "ORDER BY created_ts,id",
+            application_ids,
+        )
+        interviews = await self.db.fetchall(
+            f"SELECT * FROM staff_application_interviews WHERE application_id IN ({placeholders}) "  # nosec B608
+            "ORDER BY created_ts,id",
+            application_ids,
+        )
+        probations = await self.db.fetchall(
+            f"SELECT * FROM staff_application_probations WHERE application_id IN ({placeholders})",  # nosec B608
+            application_ids,
+        )
         notes_by_application: dict[int, list[dict[str, Any]]] = defaultdict(list)
         events_by_application: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        assessments_by_application: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        interviews_by_application: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        probation_by_application: dict[int, dict[str, Any]] = {}
         identity_ids = {
             int(row["applicant_id"])
             for row in rows
@@ -3399,6 +3807,35 @@ class StaffPortalService:
             event_payload = _row_dict(event)
             event_payload["detail"] = _json_object(event_payload.pop("detail_json", "{}"))
             events_by_application[int(event["application_id"])].append(event_payload)
+        for assessment in assessments:
+            identity_ids.add(int(assessment["reviewer_id"]))
+            assessment_payload = _row_dict(assessment)
+            assessment_payload["scores"] = _json_object(
+                assessment_payload.pop("scores_json", "{}")
+            )
+            assessment_payload["evidence"] = _json_object(
+                assessment_payload.pop("evidence_json", "{}")
+            )
+            assessments_by_application[int(assessment["application_id"])].append(
+                assessment_payload
+            )
+        for interview in interviews:
+            identity_ids.add(int(interview["requested_by"]))
+            if interview["completed_by"] is not None:
+                identity_ids.add(int(interview["completed_by"]))
+            interview_payload = _row_dict(interview)
+            interview_payload["questions"] = _json_list(
+                interview_payload.pop("questions_json", "[]")
+            )
+            interviews_by_application[int(interview["application_id"])].append(
+                interview_payload
+            )
+        for probation in probations:
+            if probation["completed_by"] is not None:
+                identity_ids.add(int(probation["completed_by"]))
+            probation_by_application[int(probation["application_id"])] = _row_dict(
+                probation
+            )
         identities = await self._resolve_identities(identity_ids)
         for note_items in notes_by_application.values():
             for note in note_items:
@@ -3406,6 +3843,25 @@ class StaffPortalService:
         for event_items in events_by_application.values():
             for event in event_items:
                 event["actor"] = identities.get(int(event["actor_id"]))
+        for assessment_items in assessments_by_application.values():
+            for assessment in assessment_items:
+                assessment["reviewer"] = identities.get(
+                    int(assessment["reviewer_id"])
+                )
+        for interview_items in interviews_by_application.values():
+            for interview in interview_items:
+                interview["requested_by_identity"] = identities.get(
+                    int(interview["requested_by"])
+                )
+                if interview.get("completed_by") is not None:
+                    interview["completed_by_identity"] = identities.get(
+                        int(interview["completed_by"])
+                    )
+        for probation in probation_by_application.values():
+            if probation.get("completed_by") is not None:
+                probation["completed_by_identity"] = identities.get(
+                    int(probation["completed_by"])
+                )
         return {
             "items": [
                 {
@@ -3420,7 +3876,25 @@ class StaffPortalService:
                     "decided_by_identity": identities.get(int(row["decided_by"]))
                     if row["decided_by"] is not None
                     else None,
-                    "answers": _json_object(row["answers_json"]),
+                    "answers": _json_object(
+                        row["submitted_answers_json"] or row["answers_json"]
+                    ),
+                    "questions": self._submitted_application_questions(row),
+                    "rubric": self._application_rubric(
+                        str(row["application_type"])
+                    ),
+                    "decision_categories": {
+                        action: self._application_decision_categories(action)
+                        for action in ("hold", "accept", "reject")
+                    },
+                    "assessments": assessments_by_application[int(row["id"])],
+                    "assessment_summary": self._application_assessment_summary(
+                        str(row["application_type"]),
+                        assessments_by_application[int(row["id"])],
+                        calibration_resolved=bool(row["calibration_resolved_ts"]),
+                    ),
+                    "interviews": interviews_by_application[int(row["id"])],
+                    "probation": probation_by_application.get(int(row["id"])),
                     "internal_notes": notes_by_application[int(row["id"])],
                     "timeline": events_by_application[int(row["id"])],
                     "available_actions": self._application_actions_for_status(
@@ -3429,12 +3903,389 @@ class StaffPortalService:
                             row["interview_delivery_status"] or ""
                         )
                         in {"pending", "processing", "failed"},
+                    )
+                    + (
+                        ["calibrate"]
+                        if principal.can("applications.review_all")
+                        and self._application_assessment_summary(
+                            str(row["application_type"]),
+                            assessments_by_application[int(row["id"])],
+                            calibration_resolved=bool(
+                                row["calibration_resolved_ts"]
+                            ),
+                        )["calibration_required"]
+                        else []
                     ),
                 }
                 for row in rows
             ],
             "application_types": visible_types,
         }
+
+    async def application_assessment(self, principal, application_id, payload):
+        row = await self.db.fetchone(
+            "SELECT * FROM staff_applications WHERE id=? AND guild_id=?",
+            (application_id, principal.guild_id),
+        )
+        if row is None:
+            raise PortalError(404, "application_not_found", "Application not found")
+        application_type = str(row["application_type"] or "judge")
+        if not self._can_review_application_type(principal, application_type):
+            raise PortalError(
+                403, "application_scope_denied", "You cannot assess that application"
+            )
+        if str(row["status"]) not in {
+            "submitted",
+            "under_review",
+            "interview",
+            "hold",
+        }:
+            raise PortalError(
+                409,
+                "assessment_unavailable",
+                "Assessments are closed for this application",
+            )
+        rubric = self._application_rubric(application_type)
+        raw_scores = payload.get("scores")
+        raw_evidence = payload.get("evidence")
+        if not isinstance(raw_scores, dict) or not isinstance(raw_evidence, dict):
+            raise PortalError(
+                400,
+                "invalid_assessment",
+                "Every rubric dimension needs a score and evidence note",
+            )
+        scores: dict[str, int] = {}
+        evidence: dict[str, str] = {}
+        for dimension in rubric["dimensions"]:
+            key = dimension["key"]
+            value = raw_scores.get(key)
+            if isinstance(value, bool):
+                value = 0
+            try:
+                score = int(value)
+            except (TypeError, ValueError) as exc:
+                raise PortalError(
+                    400,
+                    "invalid_assessment_score",
+                    f"Score {dimension['label']} from 1 to 5",
+                ) from exc
+            if not 1 <= score <= 5:
+                raise PortalError(
+                    400,
+                    "invalid_assessment_score",
+                    f"Score {dimension['label']} from 1 to 5",
+                )
+            scores[key] = score
+            evidence[key] = _bounded_text(
+                raw_evidence.get(key), 1000, required=True
+            )
+        recommendation = str(payload.get("recommendation") or "").casefold()
+        if recommendation not in {"hold", "interview", "accept", "reject"}:
+            raise PortalError(
+                400,
+                "invalid_assessment_recommendation",
+                "Choose Hold, Interview, Accept, or Reject",
+            )
+        now = int(time.time())
+        correlation = new_correlation_id("application-assessment")
+        await self.db.execute_transaction(
+            [
+                (
+                    (
+                        "INSERT INTO staff_application_assessments("
+                        "application_id,reviewer_id,rubric_version,scores_json,"
+                        "evidence_json,recommendation,created_ts,updated_ts"
+                        ") VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(application_id,reviewer_id) "
+                        "DO UPDATE SET rubric_version=excluded.rubric_version,"
+                        "scores_json=excluded.scores_json,evidence_json=excluded.evidence_json,"
+                        "recommendation=excluded.recommendation,updated_ts=excluded.updated_ts"
+                    ),
+                    (
+                        application_id,
+                        principal.user_id,
+                        rubric["version"],
+                        json.dumps(scores, separators=(",", ":")),
+                        json.dumps(evidence, separators=(",", ":"), ensure_ascii=False),
+                        recommendation,
+                        now,
+                        now,
+                    ),
+                ),
+                (
+                    (
+                        "UPDATE staff_applications SET claimed_by=COALESCE(claimed_by,?),"
+                        "first_review_ts=COALESCE(first_review_ts,?),updated_ts=?,"
+                        "calibration_resolved_ts=NULL,calibration_resolved_by=NULL,"
+                        "calibration_note='' WHERE id=?"
+                    ),
+                    (principal.user_id, now, now, application_id),
+                ),
+                (
+                    (
+                        "INSERT INTO staff_application_events("
+                        "application_id,actor_id,event,from_status,to_status,detail_json,"
+                        "created_ts,correlation_id) VALUES(?,?,?,?,?,?,?,?)"
+                    ),
+                    (
+                        application_id,
+                        principal.user_id,
+                        "assessment_recorded",
+                        str(row["status"]),
+                        str(row["status"]),
+                        json.dumps(
+                            {
+                                "rubric_version": rubric["version"],
+                                "recommendation": recommendation,
+                            },
+                            separators=(",", ":"),
+                        ),
+                        now,
+                        correlation,
+                    ),
+                ),
+            ],
+            retry_safe=True,
+        )
+        stored = await self.db.fetchall(
+            "SELECT reviewer_id,scores_json,evidence_json,recommendation FROM "
+            "staff_application_assessments WHERE application_id=?",
+            (application_id,),
+        )
+        items = [
+            {
+                "reviewer_id": str(item["reviewer_id"]),
+                "scores": _json_object(item["scores_json"]),
+                "evidence": _json_object(item["evidence_json"]),
+                "recommendation": str(item["recommendation"]),
+            }
+            for item in stored
+        ]
+        return {
+            "ok": True,
+            "assessment_summary": self._application_assessment_summary(
+                application_type, items, calibration_resolved=False
+            ),
+        }
+
+    async def application_interview_outcome(self, principal, application_id, payload):
+        async with self._application_lock:
+            return await self._application_interview_outcome_unlocked(
+                principal, application_id, payload
+            )
+
+    async def _application_interview_outcome_unlocked(
+        self, principal, application_id, payload
+    ):
+        if payload.get("confirmed") is not True:
+            raise PortalError(
+                400, "confirmation_required", "Confirm the interview outcome"
+            )
+        try:
+            interview_id = int(payload.get("interview_id"))
+        except (TypeError, ValueError) as exc:
+            raise PortalError(
+                400, "invalid_interview", "Choose the interview to complete"
+            ) from exc
+        notes = _bounded_text(payload.get("notes"), 4000, required=True)
+        recommendation = str(payload.get("recommendation") or "").casefold()
+        if recommendation not in {"hold", "accept", "reject"}:
+            raise PortalError(
+                400,
+                "invalid_interview_recommendation",
+                "Choose Hold, Accept, or Reject",
+            )
+        row = await self.db.fetchone(
+            "SELECT i.*,a.application_type,a.status AS application_status "
+            "FROM staff_application_interviews i "
+            "JOIN staff_applications a ON a.id=i.application_id "
+            "WHERE i.id=? AND i.application_id=? AND a.guild_id=?",
+            (interview_id, application_id, principal.guild_id),
+        )
+        if row is None:
+            raise PortalError(404, "interview_not_found", "Interview record not found")
+        application_type = str(row["application_type"] or "judge")
+        if not self._can_review_application_type(principal, application_type):
+            raise PortalError(
+                403,
+                "application_scope_denied",
+                "You cannot complete that interview",
+            )
+        if str(row["status"]) != "open":
+            raise PortalError(
+                409,
+                "interview_not_open",
+                "Only an open interview can be completed",
+            )
+        now = int(time.time())
+        correlation = new_correlation_id("application-interview-outcome")
+        await self.db.execute_transaction(
+            [
+                (
+                    (
+                        "UPDATE staff_application_interviews SET status='completed',"
+                        "notes=?,recommendation=?,completed_ts=?,completed_by=? "
+                        "WHERE id=? AND application_id=? AND status='open'"
+                    ),
+                    (
+                        notes,
+                        recommendation,
+                        now,
+                        principal.user_id,
+                        interview_id,
+                        application_id,
+                    ),
+                ),
+                (
+                    (
+                        "UPDATE staff_applications SET calibration_resolved_ts=?,"
+                        "calibration_resolved_by=?,calibration_note=?,updated_ts=? "
+                        "WHERE id=? AND guild_id=?"
+                    ),
+                    (
+                        now,
+                        principal.user_id,
+                        f"Interview completed: {notes}",
+                        now,
+                        application_id,
+                        principal.guild_id,
+                    ),
+                ),
+                (
+                    (
+                        "INSERT INTO staff_application_events("
+                        "application_id,actor_id,event,from_status,to_status,"
+                        "detail_json,created_ts,correlation_id) VALUES(?,?,?,?,?,?,?,?)"
+                    ),
+                    (
+                        application_id,
+                        principal.user_id,
+                        "interview_completed",
+                        str(row["application_status"]),
+                        str(row["application_status"]),
+                        json.dumps(
+                            {
+                                "interview_id": interview_id,
+                                "recommendation": recommendation,
+                            },
+                            separators=(",", ":"),
+                        ),
+                        now,
+                        correlation,
+                    ),
+                ),
+            ],
+            retry_safe=True,
+        )
+        return {
+            "ok": True,
+            "interview_id": interview_id,
+            "status": "completed",
+            "recommendation": recommendation,
+            "calibration_resolved": True,
+        }
+
+    async def application_probation_action(self, principal, application_id, payload):
+        principal.require("applications.review_all")
+        action = str(payload.get("action") or "").casefold()
+        if action not in {"complete", "extend", "end"}:
+            raise PortalError(
+                400, "invalid_probation_action", "Choose a valid probation action"
+            )
+        if payload.get("confirmed") is not True:
+            raise PortalError(400, "confirmation_required", "Confirm this action")
+        reason = _bounded_text(payload.get("reason"), 1000, required=True)
+        row = await self.db.fetchone(
+            "SELECT p.*,a.status AS application_status FROM staff_application_probations p "
+            "JOIN staff_applications a ON a.id=p.application_id "
+            "WHERE p.application_id=? AND p.guild_id=?",
+            (application_id, principal.guild_id),
+        )
+        if row is None:
+            raise PortalError(404, "probation_not_found", "Probation record not found")
+        if str(row["status"]) != "active":
+            raise PortalError(409, "probation_closed", "This probation is already closed")
+        now = int(time.time())
+        if action == "extend":
+            try:
+                extra_days = max(1, min(90, int(payload.get("days") or 7)))
+            except (TypeError, ValueError) as exc:
+                raise PortalError(400, "invalid_probation_extension", "Enter valid days") from exc
+            due_ts = int(row["due_ts"]) + extra_days * 86400
+            status = "active"
+            outcome = "extended"
+            completed_ts = None
+        else:
+            due_ts = int(row["due_ts"])
+            status = "completed" if action == "complete" else "ended"
+            outcome = "passed" if action == "complete" else "ended_early"
+            completed_ts = now
+        correlation = new_correlation_id("application-probation")
+        await self.db.execute_transaction(
+            [
+                (
+                    (
+                        "UPDATE staff_application_probations SET status=?,due_ts=?,"
+                        "completed_ts=?,completed_by=?,outcome=?,notes=?,updated_ts=? "
+                        "WHERE application_id=? AND status='active'"
+                    ),
+                    (
+                        status,
+                        due_ts,
+                        completed_ts,
+                        principal.user_id if completed_ts else None,
+                        outcome,
+                        reason,
+                        now,
+                        application_id,
+                    ),
+                ),
+                (
+                    (
+                        "INSERT INTO staff_application_events("
+                        "application_id,actor_id,event,from_status,to_status,detail_json,"
+                        "created_ts,correlation_id) VALUES(?,?,?,?,?,?,?,?)"
+                    ),
+                    (
+                        application_id,
+                        principal.user_id,
+                        f"probation_{action}",
+                        str(row["application_status"]),
+                        str(row["application_status"]),
+                        json.dumps(
+                            {"reason": reason, "due_ts": due_ts},
+                            separators=(",", ":"),
+                        ),
+                        now,
+                        correlation,
+                    ),
+                ),
+            ],
+            retry_safe=True,
+        )
+        if action in {"complete", "end"}:
+            await self.db.execute(
+                "UPDATE staff_tasks SET status='done',completed_ts=?,updated_ts=? "
+                "WHERE guild_id=? AND linked_entity_type='application' "
+                "AND linked_entity_id=? AND task_type='system' AND status!='done'",
+                (now, now, principal.guild_id, str(application_id)),
+            )
+        await self.bot.outbox.enqueue(
+            "send_dm",
+            guild_id=principal.guild_id,
+            user_id=int(row["applicant_id"]),
+            payload={
+                "content": (
+                    f"Your GD Avenue probation has been extended until <t:{due_ts}:D>."
+                    if action == "extend"
+                    else "Your GD Avenue probation has been completed. Thank you for your work."
+                    if action == "complete"
+                    else "Your GD Avenue probation has ended. Staff will contact you if more context is needed."
+                )
+            },
+            correlation_id=correlation,
+            idempotency_key=f"{correlation}:probation-dm",
+        )
+        return {"ok": True, "status": status, "due_ts": due_ts}
 
     async def application_action(self, principal, application_id, payload):
         action = str(payload.get("action") or "").casefold()
@@ -3445,15 +4296,17 @@ class StaffPortalService:
             "accept": "accepted_pending_role",
             "reject": "rejected",
         }
-        if action not in {*targets, "message"}:
+        if action not in {*targets, "message", "calibrate"}:
             raise PortalError(400, "invalid_application_action", "Choose a valid application action")
-        if action in {"interview", "accept", "reject"} and payload.get("confirmed") is not True:
+        if action in {"interview", "accept", "reject", "calibrate"} and payload.get("confirmed") is not True:
             raise PortalError(400, "confirmation_required", "Confirm the final application decision")
         reason = _bounded_text(
             payload.get("reason"),
             1000,
-            required=action in {"hold", "accept", "reject"},
+            required=action in {"hold", "accept", "reject", "calibrate"},
         )
+        applicant_message = _bounded_text(payload.get("applicant_message"), 1000)
+        decision_category = str(payload.get("category") or "").strip().casefold()[:80]
         async with self._application_lock:
             row = await self.db.fetchone("SELECT * FROM staff_applications WHERE id=? AND guild_id=?", (application_id, principal.guild_id))
             if row is None:
@@ -3463,6 +4316,21 @@ class StaffPortalService:
                 raise PortalError(403, "application_scope_denied", "You cannot manage that application type")
             application_label = self._application_label(application_type)
             old = str(row["status"])
+            is_v2 = str(row["form_version"] or "") == self._application_form_version()
+            if is_v2 and action == "interview" and not reason:
+                raise PortalError(
+                    400,
+                    "interview_reason_required",
+                    "Document why an interview is needed",
+                )
+            if is_v2 and action in {"hold", "accept", "reject"}:
+                categories = self._application_decision_categories(action)
+                if decision_category not in categories:
+                    raise PortalError(
+                        400,
+                        "decision_category_required",
+                        "Choose an internal decision category",
+                    )
             interview_delivery_pending = False
             if old == "interview" and row["interview_ticket_outbox_id"] is not None:
                 delivery = await self.db.fetchone(
@@ -3474,6 +4342,68 @@ class StaffPortalService:
                     and str(delivery["status"] or "")
                     in {"pending", "processing", "failed"}
                 )
+            if action == "calibrate":
+                if not principal.can("applications.review_all"):
+                    raise PortalError(
+                        403,
+                        "calibration_permission_required",
+                        "A Head Reviewer or higher must resolve calibration",
+                    )
+                assessments = await self.db.fetchall(
+                    "SELECT scores_json,evidence_json,recommendation FROM "
+                    "staff_application_assessments WHERE application_id=?",
+                    (application_id,),
+                )
+                summary = self._application_assessment_summary(
+                    application_type,
+                    [
+                        {
+                            "scores": _json_object(item["scores_json"]),
+                            "evidence": _json_object(item["evidence_json"]),
+                            "recommendation": str(item["recommendation"]),
+                        }
+                        for item in assessments
+                    ],
+                    calibration_resolved=False,
+                )
+                if not summary["calibration_required"]:
+                    raise PortalError(
+                        409,
+                        "calibration_not_required",
+                        "This application does not have an unresolved scoring disagreement",
+                    )
+                now = int(time.time())
+                correlation = new_correlation_id("application-calibration")
+                await self.db.execute_transaction(
+                    [
+                        (
+                            (
+                                "UPDATE staff_applications SET calibration_resolved_ts=?,"
+                                "calibration_resolved_by=?,calibration_note=?,updated_ts=? WHERE id=?"
+                            ),
+                            (now, principal.user_id, reason, now, application_id),
+                        ),
+                        (
+                            (
+                                "INSERT INTO staff_application_events("
+                                "application_id,actor_id,event,from_status,to_status,"
+                                "detail_json,created_ts,correlation_id) VALUES(?,?,?,?,?,?,?,?)"
+                            ),
+                            (
+                                application_id,
+                                principal.user_id,
+                                "calibration_resolved",
+                                old,
+                                old,
+                                json.dumps({"reason": reason}, separators=(",", ":")),
+                                now,
+                                correlation,
+                            ),
+                        ),
+                    ],
+                    retry_safe=True,
+                )
+                return {"ok": True, "status": old, "calibration_resolved": True}
             if action not in self._application_actions_for_status(old):
                 raise PortalError(
                     409,
@@ -3527,7 +4457,52 @@ class StaffPortalService:
             if old == "accepted_pending_role" and action == "accept":
                 await self._reconcile_application_roles()
                 return {"ok": True, "status": old, "role_delivery": "pending"}
+            if is_v2 and action in {"accept", "reject"}:
+                assessment_rows = await self.db.fetchall(
+                    "SELECT scores_json,evidence_json,recommendation FROM "
+                    "staff_application_assessments WHERE application_id=?",
+                    (application_id,),
+                )
+                summary = self._application_assessment_summary(
+                    application_type,
+                    [
+                        {
+                            "scores": _json_object(item["scores_json"]),
+                            "evidence": _json_object(item["evidence_json"]),
+                            "recommendation": str(item["recommendation"]),
+                        }
+                        for item in assessment_rows
+                    ],
+                    calibration_resolved=bool(row["calibration_resolved_ts"]),
+                )
+                if not summary["complete"]:
+                    raise PortalError(
+                        409,
+                        "assessments_incomplete",
+                        f"Record {summary['minimum']} independent rubric assessments before a final decision",
+                    )
+                if summary["calibration_required"]:
+                    raise PortalError(
+                        409,
+                        "calibration_required",
+                        "Resolve the scoring disagreement or interview the applicant before a final decision",
+                    )
             target = targets[action]
+            interview_questions: list[str] = []
+            if action == "interview":
+                interview_questions = [
+                    line.strip()[:500]
+                    for line in str(
+                        payload.get("clarification_questions") or ""
+                    ).splitlines()
+                    if line.strip()
+                ][:12]
+                if is_v2 and not interview_questions:
+                    raise PortalError(
+                        400,
+                        "interview_questions_required",
+                        "Add at least one question the interview should clarify",
+                    )
             role_ids: list[int] = []
             if action == "accept":
                 role_ids = self._application_role_ids(application_type)
@@ -3541,7 +4516,9 @@ class StaffPortalService:
                         (
                             "UPDATE staff_applications SET status=?,"
                             "claimed_by=COALESCE(claimed_by,?),updated_ts=?,"
-                            "decided_by=?,decided_ts=?,decision_reason=? "
+                            "decided_by=?,decided_ts=?,decision_reason=?,"
+                            "decision_category=?,applicant_message=?,"
+                            "first_review_ts=COALESCE(first_review_ts,?) "
                             "WHERE id=? AND guild_id=?"
                         ),
                         (
@@ -3551,6 +4528,9 @@ class StaffPortalService:
                             principal.user_id if action in {"accept", "reject"} else None,
                             now if action in {"accept", "reject"} else None,
                             reason,
+                            decision_category,
+                            applicant_message,
+                            now,
                             application_id,
                             principal.guild_id,
                         ),
@@ -3568,7 +4548,14 @@ class StaffPortalService:
                             action,
                             old,
                             target,
-                            json.dumps({"reason": reason}, separators=(",", ":")),
+                            json.dumps(
+                                {
+                                    "reason": reason,
+                                    "category": decision_category,
+                                    "applicant_message": applicant_message,
+                                },
+                                separators=(",", ":"),
+                            ),
                             now,
                             correlation,
                         ),
@@ -3578,6 +4565,40 @@ class StaffPortalService:
             )
             outbox_id = None
             if action == "accept":
+                probation_days = self._application_probation_days()
+                probation_due_ts = now + probation_days * 86400
+                await self.db.execute(
+                    "INSERT INTO staff_application_probations("
+                    "application_id,guild_id,applicant_id,application_type,status,"
+                    "started_ts,due_ts,updated_ts) VALUES(?,?,?,?, 'active',?,?,?) "
+                    "ON CONFLICT(application_id) DO NOTHING",
+                    (
+                        application_id,
+                        principal.guild_id,
+                        int(row["applicant_id"]),
+                        application_type,
+                        now,
+                        probation_due_ts,
+                        now,
+                    ),
+                )
+                await self.db.execute(
+                    "INSERT INTO staff_tasks("
+                    "guild_id,task_type,title,description,priority,status,created_by,"
+                    "assignee_id,created_ts,updated_ts,due_ts,linked_entity_type,"
+                    "linked_entity_id) VALUES(?, 'system', ?, ?, 'normal',"
+                    "'todo', ?, NULL, ?, ?, ?, 'application', ?)",
+                    (
+                        principal.guild_id,
+                        f"{application_label} probation checkpoint",
+                        "Review the new staff member's probation with documented examples and record the outcome.",
+                        principal.user_id,
+                        now,
+                        now,
+                        probation_due_ts,
+                        str(application_id),
+                    ),
+                )
                 if role_ids:
                     outbox_id = await self.bot.outbox.enqueue(
                         "add_role",
@@ -3599,14 +4620,20 @@ class StaffPortalService:
                     "send_dm",
                     guild_id=principal.guild_id,
                     user_id=int(row["applicant_id"]),
-                    payload={"content": f"Your GD Avenue {application_label} was accepted. Welcome to the team."},
+                    payload={
+                        "content": (
+                            f"Your GD Avenue {application_label} was accepted. Welcome to the team. "
+                            f"Your {probation_days}-day probation checkpoint is <t:{probation_due_ts}:D>."
+                            + (f"\n\n{applicant_message}" if applicant_message else "")
+                        )
+                    },
                     correlation_id=f"staff-application:{application_id}",
                     idempotency_key=f"staff-application:{application_id}:accepted-dm",
                 )
             elif action == "reject":
                 message = f"Your GD Avenue {application_label} was not accepted."
-                if reason:
-                    message += f"\n\nReason: {reason}"
+                if applicant_message:
+                    message += f"\n\n{applicant_message}"
                 await self.bot.outbox.enqueue(
                     "send_dm",
                     guild_id=principal.guild_id,
@@ -3617,6 +4644,19 @@ class StaffPortalService:
                 )
             elif action == "interview":
                 repeat_interview = bool(row["interview_ticket_channel_id"])
+                await self.db.execute(
+                    "INSERT INTO staff_application_interviews("
+                    "application_id,requested_by,reason,questions_json,recommendation,"
+                    "status,created_ts) VALUES(?,?,?,?,?,'requested',?)",
+                    (
+                        application_id,
+                        principal.user_id,
+                        reason,
+                        json.dumps(interview_questions, separators=(",", ":"), ensure_ascii=False),
+                        str(payload.get("recommendation") or "")[:80],
+                        now,
+                    ),
+                )
                 interview_outbox_id = await self.bot.outbox.enqueue(
                     "create_interview_ticket",
                     guild_id=principal.guild_id,
@@ -3627,6 +4667,7 @@ class StaffPortalService:
                         "application_label": application_label,
                         "interview_run_id": correlation,
                         "repeat_interview": repeat_interview,
+                        "clarification_questions": interview_questions,
                     },
                     correlation_id=correlation,
                     idempotency_key=f"{correlation}:interview-ticket",

@@ -335,14 +335,25 @@ class DiscordOutbox:
                     "UPDATE staff_applications SET review_thread_id=?,updated_ts=? WHERE id=?",
                     (thread_id, int(time.time()), application_id),
                 )
+            previous_section = None
             for index, response in enumerate(payload.get("responses") or []):
                 if not isinstance(response, dict):
                     continue
+                section = str(response.get("section") or "Application")[:100]
                 question = str(response.get("question") or "Question")[:500]
                 answer = str(response.get("answer") or "No answer provided")
                 chunks = [answer[start:start + 1750] for start in range(0, len(answer), 1750)] or ["No answer provided"]
                 for chunk_index, chunk in enumerate(chunks):
-                    label = f"**{question}**\n" if chunk_index == 0 else f"**{question} (continued)**\n"
+                    section_heading = (
+                        f"### {section}\n"
+                        if chunk_index == 0 and section != previous_section
+                        else ""
+                    )
+                    label = (
+                        f"{section_heading}**{question}**\n"
+                        if chunk_index == 0
+                        else f"**{question} (continued)**\n"
+                    )
                     answer_nonce = hashlib.sha256(f"application:{application_id}:{index}:{chunk_index}".encode()).hexdigest()[:24]
                     await thread.send(
                         content=f"{label}{chunk}"[:2000],
@@ -350,6 +361,7 @@ class DiscordOutbox:
                         nonce=answer_nonce,
                         enforce_nonce=True,
                     )
+                previous_section = section
             return thread_id
 
         if action == "create_interview_ticket":
@@ -450,6 +462,34 @@ class DiscordOutbox:
                 "UPDATE staff_applications SET interview_ticket_channel_id=?,updated_ts=? WHERE id=?",
                 (int(interview.id), now, application_id),
             )
+            await self.bot.db.execute(
+                "UPDATE staff_application_interviews SET ticket_channel_id=?,"
+                "status='open' WHERE id=(SELECT id FROM staff_application_interviews "
+                "WHERE application_id=? ORDER BY created_ts DESC,id DESC LIMIT 1)",
+                (int(interview.id), application_id),
+            )
+            clarification_questions = [
+                str(item).strip()[:500]
+                for item in payload.get("clarification_questions") or []
+                if str(item).strip()
+            ]
+            if clarification_questions:
+                await interview.send(
+                    content=(
+                        "## Topics to clarify\n"
+                        + "\n".join(
+                            f"{index}. {question}"
+                            for index, question in enumerate(
+                                clarification_questions, start=1
+                            )
+                        )
+                    )[:2000],
+                    allowed_mentions=no_mentions(),
+                    nonce=hashlib.sha256(
+                        f"application:{application_id}:{interview_run_id or 'initial'}:questions".encode()
+                    ).hexdigest()[:24],
+                    enforce_nonce=True,
+                )
             await self.enqueue(
                 "send_dm",
                 guild_id=int(row["guild_id"] or 0),

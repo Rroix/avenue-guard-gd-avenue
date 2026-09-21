@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 CONFIG_SCHEMA_VERSION = 2
 RUNTIME_SCHEMA_VERSION = 2
 EMBED_SCHEMA_VERSION = 2
-DATABASE_SCHEMA_VERSION = 11
+DATABASE_SCHEMA_VERSION = 12
 
 
 @dataclass(frozen=True)
@@ -550,6 +550,42 @@ def validate_config(data: Any) -> list[ConfigIssue]:
                 needs_review_prompt = needs_review_prompt or bool(
                     question.get("uses_review_prompt")
                 )
+                recommended_words = question.get("recommended_words")
+                if recommended_words is not None and (
+                    isinstance(recommended_words, bool)
+                    or not isinstance(recommended_words, int)
+                    or not 1 <= recommended_words <= 1000
+                ):
+                    issues.append(
+                        ConfigIssue(
+                            f"{path}.recommended_words",
+                            "must be an integer from 1 to 1000",
+                        )
+                    )
+                if not str(question.get("section") or "").strip():
+                    issues.append(ConfigIssue(f"{path}.section", "must not be empty"))
+
+        rubrics = staff_portal.get("application_rubrics", {})
+        if portal_enabled:
+            if not isinstance(rubrics, dict):
+                issues.append(ConfigIssue("staff_portal.application_rubrics", "must be an object"))
+            else:
+                for application_type in normalized_types:
+                    rubric = rubrics.get(application_type)
+                    path = f"staff_portal.application_rubrics.{application_type}"
+                    if not isinstance(rubric, dict):
+                        issues.append(ConfigIssue(path, "must be an object"))
+                        continue
+                    dimensions = rubric.get("dimensions")
+                    if not isinstance(dimensions, list) or not dimensions:
+                        issues.append(ConfigIssue(f"{path}.dimensions", "must contain rubric dimensions"))
+                    elif any(
+                        not isinstance(item, dict)
+                        or not str(item.get("key") or "").strip()
+                        or not str(item.get("label") or "").strip()
+                        for item in dimensions
+                    ):
+                        issues.append(ConfigIssue(f"{path}.dimensions", "must contain keyed, labelled objects"))
         review_levels = staff_portal.get("application_review_levels", [])
         if portal_enabled and needs_review_prompt and (
             not isinstance(review_levels, list) or not review_levels
