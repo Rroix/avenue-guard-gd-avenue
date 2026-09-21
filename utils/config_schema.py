@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 CONFIG_SCHEMA_VERSION = 2
 RUNTIME_SCHEMA_VERSION = 2
 EMBED_SCHEMA_VERSION = 2
-DATABASE_SCHEMA_VERSION = 12
+DATABASE_SCHEMA_VERSION = 13
 
 
 @dataclass(frozen=True)
@@ -428,6 +428,23 @@ def validate_config(data: Any) -> list[ConfigIssue]:
         stale_hours = staff_portal.get("claim_stale_hours", 48)
         if isinstance(stale_hours, bool) or not isinstance(stale_hours, int) or not 1 <= stale_hours <= 720:
             issues.append(ConfigIssue("staff_portal.claim_stale_hours", "must be an integer from 1 to 720"))
+        appeals_enabled = staff_portal.get("appeals_enabled", True)
+        if not isinstance(appeals_enabled, bool):
+            issues.append(
+                ConfigIssue("staff_portal.appeals_enabled", "must be true or false")
+            )
+        appeal_snapshot_ttl = staff_portal.get("appeal_snapshot_ttl_seconds", 900)
+        if (
+            isinstance(appeal_snapshot_ttl, bool)
+            or not isinstance(appeal_snapshot_ttl, int)
+            or not 60 <= appeal_snapshot_ttl <= 3600
+        ):
+            issues.append(
+                ConfigIssue(
+                    "staff_portal.appeal_snapshot_ttl_seconds",
+                    "must be an integer from 60 to 3600",
+                )
+            )
         identity_ttl = staff_portal.get("identity_cache_ttl_seconds", 300)
         if (
             isinstance(identity_ttl, bool)

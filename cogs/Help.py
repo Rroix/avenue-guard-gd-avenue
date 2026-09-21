@@ -1475,37 +1475,17 @@ class HelpCog(commands.Cog):
                 return await interaction.channel.send(limit_msg, allowed_mentions=no_mentions())
 
         if value == "appeal":
-            remaining = await self._remaining_help_cooldown(guild.id, interaction.user.id, "appeal", cds["appeal"][1])
-            if remaining:
-                embed = await self._cooldown_embed(guild.id, interaction.user.id, "appeal", cds["appeal"][0], cds["appeal"][1])
-                return await interaction.channel.send(
-                    embed=embed,
-                    view=HelpMenuView(exclude_values={"appeal"}),
-                    allowed_mentions=no_mentions(),
-                )
-
-            await self._start_help_session(
-                interaction.user.id,
-                guild.id,
-                "appeal_punishment",
-                {
-                    "appeal_type": "punishment",
-                },
-            )
             embed = self._help_embed(
                 title="Appeal punishment",
-                description="What punishment are you appealing, and what happened? Attach screenshots if they help.",
+                description=(
+                    "Punishment appeals now use the secure GD Avenue web portal. "
+                    "It checks your current Discord ban record before preparing the form and keeps replies in one private case.\n\n"
+                    "[Open the punishment appeal form](https://gdavenue.netlify.app/apply/?type=appeal)"
+                ),
             )
-            embed.set_footer(text="Press Start, or send your first answer as your next DM")
             return await interaction.channel.send(
                 embed=embed,
-                view=HelpSessionControlView(
-                    self,
-                    interaction.user.id,
-                    guild.id,
-                    allow_back=False,
-                    show_start=True,
-                ),
+                view=HelpMenuView(exclude_values={"appeal"}),
                 allowed_mentions=no_mentions(),
             )
 

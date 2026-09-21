@@ -67,6 +67,8 @@
       "mod"
     ],
     "application_cooldown_days": 5,
+    "appeals_enabled": true,
+    "appeal_snapshot_ttl_seconds": 900,
     "application_form_version": "applications-v2",
     "application_minimum_assessments": 2,
     "application_disagreement_threshold": 2,

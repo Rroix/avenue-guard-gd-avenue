@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import discord
 import pytest
 import pytest_asyncio
 
@@ -151,6 +153,7 @@ async def portal(tmp_path, monkeypatch):
         FakeMember(OWNER_ID, []),
         FakeMember(DEV_ID, []),
         FakeMember(999, []),
+        FakeMember(1000, []),
     ]
     guild = FakeGuild(members)
     config = PortalConfig()
@@ -258,6 +261,64 @@ async def test_staff_session_denies_nonstaff_and_outside_guild(portal):
     application = await service.create_session({"user_id": 999, "purpose": "apply"})
     assert application["user"]["role"] == "applicant"
     assert application["user"]["staff_access"] is False
+
+    outside_application = await service.create_session(
+        {
+            "user_id": 998,
+            "purpose": "apply",
+            "username": "outside-user",
+            "global_name": "Outside User",
+            "avatar_url": "https://cdn.discordapp.com/avatars/998/avatar.webp",
+        }
+    )
+    assert outside_application["user"]["display_name"] == "Outside User"
+    assert outside_application["user"]["role"] == "applicant"
+
+
+@pytest.mark.asyncio
+async def test_outside_guild_session_can_appeal_but_cannot_submit_staff_application(
+    portal,
+):
+    service, guild = portal
+    guild.fetch_ban = AsyncMock(return_value=SimpleNamespace(reason="Original ban"))
+
+    async def audit_logs(**_kwargs):
+        if False:
+            yield None
+
+    guild.audit_logs = audit_logs
+    session = await service.create_session(
+        {
+            "user_id": 998,
+            "purpose": "apply",
+            "username": "outside-user",
+            "global_name": "Outside User",
+        }
+    )
+    headers = {
+        "x-avenue-portal-key": "test-service-token",
+        "x-staff-session": session["session_token"],
+    }
+    status, options = await service.handle_request(
+        "GET", "/api/apply/options", headers, b""
+    )
+    appeal = next(
+        item for item in options["items"] if item["application_type"] == "appeal"
+    )
+    reviewer = next(
+        item for item in options["items"] if item["application_type"] == "judge"
+    )
+    assert status == 200
+    assert options["guild_member"] is False
+    assert appeal["enabled"] is True
+    assert reviewer["enabled"] is False
+
+    with pytest.raises(PortalError) as recruitment:
+        await service.application_form(principal(998, "applicant"), "judge")
+    assert recruitment.value.code == "membership_required"
+
+    appeal_form = await service.appeals.form(principal(998, "applicant"))
+    assert appeal_form["eligibility"]["eligible"] is True
 
 
 @pytest.mark.asyncio
@@ -1323,13 +1384,14 @@ async def test_application_catalog_and_mod_form_are_server_defined(portal):
     by_type = {item["application_type"]: item for item in options["items"]}
     assert by_type["judge"]["enabled"] is True
     assert by_type["mod"]["label"] == "Mod application"
-    assert by_type["appeal"]["enabled"] is False
+    assert by_type["appeal"]["enabled"] is True
+    assert by_type["appeal"]["label"] == "Punishment appeal"
     assert options["cooldowns"]["judge"]["days"] == 5
     assert options["cooldowns"]["mod"]["active"] is False
     assert options["application_open_by_type"] == {"judge": True, "mod": True}
     assert by_type["judge"]["open"] is True
     assert by_type["mod"]["open"] is True
-    assert by_type["appeal"]["open"] is False
+    assert by_type["appeal"]["open"] is True
 
     form = await service.application_form(applicant, "mod")
     questions = {item["key"]: item for item in form["questions"]}
@@ -1928,3 +1990,267 @@ async def test_application_analytics_are_aggregate_and_private(portal):
     assert process["reason_breakdown"] == {"availability": 1}
     assert "applicant_id" not in json.dumps(process)
     assert _youtube_embed_url("https://youtu.be/too-short") == ""
+
+
+@pytest.mark.asyncio
+async def test_appeal_form_uses_discord_ban_and_audit_provenance_for_outsider(portal):
+    service, guild = portal
+    outsider = principal(998, "applicant")
+    guild.fetch_ban = AsyncMock(
+        return_value=SimpleNamespace(reason="Sapphire ban reason")
+    )
+
+    async def audit_logs(**_kwargs):
+        yield SimpleNamespace(
+            id=123456789012345678,
+            target=SimpleNamespace(id=998),
+            user=SimpleNamespace(id=555),
+            reason="Sapphire ban reason",
+            created_at=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
+        )
+
+    guild.audit_logs = audit_logs
+    form = await service.appeals.form(outsider)
+
+    assert form["eligibility"]["eligible"] is True
+    assert form["punishment"]["reason"] == "Sapphire ban reason"
+    assert form["punishment"]["reason_source"] == "discord_ban"
+    assert form["punishment"]["issued_ts"] == 1788264000
+    assert "issued_by_id" not in form["punishment"]
+    assert any(question.get("show_for") for question in form["questions"])
+
+
+@pytest.mark.asyncio
+async def test_appeal_reason_conflict_is_preserved_and_submission_is_immutable(portal):
+    service, guild = portal
+    applicant = principal(999, "applicant")
+    guild.fetch_ban = AsyncMock(return_value=SimpleNamespace(reason="Live reason"))
+
+    async def audit_logs(**_kwargs):
+        yield SimpleNamespace(
+            id=999999999999999999,
+            target=SimpleNamespace(id=999),
+            user=SimpleNamespace(id=555),
+            reason="Older audit reason",
+            created_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
+
+    guild.audit_logs = audit_logs
+    answers = {
+        "primary_ground": "I am asking for reconsideration",
+        "chronology": "I am providing a chronological account with enough detail for a fair review.",
+        "disputed_detail": "",
+        "reconsideration": "I understand the concern and have changed how I handle conflict.",
+        "evidence_links": "",
+        "requested_outcome": "Remove the punishment",
+        "confirmation": "I confirm",
+    }
+    submitted = await service.appeals.save(
+        applicant, {"answers": answers}, submit=True
+    )
+    appeal_id = int(submitted["application"]["id"])
+    notification_kind, notification = service.bot.outbox.calls[-1]
+    assert notification_kind == "send_channel"
+    assert notification["channel_id"] == 1455042313855307939
+    stored = await service.db.fetchone(
+        "SELECT submitted_snapshot_json,answers_json FROM punishment_appeals WHERE id=?",
+        (appeal_id,),
+    )
+    snapshot = json.loads(stored["submitted_snapshot_json"])
+    assert snapshot["reason"] == "Live reason"
+    assert snapshot["reason_conflict"] is True
+
+    changed = dict(answers, chronology="A replacement answer that must not overwrite the submitted case.")
+    retried = await service.appeals.save(applicant, {"answers": changed}, submit=True)
+    assert retried["application"]["id"] == appeal_id
+    after = await service.db.fetchone(
+        "SELECT submitted_snapshot_json,answers_json FROM punishment_appeals WHERE id=?",
+        (appeal_id,),
+    )
+    assert after["submitted_snapshot_json"] == stored["submitted_snapshot_json"]
+    assert after["answers_json"] == stored["answers_json"]
+
+
+@pytest.mark.asyncio
+async def test_appeal_lookup_failure_keeps_prior_evidence_but_blocks_submission(portal):
+    service, guild = portal
+    applicant = principal(997, "applicant")
+    guild.fetch_ban = AsyncMock(return_value=SimpleNamespace(reason="Verified reason"))
+
+    async def audit_logs(**_kwargs):
+        yield SimpleNamespace(
+            id=777777777777777777,
+            target=SimpleNamespace(id=997),
+            user=SimpleNamespace(id=555),
+            reason="Verified reason",
+            created_at=datetime(2026, 9, 3, tzinfo=timezone.utc),
+        )
+
+    guild.audit_logs = audit_logs
+    first = await service.appeals.snapshot_punishment(applicant, force=True)
+    response = SimpleNamespace(status=403, reason="Forbidden", headers={})
+    guild.fetch_ban = AsyncMock(
+        side_effect=discord.Forbidden(
+            response, {"message": "Missing Permissions", "code": 50013}
+        )
+    )
+    failed = await service.appeals.snapshot_punishment(applicant, force=True)
+
+    assert failed["lookup_status"] == "forbidden"
+    assert failed["reason"] == "Verified reason"
+    assert failed["issued_ts"] == first["issued_ts"]
+    assert (
+        json.loads(failed["source_detail_json"])["evidence_reused_from_snapshot_id"]
+        == first["id"]
+    )
+    with pytest.raises(PortalError) as blocked:
+        await service.appeals.save(
+            applicant,
+            {
+                "answers": {
+                    "primary_ground": "Other",
+                    "chronology": "A complete chronological account with enough detail for review.",
+                    "disputed_detail": "",
+                    "reconsideration": "",
+                    "evidence_links": "",
+                    "requested_outcome": "Review the decision",
+                    "confirmation": "I confirm",
+                }
+            },
+            submit=True,
+        )
+    assert blocked.value.code == "no_active_ban"
+
+
+@pytest.mark.asyncio
+async def test_appeal_decision_requires_two_independent_reviews_and_queues_unban(portal):
+    service, guild = portal
+    applicant = principal(999, "applicant")
+    guild.fetch_ban = AsyncMock(return_value=SimpleNamespace(reason=None))
+
+    async def audit_logs(**_kwargs):
+        if False:
+            yield None
+
+    guild.audit_logs = audit_logs
+    answers = {
+        "primary_ground": "Other",
+        "chronology": "This is a complete chronological account of the events for staff review.",
+        "disputed_detail": "",
+        "reconsideration": "",
+        "evidence_links": "",
+        "requested_outcome": "Remove the punishment",
+        "confirmation": "I confirm",
+    }
+    appeal = await service.appeals.save(applicant, {"answers": answers}, submit=True)
+    appeal_id = int(appeal["application"]["id"])
+    findings = {
+        "factual_accuracy": "Reviewed",
+        "rule_applicability": "Reviewed",
+        "proportionality": "Reviewed",
+        "consistency": "Reviewed",
+        "new_evidence": "Reviewed",
+        "current_risk": "Reviewed",
+    }
+    await service.appeals.assessment(
+        principal(ADMIN_ID, "admin"),
+        appeal_id,
+        {"findings": findings, "recommendation": "removed", "rationale": "Independent review one."},
+    )
+    with pytest.raises(PortalError) as early:
+        await service.appeals.action(
+            principal(OWNER_ID, "owner"),
+            appeal_id,
+            {"action": "decide", "outcome": "removed", "internal_rationale": "Decision", "applicant_explanation": "Your ban was removed.", "execute_unban": True},
+        )
+    assert early.value.code == "second_review_required"
+    await service.appeals.assessment(
+        principal(HEAD_ID, "admin"),
+        appeal_id,
+        {"findings": findings, "recommendation": "removed", "rationale": "Independent review two."},
+    )
+    result = await service.appeals.action(
+        principal(OWNER_ID, "owner"),
+        appeal_id,
+        {"action": "decide", "outcome": "removed", "internal_rationale": "Decision", "applicant_explanation": "Your ban was removed.", "execute_unban": True},
+    )
+    assert result["unban_outbox_id"]
+    assert service.bot.outbox.calls[-1][0] == "unban_member"
+
+
+@pytest.mark.asyncio
+async def test_punishment_appeals_have_an_independent_runtime_switch(portal):
+    service, _guild = portal
+    await service.db.set_runtime_setting(
+        "staff_portal.safe_config",
+        {
+            "applications_open": False,
+            "application_open_by_type": {"judge": False, "mod": False},
+            "appeals_open": True,
+        },
+    )
+
+    options = await service.application_options(principal(999, "applicant"))
+    appeal = next(
+        item for item in options["items"] if item["application_type"] == "appeal"
+    )
+
+    assert options["applications_open"] is False
+    assert appeal["open"] is True
+
+
+@pytest.mark.asyncio
+async def test_reopening_is_controlled_and_removes_case_cooldown(portal):
+    service, guild = portal
+    applicant = principal(999, "applicant")
+    guild.fetch_ban = AsyncMock(return_value=SimpleNamespace(reason="Original reason"))
+
+    async def audit_logs(**_kwargs):
+        if False:
+            yield None
+
+    guild.audit_logs = audit_logs
+    appeal = await service.appeals.save(
+        applicant,
+        {
+            "answers": {
+                "primary_ground": "Other",
+                "chronology": "A complete chronological account with sufficient detail for review.",
+                "disputed_detail": "",
+                "reconsideration": "",
+                "evidence_links": "",
+                "requested_outcome": "Review the decision",
+                "confirmation": "I confirm",
+            }
+        },
+        submit=True,
+    )
+    appeal_id = int(appeal["application"]["id"])
+    punishment = await service.db.fetchone(
+        "SELECT punishment_id FROM punishment_appeals WHERE id=?", (appeal_id,)
+    )
+    now = int(time.time())
+    await service.db.execute(
+        "UPDATE punishment_appeals SET status='decided',outcome='upheld' WHERE id=?",
+        (appeal_id,),
+    )
+    await service.db.execute(
+        "INSERT INTO punishment_appeal_cooldowns("
+        "guild_id,appellant_id,punishment_id,cooldown_until_ts,source,created_ts,updated_ts"
+        ") VALUES(?,?,?,?,?,?,?)",
+        (GUILD_ID, 999, punishment["punishment_id"], now + 86400, "upheld", now, now),
+    )
+
+    await service.appeals.action(
+        principal(OWNER_ID, "owner"), appeal_id, {"action": "reopen"}
+    )
+
+    stored = await service.db.fetchone(
+        "SELECT status FROM punishment_appeals WHERE id=?", (appeal_id,)
+    )
+    cooldown = await service.db.fetchone(
+        "SELECT 1 FROM punishment_appeal_cooldowns WHERE punishment_id=?",
+        (punishment["punishment_id"],),
+    )
+    assert stored["status"] == "second_review"
+    assert cooldown is None

@@ -15,6 +15,12 @@ STAFF_PORTAL_TABLES = {
     "staff_application_assessments",
     "staff_application_interviews",
     "staff_application_probations",
+    "moderation_punishments",
+    "punishment_appeals",
+    "punishment_appeal_events",
+    "punishment_appeal_messages",
+    "punishment_appeal_assessments",
+    "punishment_appeal_cooldowns",
     "staff_members",
     "staff_portal_profiles",
     "staff_portal_nickname_history",
@@ -218,6 +224,95 @@ STAFF_PORTAL_SCHEMA = (
         notes TEXT NOT NULL DEFAULT '',
         updated_ts INTEGER NOT NULL
     );""",
+    """CREATE TABLE IF NOT EXISTS moderation_punishments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        punishment_type TEXT NOT NULL DEFAULT 'ban',
+        source_key TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        reason TEXT,
+        reason_source TEXT NOT NULL DEFAULT 'unknown',
+        reason_conflict INTEGER NOT NULL DEFAULT 0,
+        issued_ts INTEGER,
+        issued_by_id INTEGER,
+        audit_log_entry_id INTEGER,
+        external_source TEXT NOT NULL DEFAULT 'discord_observed',
+        source_detail_json TEXT NOT NULL DEFAULT '{}',
+        checked_ts INTEGER NOT NULL,
+        lookup_status TEXT NOT NULL,
+        lookup_error TEXT,
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL,
+        UNIQUE(guild_id,user_id,punishment_type,source_key)
+    );""",
+    """CREATE TABLE IF NOT EXISTS punishment_appeals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        appellant_id INTEGER NOT NULL,
+        punishment_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft',
+        answers_json TEXT NOT NULL DEFAULT '{}',
+        submitted_snapshot_json TEXT,
+        primary_ground TEXT NOT NULL DEFAULT '',
+        requested_outcome TEXT NOT NULL DEFAULT '',
+        claimed_by INTEGER,
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL,
+        submitted_ts INTEGER,
+        first_review_ts INTEGER,
+        decided_ts INTEGER,
+        decided_by INTEGER,
+        outcome TEXT NOT NULL DEFAULT '',
+        internal_rationale TEXT NOT NULL DEFAULT '',
+        applicant_explanation TEXT NOT NULL DEFAULT '',
+        unban_outbox_id INTEGER,
+        version TEXT NOT NULL DEFAULT 'appeals-v1'
+    );""",
+    """CREATE TABLE IF NOT EXISTS punishment_appeal_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        appeal_id INTEGER NOT NULL,
+        actor_id INTEGER,
+        event TEXT NOT NULL,
+        from_status TEXT,
+        to_status TEXT,
+        detail_json TEXT NOT NULL DEFAULT '{}',
+        created_ts INTEGER NOT NULL,
+        correlation_id TEXT NOT NULL
+    );""",
+    """CREATE TABLE IF NOT EXISTS punishment_appeal_messages(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        appeal_id INTEGER NOT NULL,
+        author_type TEXT NOT NULL,
+        author_id INTEGER,
+        body TEXT NOT NULL,
+        created_ts INTEGER NOT NULL,
+        applicant_read_ts INTEGER,
+        staff_read_ts INTEGER,
+        dm_outbox_id INTEGER
+    );""",
+    """CREATE TABLE IF NOT EXISTS punishment_appeal_assessments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        appeal_id INTEGER NOT NULL,
+        reviewer_id INTEGER NOT NULL,
+        findings_json TEXT NOT NULL DEFAULT '{}',
+        recommendation TEXT NOT NULL,
+        rationale TEXT NOT NULL,
+        recused INTEGER NOT NULL DEFAULT 0,
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL,
+        UNIQUE(appeal_id,reviewer_id)
+    );""",
+    """CREATE TABLE IF NOT EXISTS punishment_appeal_cooldowns(
+        guild_id INTEGER NOT NULL,
+        appellant_id INTEGER NOT NULL,
+        punishment_id INTEGER NOT NULL,
+        cooldown_until_ts INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL,
+        PRIMARY KEY(guild_id,appellant_id,punishment_id)
+    );""",
     """CREATE TABLE IF NOT EXISTS staff_members(
         guild_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
@@ -314,6 +409,21 @@ STAFF_PORTAL_SCHEMA = (
         ON staff_application_interviews(application_id,created_ts);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_application_probations
         ON staff_application_probations(guild_id,status,due_ts);""",
+    """CREATE INDEX IF NOT EXISTS idx_moderation_punishments_user
+        ON moderation_punishments(guild_id,user_id,active,checked_ts DESC);""",
+    """CREATE INDEX IF NOT EXISTS idx_punishment_appeals_appellant
+        ON punishment_appeals(guild_id,appellant_id,updated_ts DESC);""",
+    """CREATE INDEX IF NOT EXISTS idx_punishment_appeals_review
+        ON punishment_appeals(guild_id,status,submitted_ts);""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_punishment_appeals_one_active
+        ON punishment_appeals(guild_id,appellant_id,punishment_id)
+        WHERE status IN('draft','submitted','triage','under_review','awaiting_information','second_review');""",
+    """CREATE INDEX IF NOT EXISTS idx_punishment_appeal_events
+        ON punishment_appeal_events(appeal_id,created_ts);""",
+    """CREATE INDEX IF NOT EXISTS idx_punishment_appeal_messages
+        ON punishment_appeal_messages(appeal_id,created_ts);""",
+    """CREATE INDEX IF NOT EXISTS idx_punishment_appeal_assessments
+        ON punishment_appeal_assessments(appeal_id,updated_ts);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_idempotency_expiry
         ON staff_idempotency(expires_ts);""",
     """CREATE INDEX IF NOT EXISTS idx_staff_nickname_history_user

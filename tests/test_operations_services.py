@@ -224,6 +224,76 @@ async def test_outbox_is_idempotent_and_records_delivery(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_appeal_unban_delivery_uses_discord_and_updates_durable_state(tmp_path):
+    database = Database(str(tmp_path / "appeal-unban.db"))
+    await database.connect()
+    now = 1_789_000_000
+    punishment_id = await database.execute_insert(
+        "INSERT INTO moderation_punishments("
+        "guild_id,user_id,punishment_type,source_key,active,reason,reason_source,"
+        "reason_conflict,source_detail_json,checked_ts,lookup_status,created_ts,updated_ts"
+        ") VALUES(1,42,'ban','discord-live',1,'Original reason','discord_ban',0,'{}',"
+        "?, 'found',?,?)",
+        (now, now, now),
+    )
+    appeal_id = await database.execute_insert(
+        "INSERT INTO punishment_appeals("
+        "guild_id,appellant_id,punishment_id,status,answers_json,created_ts,updated_ts"
+        ") VALUES(1,42,?,'decided','{}',?,?)",
+        (punishment_id, now, now),
+    )
+
+    class Guild:
+        def __init__(self):
+            self.unbans = []
+
+        async def unban(self, user, *, reason):
+            self.unbans.append((user.id, reason))
+
+    guild = Guild()
+    bot = SimpleNamespace(
+        db=database,
+        get_guild=lambda guild_id: guild if guild_id == 1 else None,
+        fetch_guild=AsyncMock(return_value=guild),
+    )
+    outbox = DiscordOutbox(bot)
+    outbox_id = await outbox.enqueue(
+        "unban_member",
+        guild_id=1,
+        user_id=42,
+        payload={
+            "appeal_id": appeal_id,
+            "punishment_id": punishment_id,
+            "reason": "Punishment appeal approved by staff",
+        },
+        idempotency_key="appeal:1:unban",
+    )
+
+    assert await outbox.process_once() == {
+        "delivered": 1,
+        "retried": 0,
+        "dead": 0,
+    }
+    assert guild.unbans == [(42, "Punishment appeal approved by staff")]
+    punishment = await database.fetchone(
+        "SELECT active,lookup_status FROM moderation_punishments WHERE id=?",
+        (punishment_id,),
+    )
+    event = await database.fetchone(
+        "SELECT event FROM punishment_appeal_events WHERE appeal_id=?",
+        (appeal_id,),
+    )
+    delivery = await database.fetchone(
+        "SELECT status FROM discord_outbox WHERE id=?", (outbox_id,)
+    )
+    assert punishment["active"] == 0
+    assert punishment["lookup_status"] == "unbanned_by_appeal"
+    assert event["event"] == "unban_delivered"
+    assert delivery["status"] == "delivered"
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_application_thread_delivery_persists_thread_and_review_link(
     tmp_path, monkeypatch
 ):

@@ -18,6 +18,7 @@ SUPPORTED_ACTIONS = {
     "delete_message",
     "add_role",
     "remove_role",
+    "unban_member",
     "create_application_thread",
     "create_interview_ticket",
 }
@@ -526,6 +527,30 @@ class DiscordOutbox:
                 nonce=nonce, enforce_nonce=True,
             )
             return int(getattr(sent, "id", 0) or 0)
+        if action == "unban_member":
+            guild = await self._guild(int(row["guild_id"] or 0))
+            reason = str(payload.get("reason") or "Punishment appeal approved")[:512]
+            try:
+                await guild.unban(discord.Object(id=user_id), reason=reason)
+            except discord.NotFound:
+                # Desired state is already true; retries remain idempotent.
+                pass
+            punishment_id = int(payload.get("punishment_id") or 0)
+            appeal_id = int(payload.get("appeal_id") or 0)
+            now = int(time.time())
+            if punishment_id:
+                await self.bot.db.execute(
+                    "UPDATE moderation_punishments SET active=0,checked_ts=?,lookup_status='unbanned_by_appeal',"
+                    "lookup_error=NULL,updated_ts=? WHERE id=?",
+                    (now, now, punishment_id),
+                )
+            if appeal_id:
+                await self.bot.db.execute(
+                    "INSERT INTO punishment_appeal_events(appeal_id,actor_id,event,from_status,to_status,"
+                    "detail_json,created_ts,correlation_id) VALUES(?,NULL,'unban_delivered','decided','decided','{}',?,?)",
+                    (appeal_id, now, str(row["correlation_id"] or "")),
+                )
+            return 0
         if action in {"edit_message", "delete_message"}:
             guard = payload.get("request_validation_guard")
             if action == "edit_message" and isinstance(guard, dict):

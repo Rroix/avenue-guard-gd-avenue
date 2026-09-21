@@ -201,6 +201,7 @@ def _legacy_where_params(sql: str, params: Sequence[Any]) -> Optional[tuple[Any,
 _USER_SNOWFLAKE_COLUMNS = {
     "actor_id",
     "applicant_id",
+    "appellant_id",
     "assignee_id",
     "author_id",
     "claimed_by",
@@ -211,6 +212,7 @@ _USER_SNOWFLAKE_COLUMNS = {
     "disabled_by",
     "ended_by",
     "handled_by",
+    "issued_by_id",
     "new_owner_id",
     "previous_owner_id",
     "qa_by",
@@ -261,6 +263,12 @@ _SNOWFLAKE_REPAIR_TABLES = {
     "staff_application_events",
     "staff_application_notes",
     "staff_application_cooldowns",
+    "moderation_punishments",
+    "punishment_appeals",
+    "punishment_appeal_events",
+    "punishment_appeal_messages",
+    "punishment_appeal_assessments",
+    "punishment_appeal_cooldowns",
     "staff_applications",
     "staff_members",
     "staff_milestones",
@@ -873,6 +881,7 @@ class Database:
             {**expected, "database": 9},
             {**expected, "database": 10},
             {**expected, "database": 11},
+            {**expected, "database": 12},
         ):
             self._conn.execute("BEGIN IMMEDIATE")
             try:

@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 import discord
 
 from services.priority_system import PrioritySystemService
+from services.punishment_appeals import PunishmentAppealService
 from utils.errors import log_error
 from utils.keepalive import get_keepalive_status, get_runtime_health
 from utils.priority_system import (
@@ -26,6 +27,7 @@ from utils.priority_system import (
 from utils.staff_auth import (
     ROLE_ORDER,
     StaffPrincipal,
+    canonical_role,
     capability_set,
     new_csrf_token,
     new_session_token,
@@ -37,7 +39,7 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 7
+PORTAL_API_VERSION = 8
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
@@ -63,11 +65,16 @@ PORTAL_FEATURES = (
     "application_calibration",
     "application_probation",
     "application_process_analytics",
+    "punishment_appeals",
+    "appeal_discord_evidence",
+    "appeal_portal_messages",
+    "appeal_unban_outbox",
 )
 DISCORD_ID_FIELDS = {
     "actor_id",
     "allowed_guild_id",
     "applicant_id",
+    "appellant_id",
     "assignee_id",
     "author_id",
     "channel_id",
@@ -78,6 +85,8 @@ DISCORD_ID_FIELDS = {
     "ended_by",
     "forum_channel_id",
     "guild_id",
+    "issued_by_id",
+    "audit_log_entry_id",
     "log_message_id",
     "legacy_id",
     "message_id",
@@ -229,6 +238,7 @@ class StaffPortalService:
         self._rate_lock = asyncio.Lock()
         self._rate_windows: dict[str, deque[float]] = defaultdict(deque)
         self._identity_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+        self.appeals = PunishmentAppealService(self, PortalError)
 
     @property
     def enabled(self) -> bool:
@@ -271,6 +281,15 @@ class StaffPortalService:
                 raise PortalError(503, "discord_unavailable", "Discord membership could not be verified") from exc
         return guild, member
 
+    async def _require_guild_member(self, user_id: int) -> None:
+        _guild, member = await self._member(user_id)
+        if member is None:
+            raise PortalError(
+                403,
+                "membership_required",
+                "GD Avenue membership is required for staff applications. Punishment appeals remain available.",
+            )
+
     def _principal_from_member(self, member, *, session_hash: str = "") -> StaffPrincipal:
         role_ids = tuple(int(role.id) for role in getattr(member, "roles", ()) if getattr(role, "id", 0))
         role = resolve_staff_role(member.id, role_ids, self.bot.config)
@@ -291,6 +310,30 @@ class StaffPortalService:
             session_hash=session_hash,
             discord_display_name=discord_display_name,
             global_display_name=global_display_name,
+            username=username,
+        )
+
+    def _principal_from_oauth_identity(
+        self, payload: dict[str, Any], *, session_hash: str = ""
+    ) -> StaffPrincipal:
+        user_id = _discord_id(payload.get("user_id"), field="Discord user ID")
+        username = _bounded_text(payload.get("username"), 100)
+        global_name = _bounded_text(payload.get("global_name"), 100)
+        display_name = global_name or username or f"Discord user {user_id}"
+        avatar_url = _bounded_text(payload.get("avatar_url"), 1000)
+        if avatar_url and not avatar_url.startswith("https://cdn.discordapp.com/"):
+            avatar_url = ""
+        return StaffPrincipal(
+            user_id=user_id,
+            guild_id=self.guild_id,
+            display_name=display_name,
+            avatar_url=avatar_url,
+            role="applicant",
+            role_ids=(),
+            capabilities=capability_set("applicant"),
+            session_hash=session_hash,
+            discord_display_name=display_name,
+            global_display_name=global_name,
             username=username,
         )
 
@@ -342,11 +385,20 @@ class StaffPortalService:
             "WHERE guild_id=? AND user_id=?",
             (self.guild_id, user_id),
         )
+        session_identity = await self.db.fetchone(
+            "SELECT display_name,avatar_url FROM staff_web_sessions "
+            "WHERE guild_id=? AND user_id=? ORDER BY last_seen_ts DESC LIMIT 1",
+            (self.guild_id, user_id),
+        )
         nickname = str(profile["portal_nickname"] or "").strip() if profile else ""
-        discord_display = str(getattr(member, "display_name", "") or "")[:100]
+        discord_display = str(
+            getattr(member, "display_name", "")
+            or (session_identity["display_name"] if session_identity else "")
+            or ""
+        )[:100]
         global_display = str(getattr(member, "global_name", "") or "")[:100]
         username = str(getattr(member, "name", "") or "")[:100]
-        unresolved = member is None and not nickname
+        unresolved = member is None and not nickname and not discord_display
         display_name = (
             nickname
             or discord_display
@@ -361,7 +413,9 @@ class StaffPortalService:
         )
         role = resolve_staff_role(user_id, roles, self.bot.config)
         avatar = str(
-            getattr(getattr(member, "display_avatar", None), "url", "") or ""
+            getattr(getattr(member, "display_avatar", None), "url", "")
+            or (session_identity["avatar_url"] if session_identity else "")
+            or ""
         )[:1000]
         identity = {
             "id": str(user_id),
@@ -554,13 +608,18 @@ class StaffPortalService:
 
     async def create_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         user_id = _discord_id(payload.get("user_id"), field="Discord user ID")
-        _guild, member = await self._member(user_id)
-        if member is None:
-            raise PortalError(403, "not_a_member", "You must be a GD Avenue member to continue")
-        principal = await self._principal_with_profile(self._principal_from_member(member))
         purpose = str(payload.get("purpose") or "staff").strip().casefold()
         if purpose not in {"staff", "apply"}:
             raise PortalError(400, "invalid_session_purpose", "The requested sign-in flow is invalid")
+        _guild, member = await self._member(user_id)
+        if member is None:
+            if purpose == "staff":
+                raise PortalError(403, "not_a_member", "You must be a GD Avenue member to continue")
+            principal = self._principal_from_oauth_identity(payload)
+        else:
+            principal = await self._principal_with_profile(
+                self._principal_from_member(member)
+            )
         if purpose == "staff" and not principal.can("staff.access"):
             raise PortalError(
                 403,
@@ -588,6 +647,7 @@ class StaffPortalService:
                 expires_ts,
             ),
         )
+        self._invalidate_identity(user_id)
         return {
             "session_token": raw_session,
             "csrf_token": raw_csrf,
@@ -610,14 +670,29 @@ class StaffPortalService:
             raise PortalError(401, "session_expired", "Your session expired; sign in again")
         _guild, member = await self._member(int(row["user_id"]))
         if member is None:
-            await self.db.execute(
-                "UPDATE staff_web_sessions SET revoked_ts=? WHERE token_hash=? AND revoked_ts IS NULL",
-                (now, digest),
+            if canonical_role(str(row["role_key"] or "")) != "applicant":
+                await self.db.execute(
+                    "UPDATE staff_web_sessions SET revoked_ts=? WHERE token_hash=? AND revoked_ts IS NULL",
+                    (now, digest),
+                )
+                raise PortalError(
+                    403, "membership_required", "GD Avenue membership is required"
+                )
+            principal = StaffPrincipal(
+                user_id=int(row["user_id"]),
+                guild_id=int(row["guild_id"]),
+                display_name=str(row["display_name"] or "Discord user")[:100],
+                avatar_url=str(row["avatar_url"] or "")[:1000],
+                role="applicant",
+                role_ids=(),
+                capabilities=capability_set("applicant"),
+                session_hash=digest,
+                discord_display_name=str(row["display_name"] or "")[:100],
             )
-            raise PortalError(403, "membership_required", "GD Avenue membership is required")
-        principal = await self._principal_with_profile(
-            self._principal_from_member(member, session_hash=digest)
-        )
+        else:
+            principal = await self._principal_with_profile(
+                self._principal_from_member(member, session_hash=digest)
+            )
         if (
             now - int(row["last_seen_ts"] or 0) >= 300
             or str(row["display_name"] or "") != principal.display_name
@@ -884,6 +959,9 @@ class StaffPortalService:
         if path == "/api/staff/applications" and method == "GET":
             principal.require("applications.review_judge")
             return 200, await self.applications(principal, query)
+        if path == "/api/staff/appeals" and method == "GET":
+            principal.require("appeals.review")
+            return 200, await self.appeals.list_staff(principal, query)
         if path == "/api/staff/staff" and method == "GET":
             principal.require("staff.view")
             return 200, await self.staff_list(principal)
@@ -972,6 +1050,18 @@ class StaffPortalService:
                     principal, int(app_match.group(1)), payload
                 )
             return 200, await self.application_action(principal, int(app_match.group(1)), payload)
+        appeal_match = re.fullmatch(
+            r"/api/staff/appeals/(\d+)/(action|assessment|message)", path
+        )
+        if appeal_match and method == "POST":
+            principal.require("appeals.review")
+            appeal_id = int(appeal_match.group(1))
+            operation = appeal_match.group(2)
+            if operation == "assessment":
+                return 200, await self.appeals.assessment(principal, appeal_id, payload)
+            if operation == "message":
+                return 201, await self.appeals.staff_message(principal, appeal_id, payload)
+            return 200, await self.appeals.action(principal, appeal_id, payload)
         staff_match = re.fullmatch(r"/api/staff/staff/(\d+)/action", path)
         if staff_match and method == "POST":
             principal.require("staff.manage_standard_roles")
@@ -2620,6 +2710,8 @@ class StaffPortalService:
             return 200, await self.application_form(principal)
         form_match = re.fullmatch(r"/api/apply/form/([a-z][a-z0-9_]{1,39})", path)
         if form_match and method == "GET":
+            if form_match.group(1) == "appeal":
+                return 200, await self.appeals.form(principal)
             return 200, await self.application_form(principal, form_match.group(1))
         if path == "/api/apply/mine" and method == "GET":
             await self._reconcile_application_roles()
@@ -2629,8 +2721,7 @@ class StaffPortalService:
                 "WHERE guild_id=? AND applicant_id=? ORDER BY updated_ts DESC LIMIT 20",
                 (principal.guild_id, principal.user_id),
             )
-            return 200, {
-                "items": [
+            recruitment_items = [
                     {
                         **_row_dict(row),
                         "application_label": self._application_label(
@@ -2640,13 +2731,27 @@ class StaffPortalService:
                     }
                     for row in rows
                 ]
-            }
+            return 200, {"items": recruitment_items + await self.appeals.mine(principal)}
         if path == "/api/apply/mine" and method == "DELETE":
             return 200, await self.reset_own_application_data(principal, payload)
         if path == "/api/apply/save" and method == "POST":
+            if str(payload.get("application_type") or "").casefold() == "appeal":
+                return 200, await self.appeals.save(principal, payload, submit=False)
             return 200, await self.save_application(principal, payload, submit=False)
         if path == "/api/apply/submit" and method == "POST":
+            if str(payload.get("application_type") or "").casefold() == "appeal":
+                return 200, await self.appeals.save(principal, payload, submit=True)
             return 200, await self.save_application(principal, payload, submit=True)
+        appeal_message = re.fullmatch(r"/api/apply/appeals/(\d+)/messages", path)
+        if appeal_message and method == "POST":
+            return 201, await self.appeals.applicant_message(
+                principal, int(appeal_message.group(1)), payload
+            )
+        appeal_withdraw = re.fullmatch(r"/api/apply/appeals/(\d+)/withdraw", path)
+        if appeal_withdraw and method == "POST":
+            return 200, await self.appeals.withdraw(
+                principal, int(appeal_withdraw.group(1))
+            )
         match = re.fullmatch(r"/api/apply/(\d+)/withdraw", path)
         if match and method == "POST":
             application_id = int(match.group(1))
@@ -3029,6 +3134,8 @@ class StaffPortalService:
     async def application_options(self, principal: StaffPrincipal) -> dict[str, Any]:
         configured_types = self._configured_application_types()
         configuration = (await self.safe_configuration())["configuration"]
+        _guild, current_member = await self._member(principal.user_id)
+        recruitment_eligible = current_member is not None
         forms = []
         cooldowns: dict[str, dict[str, Any]] = {}
         for application_type in configured_types:
@@ -3042,10 +3149,12 @@ class StaffPortalService:
                     "application_type": application_type,
                     "label": self._application_label(application_type),
                     "description": str(config.get("description") or "").strip()[:500],
-                    "enabled": True,
-                    "open": self._application_type_is_open(
+                    "enabled": recruitment_eligible,
+                    "open": recruitment_eligible
+                    and self._application_type_is_open(
                         configuration, application_type
                     ),
+                    "membership_required": not recruitment_eligible,
                     "cooldown": cooldown,
                 }
             )
@@ -3053,10 +3162,11 @@ class StaffPortalService:
             forms.append(
                 {
                     "application_type": "appeal",
-                    "label": "Appeal application",
-                    "description": "This application will be added in a future update.",
-                    "enabled": False,
-                    "open": False,
+                    "label": "Punishment appeal",
+                    "description": "Ask GD Avenue to review an active server ban and its supporting evidence.",
+                    "enabled": True,
+                    "open": bool(configuration.get("appeals_open", True)),
+                    "cooldown": {"active": False, "days": 30},
                 }
             )
         active_rows = await self.db.fetchall(
@@ -3067,6 +3177,14 @@ class StaffPortalService:
             (principal.guild_id, principal.user_id),
         )
         active_applications = [_row_dict(row) for row in active_rows]
+        appeal_rows = await self.db.fetchall(
+            "SELECT id,'appeal' AS application_type,status FROM punishment_appeals "
+            "WHERE guild_id=? AND appellant_id=? AND status IN"
+            "('draft','submitted','triage','under_review','awaiting_information','second_review') "
+            "ORDER BY updated_ts DESC,id DESC",
+            (principal.guild_id, principal.user_id),
+        )
+        active_applications.extend(_row_dict(row) for row in appeal_rows)
         return {
             "items": forms,
             "applications_open": bool(configuration["applications_open"]),
@@ -3077,6 +3195,7 @@ class StaffPortalService:
             "cooldowns": cooldowns,
             "active_applications": active_applications,
             "active_application": active_applications[0] if active_applications else None,
+            "guild_member": recruitment_eligible,
         }
 
     def _application_questions(
@@ -3160,6 +3279,7 @@ class StaffPortalService:
     async def application_form(
         self, principal: StaffPrincipal, application_type: str = "judge"
     ) -> dict[str, Any]:
+        await self._require_guild_member(principal.user_id)
         application_type = str(application_type or "judge").strip().casefold()
         if (
             application_type not in self._configured_application_types()
@@ -3440,6 +3560,7 @@ class StaffPortalService:
         return repaired
 
     async def save_application(self, principal, payload, *, submit):
+        await self._require_guild_member(principal.user_id)
         configuration = (await self.safe_configuration())["configuration"]
         app_type = str(payload.get("application_type") or "judge").casefold()
         if (
@@ -5536,6 +5657,14 @@ class StaffPortalService:
                     )
                     for application_type in configured_types
                 },
+                "appeals_open": bool(
+                    saved.get(
+                        "appeals_open",
+                        self.bot.config.get(
+                            "staff_portal", "appeals_enabled", default=True
+                        ),
+                    )
+                ),
             }
         }
 
@@ -5548,6 +5677,8 @@ class StaffPortalService:
             current["claim_stale_hours"] = value
         if "applications_open" in payload:
             current["applications_open"] = bool(payload["applications_open"])
+        if "appeals_open" in payload:
+            current["appeals_open"] = bool(payload["appeals_open"])
         if "application_open_by_type" in payload:
             incoming = payload["application_open_by_type"]
             if not isinstance(incoming, dict):

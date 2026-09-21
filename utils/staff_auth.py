@@ -68,6 +68,8 @@ HEAD_REVIEWER_CAPABILITIES = REVIEWER_CAPABILITIES | {
 ADMIN_CAPABILITIES = HEAD_REVIEWER_CAPABILITIES | {
     "admin.access",
     "applications.review_standard",
+    "appeals.execute",
+    "appeals.review",
     "audit.view_limited",
     "forum.manage",
     "operations.manage_standard",
