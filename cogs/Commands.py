@@ -268,6 +268,9 @@ class CommandsCog(commands.Cog):
         self.requests_group.command(name="history", description="Show request edit history")(self.requests_history)
         self.requests_group.command(name="repair", description="Repair request system messages")(self.requests_repair)
         self.requests_group.command(name="notifications", description="Choose how request results notify you")(self.requests_notifications)
+        self.requests_group.command(name="follow", description="Follow major updates for a recommended level")(self.requests_follow)
+        self.requests_group.command(name="unfollow", description="Stop updates for a recommended level")(self.requests_unfollow)
+        self.requests_group.command(name="my_notifications", description="Show levels you follow and notification preferences")(self.requests_my_notifications)
         self.requests_group.command(name="analytics", description="Show request outcomes and review performance")(self.requests_analytics)
         self.requests_group.command(name="historical_audit", description="Run or inspect a private historical request audit")(self.requests_historical_audit)
         self.pps_group.command(name="dashboard", description="Show the private PPS queue and worker overview")(self.pps_dashboard)
@@ -3813,32 +3816,149 @@ class CommandsCog(commands.Cog):
                 discord.OptionChoice("No personal notification", "none"),
             ],
         ),
+        major_level_updates: discord.Option(
+            bool,
+            "Receive major updates for levels you follow",
+            required=False,
+            default=None,
+        ),
+        priority_band_changes: discord.Option(
+            bool,
+            "Receive optional public priority-band changes",
+            required=False,
+            default=None,
+        ),
+        final_outcomes: discord.Option(
+            bool,
+            "Receive final observed outcomes",
+            required=False,
+            default=None,
+        ),
     ):
         if not self._in_allowed_guild(ctx):
             return await ctx.respond("Wrong server.", ephemeral=True)
         await self._defer(ctx, ephemeral=True)
         selected = str(mode or "show").casefold()
-        if selected != "show":
-            selected = normalize_notification_mode(selected)
+        row = await self.bot.db.fetchone(
+            "SELECT request_result_mode,level_major_updates,level_priority_band_changes,level_final_outcomes "
+            "FROM user_notification_preferences WHERE guild_id=? AND user_id=?",
+            (ctx.guild.id, ctx.user.id),
+        )
+        default_mode = self.bot.config.get("level_requests", "default_result_notification", default="channel")
+        current_mode = normalize_notification_mode(row["request_result_mode"] if row else default_mode)
+        selected = current_mode if selected == "show" else normalize_notification_mode(selected)
+        major = bool(int(row["level_major_updates"])) if row else True
+        priority = bool(int(row["level_priority_band_changes"])) if row else False
+        final = bool(int(row["level_final_outcomes"])) if row else True
+        major = major if major_level_updates is None else bool(major_level_updates)
+        priority = priority if priority_band_changes is None else bool(priority_band_changes)
+        final = final if final_outcomes is None else bool(final_outcomes)
+        if str(mode or "show").casefold() != "show" or any(
+            value is not None for value in (major_level_updates, priority_band_changes, final_outcomes)
+        ):
             await self.bot.db.execute(
-                "INSERT INTO user_notification_preferences(guild_id,user_id,request_result_mode,updated_ts) VALUES(?,?,?,?) "
-                "ON CONFLICT(guild_id,user_id) DO UPDATE SET request_result_mode=excluded.request_result_mode,updated_ts=excluded.updated_ts",
-                (ctx.guild.id, ctx.user.id, selected, int(time.time())),
+                "INSERT INTO user_notification_preferences(guild_id,user_id,request_result_mode,level_major_updates,level_priority_band_changes,level_final_outcomes,updated_ts) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(guild_id,user_id) DO UPDATE SET request_result_mode=excluded.request_result_mode,level_major_updates=excluded.level_major_updates,level_priority_band_changes=excluded.level_priority_band_changes,level_final_outcomes=excluded.level_final_outcomes,updated_ts=excluded.updated_ts",
+                (ctx.guild.id, ctx.user.id, selected, int(major), int(priority), int(final), int(time.time())),
             )
-        else:
-            row = await self.bot.db.fetchone(
-                "SELECT request_result_mode FROM user_notification_preferences WHERE guild_id=? AND user_id=?",
-                (ctx.guild.id, ctx.user.id),
-            )
-            default_mode = self.bot.config.get("level_requests", "default_result_notification", default="channel")
-            selected = normalize_notification_mode(row["request_result_mode"] if row else default_mode)
         labels = {
             "channel": "a ping in the result channel",
             "dm": "a direct message",
             "both": "a result-channel ping and a direct message",
             "none": "no personal notification; the result still appears in the result channel",
         }
-        await self._send(ctx, f"Request result notifications: **{labels[selected]}**.", ephemeral=True)
+        await self._send(
+            ctx,
+            f"Request result notifications: **{labels[selected]}**.\n"
+            f"Level updates: major **{'on' if major else 'off'}**, priority bands **{'on' if priority else 'off'}**, final outcomes **{'on' if final else 'off'}**.",
+            ephemeral=True,
+        )
+
+    async def requests_follow(
+        self,
+        ctx: discord.ApplicationContext,
+        level_id: discord.Option(str, "Geometry Dash level ID"),
+        priority_changes: discord.Option(
+            bool,
+            "Also notify me when its public priority band changes",
+            required=False,
+            default=False,
+        ),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        normalized = re.sub(r"\D", "", str(level_id or ""))
+        if not (7 <= len(normalized) <= 9):
+            return await self._send(ctx, "Enter a valid Geometry Dash level ID.", ephemeral=True)
+        priority_cog = self.bot.get_cog("PrioritySystemCog")
+        if priority_cog is None:
+            return await self._send(ctx, "Level notifications are temporarily unavailable.", ephemeral=True)
+        row = await self.bot.db.fetchone(
+            "SELECT 1 FROM level_outreach_queue WHERE guild_id=? AND level_id=? AND queue_state!='hidden' LIMIT 1",
+            (ctx.guild.id, normalized),
+        )
+        if not row:
+            return await self._send(ctx, "That level does not have a public Avenue recommendation page.", ephemeral=True)
+        await priority_cog.service.notifications.subscribe(
+            ctx.guild.id,
+            normalized,
+            ctx.user.id,
+            source="manual",
+            priority_band_changes=bool(priority_changes),
+        )
+        await self._send(
+            ctx,
+            f"You now follow level `{normalized}` for major updates"
+            + (" and priority-band changes." if priority_changes else "."),
+            ephemeral=True,
+        )
+
+    async def requests_unfollow(
+        self,
+        ctx: discord.ApplicationContext,
+        level_id: discord.Option(str, "Geometry Dash level ID"),
+    ):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        normalized = re.sub(r"\D", "", str(level_id or ""))
+        priority_cog = self.bot.get_cog("PrioritySystemCog")
+        if priority_cog is None:
+            return await self._send(ctx, "Level notifications are temporarily unavailable.", ephemeral=True)
+        removed = await priority_cog.service.notifications.unsubscribe(
+            ctx.guild.id, normalized, ctx.user.id
+        )
+        await self._send(
+            ctx,
+            f"You no longer follow level `{normalized}`." if removed else f"You were not following level `{normalized}`.",
+            ephemeral=True,
+        )
+
+    async def requests_my_notifications(self, ctx: discord.ApplicationContext):
+        if not self._in_allowed_guild(ctx):
+            return await ctx.respond("Wrong server.", ephemeral=True)
+        await self._defer(ctx, ephemeral=True)
+        priority_cog = self.bot.get_cog("PrioritySystemCog")
+        if priority_cog is None:
+            return await self._send(ctx, "Level notifications are temporarily unavailable.", ephemeral=True)
+        rows = await priority_cog.service.notifications.subscriptions(ctx.guild.id, ctx.user.id)
+        preferences = await self.bot.db.fetchone(
+            "SELECT request_result_mode,level_major_updates,level_priority_band_changes,level_final_outcomes "
+            "FROM user_notification_preferences WHERE guild_id=? AND user_id=?",
+            (ctx.guild.id, ctx.user.id),
+        )
+        lines = [
+            f"`{row['level_id']}` - {row['source']}"
+            + (" + priority bands" if int(row["priority_band_changes"] or 0) else "")
+            for row in rows[:20]
+        ]
+        mode = str(preferences["request_result_mode"] if preferences else "default")
+        await self._send(
+            ctx,
+            f"**Request result mode:** {mode}\n**Followed levels:**\n" + ("\n".join(lines) if lines else "None"),
+            ephemeral=True,
+        )
 
     async def requests_analytics(self, ctx: discord.ApplicationContext):
         if not self._in_allowed_guild(ctx):

@@ -76,7 +76,7 @@ Overview is personalized and uses real counts. Progress bars appear only where t
 
 ## Durable Data
 
-Database schema 11 includes these tables without replacing existing request/PPS tables:
+Database schema 14 includes the portal tables plus additive PPS evidence, model snapshot, network-era, capacity-forecast, exclusion and notification tables without replacing existing request/PPS tables:
 
 - `staff_web_sessions`
 - `staff_queue_claims`
@@ -178,7 +178,7 @@ All private endpoints require the service key. Except for OAuth session creation
 | `GET /api/staff/operations/incidents/{fingerprint}` | Sanitized full trace for Owner/Dev |
 | `GET/POST /api/staff/requests` | Request waves, scheduled openings, button refresh, and repair |
 | `GET/POST /api/staff/community` | Tracking, support, forum, and server-presentation operations |
-| `GET/POST /api/staff/pps` | Existing PPS dashboard and cycle/override services |
+| `GET/POST /api/staff/pps` | PPS dashboard, Statistics Lab, simulator, era/model controls, exclusions and cycle/override services |
 | `GET/POST /api/staff/system` | Dev-only sanitized diagnostics and safe recovery actions |
 | `GET /api/staff/audit` | Filtered durable workflow events |
 | `GET/PATCH /api/staff/configuration` | Allowlisted safe settings only |

@@ -1032,6 +1032,41 @@
     "public_level_base_url": "https://gdavenue.netlify.app/level",
     "new_wave_version": "pps_v1",
     "model_version": "pps_v1",
+    "bayesian": {
+      "enabled": true,
+      "public_probability_auto_activate": true,
+      "model_versions": {
+        "access": "access_model_v1",
+        "rating": "rating_model_v1",
+        "capacity": "capacity_model_v1"
+      },
+      "prior_alpha": 1.0,
+      "prior_beta": 1.0,
+      "carryover_effective_n": 4.0,
+      "subgroup_prior_effective_n": 4.0,
+      "subgroup_min_observations": 15,
+      "monte_carlo_draws": 20000,
+      "refresh_seconds": 1800,
+      "access": {
+        "min_observations": 40,
+        "min_successes": 5,
+        "min_failures": 5,
+        "max_90_interval_width": 0.45,
+        "max_stale_days": 45
+      },
+      "rating": {
+        "min_observations": 25,
+        "min_successes": 5,
+        "min_failures": 5,
+        "max_90_interval_width": 0.5,
+        "max_stale_days": 60
+      },
+      "calibration": {
+        "min_resolved_predictions": 50,
+        "max_ece": 0.15,
+        "max_brier": 0.3
+      }
+    },
     "prestige_base": 1.8,
     "prestige_x": {
       "rate": 0.0,
@@ -1056,6 +1091,7 @@
     "outcome_window_days": 30,
     "maintenance_interval_seconds": 300,
     "maintenance_batch_size": 5,
+    "priority_band_notification_cooldown_hours": 12,
     "failure_retry_minutes": 15
   },
   "operations": {

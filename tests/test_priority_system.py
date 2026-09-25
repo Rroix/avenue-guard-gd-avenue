@@ -408,7 +408,7 @@ async def test_schema_v7_upgrade_marks_existing_state_and_submissions_legacy(tmp
                 "SELECT schema_version FROM schema_metadata WHERE component='database'"
             )
         )["schema_version"]
-    ) == 13
+        ) == 14
     assert not await upgraded.fetchall("SELECT * FROM level_outreach_queue")
     await upgraded.close()
 
@@ -924,6 +924,7 @@ async def test_successful_cycle_ages_only_eligible_unsubmitted_start_candidates(
         OWNER_ID,
         status="submitted_to_mod",
         route_type="direct",
+        target_label="Moderator A",
         idempotency_key="attempt-submitted",
     )
     repeated = await service.record_attempt(

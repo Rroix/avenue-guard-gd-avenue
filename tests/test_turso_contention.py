@@ -47,6 +47,33 @@ def tracking_cog(database):
 
 
 @pytest.mark.asyncio
+async def test_active_queue_duplicate_is_recorded_and_returns_public_status_link(db):
+    now = int(time.time())
+    queue_id = await db.execute_insert(
+        "INSERT INTO level_outreach_queue(guild_id,wave_id,requester_id,request_message_id,level_id,send_type,queued_ts,prestige_t,prestige_component_f,waiting_cycles,waiting_component_h,priority_complete,model_version,queue_state,correlation_id,updated_ts) "
+        "VALUES(717,4,22,33,'101935961','epic',?,2.5,3.35,0,0,0,'pps_v1','queued','duplicate-test',?)",
+        (now, now),
+    )
+    config = SimpleNamespace(
+        get=lambda *path, default=None: "https://gdavenue.netlify.app/level"
+        if path == ("priority_system", "public_level_base_url")
+        else default
+    )
+    cog = object.__new__(RequestLevelsCog)
+    cog.bot = SimpleNamespace(db=db, config=config)
+
+    message = await cog._record_active_queue_duplicate(717, 44, "101935961", wave_id=5)
+
+    assert "already active" in message
+    assert "https://gdavenue.netlify.app/level/101935961" in message
+    occurrence = await db.fetchone("SELECT * FROM level_request_duplicate_occurrences")
+    assert occurrence["queue_id"] == queue_id
+    assert occurrence["user_id"] == 44
+    event = await db.fetchone("SELECT event FROM workflow_events WHERE entity_id=?", (f"queue:{queue_id}",))
+    assert event["event"] == "duplicate_active_queue_request"
+
+
+@pytest.mark.asyncio
 async def test_remote_reads_and_atomic_batches_work_with_native_driver_behind_busy_writer(tmp_path, monkeypatch):
     database = Database(str(tmp_path / "native.db"), remote_url="libsql://test.invalid")
     monkeypatch.setattr(database, "_open_connection_sync", lambda: IsolatedConnection(str(database.path)))
@@ -169,7 +196,7 @@ async def test_schema_five_upgrade_is_additive_and_preserves_counts(db, tmp_path
             await restored.fetchone(
                 "SELECT schema_version FROM schema_metadata WHERE component='database'"
             )
-        )["schema_version"] == 13
+        )["schema_version"] == 14
         assert await restored.fetchall("SELECT * FROM activity_flush_batches") == []
     finally:
         await restored.close()

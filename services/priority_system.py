@@ -5,7 +5,9 @@ import json
 import time
 from typing import Any
 
+from services.bayesian_models import BayesianModelService, observed_rating_tier
 from services.historical_audit import normalize_level_snapshot
+from services.level_notifications import LevelNotificationService
 from utils.errors import log_error
 from utils.gd_profile import fetch_creator_profile
 from utils.priority_system import (
@@ -30,6 +32,8 @@ class PrioritySystemService:
         self._refresh_locks: dict[int, asyncio.Lock] = {}
         self._level_locks: dict[str, asyncio.Lock] = {}
         self._account_locks: dict[int, asyncio.Lock] = {}
+        self.models = BayesianModelService(bot)
+        self.notifications = LevelNotificationService(bot)
 
     @property
     def settings(self):
@@ -74,6 +78,9 @@ class PrioritySystemService:
             ),
         )
         if changed:
+            await self.notifications.subscribe_requester(
+                int(row["guild_id"]), str(row["level_id"]), int(row["user_id"])
+            )
             await self._event(
                 "queue_repaired",
                 queue_id=await self._queue_id_for_message(int(row["guild_id"]), int(row["request_message_id"])),
@@ -210,6 +217,22 @@ class PrioritySystemService:
             )
             if not cycle:
                 raise ValueError("An outreach cycle became active before this one could start")
+            try:
+                candidate = await self.db.fetchone(
+                    "SELECT COUNT(*) AS c FROM level_outreach_cycle_entries WHERE cycle_id=?",
+                    (int(cycle["id"]),),
+                )
+                await self.models.capacity(
+                    guild_id,
+                    int(candidate["c"] or 0) if candidate else 0,
+                    cycle_id=int(cycle["id"]),
+                    persist=True,
+                )
+            except Exception as exc:
+                await log_error(
+                    self.bot,
+                    f"Shadow capacity forecast deferred for cycle {int(cycle['id'])}: {exc!r}",
+                )
             return cycle
 
     async def cycle_entries(self, cycle_id: int):
@@ -221,6 +244,26 @@ class PrioritySystemService:
             "e.priority_points_snapshot DESC,e.waiting_cycles_snapshot DESC,q.queued_ts,e.queue_id",
             (cycle_id,),
         )
+
+    async def _ensure_episode_for_attempt(self, guild_id: int, queue_id: int, actor_id: int):
+        existing = await self.db.fetchone(
+            "SELECT * FROM staff_outreach_episodes WHERE guild_id=? AND queue_id=? "
+            "AND status IN('active','awaiting_outcome') ORDER BY episode_number DESC LIMIT 1",
+            (guild_id, queue_id),
+        )
+        if existing:
+            return existing
+        row = await self.db.fetchone(
+            "SELECT COALESCE(MAX(episode_number),0) AS n FROM staff_outreach_episodes WHERE queue_id=?",
+            (queue_id,),
+        )
+        now = int(time.time())
+        episode_id = await self.db.execute_insert(
+            "INSERT INTO staff_outreach_episodes(guild_id,queue_id,episode_number,status,started_by,started_ts) "
+            "VALUES(?,?,?,'active',?,?)",
+            (guild_id, queue_id, int(row["n"] or 0) + 1, actor_id, now),
+        )
+        return await self.db.fetchone("SELECT * FROM staff_outreach_episodes WHERE id=?", (episode_id,))
 
     async def record_attempt(
         self,
@@ -264,9 +307,12 @@ class PrioritySystemService:
             ):
                 return existing
             raise ValueError("That outreach interaction was already used for another action")
+        if normalized_episode_id is None:
+            episode = await self._ensure_episode_for_attempt(guild_id, queue_id, actor_id)
+            normalized_episode_id = int(episode["id"])
         if (
             status == "follow_up"
-            or (status == "submitted_to_mod" and normalized_episode_id is not None)
+            or status == "submitted_to_mod"
         ) and not normalized_target:
             raise ValueError("Confirmed submissions and follow-ups require a private target")
         cycle = await self.db.fetchone(
@@ -335,7 +381,7 @@ class PrioritySystemService:
             ),
         ]
         if status == "submitted_to_mod":
-            due_ts = now + self.settings.outcome_window_seconds
+            due_ts = recorded_ts + self.settings.outcome_window_seconds
             statements.extend(
                 [
                     (
@@ -347,7 +393,7 @@ class PrioritySystemService:
                         "UPDATE level_outreach_queue SET queue_state='awaiting_outcome',submitted_to_mod_ts=COALESCE(submitted_to_mod_ts,?),"
                         "outcome_window_due_ts=COALESCE(outcome_window_due_ts,?),updated_ts=? WHERE id=? AND queue_state IN('queued','in_cycle','awaiting_outcome') "
                         f"AND EXISTS({attempt_guard})",  # nosec B608
-                        (now, due_ts, now, queue_id, *attempt_guard_params),
+                        (recorded_ts, due_ts, now, queue_id, *attempt_guard_params),
                     ),
                 ]
             )
@@ -387,6 +433,31 @@ class PrioritySystemService:
         )
         if not saved:
             raise ValueError("That outreach interaction was already used for another action")
+        try:
+            await self.models.project_attempt(int(saved["id"]))
+        except Exception as exc:  # Shadow evidence must never break live outreach recording.
+            await log_error(
+                self.bot,
+                f"Bayesian opportunity projection deferred for attempt {int(saved['id'])}: {exc!r}",
+            )
+        try:
+            queue = await self.db.fetchone(
+                "SELECT level_id FROM level_outreach_queue WHERE id=?", (queue_id,)
+            )
+            if queue and status == "submitted_to_mod":
+                event = "reached_moderator"
+                message = "A confirmed moderator submission was recorded for your level."
+                await self.notifications.emit(
+                    guild_id,
+                    str(queue["level_id"]),
+                    event,
+                    f"attempt:{int(saved['id'])}:{event}",
+                    message,
+                    queue_id=queue_id,
+                    episode_id=normalized_episode_id,
+                )
+        except Exception as exc:  # Delivery is isolated from outreach truth.
+            await log_error(self.bot, f"Level update notification deferred: {exc!r}")
         return saved
 
     async def complete_cycle(self, guild_id: int, cycle_id: int, actor_id: int):
@@ -468,6 +539,14 @@ class PrioritySystemService:
                 ]
             )
             await self.db.execute_transaction(statements, retry_safe=True)
+            actual = await self.db.fetchone(
+                "SELECT COUNT(*) AS c FROM level_outreach_cycle_entries WHERE cycle_id=? AND submitted_to_mod=1",
+                (cycle_id,),
+            )
+            await self.db.execute(
+                "UPDATE bayes_capacity_forecasts SET actual_submissions=?,resolved_ts=? WHERE cycle_id=? AND actual_submissions IS NULL",
+                (int(actual["c"] or 0) if actual else 0, now, cycle_id),
+            )
             saved = await self.db.fetchone(
                 "SELECT * FROM level_outreach_cycles WHERE id=?", (cycle_id,)
             )
@@ -507,6 +586,14 @@ class PrioritySystemService:
                     ),
                 ],
                 retry_safe=True,
+            )
+            actual = await self.db.fetchone(
+                "SELECT COUNT(*) AS c FROM level_outreach_cycle_entries WHERE cycle_id=? AND submitted_to_mod=1",
+                (cycle_id,),
+            )
+            await self.db.execute(
+                "UPDATE bayes_capacity_forecasts SET actual_submissions=?,resolved_ts=? WHERE cycle_id=? AND actual_submissions IS NULL",
+                (int(actual["c"] or 0) if actual else 0, now, cycle_id),
             )
             return await self.db.fetchone(
                 "SELECT * FROM level_outreach_cycles WHERE id=?", (cycle_id,)
@@ -602,7 +689,8 @@ class PrioritySystemService:
             [
                 (
                     "INSERT INTO level_outreach_level_snapshots(queue_id,checked_ts,current_exists,current_rated,stars,"
-                    "uploader_name,uploader_user_id,uploader_account_id,lookup_status,error_text) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "uploader_name,uploader_user_id,uploader_account_id,lookup_status,error_text,current_featured,current_epic,"
+                    "current_epic_tier_raw,current_legendary,current_mythic) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         int(row["id"]),
                         now,
@@ -614,13 +702,19 @@ class PrioritySystemService:
                         snapshot.get("current_uploader_account_id"),
                         str(snapshot.get("gd_lookup_status") or "unavailable"),
                         str(snapshot.get("gd_lookup_error") or "")[:500] or None,
+                        snapshot.get("current_featured"),
+                        snapshot.get("current_epic"),
+                        snapshot.get("current_epic_tier_raw"),
+                        snapshot.get("current_legendary"),
+                        snapshot.get("current_mythic"),
                     ),
                 ),
                 (
                     "UPDATE level_outreach_queue SET current_exists=?,current_rated=?,current_stars=?,current_level_name=?,"
                     "uploader_name=COALESCE(?,uploader_name),uploader_user_id=COALESCE(?,uploader_user_id),"
                     "uploader_account_id=COALESCE(?,uploader_account_id),level_checked_ts=?,level_refresh_after_ts=?,queue_state=?,"
-                    "rated_observed_ts=?,updated_ts=? WHERE id=?",
+                    "rated_observed_ts=?,current_featured=?,current_epic=?,current_epic_tier_raw=?,current_legendary=?,current_mythic=?,"
+                    "observed_rating_tier=COALESCE(?,observed_rating_tier),updated_ts=? WHERE id=?",
                     (
                         None if exists is None else int(bool(exists)),
                         None if rated is None else int(bool(rated)),
@@ -633,6 +727,12 @@ class PrioritySystemService:
                         refresh_after,
                         next_state,
                         rated_observed,
+                        snapshot.get("current_featured"),
+                        snapshot.get("current_epic"),
+                        snapshot.get("current_epic_tier_raw"),
+                        snapshot.get("current_legendary"),
+                        snapshot.get("current_mythic"),
+                        observed_rating_tier(snapshot),
                         now,
                         int(row["id"]),
                     ),
@@ -640,6 +740,18 @@ class PrioritySystemService:
             ],
             retry_safe=True,
         )
+        if rated is True and row["current_rated"] not in (1, "1", True):
+            try:
+                await self.notifications.emit(
+                    int(row["guild_id"]),
+                    str(row["level_id"]),
+                    "rated_observed",
+                    f"queue:{int(row['id'])}:rated:{now}",
+                    "The level is currently shown as rated in Geometry Dash. This reports the current official state and does not claim Avenue caused the rating.",
+                    queue_id=int(row["id"]),
+                )
+            except Exception as exc:
+                await log_error(self.bot, f"Rated observation notification deferred: {exc!r}")
 
     async def _save_creator_snapshot(self, row, snapshot: dict[str, Any]) -> None:
         checked = int(snapshot.get("checked_ts") or time.time())
@@ -721,6 +833,11 @@ class PrioritySystemService:
             "current_exists": None if row["current_exists"] is None else bool(row["current_exists"]),
             "current_rated": None if row["current_rated"] is None else bool(row["current_rated"]),
             "current_stars": row["stars"],
+            "current_featured": row["current_featured"],
+            "current_epic": row["current_epic"],
+            "current_epic_tier_raw": row["current_epic_tier_raw"],
+            "current_legendary": row["current_legendary"],
+            "current_mythic": row["current_mythic"],
             "current_level_name": row["current_level_name"],
             "current_uploader_name": row["uploader_name"],
             "current_uploader_user_id": row["uploader_user_id"],
@@ -866,7 +983,7 @@ class PrioritySystemService:
                     f"PPS queue refresh deferred queue_id={queue_id}: {type(exc).__name__}: {str(exc)[:300]}",
                 )
         due = await self.db.fetchall(
-            "SELECT id,rated_observed_ts,outcome_window_due_ts FROM level_outreach_queue "
+            "SELECT id,level_id,rated_observed_ts,outcome_window_due_ts FROM level_outreach_queue "
             "WHERE guild_id=? AND submitted_to_mod_ts IS NOT NULL AND outcome_window_due_ts<=? "
             "AND outcome_window_completed_ts IS NULL AND queue_state!='hidden' "
             "ORDER BY outcome_window_due_ts LIMIT ?",
@@ -914,7 +1031,26 @@ class PrioritySystemService:
                 "WHERE id=? AND outcome_window_completed_ts IS NULL",
                 (rated_within, now, now, int(row["id"])),
             )
-        return {"refreshed": refreshed, "failed": failed, "outcomes_completed": completed}
+            if not rated_within:
+                try:
+                    await self.notifications.emit(
+                        guild_id,
+                        str(row["level_id"]),
+                        "outcome_window_closed",
+                        f"queue:{int(row['id'])}:outcome-window",
+                        "No rating has been observed within Avenue's 30-day tracking window. This does not prevent the level from being rated later, and its Avenue history remains preserved.",
+                        queue_id=int(row["id"]),
+                        payload={"rated_within_window": False},
+                    )
+                except Exception as exc:
+                    await log_error(self.bot, f"Outcome notification deferred: {exc!r}")
+        deliveries_synced = await self.notifications.sync_delivery_states()
+        return {
+            "refreshed": refreshed,
+            "failed": failed,
+            "outcomes_completed": completed,
+            "notification_deliveries_synced": deliveries_synced,
+        }
 
     async def dashboard(self, guild_id: int) -> dict[str, Any]:
         rows = await self.db.fetchall(

@@ -1,6 +1,6 @@
 # Avenue Guard Priority Point System v1
 
-This is the private technical and operating guide for the first production Priority Point System. PPS is a deterministic queue for human outreach. It is not a probability model, does not contact moderators, and does not claim that a recommendation has reached a moderator.
+This is the private technical and operating guide for the production Priority Point System and its separate evidence models. PPS is a deterministic queue for human outreach. Bayesian models observe what happens after staff act; they never alter PPS, contact moderators, or turn a recommendation into a claimed submission.
 
 ## 1. The Mental Model
 
@@ -35,7 +35,7 @@ Discord is the interface, but Turso/SQLite is authoritative. The visible request
 
 ## 2. Rollout Boundary
 
-Schema 8 adds `review_system_version` to both `level_request_state` and `level_request_submissions`. Their migration default is `legacy`.
+Schema 14 preserves the original version boundary introduced with schema 8: `review_system_version` exists on both `level_request_state` and `level_request_submissions`, and migrated rows default to `legacy`.
 
 This is the safety rule:
 
@@ -219,7 +219,7 @@ Successful snapshots use the normal CP and level cache intervals. Failed checks 
 
 ## 9. Database Tables
 
-Schema 8 is additive.
+Schema 14 is additive.
 
 | Table | Durable responsibility |
 |---|---|
@@ -229,10 +229,21 @@ Schema 8 is additive.
 | `level_outreach_attempts` | Planned, attempted, submitted and failed outreach evidence |
 | `level_outreach_cp_snapshots` | Append-only CP lookup/override history |
 | `level_outreach_level_snapshots` | Append-only current level/rating lookup history |
+| `staff_outreach_episodes` | Reconstructable per-level episode, first confirmed submission, fixed outcome and eventual outcome |
+| `level_outreach_targets` | Private normalized target identity; never projected publicly |
+| `level_outreach_opportunities` | One episode + level + target Bernoulli opportunity; follow-ups remain one trial |
+| `level_network_eras` | Explicit access environments and exact carryover prior |
+| `bayes_model_versions` | Immutable version/config registrations |
+| `bayes_model_snapshots` | Immutable posterior, readiness, calibration and config-hash snapshots |
+| `bayes_predictions` | Immutable access, rating and public combined-path prediction records |
+| `bayes_capacity_forecasts` | Reproducible cycle/sandbox posterior predictive forecasts and actuals |
+| `bayes_model_exclusions` | Audited, reversible evidence exclusions with explicit reason |
+| `level_notification_subscriptions` | Per-level durable DM preferences |
+| `level_notification_events` / `level_notification_deliveries` | Idempotent event and outbox delivery audit |
 
 Important transitions also write `workflow_events` with correlation IDs. Discord result delivery continues through `discord_outbox`.
 
-No historical request row is rewritten into PPS. No legacy request is backfilled into the queue.
+No historical request row is rewritten into PPS. No legacy request is backfilled into the queue. The model worker only projects prospective PPS attempts with an existing episode and sufficient target semantics. Ambiguous records receive an explicit exclusion instead of invented evidence.
 
 ## 10. Owner Commands
 
@@ -298,7 +309,7 @@ Changing parameters does not silently rewrite cycle snapshots. A future PPS v2 s
 
 Use staging or a controlled request wave where possible.
 
-1. Back up the database and deploy schema 8.
+1. Back up the database and deploy schema 14.
 2. Run `/pps dashboard`; confirm the deployment-time current wave says `legacy` and the next new wave says `pps_v1`.
 3. Run `/requests repair`; confirm existing cards still have the green generic Send button.
 4. Submit another request to that same existing wave; confirm it is still legacy.
@@ -321,6 +332,58 @@ Exact queue rank is converted server-side with `public_priority_band(position, t
 
 Public lifecycle values are derived independently. `Rated` is an outcome, never an outreach status. Missing submission/rating evidence remains unknown, and the website only marks timeline stages supported by persisted timestamps or authoritative queue state.
 
-## 15. Explicit Non-Features
+## 15. Outreach Episodes And Opportunities
 
-PPS v1 does not implement Bayesian probabilities, AI ranking, public exact scores or ranks, automated moderator contact, external-moderator DMs, or retroactive historical scoring. Humans make the recommendation and perform outreach; PPS makes ordering and evidence durable and explainable.
+Every active/requeued lifetime is a separate `staff_outreach_episodes` row. The first confirmed submission opens exactly one 30-day episode outcome. A later manual requeue preserves the old episode and creates the next episode with refreshed CP, recalculated PPS and `W = 0`.
+
+An opportunity is unique to episode + level + normalized private target. Planned, attempted, failed, submitted and follow-up events roll into that row. Planned-only opportunities are not evidence; an attempted opportunity explicitly closed without submission is a failure; confirmed submission is a success. Same-target follow-ups never increase the Bernoulli trial count. Different targets remain different opportunities.
+
+## 16. Bayesian Evidence Models
+
+The shadow family is versioned independently from `pps_v1`:
+
+- `access_model_v1`: `P(confirmed submission | resolved real opportunity)` in the current network era;
+- `rating_model_v1`: `P(rated within 30 days | episode had a confirmed submission)`;
+- `capacity_model_v1`: posterior predictive confirmed-submission totals for planned opportunities.
+
+Global models begin at `Beta(1,1)`. Route and recommendation-tier subgroups shrink toward the applicable global posterior mean with configurable effective sample size. A new network era uses the configured reset policy or the previous posterior mean compressed to a weak prior: `alpha = 1 + m*n`, `beta = 1 + (1-m)*n`.
+
+Pre-rated episodes, malformed prospective records and manual exclusions never enter the relevant likelihood. The original recommendation and eventual official tier remain separate fields.
+
+## 17. Readiness, Calibration And Publication
+
+Statuses are `collecting`, `provisional`, `active`, `degraded` and `paused`. Central configuration controls minimum observations/successes/failures, maximum 90% credible-interval width, freshness, subgroup readiness and calibration thresholds. Evidence labels (`limited`, `moderate`, `strong`) combine count, interval width and freshness.
+
+Each posterior snapshot stores alpha, beta, 50/80/90/95% credible intervals, evidence counts, data cutoff, exact prior, readiness reason, calibration metrics and config hash. Resolved prediction snapshots retain their original probability and gain outcome/Brier fields. Reliability bins and ECE are evaluated only after the configured minimum resolved count.
+
+Public reads use persisted active snapshots only. Access and rating estimates may activate independently. The combined Avenue-path estimate appears only when both are active and is calculated from deterministic Monte Carlo draws of both posteriors, never by multiplying interval endpoints. Degraded, paused or new-era collecting models disappear automatically.
+
+## 18. Capacity Forecasts
+
+Capacity simulations draw route/global access probabilities and then candidate outcomes. Follow-ups are not new trials. Forecasts persist the selected snapshot IDs, seed, draw count, expected submissions and:
+
+```text
+Kq = max { k : P(S >= k) >= q }
+```
+
+`K80`, `K90` and `K95` are conservative internal commitments, not public promises. The Statistics Lab simulator is non-mutating; cycle-start forecasts are persisted and resolved against actual confirmed submissions.
+
+## 19. Network Eras
+
+Exactly one era is active. Owner/Dev starts a new era with mandatory private reason and optional sanitized public reason. The transaction closes the old era, records the carryover prior and emits an audit event. Access and capacity return to collecting/provisional until current-era evidence passes readiness.
+
+## 20. Notifications
+
+Requester subscriptions are created after a PPS recommendation unless existing preferences opt out. `/requests follow`, `/requests unfollow`, `/requests notifications` and notification preferences support other members and optional public-band changes. Default major/final DMs cover confirmed moderator submission, observed official rating, withdrawal, invalidation, explicit requeue and an unrated 30-day completion. Routine attempts, CP refreshes, rank movement and provider refreshes never DM.
+
+Every event and recipient uses a stable idempotency key, the existing durable Discord outbox and a persisted delivery row. Public messages contain no target, route, reviewer or private note. Current-rated wording reports observation and never implies Avenue causation.
+
+## 21. Statistics Lab And Public Boundary
+
+Staff Portal > Admin > PPS > Statistics Lab displays era history, posterior summaries, credible intervals, shadow predictions, readiness reasons, calibration bins, exclusions, forecast history, notification health and the simulation sandbox according to capability. Dev can manage exclusions, pauses and eras; less privileged roles receive progressively sanitized summaries.
+
+Public payloads expose only rounded active estimates, whole-percent 90% likely ranges, evidence label, model version and timestamps. They never expose raw alpha/beta, counts, routes, targets, actors or exclusions. `/methodology/queue/` is the permanent public source of truth and is linked as **How we order the queue**.
+
+## 22. Explicit Non-Features
+
+The system does not implement AI ranking, automatic moderator contact, external-moderator DMs, public exact PPS/rank, causal claims about ratings, or guessed legacy evidence. Humans still review levels and perform outreach. The models quantify uncertainty after human action; they do not make live request decisions.

@@ -10,7 +10,7 @@ from discord.ext import commands
 
 from services.priority_system import PrioritySystemService
 from utils.errors import log_error
-from utils.keepalive import set_public_level_data
+from utils.keepalive import set_public_level_data, set_public_model_status
 from utils.mentions import no_mentions
 from utils.priority_system import (
     public_lifecycle_state,
@@ -24,23 +24,32 @@ class PrioritySystemCog(commands.Cog):
         self.bot = bot
         self.service = PrioritySystemService(bot)
         self._maintenance_task: asyncio.Task | None = None
+        self._model_task: asyncio.Task | None = None
         self._next_maintenance_ts = 0
         self._last_maintenance: dict[str, int] = {}
+        self._last_model_maintenance: dict = {}
 
     def cog_unload(self) -> None:
         if self._maintenance_task:
             self._maintenance_task.cancel()
+        if self._model_task:
+            self._model_task.cancel()
 
     async def close_resources(self) -> None:
-        task = self._maintenance_task
-        if task and task is not asyncio.current_task() and not task.done():
+        tasks = [task for task in (self._maintenance_task, self._model_task) if task and task is not asyncio.current_task() and not task.done()]
+        for task in tasks:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def start_background(self) -> None:
         if self._maintenance_task is None or self._maintenance_task.done():
             self._maintenance_task = asyncio.create_task(
                 self._maintenance_loop(), name="avenue-guard:priority-maintenance"
+            )
+        if self._model_task is None or self._model_task.done():
+            self._model_task = asyncio.create_task(
+                self._model_loop(), name="avenue-guard:bayesian-model-maintenance"
             )
         try:
             await self.refresh_public_level_cache()
@@ -72,6 +81,7 @@ class PrioritySystemCog(commands.Cog):
             (int(guild_id),),
         )
         levels = []
+        public_probabilities: dict[str, dict | None] = {}
         seen: set[str] = set()
         for row in rows:
             level_id = str(row["level_id"] or "")
@@ -91,6 +101,40 @@ class PrioritySystemCog(commands.Cog):
                 rated_within_window=row["rated_within_window"],
                 outcome_window_completed_at=row["outcome_window_completed_ts"],
             )
+            send_type = str(row["send_type"] or "")
+            priority_band = public_priority_band(queue_position, active_total)
+            previous_band = str(row["last_public_priority_band"] or "")
+            if priority_band and priority_band != previous_band:
+                now = int(time.time())
+                raw_priority = self.bot.config.data.get("priority_system", {})
+                raw_priority = raw_priority if isinstance(raw_priority, dict) else {}
+                cooldown_hours = int(raw_priority.get("priority_band_notification_cooldown_hours") or 12)
+                cooldown_seconds = max(3600, cooldown_hours * 3600)
+                last_notified = int(row["last_public_priority_band_notified_ts"] or 0)
+                should_notify = bool(previous_band) and last_notified <= now - cooldown_seconds
+                await self.bot.db.execute(
+                    "UPDATE level_outreach_queue SET last_public_priority_band=?,"
+                    "last_public_priority_band_notified_ts=CASE WHEN ?=1 THEN ? ELSE last_public_priority_band_notified_ts END WHERE id=?",
+                    (priority_band, int(should_notify), now, int(row["id"])),
+                )
+                if should_notify:
+                    try:
+                        await self.service.notifications.emit(
+                            int(guild_id),
+                            level_id,
+                            "priority_band_changed",
+                            f"queue:{int(row['id'])}:band:{priority_band}:window:{now // cooldown_seconds}",
+                            f"The public priority band changed from {previous_band.replace('_', ' ').title()} to {priority_band.replace('_', ' ').title()}.",
+                            queue_id=int(row["id"]),
+                            payload={"from": previous_band, "to": priority_band},
+                        )
+                    except Exception as exc:
+                        await log_error(self.bot, f"Priority-band notification deferred: {exc!r}")
+            if send_type not in public_probabilities:
+                public_probabilities[send_type] = await self.service.models.public_projection(
+                    int(guild_id), send_type
+                )
+            probability = public_probabilities[send_type]
             levels.append(
                 {
                     "level_id": level_id,
@@ -98,9 +142,8 @@ class PrioritySystemCog(commands.Cog):
                     "uploader_name": str(row["uploader_name"] or ""),
                     "recommended_at": int(row["queued_ts"] or 0),
                     "recommendation_type": str(row["send_type"] or ""),
-                    "public_priority_band": public_priority_band(
-                        queue_position, active_total
-                    ),
+                    **({"probability": probability} if probability else {}),
+                    "public_priority_band": priority_band,
                     "submitted_to_mod_at": row["submitted_to_mod_ts"],
                     "rated_observed_at": row["rated_observed_ts"],
                     "last_updated_at": int(
@@ -110,6 +153,48 @@ class PrioritySystemCog(commands.Cog):
                 }
             )
         set_public_level_data(levels)
+        latest = await self.service.models.latest_models(int(guild_id))
+        public_models = [
+            {
+                "model_key": item["model_key"],
+                "status": item["status"],
+                "evidence_strength": item["evidence_strength"],
+                "generated_at": item["generated_ts"],
+                "reason": item["reason"],
+            }
+            for item in latest.get("models", [])
+            if item.get("subgroup_key") == "global"
+        ]
+        access_model = next(
+            (item for item in public_models if item["model_key"] == "access_model_v1"),
+            None,
+        )
+        if access_model:
+            public_models.append(
+                {
+                    **access_model,
+                    "model_key": "capacity_model_v1",
+                    "reason": (
+                        "Capacity forecasts use the current access posterior."
+                        if access_model["status"] == "active"
+                        else "Capacity estimates remain in shadow mode with the access model."
+                    ),
+                }
+            )
+        set_public_model_status(
+            {
+                "methodology_version": "2026.09",
+                "network_era": str((latest.get("era") or {}).get("name") or ""),
+                "models": public_models,
+                "probabilities_published": self.service.models.settings.public_auto_activate
+                and any(
+                    item["status"] == "active"
+                    for item in public_models
+                    if item["model_key"] in {"access_model_v1", "rating_model_v1"}
+                ),
+                "updated_at": int(time.time()),
+            }
+        )
         return len(levels)
 
     def is_owner(self, user_id: int) -> bool:
@@ -633,6 +718,25 @@ class PrioritySystemCog(commands.Cog):
                 await log_error(
                     self.bot,
                     f"PPS maintenance loop error; durable queue retained: {exc!r}",
+                )
+            await asyncio.sleep(interval)
+
+    async def _model_loop(self) -> None:
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(105)
+        while not self.bot.is_closed():
+            interval = self.service.models.settings.refresh_seconds
+            try:
+                guild_id = self.bot.config.get_int("guild", "allowed_guild_id", default=0)
+                if guild_id:
+                    self._last_model_maintenance = await self.service.models.maintenance_once(int(guild_id))
+                    await self.refresh_public_level_cache()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await log_error(
+                    self.bot,
+                    f"Bayesian shadow-model loop error; live PPS behavior unchanged: {exc!r}",
                 )
             await asyncio.sleep(interval)
 

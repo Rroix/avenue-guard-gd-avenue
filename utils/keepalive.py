@@ -38,6 +38,14 @@ _public_metrics = {
 }
 _public_releases: list[dict] = []
 _public_levels: dict[str, dict] = {}
+_public_model_status: dict = {
+    "schema_version": 1,
+    "methodology_version": "2026.09",
+    "network_era": "",
+    "models": [],
+    "probabilities_published": False,
+    "updated_at": 0,
+}
 _public_health_history: list[dict] = []
 _public_team_members: list[dict] = []
 _runtime_heartbeat = 0.0
@@ -332,6 +340,45 @@ def set_public_level_data(levels: list[dict]) -> None:
         uploader_name = str(level.get("uploader_name") or "").strip()[:100]
         if uploader_name:
             payload["uploader_name"] = uploader_name
+        probability = level.get("probability")
+        if isinstance(probability, dict) and str(probability.get("status")) == "active":
+            try:
+                strengths = {"limited", "moderate", "strong"}
+
+                def public_probability(prefix: str = "") -> tuple[int, list[int], str] | None:
+                    point_key = f"{prefix}probability_percent"
+                    interval_key = f"{prefix}credible_interval_90_percent"
+                    strength_key = f"{prefix}evidence_strength"
+                    if probability.get(point_key) is None:
+                        return None
+                    point_value = max(0, min(100, int(probability.get(point_key))))
+                    raw_interval = probability.get(interval_key)
+                    lower_value = max(0, min(100, int(raw_interval[0])))
+                    upper_value = max(0, min(100, int(raw_interval[1])))
+                    raw_strength = str(probability.get(strength_key) or "limited")
+                    return (
+                        point_value,
+                        [min(lower_value, upper_value), max(lower_value, upper_value)],
+                        raw_strength if raw_strength in strengths else "limited",
+                    )
+
+                safe_probability = {
+                    "status": "active",
+                    "generated_at": max(0, int(probability.get("generated_at") or 0)),
+                    "data_cutoff": max(0, int(probability.get("data_cutoff") or 0)),
+                }
+                for prefix in ("access_", "rating_", ""):
+                    component = public_probability(prefix)
+                    if component is None:
+                        continue
+                    point, interval, strength = component
+                    safe_probability[f"{prefix}probability_percent"] = point
+                    safe_probability[f"{prefix}credible_interval_90_percent"] = interval
+                    safe_probability[f"{prefix}evidence_strength"] = strength
+                if any(key.endswith("probability_percent") for key in safe_probability):
+                    payload["probability"] = safe_probability
+            except (TypeError, ValueError, IndexError):
+                pass
         for key in (
             "recommended_at",
             "submitted_to_mod_at",
@@ -348,6 +395,42 @@ def set_public_level_data(levels: list[dict]) -> None:
     with _status_lock:
         _public_levels.clear()
         _public_levels.update(safe_levels)
+
+
+def set_public_model_status(status: dict) -> None:
+    allowed_statuses = {"collecting", "provisional", "active", "degraded", "paused"}
+    safe_models = []
+    for model in status.get("models", []) if isinstance(status, dict) else []:
+        model_key = str(model.get("model_key") or "")
+        model_status = str(model.get("status") or "collecting")
+        if model_key not in {"access_model_v1", "rating_model_v1", "capacity_model_v1"} or model_status not in allowed_statuses:
+            continue
+        safe_models.append(
+            {
+                "model_key": model_key,
+                "status": model_status,
+                "evidence_strength": str(model.get("evidence_strength") or "limited")[:30],
+                "generated_at": max(0, int(model.get("generated_at") or 0)),
+                "reason": str(model.get("reason") or "")[:300],
+            }
+        )
+    with _status_lock:
+        _public_model_status.clear()
+        _public_model_status.update(
+            {
+                "schema_version": 1,
+                "methodology_version": str(status.get("methodology_version") or "2026.09")[:40],
+                "network_era": str(status.get("network_era") or "")[:120],
+                "models": safe_models,
+                "probabilities_published": bool(status.get("probabilities_published")) and bool(safe_models),
+                "updated_at": max(0, int(status.get("updated_at") or 0)),
+            }
+        )
+
+
+def get_public_model_status_payload() -> dict:
+    with _status_lock:
+        return json.loads(json.dumps(_public_model_status))
 
 
 def get_public_level_payload(level_id: str) -> dict | None:
@@ -567,6 +650,9 @@ def _response_for_path(raw_path: str) -> tuple[bytes, str, str, bool]:
             get_public_levels_payload(query), separators=(",", ":")
         ).encode("utf-8")
         return body, "application/json; charset=utf-8", "public, max-age=30", True
+    if path == "/api/methodology/queue/status":
+        body = json.dumps(get_public_model_status_payload(), separators=(",", ":")).encode("utf-8")
+        return body, "application/json; charset=utf-8", "public, max-age=60", True
     level_prefix = next(
         (prefix for prefix in ("/api/level/", "/api/levels/") if path.startswith(prefix)),
         "",
@@ -844,6 +930,7 @@ async def start_keepalive() -> None:
     app.router.add_route("*", "/api/releases", _handle)
     app.router.add_route("*", "/api/team", _handle)
     app.router.add_route("*", "/api/levels", _handle)
+    app.router.add_route("*", "/api/methodology/queue/status", _handle)
     app.router.add_route("*", "/api/level/{level_id}", _handle)
     app.router.add_route("*", "/api/levels/{level_id}", _handle)
     app.router.add_route("*", "/api/staff/{tail:.*}", _handle)

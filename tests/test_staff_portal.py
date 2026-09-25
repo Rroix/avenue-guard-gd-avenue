@@ -747,13 +747,18 @@ async def test_requeue_preserves_episode_history_and_resets_waiting(portal):
         state="awaiting_outcome",
     )
     await service.db.execute(
-        "UPDATE level_outreach_queue SET waiting_cycles=3,waiting_component_h=7.79 WHERE id=?",
+        "UPDATE level_outreach_queue SET waiting_cycles=3,waiting_component_h=7.79,"
+        "outcome_window_completed_ts=200,rated_within_window=0 WHERE id=?",
         (queue_id,),
     )
     await service.db.execute(
         "INSERT INTO staff_outreach_episodes(guild_id,queue_id,episode_number,status,started_by,started_ts) "
         "VALUES(?,?,1,'awaiting_outcome',?,100)",
         (GUILD_ID, queue_id, JUDGE_ID),
+    )
+    await service.db.execute(
+        "UPDATE staff_outreach_episodes SET outcome='not_rated_within_window',rated_within_window=0,outcome_completed_ts=200 WHERE queue_id=?",
+        (queue_id,),
     )
     service.priority.refresh_queue_entry = AsyncMock()
 
@@ -768,7 +773,7 @@ async def test_requeue_preserves_episode_history_and_resets_waiting(portal):
         (queue_id,),
     )
     episodes = await service.db.fetchall(
-        "SELECT episode_number,status,reason FROM staff_outreach_episodes "
+        "SELECT episode_number,status,reason,outcome FROM staff_outreach_episodes "
         "WHERE queue_id=? ORDER BY episode_number",
         (queue_id,),
     )
@@ -786,8 +791,31 @@ async def test_requeue_preserves_episode_history_and_resets_waiting(portal):
         (1, "completed"),
         (2, "active"),
     ]
+    assert episodes[0]["outcome"] == "not_rated_within_window"
     assert "previous observation window" in event["payload_json"]
     service.priority.refresh_queue_entry.assert_awaited_once_with(queue_id, force_cp=True)
+
+
+@pytest.mark.asyncio
+async def test_requeue_rejects_an_open_outcome_window(portal):
+    service, _guild = portal
+    queue_id = await insert_queue(
+        service,
+        level_id="454545454",
+        message_id=45,
+        priority=8,
+        state="awaiting_outcome",
+    )
+    with pytest.raises(PortalError, match="not ready"):
+        await service._requeue(
+            principal(HEAD_ID, "head_judge"),
+            queue_id,
+            {"reason": "Too early", "confirmed": True},
+        )
+    assert not await service.db.fetchone(
+        "SELECT 1 FROM staff_outreach_episodes WHERE queue_id=?",
+        (queue_id,),
+    )
 
 
 @pytest.mark.asyncio

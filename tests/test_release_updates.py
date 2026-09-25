@@ -382,6 +382,51 @@ def test_public_level_payload_preserves_unknown_states():
     set_public_level_data([])
 
 
+def test_public_probability_projection_allows_active_components_without_shadow_leakage():
+    set_public_level_data(
+        [
+            {
+                "level_id": "111111114",
+                "level_name": "Access Only",
+                "recommendation_type": "epic",
+                "public_queue_state": "queued",
+                "probability": {
+                    "status": "active",
+                    "access_probability_percent": 63,
+                    "access_credible_interval_90_percent": [48, 76],
+                    "access_evidence_strength": "moderate",
+                    "raw_alpha": 12,
+                    "private_target_label": "never public",
+                },
+            },
+            {
+                "level_id": "111111115",
+                "level_name": "Shadow",
+                "recommendation_type": "rate",
+                "public_queue_state": "queued",
+                "probability": {
+                    "status": "provisional",
+                    "access_probability_percent": 88,
+                    "access_credible_interval_90_percent": [80, 95],
+                },
+            },
+        ]
+    )
+    active = get_public_level_payload("111111114")
+    assert active["probability"] == {
+        "status": "active",
+        "generated_at": 0,
+        "data_cutoff": 0,
+        "access_probability_percent": 63,
+        "access_credible_interval_90_percent": [48, 76],
+        "access_evidence_strength": "moderate",
+    }
+    assert "raw_alpha" not in json.dumps(active)
+    assert "private_target_label" not in json.dumps(active)
+    assert "probability" not in get_public_level_payload("111111115")
+    set_public_level_data([])
+
+
 def test_service_uptime_survives_discord_gateway_reconnect(monkeypatch):
     clock = [2_000]
     monkeypatch.setattr(keepalive_module, "_process_started_ts", 1_000)

@@ -870,6 +870,7 @@ class Database:
         if versions.get("database", 0) > DATABASE_SCHEMA_VERSION:
             raise RuntimeError("Database schema is newer than this bot; deploy matching code instead of downgrading it")
         from utils.historical_audit_schema import AUDIT_SCHEMA, AUDIT_TABLES
+        from utils.bayesian_schema import BAYESIAN_SCHEMA, BAYESIAN_TABLES
         from utils.priority_system_schema import PRIORITY_SCHEMA, PRIORITY_TABLES
         from utils.staff_portal_schema import STAFF_PORTAL_SCHEMA, STAFF_PORTAL_TABLES
 
@@ -882,6 +883,7 @@ class Database:
             {**expected, "database": 10},
             {**expected, "database": 11},
             {**expected, "database": 12},
+            {**expected, "database": 13},
         ):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -917,6 +919,9 @@ class Database:
                 self._ensure_column_sync("level_outreach_attempts", "event_ts", "INTEGER")
                 for stmt in STAFF_PORTAL_SCHEMA:
                     self._conn.execute(stmt)
+                for stmt in BAYESIAN_SCHEMA:
+                    self._conn.execute(stmt)
+                self._ensure_bayesian_columns_sync()
                 self._ensure_column_sync("staff_applications", "review_prompt_key", "TEXT")
                 self._ensure_column_sync("staff_applications", "review_thread_outbox_id", "INTEGER")
                 self._ensure_column_sync("staff_applications", "review_thread_id", "INTEGER")
@@ -941,7 +946,7 @@ class Database:
             versions["database"] = DATABASE_SCHEMA_VERSION
         if versions == expected:
             tables = {row[0] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if AUDIT_TABLES | PRIORITY_TABLES | STAFF_PORTAL_TABLES | {"tickets", "ticket_transcripts", "activity_counts", "activity_flush_batches", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
+            if AUDIT_TABLES | PRIORITY_TABLES | STAFF_PORTAL_TABLES | BAYESIAN_TABLES | {"tickets", "ticket_transcripts", "activity_counts", "activity_flush_batches", "weekly_claims", "weekly_sessions", "daily_stats", "level_request_state", "level_request_submissions", "weekly_request_reviews", "gd_level_validation_cache", "discord_outbox", "workflow_events", "error_incidents", "error_incident_batches", "health_metrics", "runtime_settings", "bot_releases", "impact_snapshots", "restore_drills", "monthly_impact_reports"} <= tables:
                 return
         stmts = [
             """CREATE TABLE IF NOT EXISTS activity_counts(
@@ -1631,6 +1636,9 @@ class Database:
         self._ensure_column_sync("level_outreach_attempts", "event_ts", "INTEGER")
         for stmt in STAFF_PORTAL_SCHEMA:
             self._conn.execute(stmt)
+        for stmt in BAYESIAN_SCHEMA:
+            self._conn.execute(stmt)
+        self._ensure_bayesian_columns_sync()
         self._ensure_column_sync("staff_applications", "review_prompt_key", "TEXT")
         self._ensure_column_sync("staff_applications", "review_thread_outbox_id", "INTEGER")
         self._ensure_column_sync("staff_applications", "review_thread_id", "INTEGER")
@@ -1658,6 +1666,69 @@ class Database:
         if column in cols:
             return
         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+    def _ensure_bayesian_columns_sync(self) -> None:
+        columns = (
+            ("level_outreach_queue", "current_featured", "INTEGER"),
+            ("level_outreach_queue", "current_epic", "INTEGER"),
+            ("level_outreach_queue", "current_epic_tier_raw", "TEXT"),
+            ("level_outreach_queue", "current_legendary", "INTEGER"),
+            ("level_outreach_queue", "current_mythic", "INTEGER"),
+            ("level_outreach_queue", "observed_rating_tier", "TEXT"),
+            ("level_outreach_queue", "last_public_priority_band", "TEXT"),
+            ("level_outreach_queue", "last_public_priority_band_notified_ts", "INTEGER"),
+            ("level_outreach_attempts", "opportunity_id", "INTEGER"),
+            ("level_outreach_level_snapshots", "current_featured", "INTEGER"),
+            ("level_outreach_level_snapshots", "current_epic", "INTEGER"),
+            ("level_outreach_level_snapshots", "current_epic_tier_raw", "TEXT"),
+            ("level_outreach_level_snapshots", "current_legendary", "INTEGER"),
+            ("level_outreach_level_snapshots", "current_mythic", "INTEGER"),
+            ("staff_outreach_episodes", "network_era_id", "INTEGER"),
+            ("staff_outreach_episodes", "recommendation_type", "TEXT"),
+            ("staff_outreach_episodes", "first_confirmed_submission_ts", "INTEGER"),
+            ("staff_outreach_episodes", "outcome_window_days", "INTEGER NOT NULL DEFAULT 30"),
+            ("staff_outreach_episodes", "outcome_window_end_ts", "INTEGER"),
+            ("staff_outreach_episodes", "rated_within_window", "INTEGER"),
+            ("staff_outreach_episodes", "outcome_completed_ts", "INTEGER"),
+            ("staff_outreach_episodes", "eventual_rated", "INTEGER"),
+            ("staff_outreach_episodes", "eventual_rated_ts", "INTEGER"),
+            ("staff_outreach_episodes", "rated_before_first_submission", "INTEGER NOT NULL DEFAULT 0"),
+            ("staff_outreach_episodes", "observed_rating_tier", "TEXT"),
+            ("staff_outreach_episodes", "exclusion_reason", "TEXT"),
+            ("level_network_eras", "prior_alpha", "REAL NOT NULL DEFAULT 1"),
+            ("level_network_eras", "prior_beta", "REAL NOT NULL DEFAULT 1"),
+            ("level_network_eras", "public_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("level_network_eras", "private_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("level_outreach_opportunities", "target_id", "INTEGER"),
+            ("level_outreach_opportunities", "cycle_id", "INTEGER"),
+            ("level_outreach_opportunities", "initial_route", "TEXT NOT NULL DEFAULT 'other'"),
+            ("level_outreach_opportunities", "current_route", "TEXT NOT NULL DEFAULT 'other'"),
+            ("level_outreach_opportunities", "first_planned_ts", "INTEGER"),
+            ("level_outreach_opportunities", "closed_ts", "INTEGER"),
+            ("level_outreach_opportunities", "failure_reason", "TEXT"),
+            ("level_outreach_opportunities", "actor_id", "INTEGER"),
+            ("level_outreach_opportunities", "dependency_group", "TEXT"),
+            ("bayes_model_snapshots", "prior_alpha", "REAL"),
+            ("bayes_model_snapshots", "prior_beta", "REAL"),
+            ("bayes_model_snapshots", "data_cutoff_ts", "INTEGER"),
+            ("bayes_model_snapshots", "config_hash", "TEXT"),
+            ("bayes_predictions", "median", "REAL"),
+            ("bayes_predictions", "posterior_alpha", "REAL"),
+            ("bayes_predictions", "posterior_beta", "REAL"),
+            ("bayes_predictions", "data_cutoff_ts", "INTEGER"),
+            ("bayes_predictions", "access_prediction_id", "INTEGER"),
+            ("bayes_predictions", "rating_prediction_id", "INTEGER"),
+            ("bayes_predictions", "access_snapshot_id", "INTEGER"),
+            ("bayes_predictions", "rating_snapshot_id", "INTEGER"),
+            ("bayes_capacity_forecasts", "cycle_id", "INTEGER"),
+            ("bayes_capacity_forecasts", "actual_submissions", "INTEGER"),
+            ("bayes_capacity_forecasts", "resolved_ts", "INTEGER"),
+            ("user_notification_preferences", "level_major_updates", "INTEGER NOT NULL DEFAULT 1"),
+            ("user_notification_preferences", "level_priority_band_changes", "INTEGER NOT NULL DEFAULT 0"),
+            ("user_notification_preferences", "level_final_outcomes", "INTEGER NOT NULL DEFAULT 1"),
+        )
+        for table, column, coltype in columns:
+            self._ensure_column_sync(table, column, coltype)
 
     def _normalize_weekly_dm_log_sync(self) -> None:
         assert self._conn is not None

@@ -1011,6 +1011,44 @@ class RequestLevelsCog(commands.Cog):
         clean_id = self._clean_level_id(level_id)
         return f"{base}/{clean_id}" if clean_id else base
 
+    async def _record_active_queue_duplicate(
+        self, guild_id: int, user_id: int, level_id: str, wave_id: int | None = None
+    ) -> str | None:
+        active = await self.bot.db.fetchone(
+            "SELECT id,queue_state FROM level_outreach_queue WHERE guild_id=? AND level_id=? "
+            "AND queue_state IN('queued','in_cycle','awaiting_outcome') ORDER BY queued_ts DESC LIMIT 1",
+            (guild_id, level_id),
+        )
+        if active is None:
+            return None
+        now = int(time_module.time())
+        correlation_id = new_correlation_id("duplicate-request")
+        if wave_id is None:
+            state = await self._get_state(guild_id)
+            wave_id = int(state["wave_id"] or 0)
+        await self.bot.db.execute_transaction(
+            (
+                (
+                    "INSERT INTO level_request_duplicate_occurrences(guild_id,level_id,user_id,queue_id,wave_id,created_ts,correlation_id) VALUES(?,?,?,?,?,?,?)",
+                    (guild_id, level_id, user_id, int(active["id"]), int(wave_id or 0), now, correlation_id),
+                ),
+                (
+                    "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) "
+                    "VALUES(?,'level_request',?,'duplicate_active_queue_request',?,?,?,?)",
+                    (
+                        correlation_id, f"queue:{int(active['id'])}", guild_id, user_id,
+                        json.dumps({"level_id": level_id, "queue_state": str(active["queue_state"])}, separators=(",", ":")),
+                        now,
+                    ),
+                ),
+            ),
+            retry_safe=True,
+        )
+        return (
+            "That level is already active in the outreach queue. "
+            f"[View its current public page]({self._public_level_url(level_id)})."
+        )
+
     def _level_validation_providers(self) -> dict[str, bool]:
         providers = self._level_validation_cfg().get("providers", {})
         if not isinstance(providers, dict):
@@ -3296,6 +3334,16 @@ class RequestLevelsCog(commands.Cog):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
+        normalized_level_id = self._normalize_level_id(data["level_id"])
+        duplicate_message = await self._record_active_queue_duplicate(
+            interaction.guild.id, interaction.user.id, normalized_level_id
+        )
+        if duplicate_message:
+            return await self._reply_ephemeral(
+                interaction,
+                duplicate_message,
+            )
+
         external_errors, level_validation = await self._validate_level_external(data, interaction.guild.id, interaction.user.id)
         if external_errors:
             return await self._reply_ephemeral(
@@ -3341,6 +3389,11 @@ class RequestLevelsCog(commands.Cog):
                 wave_id = int(row["wave_id"])
                 user_id = interaction.user.id
                 normalized_level_id = self._normalize_level_id(data["level_id"])
+                duplicate_message = await self._record_active_queue_duplicate(
+                    interaction.guild.id, user_id, normalized_level_id, wave_id
+                )
+                if duplicate_message:
+                    return await self._reply_ephemeral(interaction, duplicate_message)
                 request_type = self._request_type_from_row(row)
                 type_error = self._request_type_validation_error(request_type, data, level_validation)
                 if type_error:
@@ -4355,6 +4408,18 @@ class RequestLevelsCog(commands.Cog):
                 and review_system_version == PPS_V1_REVIEW_SYSTEM
             ):
                 priority_cog = self.bot.get_cog("PrioritySystemCog")
+                if priority_cog is not None:
+                    try:
+                        await priority_cog.service.notifications.subscribe_requester(
+                            interaction.guild.id,
+                            str(saved["level_id"]),
+                            requester_id,
+                        )
+                    except Exception as exc:
+                        await log_error(
+                            self.bot,
+                            f"Requester level subscription deferred for message_id={message_id}: {exc!r}",
+                        )
                 refresh_public = getattr(priority_cog, "refresh_public_level_cache", None)
                 if callable(refresh_public):
                     try:

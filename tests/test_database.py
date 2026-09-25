@@ -45,6 +45,17 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         "level_outreach_attempts",
         "level_outreach_cp_snapshots",
             "level_outreach_level_snapshots",
+            "level_network_eras",
+            "level_outreach_targets",
+            "level_outreach_opportunities",
+            "bayes_model_versions",
+            "bayes_model_snapshots",
+            "bayes_predictions",
+            "bayes_capacity_forecasts",
+            "bayes_model_exclusions",
+            "level_notification_subscriptions",
+            "level_notification_events",
+            "level_notification_deliveries",
             "staff_web_sessions",
             "staff_queue_claims",
             "staff_queue_claim_events",
@@ -109,7 +120,7 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     schema_rows = await db.fetchall("SELECT component,schema_version FROM schema_metadata")
     schema_versions = {str(row["component"]): int(row["schema_version"]) for row in schema_rows}
     assert schema_versions == {
-        "database": 13,
+        "database": 14,
         "config": 2,
         "runtime_settings": 2,
         "embed_templates": 2,

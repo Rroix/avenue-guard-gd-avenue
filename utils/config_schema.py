@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 CONFIG_SCHEMA_VERSION = 2
 RUNTIME_SCHEMA_VERSION = 2
 EMBED_SCHEMA_VERSION = 2
-DATABASE_SCHEMA_VERSION = 13
+DATABASE_SCHEMA_VERSION = 14
 
 
 @dataclass(frozen=True)

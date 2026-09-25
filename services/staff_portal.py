@@ -39,7 +39,7 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 8
+PORTAL_API_VERSION = 9
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
@@ -69,6 +69,11 @@ PORTAL_FEATURES = (
     "appeal_discord_evidence",
     "appeal_portal_messages",
     "appeal_unban_outbox",
+    "pps_statistics_lab",
+    "pps_network_eras",
+    "pps_model_controls",
+    "pps_capacity_forecasts",
+    "pps_model_exclusions",
 )
 DISCORD_ID_FIELDS = {
     "actor_id",
@@ -1010,7 +1015,7 @@ class StaffPortalService:
         if path == "/api/staff/search" and method == "GET":
             return 200, await self.search(principal, query.get("q", ""))
 
-        queue_match = re.fullmatch(r"/api/staff/queue/(\d+)(?:/(claim|release|reassign|state|requeue|tier|hide|restore))?", path)
+        queue_match = re.fullmatch(r"/api/staff/queue/(\d+)(?:/(claim|release|reassign|state|requeue|rereview|tier|hide|restore))?", path)
         if queue_match:
             queue_id = int(queue_match.group(1))
             action = queue_match.group(2)
@@ -1735,6 +1740,9 @@ class StaffPortalService:
         if action == "requeue":
             principal.require("queue.manage_state")
             return await self._requeue(principal, queue_id, payload)
+        if action == "rereview":
+            principal.require("review.qa")
+            return await self._request_rereview(principal, queue_id, payload)
         if action == "tier":
             principal.require("review.adjust_tier")
             return await self._adjust_tier(principal, queue_id, payload)
@@ -1745,6 +1753,33 @@ class StaffPortalService:
             principal.require("developer.access")
             return await self._restore_hidden_queue(principal, queue_id, payload)
         raise PortalError(404, "unknown_action", "Unknown queue action")
+
+    async def _request_rereview(self, principal, queue_id: int, payload: dict[str, Any]):
+        if payload.get("confirmed") is not True:
+            raise PortalError(400, "confirmation_required", "Confirm the material-update re-review")
+        reason = _bounded_text(payload.get("reason"), 1000, required=True)
+        row = await self.priority.queue_entry(principal.guild_id, queue_id, include_hidden=True)
+        if not row:
+            raise PortalError(404, "not_found", "Queue entry not found")
+        now = int(time.time())
+        correlation = new_correlation_id("qa-rereview")
+        await self.db.execute_transaction(
+            (
+                (
+                    "INSERT INTO staff_review_qa(guild_id,request_message_id,qa_status,qa_by,reason,created_ts,updated_ts) "
+                    "VALUES(?,?,'re_review_requested',?,?,?,?) ON CONFLICT(guild_id,request_message_id) DO UPDATE SET "
+                    "qa_status='re_review_requested',qa_by=excluded.qa_by,reason=excluded.reason,updated_ts=excluded.updated_ts",
+                    (principal.guild_id, int(row["request_message_id"]), principal.user_id, reason, now, now),
+                ),
+                (
+                    "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) "
+                    "VALUES(?,'priority_system',?,'re_review_requested',?,?,?,?)",
+                    (correlation, f"queue:{queue_id}", principal.guild_id, principal.user_id, json.dumps({"reason": reason}), now),
+                ),
+            ),
+            retry_safe=True,
+        )
+        return {"ok": True, "queue_id": queue_id, "status": "re_review_requested"}
 
     async def _hide_queue(self, principal, queue_id: int, payload: dict[str, Any]):
         if payload.get("confirmed") is not True:
@@ -2066,7 +2101,11 @@ class StaffPortalService:
         row = await self.priority.queue_entry(principal.guild_id, queue_id)
         if row is None:
             raise PortalError(404, "queue_not_found", "Queue entry not found")
-        if str(row["queue_state"]) not in {"awaiting_outcome", "paused", "withdrawn"}:
+        if (
+            str(row["queue_state"]) not in {"awaiting_outcome", "paused", "withdrawn"}
+            or row["outcome_window_completed_ts"] is None
+            or int(row["rated_within_window"] if row["rated_within_window"] is not None else -1) != 0
+        ):
             raise PortalError(409, "not_requeueable", "This entry is not ready for a new outreach episode")
         score = score_components(str(row["send_type"]), row["current_creator_points"], 0, self.priority.settings)
         now = int(time.time())
@@ -2076,7 +2115,7 @@ class StaffPortalService:
         correlation = new_correlation_id("outreach-requeue")
         statements = []
         if old_episode:
-            statements.append(("UPDATE staff_outreach_episodes SET status='completed',ended_by=?,ended_ts=?,reason=?,outcome='not_observed' WHERE id=? AND status IN('active','awaiting_outcome')", (principal.user_id, now, reason, int(old_episode["id"]))))
+            statements.append(("UPDATE staff_outreach_episodes SET status='completed',ended_by=?,ended_ts=? WHERE id=? AND status IN('active','awaiting_outcome')", (principal.user_id, now, int(old_episode["id"]))))
         statements.extend(
             [
                 ("INSERT INTO staff_outreach_episodes(guild_id,queue_id,episode_number,status,started_by,started_ts,reason) VALUES(?,?,?,'active',?,?,?)", (principal.guild_id, queue_id, new_number, principal.user_id, now, reason)),
@@ -2085,6 +2124,17 @@ class StaffPortalService:
             ]
         )
         await self.db.execute_transaction(statements, retry_safe=True)
+        try:
+            await self.priority.notifications.emit(
+                principal.guild_id,
+                str(row["level_id"]),
+                "requeued",
+                f"queue:{queue_id}:episode:{new_number}:requeued",
+                "A new outreach episode has started for this level.",
+                queue_id=queue_id,
+            )
+        except Exception as exc:
+            await log_error(self.bot, f"Requeue notification deferred queue_id={queue_id}: {exc!r}")
         try:
             await self.priority.refresh_queue_entry(queue_id, force_cp=True)
         except Exception as exc:  # noqa: BLE001 - external refresh must not undo a durable requeue.
@@ -2137,6 +2187,17 @@ class StaffPortalService:
             ],
             retry_safe=True,
         )
+        try:
+            await self.priority.notifications.emit(
+                principal.guild_id,
+                str(row["level_id"]),
+                "recommendation_changed",
+                f"queue:{queue_id}:tier:{new_tier}:{now}",
+                f"The Avenue recommendation was updated from {old_tier.title()} to {new_tier.title()} after staff review.",
+                queue_id=queue_id,
+            )
+        except Exception as exc:
+            await log_error(self.bot, f"Tier-change notification deferred queue_id={queue_id}: {exc!r}")
         await self._refresh_public_cache()
         return {"ok": True, "tier": new_tier}
 
@@ -5549,21 +5610,179 @@ class StaffPortalService:
         return {"ok": True, "result": result, "correlation_id": correlation}
 
     async def pps_admin(self, principal):
+        principal.require("pps.statistics.view")
         data = await self.priority.dashboard(principal.guild_id)
         settings = priority_settings(self.bot.config.data)
+        models = await self.priority.models.latest_models(principal.guild_id)
+        opportunities = await self.db.fetchall(
+            "SELECT route_type,outcome,COUNT(*) AS c FROM level_outreach_opportunities "
+            "WHERE guild_id=? AND exclusion_reason IS NULL GROUP BY route_type,outcome ORDER BY route_type,outcome",
+            (principal.guild_id,),
+        )
+        eras = await self.db.fetchall(
+            "SELECT id,name,status,started_ts,ended_ts,prior_mode,carryover_effective_n,prior_alpha,prior_beta,public_reason,private_reason "
+            "FROM level_network_eras WHERE guild_id=? ORDER BY started_ts DESC LIMIT 25",
+            (principal.guild_id,),
+        )
+        exclusions = await self.db.fetchall(
+            "SELECT id,entity_type,entity_id,model_key,reason_code,detail,created_by,created_ts,active,revoked_by,revoked_ts "
+            "FROM bayes_model_exclusions WHERE guild_id=? ORDER BY created_ts DESC LIMIT 100",
+            (principal.guild_id,),
+        )
+        forecasts = await self.db.fetchall(
+            "SELECT id,cycle_id,queue_size,expected_successes,k80,k90,k95,draws,seed,generated_ts,model_version,actual_submissions,resolved_ts "
+            "FROM bayes_capacity_forecasts WHERE guild_id=? ORDER BY generated_ts DESC LIMIT 25",
+            (principal.guild_id,),
+        )
+        controls = await self.db.fetchall(
+            "SELECT model_key,publication_paused,pause_reason,updated_by,updated_ts FROM bayes_model_controls WHERE guild_id=?",
+            (principal.guild_id,),
+        )
+        predictions = []
+        notification_health = []
+        if principal.can("pps.models.manage"):
+            predictions = await self.db.fetchall(
+                "SELECT id,model_key,model_version,entity_type,entity_id,subgroup_key,probability,status,evidence_strength,predicted_ts,resolved_outcome,resolved_ts,brier_score "
+                "FROM bayes_predictions WHERE guild_id=? ORDER BY predicted_ts DESC,id DESC LIMIT 100",
+                (principal.guild_id,),
+            )
+            notification_health = await self.db.fetchall(
+                "SELECT d.status,COUNT(*) AS c FROM level_notification_deliveries d "
+                "JOIN level_notification_events e ON e.id=d.event_id "
+                "WHERE e.guild_id=? GROUP BY d.status ORDER BY d.status",
+                (principal.guild_id,),
+            )
+        era_items = []
+        for row in eras:
+            item = _row_dict(row)
+            if not principal.can("pps.models.manage"):
+                item.pop("private_reason", None)
+                item.pop("prior_alpha", None)
+                item.pop("prior_beta", None)
+            era_items.append(item)
         return {
             "dashboard": _json_safe(data),
             "model_version": settings.model_version,
             "outcome_window_seconds": settings.outcome_window_seconds,
+            "statistics_lab": {
+                "models": _json_safe(models),
+                "opportunities": [_row_dict(row) for row in opportunities],
+                "network_eras": era_items,
+                "exclusions": [_row_dict(row) for row in exclusions],
+                "capacity_forecasts": [_row_dict(row) for row in forecasts],
+                "controls": [_row_dict(row) for row in controls],
+                "predictions": [_row_dict(row) for row in predictions],
+                "notification_health": [_row_dict(row) for row in notification_health],
+                "can_manage_models": principal.can("pps.models.manage"),
+            },
         }
 
     async def pps_action(self, principal, payload):
         principal.require("pps.manage_cycles")
         action = str(payload.get("action") or "").casefold()
         reason = _bounded_text(payload.get("reason"), 1000)
-        if payload.get("confirmed") is not True:
+        if action not in {"simulate_capacity", "recompute_models"} and payload.get("confirmed") is not True:
             raise PortalError(400, "confirmation_required", "Confirm the PPS action")
         try:
+            if action == "simulate_capacity":
+                opportunities = int(payload.get("opportunities") or 0)
+                if not 0 <= opportunities <= 10_000:
+                    raise PortalError(400, "invalid_capacity", "Opportunities must be between 0 and 10,000")
+                raw_routes = payload.get("route_composition")
+                route_composition = raw_routes if isinstance(raw_routes, dict) else None
+                if route_composition:
+                    try:
+                        route_total = sum(max(0, int(value)) for value in route_composition.values())
+                    except (TypeError, ValueError):
+                        raise PortalError(400, "invalid_capacity", "Route counts must be whole numbers")
+                    if route_total > 10_000:
+                        raise PortalError(400, "invalid_capacity", "Route counts exceed the simulation limit")
+                    opportunities = route_total
+                return {
+                    "ok": True,
+                    "result": await self.priority.models.capacity(
+                        principal.guild_id,
+                        opportunities,
+                        route_composition=route_composition,
+                        persist=False,
+                    ),
+                }
+            if action == "recompute_models":
+                result = await self.priority.models.maintenance_once(principal.guild_id)
+                await self._refresh_public_cache()
+                return {"ok": True, "result": _json_safe(result)}
+            if action == "start_network_era":
+                principal.require("pps.models.manage")
+                if not reason:
+                    raise PortalError(400, "reason_required", "A reason is required")
+                era = await self.priority.models.start_new_era(
+                    principal.guild_id,
+                    principal.user_id,
+                    _bounded_text(payload.get("name"), 120, required=True),
+                    reason,
+                    _bounded_text(payload.get("public_reason"), 500),
+                )
+                return {"ok": True, "result": _json_safe(era)}
+            if action in {"pause_model", "resume_model"}:
+                principal.require("pps.models.manage")
+                if not reason:
+                    raise PortalError(400, "reason_required", "A reason is required")
+                model_key = str(payload.get("model_key") or "")
+                await self.priority.models.set_publication_pause(
+                    principal.guild_id, model_key, action == "pause_model", principal.user_id, reason
+                )
+                await self.priority.models.recompute(principal.guild_id)
+                await self._refresh_public_cache()
+                return {"ok": True, "result": {"model_key": model_key, "paused": action == "pause_model"}}
+            if action == "add_exclusion":
+                principal.require("pps.models.manage")
+                if not reason:
+                    raise PortalError(400, "reason_required", "An exclusion reason is required")
+                entity_type = str(payload.get("entity_type") or "")
+                entity_id = str(payload.get("entity_id") or "")[:100]
+                model_key = str(payload.get("model_key") or "all")
+                reason_code = str(payload.get("reason_code") or "manual_exclusion")[:100]
+                if entity_type not in {"opportunity", "episode"} or not entity_id:
+                    raise PortalError(400, "invalid_exclusion", "Choose an opportunity or episode")
+                if model_key not in {"all", "access_model_v1", "rating_model_v1"}:
+                    raise PortalError(400, "invalid_exclusion", "Choose a valid model")
+                now = int(time.time())
+                correlation = new_correlation_id("model-exclusion")
+                await self.db.execute_transaction(
+                    (
+                        (
+                            "INSERT OR IGNORE INTO bayes_model_exclusions(guild_id,entity_type,entity_id,model_key,reason_code,detail,created_by,created_ts) VALUES(?,?,?,?,?,?,?,?)",
+                            (principal.guild_id, entity_type, entity_id, model_key, reason_code, reason, principal.user_id, now),
+                        ),
+                        (
+                            "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) VALUES(?,'bayesian_models',?,'model_evidence_excluded',?,?,?,?)",
+                            (correlation, f"{entity_type}:{entity_id}", principal.guild_id, principal.user_id, json.dumps({"model_key": model_key, "reason_code": reason_code}), now),
+                        ),
+                    ),
+                    retry_safe=True,
+                )
+                return {"ok": True, "result": {"excluded": True}}
+            if action == "revoke_exclusion":
+                principal.require("pps.models.manage")
+                if not reason:
+                    raise PortalError(400, "reason_required", "A revocation reason is required")
+                exclusion_id = int(payload.get("exclusion_id") or 0)
+                now = int(time.time())
+                correlation = new_correlation_id("model-exclusion")
+                await self.db.execute_transaction(
+                    (
+                        (
+                            "UPDATE bayes_model_exclusions SET active=0,revoked_by=?,revoked_ts=? WHERE id=? AND guild_id=? AND active=1",
+                            (principal.user_id, now, exclusion_id, principal.guild_id),
+                        ),
+                        (
+                            "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) VALUES(?,'bayesian_models',?,'model_exclusion_revoked',?,?,?,?)",
+                            (correlation, f"exclusion:{exclusion_id}", principal.guild_id, principal.user_id, json.dumps({"reason": reason}), now),
+                        ),
+                    ),
+                    retry_safe=True,
+                )
+                return {"ok": True, "result": {"excluded": False}}
             if action == "start_cycle":
                 cycle = await self.priority.start_cycle(
                     principal.guild_id, principal.user_id, reason

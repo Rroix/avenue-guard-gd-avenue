@@ -88,7 +88,7 @@ def test_all_registered_slash_commands_serialize_with_descriptions(tmp_path, mon
 
         names = {name for name, _ in leaves}
         assert len(bot.pending_application_commands) == 18
-        assert len(names) == 52
+        assert len(names) == 55
         assert {
             "bot release",
             "bot releases",
@@ -97,6 +97,9 @@ def test_all_registered_slash_commands_serialize_with_descriptions(tmp_path, mon
             "open-requests",
             "edit-request",
             "requests notifications",
+            "requests follow",
+            "requests unfollow",
+            "requests my_notifications",
             "requests analytics",
             "bot retention",
             "pps dashboard",

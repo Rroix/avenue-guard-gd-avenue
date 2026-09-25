@@ -287,7 +287,7 @@ def normalize_level_snapshot(level_id: str, results: dict) -> dict:
         metadata = chosen.get("audit_metadata", {})
         snapshot.update({"current_level_name": chosen.get("name"), "current_uploader_name": chosen.get("creator"),
                          "current_difficulty": chosen.get("difficulty"), "current_length": chosen.get("length")})
-        for key in ("rated", "stars", "featured", "epic", "epic_tier_raw"):
+        for key in ("rated", "stars", "featured", "epic", "epic_tier_raw", "legendary", "mythic"):
             snapshot[f"current_{key}"] = metadata.get(key)
         for key in ("uploader_user_id", "uploader_account_id"):
             values = {str(value) for row in existing if (value := row.get("audit_metadata", {}).get(key)) and int(value) > 0}
