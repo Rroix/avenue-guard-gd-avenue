@@ -6,10 +6,10 @@ import time
 from typing import Any
 
 from services.bayesian_models import BayesianModelService, observed_rating_tier
+from services.creator_points import CreatorPointsResolver
 from services.historical_audit import normalize_level_snapshot
 from services.level_notifications import LevelNotificationService
 from utils.errors import log_error
-from utils.gd_profile import fetch_creator_profile
 from utils.priority_system import (
     PPS_ATTEMPT_STATUSES,
     PPS_QUEUE_ACTIVE_STATES,
@@ -34,6 +34,7 @@ class PrioritySystemService:
         self._account_locks: dict[int, asyncio.Lock] = {}
         self.models = BayesianModelService(bot)
         self.notifications = LevelNotificationService(bot)
+        self.creator_points = CreatorPointsResolver(bot, self)
 
     @property
     def settings(self):
@@ -78,12 +79,14 @@ class PrioritySystemService:
             ),
         )
         if changed:
+            queue_id = await self._queue_id_for_message(int(row["guild_id"]), int(row["request_message_id"]))
+            await self.creator_points.enqueue(queue_id, priority=100)
             await self.notifications.subscribe_requester(
                 int(row["guild_id"]), str(row["level_id"]), int(row["user_id"])
             )
             await self._event(
                 "queue_repaired",
-                queue_id=await self._queue_id_for_message(int(row["guild_id"]), int(row["request_message_id"])),
+                queue_id=queue_id,
                 actor_id=0,
                 guild_id=int(row["guild_id"]),
                 correlation_id=correlation,
@@ -194,7 +197,7 @@ class PrioritySystemService:
                     "SELECT c.id,q.id,q.priority_points,q.priority_complete,q.prestige_component_f,"
                     "q.creator_component_g,q.waiting_component_h,q.current_creator_points,q.waiting_cycles,q.model_version "
                     "FROM level_outreach_cycles c JOIN level_outreach_queue q ON q.guild_id=c.guild_id "
-                    "WHERE c.correlation_id=? AND c.status='active' AND q.queue_state='queued'",
+                    "WHERE c.correlation_id=? AND c.status='active' AND q.queue_state='queued' AND q.priority_complete=1",
                     (correlation,),
                 ),
                 (
@@ -240,8 +243,7 @@ class PrioritySystemService:
             "SELECT e.*,q.level_id,q.send_type,q.queue_state,q.current_level_name "
             "FROM level_outreach_cycle_entries e JOIN level_outreach_queue q ON q.id=e.queue_id "
             "WHERE e.cycle_id=? AND q.queue_state!='hidden' "
-            "ORDER BY CASE WHEN e.priority_complete_snapshot=1 THEN 0 ELSE 1 END, "
-            "e.priority_points_snapshot DESC,e.waiting_cycles_snapshot DESC,q.queued_ts,e.queue_id",
+            "ORDER BY e.priority_points_snapshot DESC,e.waiting_cycles_snapshot DESC,q.queued_ts,e.queue_id",
             (cycle_id,),
         )
 
@@ -322,13 +324,15 @@ class PrioritySystemService:
         if not cycle or str(cycle["status"]) != "active":
             raise ValueError("That outreach cycle is not active")
         member = await self.db.fetchone(
-            "SELECT q.queue_state FROM level_outreach_cycle_entries e "
+            "SELECT q.queue_state,q.priority_complete FROM level_outreach_cycle_entries e "
             "JOIN level_outreach_queue q ON q.id=e.queue_id "
             "WHERE e.cycle_id=? AND e.queue_id=?",
             (cycle_id, queue_id),
         )
         if not member:
             raise ValueError("That queue entry was not eligible when this cycle started")
+        if not bool(member["priority_complete"]):
+            raise ValueError("Priority is still being calculated")
         allowed_states = (
             {"in_cycle", "awaiting_outcome"}
             if status in {"submitted_to_mod", "follow_up"}
@@ -629,44 +633,6 @@ class PrioritySystemService:
                 }
         return normalize_level_snapshot(level_id, results)
 
-    async def _provider_creator_snapshot(self, account_id: int) -> dict[str, Any]:
-        cog = self.bot.get_cog("RequestLevelsCog")
-        now = int(time.time())
-        if cog is None or not cog._level_validation_providers().get("boomlings"):
-            return {
-                "checked_ts": now,
-                "creator_points": None,
-                "status": "unavailable",
-                "error": "Boomlings provider unavailable",
-            }
-        lock = cog._validation_provider_locks.setdefault("boomlings", asyncio.Lock())
-        async with lock:
-            if cog._provider_circuit_open("boomlings"):
-                result = cog._provider_circuit_result("boomlings")
-            else:
-                session = await cog._get_level_validation_session()
-                elapsed = time.monotonic() - cog._validation_provider_last_call.get(
-                    "boomlings", 0
-                )
-                await asyncio.sleep(
-                    max(0, cog._provider_min_interval("boomlings") - elapsed)
-                )
-                result = await fetch_creator_profile(session, str(account_id))
-                cog._validation_provider_last_call["boomlings"] = time.monotonic()
-                cog._record_provider_validation_result("boomlings", result)
-        return {
-            "checked_ts": now,
-            "creator_points": result.get("current_creator_points")
-            if result.get("ok")
-            else None,
-            "status": "ok"
-            if result.get("ok")
-            else str(result.get("failure_kind") or "unavailable"),
-            "error": None if result.get("ok") else str(result.get("error") or "Profile unavailable")[:500],
-            "user_id": result.get("user_id"),
-            "name": result.get("name"),
-        }
-
     async def _save_level_snapshot(self, row, snapshot: dict[str, Any]) -> None:
         now = int(snapshot.get("gd_checked_ts") or time.time())
         lookup_ok = str(snapshot.get("gd_lookup_status") or "") == "ok"
@@ -753,69 +719,6 @@ class PrioritySystemService:
             except Exception as exc:
                 await log_error(self.bot, f"Rated observation notification deferred: {exc!r}")
 
-    async def _save_creator_snapshot(self, row, snapshot: dict[str, Any]) -> None:
-        checked = int(snapshot.get("checked_ts") or time.time())
-        points = snapshot.get("creator_points")
-        status = str(snapshot.get("status") or "unavailable")
-        refresh_after = checked + (
-            self.settings.cp_refresh_seconds
-            if status == "ok"
-            else self.settings.failure_retry_seconds
-        )
-        statements: list[tuple[str, tuple[Any, ...]]] = [
-            (
-                "INSERT INTO level_outreach_cp_snapshots(queue_id,account_id,checked_ts,creator_points,lookup_status,error_text,source) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (
-                    int(row["id"]),
-                    row["uploader_account_id"],
-                    checked,
-                    points,
-                    status,
-                    snapshot.get("error"),
-                    str(snapshot.get("source") or "boomlings"),
-                ),
-            )
-        ]
-        if points is None:
-            statements.append(
-                (
-                    "UPDATE level_outreach_queue SET current_creator_points_checked_ts=?,creator_points_refresh_after_ts=?,updated_ts=? WHERE id=?",
-                    (checked, refresh_after, checked, int(row["id"])),
-                )
-            )
-        else:
-            score = score_components(
-                str(row["send_type"]),
-                int(points),
-                int(row["waiting_cycles"] or 0),
-                self.settings,
-            )
-            statements.append(
-                (
-                    "UPDATE level_outreach_queue SET creator_points_at_recommendation=COALESCE(creator_points_at_recommendation,?),"
-                    "creator_points_checked_ts=COALESCE(creator_points_checked_ts,?),current_creator_points=?,"
-                    "current_creator_points_checked_ts=?,creator_points_refresh_after_ts=?,creator_component_g=?,waiting_component_h=?,priority_points=?,"
-                    "priority_complete=?,uploader_name=COALESCE(?,uploader_name),uploader_user_id=COALESCE(?,uploader_user_id),updated_ts=? WHERE id=?",
-                    (
-                        int(points),
-                        checked,
-                        int(points),
-                        checked,
-                        refresh_after,
-                        score["creator_component_g"],
-                        score["waiting_component_h"],
-                        score["priority_points"],
-                        score["priority_complete"],
-                        snapshot.get("name"),
-                        snapshot.get("user_id"),
-                        checked,
-                        int(row["id"]),
-                    ),
-                )
-            )
-        await self.db.execute_transaction(statements, retry_safe=True)
-
     async def _recent_level_snapshot(self, level_id: str) -> dict[str, Any] | None:
         cutoff = int(time.time()) - self.settings.level_refresh_seconds
         row = await self.db.fetchone(
@@ -846,24 +749,6 @@ class PrioritySystemService:
             "gd_lookup_error": None,
         }
 
-    async def _recent_creator_snapshot(self, account_id: int) -> dict[str, Any] | None:
-        cutoff = int(time.time()) - self.settings.cp_refresh_seconds
-        row = await self.db.fetchone(
-            "SELECT creator_points,checked_ts FROM level_outreach_cp_snapshots "
-            "WHERE account_id=? AND lookup_status IN('ok','manual_override') "
-            "AND creator_points IS NOT NULL AND checked_ts>=? ORDER BY checked_ts DESC LIMIT 1",
-            (account_id, cutoff),
-        )
-        if not row:
-            return None
-        return {
-            "checked_ts": int(row["checked_ts"]),
-            "creator_points": int(row["creator_points"]),
-            "status": "ok",
-            "error": None,
-            "source": "shared_cache",
-        }
-
     async def refresh_queue_entry(
         self,
         queue_id: int,
@@ -890,17 +775,12 @@ class PrioritySystemService:
                 row = await self.db.fetchone(
                     "SELECT * FROM level_outreach_queue WHERE id=?", (queue_id,)
                 )
-            account_id = int(row["uploader_account_id"] or 0) if row else 0
-            if account_id and (
+            if row and (
                 force_cp
+                or row["current_creator_points"] is None
                 or int(row["creator_points_refresh_after_ts"] or 0) <= now
             ):
-                account_lock = self._account_locks.setdefault(account_id, asyncio.Lock())
-                async with account_lock:
-                    snapshot = None if force_cp else await self._recent_creator_snapshot(account_id)
-                    if snapshot is None:
-                        snapshot = await self._provider_creator_snapshot(account_id)
-                    await self._save_creator_snapshot(row, snapshot)
+                await self.creator_points.resolve_queue(int(queue_id), force=force_cp)
             return await self.db.fetchone(
                 "SELECT * FROM level_outreach_queue WHERE id=?", (queue_id,)
             )
@@ -937,8 +817,14 @@ class PrioritySystemService:
                 ),
                 (
                     "UPDATE level_outreach_queue SET current_creator_points=?,current_creator_points_checked_ts=?,creator_points_refresh_after_ts=?,"
-                    "creator_component_g=?,waiting_component_h=?,priority_points=?,priority_complete=?,updated_ts=? WHERE id=?",
-                    (creator_points, now, now + self.settings.cp_refresh_seconds, score["creator_component_g"], score["waiting_component_h"], score["priority_points"], score["priority_complete"], now, queue_id),
+                    "creator_component_g=?,waiting_component_h=?,priority_points=?,priority_complete=?,creator_points_status='manual_override',"
+                    "creator_points_source='manual_override',creator_points_confidence='manual_override',creator_points_observed_at=?,"
+                    "creator_points_pending_reason=NULL,creator_points_last_error_category=NULL,last_public_priority_band=NULL,updated_ts=? WHERE id=?",
+                    (creator_points, now, now + self.settings.cp_refresh_seconds, score["creator_component_g"], score["waiting_component_h"], score["priority_points"], score["priority_complete"], now, now, queue_id),
+                ),
+                (
+                    "UPDATE creator_points_resolution_jobs SET state='manual_override',resolved_ts=?,next_attempt_ts=?,updated_ts=? WHERE queue_id=?",
+                    (now, now + self.settings.cp_refresh_seconds, now, queue_id),
                 ),
                 (
                     "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,guild_id,actor_id,payload_json,created_ts) "
@@ -1044,12 +930,15 @@ class PrioritySystemService:
                     )
                 except Exception as exc:
                     await log_error(self.bot, f"Outcome notification deferred: {exc!r}")
+        cp_jobs = await self.creator_points.run_due_jobs(limit=settings.maintenance_batch_size)
         deliveries_synced = await self.notifications.sync_delivery_states()
         return {
             "refreshed": refreshed,
             "failed": failed,
             "outcomes_completed": completed,
             "notification_deliveries_synced": deliveries_synced,
+            "creator_points_jobs": cp_jobs["attempted"],
+            "creator_points_resolved": cp_jobs["resolved"],
         }
 
     async def dashboard(self, guild_id: int) -> dict[str, Any]:
@@ -1070,7 +959,11 @@ class PrioritySystemService:
                     scored += count
                 else:
                     pending += count
-        top, _ = await self.queue_rows(guild_id, page=1, page_size=5)
+        top = await self.db.fetchall(
+            "SELECT * FROM level_outreach_queue WHERE guild_id=? AND queue_state IN('queued','in_cycle') "
+            "AND priority_complete=1 ORDER BY priority_points DESC,waiting_cycles DESC,queued_ts,id LIMIT 5",
+            (guild_id,),
+        )
         refresh = await self.db.fetchone(
             "SELECT COUNT(*) AS c,MIN(COALESCE(level_refresh_after_ts,0)) AS next_level," 
             "MIN(CASE WHEN uploader_account_id IS NOT NULL THEN COALESCE(creator_points_refresh_after_ts,0) END) AS next_cp "

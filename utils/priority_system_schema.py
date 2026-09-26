@@ -7,6 +7,10 @@ PRIORITY_TABLES = {
     "level_outreach_attempts",
     "level_outreach_cp_snapshots",
     "level_outreach_level_snapshots",
+    "creator_points_resolution_jobs",
+    "creator_level_identities",
+    "creator_points_current",
+    "creator_points_provider_observations",
 }
 
 
@@ -30,6 +34,14 @@ PRIORITY_SCHEMA = (
         current_creator_points INTEGER,
         current_creator_points_checked_ts INTEGER,
         creator_points_refresh_after_ts INTEGER,
+        creator_points_status TEXT NOT NULL DEFAULT 'pending',
+        creator_points_source TEXT,
+        creator_points_confidence TEXT,
+        creator_points_observed_at INTEGER,
+        creator_points_pending_reason TEXT DEFAULT 'creator_points',
+        creator_points_last_error_category TEXT,
+        creator_points_profile_path TEXT,
+        uploader_identity_confidence TEXT,
         creator_component_g REAL,
         waiting_cycles INTEGER NOT NULL DEFAULT 0,
         waiting_component_h REAL NOT NULL DEFAULT 0,
@@ -104,6 +116,9 @@ PRIORITY_SCHEMA = (
         lookup_status TEXT NOT NULL,
         error_text TEXT,
         source TEXT NOT NULL DEFAULT 'boomlings',
+        confidence TEXT,
+        provider_timestamp INTEGER,
+        response_fingerprint TEXT,
         actor_id INTEGER,
         reason TEXT
     );""",
@@ -119,6 +134,70 @@ PRIORITY_SCHEMA = (
         uploader_account_id INTEGER,
         lookup_status TEXT NOT NULL,
         error_text TEXT
+    );""",
+    """CREATE TABLE IF NOT EXISTS creator_points_resolution_jobs(
+        queue_id INTEGER PRIMARY KEY,
+        guild_id INTEGER NOT NULL,
+        level_id TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 100,
+        state TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        next_attempt_ts INTEGER NOT NULL,
+        first_pending_ts INTEGER NOT NULL,
+        last_attempt_ts INTEGER,
+        resolved_ts INTEGER,
+        last_error_category TEXT,
+        last_error_summary TEXT,
+        attention_emitted_ts INTEGER,
+        escalation_emitted_ts INTEGER,
+        generation INTEGER NOT NULL DEFAULT 1,
+        updated_ts INTEGER NOT NULL
+    );""",
+    """CREATE TABLE IF NOT EXISTS creator_points_current(
+        creator_key TEXT PRIMARY KEY,
+        username TEXT,
+        account_id INTEGER,
+        player_id INTEGER,
+        creator_points INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        confidence TEXT NOT NULL,
+        observed_at INTEGER NOT NULL,
+        provider_timestamp INTEGER,
+        response_fingerprint TEXT,
+        expires_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL
+    );""",
+    """CREATE TABLE IF NOT EXISTS creator_level_identities(
+        level_id TEXT PRIMARY KEY,
+        username TEXT,
+        account_id INTEGER,
+        player_id INTEGER,
+        profile_path TEXT,
+        source TEXT NOT NULL,
+        confidence TEXT NOT NULL,
+        observed_at INTEGER NOT NULL,
+        response_fingerprint TEXT,
+        expires_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL
+    );""",
+    """CREATE TABLE IF NOT EXISTS creator_points_provider_observations(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        queue_id INTEGER NOT NULL,
+        level_id TEXT NOT NULL,
+        creator_key TEXT,
+        provider TEXT NOT NULL,
+        method TEXT NOT NULL,
+        username TEXT,
+        account_id INTEGER,
+        player_id INTEGER,
+        creator_points INTEGER,
+        observed_at INTEGER NOT NULL,
+        provider_timestamp INTEGER,
+        success INTEGER NOT NULL DEFAULT 0,
+        status_code INTEGER,
+        error_category TEXT,
+        response_fingerprint TEXT,
+        latency_ms REAL
     );""",
     """CREATE UNIQUE INDEX IF NOT EXISTS idx_outreach_cycle_active
         ON level_outreach_cycles(guild_id) WHERE status='active';""",
@@ -136,4 +215,19 @@ PRIORITY_SCHEMA = (
         ON level_outreach_cp_snapshots(queue_id, checked_ts DESC);""",
     """CREATE INDEX IF NOT EXISTS idx_outreach_level_snapshots_queue
         ON level_outreach_level_snapshots(queue_id, checked_ts DESC);""",
+    """CREATE INDEX IF NOT EXISTS idx_cp_resolution_due
+        ON creator_points_resolution_jobs(state,priority,next_attempt_ts,queue_id);""",
+    """CREATE INDEX IF NOT EXISTS idx_cp_current_account
+        ON creator_points_current(account_id,expires_ts);""",
+    """CREATE INDEX IF NOT EXISTS idx_cp_level_identity_expiry
+        ON creator_level_identities(expires_ts,level_id);""",
+    """CREATE INDEX IF NOT EXISTS idx_cp_current_player
+        ON creator_points_current(player_id,expires_ts);""",
+    """CREATE INDEX IF NOT EXISTS idx_cp_observations_queue
+        ON creator_points_provider_observations(queue_id,observed_at DESC,id DESC);""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_cp_observations_dedupe
+        ON creator_points_provider_observations(
+            queue_id,provider,method,response_fingerprint,
+            COALESCE(creator_points,-1),COALESCE(error_category,''),(observed_at / 300)
+        );""",
 )

@@ -2140,6 +2140,21 @@ class RequestLevelsCog(commands.Cog):
             values,
         )
 
+    def _pps_creator_resolution_job_statement(
+        self,
+        row,
+        *,
+        reviewed_ts: int,
+    ) -> tuple[str, tuple[Any, ...]]:
+        guild_id = int(self._row_value(row, "guild_id", 0) or 0)
+        message_id = int(self._row_value(row, "request_message_id", 0) or 0)
+        return (
+            "INSERT OR IGNORE INTO creator_points_resolution_jobs(queue_id,guild_id,level_id,priority,state,attempt_count,"
+            "next_attempt_ts,first_pending_ts,generation,updated_ts) SELECT q.id,q.guild_id,q.level_id,100,'pending',0,?,?,1,? "
+            "FROM level_outreach_queue q WHERE q.guild_id=? AND q.request_message_id=? AND q.priority_complete=0",
+            (reviewed_ts, reviewed_ts, reviewed_ts, guild_id, message_id),
+        )
+
     async def _duplicate_history_warning(
         self,
         guild_id: int,
@@ -4352,6 +4367,12 @@ class RequestLevelsCog(commands.Cog):
                             correlation_id=correlation_id,
                         )
                     )
+                    statements.append(
+                        self._pps_creator_resolution_job_statement(
+                            row,
+                            reviewed_ts=reviewed_ts,
+                        )
+                    )
                 if notification_mode in {"dm", "both"}:
                     request_link = f"https://discord.com/channels/{interaction.guild.id}/{request_channel.id}/{message_id}"
                     statements.append(
@@ -4410,6 +4431,7 @@ class RequestLevelsCog(commands.Cog):
                 priority_cog = self.bot.get_cog("PrioritySystemCog")
                 if priority_cog is not None:
                     try:
+                        priority_cog.service.creator_points.wake()
                         await priority_cog.service.notifications.subscribe_requester(
                             interaction.guild.id,
                             str(saved["level_id"]),

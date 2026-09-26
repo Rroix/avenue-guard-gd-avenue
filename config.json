@@ -1092,7 +1092,23 @@
     "maintenance_interval_seconds": 300,
     "maintenance_batch_size": 5,
     "priority_band_notification_cooldown_hours": 12,
-    "failure_retry_minutes": 15
+    "failure_retry_minutes": 15,
+    "creator_points": {
+      "resolution_enabled": true,
+      "gdbrowser_html_enabled": true,
+      "gdbrowser_api_enabled": true,
+      "boomlings_enabled": true,
+      "gdhistory_enabled": true,
+      "gdrateplus_enabled": true,
+      "initial_timeout_seconds": 8,
+      "provider_timeout_seconds": 4,
+      "current_cp_ttl_seconds": 21600,
+      "level_identity_ttl_seconds": 2592000,
+      "retry_schedule_seconds": [30, 120, 600, 3600, 21600, 86400],
+      "attention_after_seconds": 900,
+      "escalation_after_seconds": 86400,
+      "max_concurrency": 3
+    }
   },
   "operations": {
     "_comment": "Durable worker supervision, health history, permission checks, monthly reporting, and retention",

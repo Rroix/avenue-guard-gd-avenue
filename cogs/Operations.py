@@ -182,6 +182,7 @@ class OperationsCog(commands.Cog):
             ("requests.auto_close", "RequestLevelsCog", "_close_task"),
             ("requests.scheduled", "RequestLevelsCog", "_scheduled_open_task"),
             ("priority.maintenance", "PrioritySystemCog", "_maintenance_task"),
+            ("priority.creator_points", "PrioritySystemCog", "_creator_points_task"),
             ("priority.models", "PrioritySystemCog", "_model_task"),
             ("history.audit", "HistoricalAuditCog", "_audit_task"),
             ("release.metrics", "ReleaseCog", "_metrics_task"),

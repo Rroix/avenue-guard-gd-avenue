@@ -39,7 +39,7 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 9
+PORTAL_API_VERSION = 10
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
@@ -74,6 +74,8 @@ PORTAL_FEATURES = (
     "pps_model_controls",
     "pps_capacity_forecasts",
     "pps_model_exclusions",
+    "creator_points_resolution",
+    "creator_points_pending_queue",
 )
 DISCORD_ID_FIELDS = {
     "actor_id",
@@ -1015,7 +1017,7 @@ class StaffPortalService:
         if path == "/api/staff/search" and method == "GET":
             return 200, await self.search(principal, query.get("q", ""))
 
-        queue_match = re.fullmatch(r"/api/staff/queue/(\d+)(?:/(claim|release|reassign|state|requeue|rereview|tier|hide|restore))?", path)
+        queue_match = re.fullmatch(r"/api/staff/queue/(\d+)(?:/(claim|release|reassign|state|requeue|rereview|tier|hide|restore|retry-cp))?", path)
         if queue_match:
             queue_id = int(queue_match.group(1))
             action = queue_match.group(2)
@@ -1264,6 +1266,20 @@ class StaffPortalService:
                 {},
             )
         )
+        creator_attention_rows = []
+        if principal.can("queue.manage_state"):
+            creator_attention_rows = await part(
+                "creator_points_attention",
+                self.db.fetchall(
+                    "SELECT q.id,q.level_id,q.current_level_name,q.creator_points_status,j.first_pending_ts,j.escalation_emitted_ts "
+                    "FROM level_outreach_queue q JOIN creator_points_resolution_jobs j ON j.queue_id=q.id "
+                    "WHERE q.guild_id=? AND q.queue_state IN('queued','in_cycle') "
+                    "AND q.priority_complete=0 AND j.attention_emitted_ts IS NOT NULL "
+                    "ORDER BY j.escalation_emitted_ts IS NULL,j.first_pending_ts,q.id LIMIT 5",
+                    (principal.guild_id,),
+                ),
+                [],
+            )
         events = await part(
             "activity",
             self.db.fetchall(
@@ -1334,6 +1350,22 @@ class StaffPortalService:
             },
             "pipeline": {str(row["queue_state"]): int(row["c"] or 0) for row in pipeline_rows},
             "pending_applications": int(application_count.get("c") or 0),
+            "attention_items": [
+                {
+                    "type": "creator_points",
+                    "queue_id": int(row["id"]),
+                    "level_id": str(row["level_id"] or ""),
+                    "level_name": str(
+                        row["current_level_name"] or row["level_id"] or "Unknown level"
+                    ),
+                    "status": str(row["creator_points_status"] or "needs_attention"),
+                    "unresolved_minutes": max(
+                        1, (now - int(row["first_pending_ts"] or now)) // 60
+                    ),
+                    "escalated": row["escalation_emitted_ts"] is not None,
+                }
+                for row in creator_attention_rows
+            ],
             "recent_activity": recent_activity,
             "warnings": warnings,
             "correlation_id": correlation,
@@ -1408,8 +1440,10 @@ class StaffPortalService:
                 key,
             )
         cp_rows = await self.db.fetchall(
-            "SELECT id,level_id,current_level_name FROM level_outreach_queue WHERE guild_id=? "
-            "AND queue_state IN('queued','in_cycle') AND current_creator_points IS NULL LIMIT 100",
+            "SELECT q.id,q.level_id,q.current_level_name,j.first_pending_ts,j.escalation_emitted_ts "
+            "FROM level_outreach_queue q JOIN creator_points_resolution_jobs j ON j.queue_id=q.id WHERE q.guild_id=? "
+            "AND q.queue_state IN('queued','in_cycle') AND q.current_creator_points IS NULL "
+            "AND j.attention_emitted_ts IS NOT NULL LIMIT 100",
             (guild_id,),
         )
         for row in cp_rows:
@@ -1419,8 +1453,8 @@ class StaffPortalService:
                 guild_id,
                 "system",
                 title[:180],
-                "Creator Points are unknown, so the priority score is incomplete.",
-                "normal",
+                f"Creator Points remain unresolved after {max(1, (now - int(row['first_pending_ts'] or now)) // 60)} minutes. Automatic retries remain scheduled.",
+                "high" if row["escalation_emitted_ts"] else "normal",
                 "todo",
                 0,
                 None,
@@ -1561,7 +1595,7 @@ class StaffPortalService:
         elif filter_key == "claimed":
             where.append("c.claim_state='active'")
         elif filter_key == "cp_zero":
-            where.append("q.current_creator_points=0")
+            where.append("q.current_creator_points=0 AND q.priority_complete=1")
         elif filter_key == "cp_unknown":
             where.append("q.current_creator_points IS NULL")
         elif filter_key == "waiting_3":
@@ -1582,22 +1616,27 @@ class StaffPortalService:
         )
         ranked_clause = " AND ".join(where[1:]) or "1=1"
         rows = await self.db.fetchall(
-            "WITH ranked_base AS (SELECT q.*,SUM(CASE WHEN q.queue_state IN('queued','in_cycle') THEN 1 ELSE 0 END) OVER(ORDER BY "
-            "CASE WHEN q.priority_complete=1 THEN 0 ELSE 1 END,q.priority_points DESC,"
-            "q.waiting_cycles DESC,q.queued_ts,q.id) AS active_rank "
-            "FROM level_outreach_queue q WHERE q.guild_id=?), "
-            "ranked AS (SELECT ranked_base.*,CASE WHEN queue_state IN('queued','in_cycle') THEN active_rank END AS exact_rank "
-            "FROM ranked_base) "
+            "WITH complete_rank AS (SELECT id,ROW_NUMBER() OVER(ORDER BY priority_points DESC,waiting_cycles DESC,queued_ts,id) AS exact_rank "
+            "FROM level_outreach_queue WHERE guild_id=? AND queue_state IN('queued','in_cycle') AND priority_complete=1), "
+            "ranked AS (SELECT q.*,r.exact_rank FROM level_outreach_queue q LEFT JOIN complete_rank r ON r.id=q.id WHERE q.guild_id=?) "
             "SELECT q.*,c.claimed_by,c.claimed_ts,c.claim_state FROM ranked q "
             "LEFT JOIN staff_queue_claims c ON c.queue_id=q.id "
-            f"WHERE {ranked_clause} ORDER BY q.exact_rank LIMIT ? OFFSET ?",  # nosec B608
-            (principal.guild_id, *params[1:], limit, (page - 1) * limit),
+            f"WHERE {ranked_clause} ORDER BY CASE WHEN q.exact_rank IS NULL THEN 1 ELSE 0 END,q.exact_rank,q.queued_ts,q.id LIMIT ? OFFSET ?",  # nosec B608
+            (principal.guild_id, principal.guild_id, *params[1:], limit, (page - 1) * limit),
+        )
+        queue_counts = await self.db.fetchone(
+            "SELECT SUM(CASE WHEN priority_complete=1 THEN 1 ELSE 0 END) AS ranked_count,"
+            "SUM(CASE WHEN priority_complete=0 THEN 1 ELSE 0 END) AS pending_count FROM level_outreach_queue "
+            "WHERE guild_id=? AND queue_state IN('queued','in_cycle')",
+            (principal.guild_id,),
         )
         return {
             "items": [await self._queue_payload(row) for row in rows],
             "page": page,
             "limit": limit,
             "total": int(count["c"] or 0),
+            "ranked_count": int(queue_counts["ranked_count"] or 0) if queue_counts else 0,
+            "pending_count": int(queue_counts["pending_count"] or 0) if queue_counts else 0,
         }
 
     async def _queue_fallback_rows(self, principal, query, page, limit):
@@ -1620,12 +1659,18 @@ class StaffPortalService:
         )
         return {
             "id": int(data.get("id") or 0),
-            "rank": int(data.get("exact_rank") or 0) or None,
+            "rank": (int(data.get("exact_rank") or 0) or None) if bool(data.get("priority_complete")) else None,
             "level_id": str(data.get("level_id") or ""),
             "level_name": str(data.get("current_level_name") or "Unknown level"),
             "creator": str(data.get("uploader_name") or "Unknown creator"),
             "tier": str(data.get("send_type") or "rate"),
             "cp": data.get("current_creator_points"),
+            "creator_points_status": str(data.get("creator_points_status") or "pending"),
+            "creator_points_source": str(data.get("creator_points_source") or "") or None,
+            "creator_points_observed_at": data.get("creator_points_observed_at"),
+            "priority_pending_reason": str(data.get("creator_points_pending_reason") or "") or None,
+            "uploader_account_id": str(data.get("uploader_account_id")) if data.get("uploader_account_id") is not None else None,
+            "uploader_player_id": str(data.get("uploader_user_id")) if data.get("uploader_user_id") is not None else None,
             "waiting_cycles": int(data.get("waiting_cycles") or 0),
             "components": {
                 "f": data.get("prestige_component_f"),
@@ -1690,12 +1735,21 @@ class StaffPortalService:
             payload = _row_dict(item)
             payload["actor"] = identities.get(int(item["actor_id"]))
             history_items.append(payload)
-        return {
+        detail = {
             "queue": await self._queue_payload(row),
             "outreach": outreach_items,
             "history": history_items,
             "notes": notes,
         }
+        if principal.can("admin.access") or principal.can("developer.access"):
+            diagnostics = await self.priority.creator_points.diagnostics(queue_id)
+            for item in diagnostics["observations"]:
+                if item.get("account_id") is not None:
+                    item["account_id"] = str(item["account_id"])
+                if item.get("player_id") is not None:
+                    item["player_id"] = str(item["player_id"])
+            detail["creator_points_diagnostics"] = diagnostics
+        return detail
 
     async def queue_action(self, principal, queue_id: int, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if action not in {"hide", "restore"}:
@@ -1721,6 +1775,10 @@ class StaffPortalService:
                 principal.require("queue.reassign")
                 await self._require_active_staff_assignee(principal, assignee)
             return await self._claim(principal, queue_id, assignee, _bounded_text(payload.get("reason"), 500))
+        if action == "retry-cp":
+            principal.require("queue.manage_state")
+            result = await self.priority.creator_points.retry(queue_id)
+            return {"ok": True, "resolution": result}
         if action == "release":
             return await self._release_claim(principal, queue_id, _bounded_text(payload.get("reason"), 500))
         if action == "reassign":
@@ -1865,6 +1923,8 @@ class StaffPortalService:
             queue = await self.priority.queue_entry(principal.guild_id, queue_id)
             if queue is None or str(queue["queue_state"]) not in {"queued", "in_cycle", "awaiting_outcome"}:
                 raise PortalError(409, "not_claimable", "This level is not currently claimable")
+            if not bool(queue["priority_complete"]):
+                raise PortalError(409, "priority_pending", "Priority is still being calculated")
             existing = await self.db.fetchone("SELECT * FROM staff_queue_claims WHERE queue_id=?", (queue_id,))
             previous = int(existing["claimed_by"] or 0) if existing and str(existing["claim_state"]) == "active" else 0
             if previous and not reassign:
@@ -5433,6 +5493,7 @@ class StaffPortalService:
             and hasattr(request_cog, "validation_provider_snapshot")
             else {}
         )
+        creator_points_provider_data = await self.priority.creator_points.health()
         operations_cog = self.bot.get_cog("OperationsCog")
         tasks = (
             operations_cog.task_snapshot()
@@ -5472,6 +5533,7 @@ class StaffPortalService:
             },
             "background_workers": tasks,
             "providers": provider_data,
+            "creator_points_providers": creator_points_provider_data,
             "request_wave": _row_dict(request_state),
             "pps_worker": str(tasks.get("priority.maintenance", "unknown")),
             "public_cache": {
@@ -5664,6 +5726,7 @@ class StaffPortalService:
             "dashboard": _json_safe(data),
             "model_version": settings.model_version,
             "outcome_window_seconds": settings.outcome_window_seconds,
+            "creator_points_health": await self.priority.creator_points.health(),
             "statistics_lab": {
                 "models": _json_safe(models),
                 "opportunities": [_row_dict(row) for row in opportunities],

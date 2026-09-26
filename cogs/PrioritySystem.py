@@ -25,6 +25,7 @@ class PrioritySystemCog(commands.Cog):
         self.service = PrioritySystemService(bot)
         self._maintenance_task: asyncio.Task | None = None
         self._model_task: asyncio.Task | None = None
+        self._creator_points_task: asyncio.Task | None = None
         self._next_maintenance_ts = 0
         self._last_maintenance: dict[str, int] = {}
         self._last_model_maintenance: dict = {}
@@ -34,9 +35,11 @@ class PrioritySystemCog(commands.Cog):
             self._maintenance_task.cancel()
         if self._model_task:
             self._model_task.cancel()
+        if self._creator_points_task:
+            self._creator_points_task.cancel()
 
     async def close_resources(self) -> None:
-        tasks = [task for task in (self._maintenance_task, self._model_task) if task and task is not asyncio.current_task() and not task.done()]
+        tasks = [task for task in (self._maintenance_task, self._model_task, self._creator_points_task) if task and task is not asyncio.current_task() and not task.done()]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -51,6 +54,10 @@ class PrioritySystemCog(commands.Cog):
             self._model_task = asyncio.create_task(
                 self._model_loop(), name="avenue-guard:bayesian-model-maintenance"
             )
+        if self._creator_points_task is None or self._creator_points_task.done():
+            self._creator_points_task = asyncio.create_task(
+                self._creator_points_loop(), name="avenue-guard:creator-points-resolution"
+            )
         try:
             await self.refresh_public_level_cache()
         except Exception as exc:
@@ -63,9 +70,8 @@ class PrioritySystemCog(commands.Cog):
             return 0
         active_rows = await self.bot.db.fetchall(
             "SELECT id FROM level_outreach_queue WHERE guild_id=? "
-            "AND queue_state IN('queued','in_cycle') "
-            "ORDER BY CASE WHEN priority_complete=1 THEN 0 ELSE 1 END, "
-            "priority_points DESC,waiting_cycles DESC,queued_ts ASC,id ASC",
+            "AND queue_state IN('queued','in_cycle') AND priority_complete=1 "
+            "ORDER BY priority_points DESC,waiting_cycles DESC,queued_ts ASC,id ASC",
             (int(guild_id),),
         )
         active_total = len(active_rows)
@@ -103,6 +109,8 @@ class PrioritySystemCog(commands.Cog):
             )
             send_type = str(row["send_type"] or "")
             priority_band = public_priority_band(queue_position, active_total)
+            if not bool(row["priority_complete"]):
+                priority_band = None
             previous_band = str(row["last_public_priority_band"] or "")
             if priority_band and priority_band != previous_band:
                 now = int(time.time())
@@ -144,6 +152,8 @@ class PrioritySystemCog(commands.Cog):
                     "recommendation_type": str(row["send_type"] or ""),
                     **({"probability": probability} if probability else {}),
                     "public_priority_band": priority_band,
+                    "priority_complete": bool(row["priority_complete"]),
+                    "public_priority_status": "ranked" if bool(row["priority_complete"]) else "pending",
                     "submitted_to_mod_at": row["submitted_to_mod_ts"],
                     "rated_observed_at": row["rated_observed_ts"],
                     "last_updated_at": int(
@@ -238,14 +248,15 @@ class PrioritySystemCog(commands.Cog):
             return "due now"
         return f"<t:{int(ts)}:R>"
 
-    def _queue_line(self, row) -> str:
+    def _queue_line(self, row, rank: int | None = None) -> str:
         level_name = str(row["current_level_name"] or "").strip()
         identity = f"{level_name} (`{row['level_id']}`)" if level_name else f"`{row['level_id']}`"
-        cp = "?" if row["current_creator_points"] is None else str(int(row["current_creator_points"]))
+        complete = bool(row["priority_complete"])
+        cp = "Resolving" if row["current_creator_points"] is None else str(int(row["current_creator_points"]))
         return (
-            f"**#{int(row['id'])}** {identity}\n"
+            f"**{'#' + str(rank) if complete and rank else '—'}** {identity}\n"
             f"{send_type_label(row['send_type'])} | CP {cp} | W {int(row['waiting_cycles'] or 0)} | "
-            f"P **{self._score(row['priority_points'])}** | `{row['queue_state']}`"
+            f"P **{self._score(row['priority_points']) if complete else 'Pending'}** | `{row['queue_state']}`"
         )
 
     async def dashboard_command(self, ctx: discord.ApplicationContext) -> None:
@@ -313,7 +324,7 @@ class PrioritySystemCog(commands.Cog):
         if data["top"]:
             embed.add_field(
                 name="Queue leaders",
-                value="\n\n".join(self._queue_line(row) for row in data["top"])[:1024],
+                value="\n\n".join(self._queue_line(row, rank) for rank, row in enumerate(data["top"], 1))[:1024],
                 inline=False,
             )
         state = await self.bot.db.fetchone(
@@ -340,18 +351,29 @@ class PrioritySystemCog(commands.Cog):
         embed = discord.Embed(
             title="PPS Outreach Queue",
             description=(
-                "Complete scores are ranked first by P, then raw waiting cycles, age, and queue ID. "
-                "Unknown CP never receives the CP 0 bonus."
+                "The ranked queue is ordered by P, then raw waiting cycles, age, and queue ID. "
+                "Pending creator data is listed separately without a rank."
             ),
             color=discord.Color.blurple(),
         )
+        ranked = [(index, row) for index, row in enumerate(rows, 1) if row["priority_complete"]]
+        pending = [row for row in rows if not row["priority_complete"]]
         embed.add_field(
-            name=f"Page {max(1, page)} of {pages}",
-            value="\n\n".join(self._queue_line(row) for row in rows)[:1024]
-            if rows
-            else "No active queue entries",
+            name=f"Ranked queue · page {max(1, page)} of {pages}",
+            value="\n\n".join(
+                self._queue_line(row, (max(1, page) - 1) * 8 + index)
+                for index, row in ranked
+            )[:1024]
+            if ranked
+            else "Ranked queue is waiting for creator data.",
             inline=False,
         )
+        if pending:
+            embed.add_field(
+                name="Pending priority data · not ranked",
+                value="\n\n".join(self._queue_line(row) for row in pending)[:1024],
+                inline=False,
+            )
         embed.set_footer(text=f"{total} active queue entries")
         await ctx.respond(embed=embed, ephemeral=True)
 
@@ -720,6 +742,26 @@ class PrioritySystemCog(commands.Cog):
                     f"PPS maintenance loop error; durable queue retained: {exc!r}",
                 )
             await asyncio.sleep(interval)
+
+    async def _creator_points_loop(self) -> None:
+        await self.bot.wait_until_ready()
+        guild_id = self.bot.config.get_int("guild", "allowed_guild_id", default=0)
+        if guild_id:
+            try:
+                await self.service.creator_points.bootstrap(int(guild_id))
+                await self.refresh_public_level_cache()
+            except Exception as exc:
+                await log_error(self.bot, f"Creator Points boot repair deferred: {exc!r}")
+        while not self.bot.is_closed():
+            try:
+                result = await self.service.creator_points.run_due_jobs()
+                if result["resolved"]:
+                    await self.refresh_public_level_cache()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await log_error(self.bot, f"Creator Points resolution worker deferred: {exc!r}")
+            await self.service.creator_points.wait(5.0)
 
     async def _model_loop(self) -> None:
         await self.bot.wait_until_ready()

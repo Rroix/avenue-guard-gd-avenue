@@ -136,11 +136,13 @@ H = 1.5 * min(W, 4)^1.5
 
 The raw waiting count keeps increasing for tie-breaking and evidence. Only the mathematical contribution caps at four.
 
-## 5. Creator Point Retrieval
+## 5. Creator Points Resolution
 
-The level worker first reuses the existing RequestLevels provider session, locks, pacing, circuit breakers, and normalized GDBrowser/Boomlings result. A reliable uploader account ID is required before CP is fetched.
+`CreatorPointsResolver` is the only service allowed to supply current CP to PPS. A recommendation transaction creates the queue row, marks priority pending, and inserts a high-priority durable resolution job. The Discord interaction then completes normally while the wakeable worker resolves `level ID -> actual uploader -> current CP` with bounded parallel calls.
 
-The direct profile request uses `getGJUserInfo20.php`. `utils/gd_profile.py` verifies these response keys:
+The resolver reuses the RequestLevels HTTP session, host locks, pacing, retry-after handling, provider telemetry, and circuit breakers. It gathers independent evidence from GDBrowser HTML, direct Boomlings, GDHistory, and GDRate+. GDBrowser's server-rendered level page is parsed semantically through `#authorLink`; that exact profile route is then parsed through `#cp` and the labelled Account ID / Player ID block. The GDBrowser JSON profile endpoint is a conservative fallback only.
+
+The direct Boomlings profile request uses `getGJUserInfo20.php`. `utils/gd_profile.py` verifies these response keys:
 
 | Boomlings key | Meaning used by Avenue Guard |
 |---|---|
@@ -148,9 +150,11 @@ The direct profile request uses `getGJUserInfo20.php`. `utils/gd_profile.py` ver
 | `8` | Creator Points |
 | `16` | GD account ID |
 
-The returned account ID must match the requested account, the user ID must be valid, and key 8 must exist as an integer. Any mismatch becomes unknown.
+The returned account ID must match the requested account, the user ID must be valid, and key 8 must exist as an integer. GDHistory contributes identity unless its real contract ever exposes an explicit CP field. GDRate+ contributes only explicit fields in its existing level response. Usernames are NFKC-normalized and case-folded for matching only; display capitalization is retained and fuzzy matching is forbidden.
 
-The first successful result fills `creator_points_at_recommendation` without overwriting it later. Subsequent successful checks update `current_creator_points`. Every check, including a failure, is appended to `level_outreach_cp_snapshots` with its status and error.
+Source precedence is verified direct Boomlings, agreement by at least two independent providers, verified GDBrowser HTML, then another verified trusted single source. Conflicting live values are never averaged and remain unranked while verification retries. Explicit zero is valid; missing or malformed CP remains null.
+
+The first accepted result fills `creator_points_at_recommendation` without overwriting it later. Subsequent checks update `current_creator_points`. Provider observations are structured and fingerprinted without retaining full HTML. Accepted snapshots preserve source, confidence, timestamp, and response fingerprint. Level-to-uploader identity is cached separately for 30 days by default because it is stable; current CP is cached for six hours because it changes. Retries occur after 30 seconds, 2 minutes, 10 minutes, 1 hour, 6 hours, 24 hours, then daily. Unresolved entries create one deduplicated attention item after 15 minutes and escalate after 24 hours.
 
 ## 6. Queue State Machine
 
@@ -169,7 +173,7 @@ queued/in_cycle ---- owner withdrawal ------> withdrawn (reserved state)
 
 `submitted_to_mod` is represented as a confirmed attempt plus `submitted_to_mod_ts`; the durable queue moves immediately to `awaiting_outcome`. It is no longer part of the ordinary ranked queue.
 
-Complete scores rank before incomplete scores. Complete ties use:
+Incomplete scores do not belong to the ranked queue, cannot enter an outreach cycle, and cannot be claimed through the normal Reviewer workflow. They appear in a separate pending-data list with null score and null rank. Complete ties use:
 
 1. Higher total P.
 2. Higher uncapped W.
@@ -205,7 +209,7 @@ A zero-submission cycle is cancelled/closed as unsuccessful. It preserves attemp
 
 `PrioritySystemCog` owns `avenue-guard:priority-maintenance`. `OperationsCog` supervises it as `priority.maintenance` and can restart it if it dies.
 
-Each pass uses `maintenance_batch_size` and performs only bounded sequential work:
+Each pass uses `maintenance_batch_size`; Creator Points jobs use bounded concurrency while ordinary queue maintenance remains bounded:
 
 - refresh stale level metadata;
 - resolve uploader identity;
@@ -219,7 +223,7 @@ Successful snapshots use the normal CP and level cache intervals. Failed checks 
 
 ## 9. Database Tables
 
-Schema 14 is additive.
+Schema 15 is additive.
 
 | Table | Durable responsibility |
 |---|---|
@@ -229,6 +233,10 @@ Schema 14 is additive.
 | `level_outreach_attempts` | Planned, attempted, submitted and failed outreach evidence |
 | `level_outreach_cp_snapshots` | Append-only CP lookup/override history |
 | `level_outreach_level_snapshots` | Append-only current level/rating lookup history |
+| `creator_points_resolution_jobs` | Durable prioritized retries, attention thresholds and resolution state |
+| `creator_level_identities` | Reusable long-lived level-to-uploader identity cache |
+| `creator_points_current` | Reusable short-lived accepted current CP by canonical creator |
+| `creator_points_provider_observations` | Structured provider evidence, errors, latency and response fingerprints |
 | `staff_outreach_episodes` | Reconstructable per-level episode, first confirmed submission, fixed outcome and eventual outcome |
 | `level_outreach_targets` | Private normalized target identity; never projected publicly |
 | `level_outreach_opportunities` | One episode + level + target Bernoulli opportunity; follow-ups remain one trial |
@@ -309,7 +317,7 @@ Changing parameters does not silently rewrite cycle snapshots. A future PPS v2 s
 
 Use staging or a controlled request wave where possible.
 
-1. Back up the database and deploy schema 14.
+1. Back up the database and deploy schema 15.
 2. Run `/pps dashboard`; confirm the deployment-time current wave says `legacy` and the next new wave says `pps_v1`.
 3. Run `/requests repair`; confirm existing cards still have the green generic Send button.
 4. Submit another request to that same existing wave; confirm it is still legacy.
@@ -323,6 +331,15 @@ Use staging or a controlled request wave where possible.
 12. Start a no-submission cycle; confirm completion is refused and cancel adds no W.
 13. Restart the bot; confirm queue, active cycle, attempts and both component types still work.
 14. Confirm weekly review cards still use the old Send workflow.
+
+The optional read-only provider smoke test does not open or mutate the Avenue Guard database:
+
+```bash
+.venv/bin/python scripts/smoke_creator_points.py --live \
+  --level 145233080 --level 149457878 --timeout 8
+```
+
+Use `--api-fallback` only when specifically testing the cautious GDBrowser JSON fallback. A third-party outage is reported in the JSON result and does not make this command fail CI.
 
 ## 14. Public Presentation Boundary
 

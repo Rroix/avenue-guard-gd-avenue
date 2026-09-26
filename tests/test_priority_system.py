@@ -408,7 +408,7 @@ async def test_schema_v7_upgrade_marks_existing_state_and_submissions_legacy(tmp
                 "SELECT schema_version FROM schema_metadata WHERE component='database'"
             )
         )["schema_version"]
-        ) == 14
+        ) == 15
     assert not await upgraded.fetchall("SELECT * FROM level_outreach_queue")
     await upgraded.close()
 
@@ -582,6 +582,7 @@ async def test_pps_review_finalization_creates_exactly_one_queue_entry(tmp_path)
         interaction, 555, "sent", "Duplicate", send_type="mythic"
     )
     assert int((await db.fetchone("SELECT COUNT(*) AS c FROM level_outreach_queue"))["c"]) == 1
+    assert int((await db.fetchone("SELECT COUNT(*) AS c FROM creator_points_resolution_jobs"))["c"]) == 1
     assert int((await db.fetchone("SELECT COUNT(*) AS c FROM discord_outbox"))["c"]) == 2
     await db.close()
 
@@ -762,70 +763,44 @@ async def test_public_level_cache_rebuilds_from_durable_queue_without_private_da
 
 
 @pytest.mark.asyncio
-async def test_cp_zero_completes_score_but_failed_cp_stays_null(tmp_path):
-    db = Database(str(tmp_path / "cp.db"))
+async def test_public_bands_use_only_ten_complete_rows_not_five_pending_rows(tmp_path):
+    db = Database(str(tmp_path / "public-band-complete-population.db"))
     await db.connect()
-    queue_id = await insert_queue(
-        db,
-        user_id=21,
-        message_id=201,
-        level_id="111111111",
-        complete=0,
-    )
-    service = PrioritySystemService(make_bot(db))
-    row = await db.fetchone("SELECT * FROM level_outreach_queue WHERE id=?", (queue_id,))
-    await service._save_creator_snapshot(
-        row,
-        {
-            "checked_ts": 1000,
-            "creator_points": None,
-            "status": "network_error",
-            "error": "timeout",
-        },
-    )
-    failed = await db.fetchone(
-        "SELECT current_creator_points,creator_component_g,priority_points,priority_complete "
-        "FROM level_outreach_queue WHERE id=?",
-        (queue_id,),
-    )
-    assert dict(failed) == {
-        "current_creator_points": None,
-        "creator_component_g": None,
-        "priority_points": None,
-        "priority_complete": 0,
-    }
+    try:
+        for index in range(10):
+            await insert_queue(
+                db,
+                user_id=100 + index,
+                message_id=800 + index,
+                level_id=str(300000000 + index),
+                priority=10 - index,
+                complete=1,
+                queued_ts=100 + index,
+            )
+        for index in range(5):
+            await insert_queue(
+                db,
+                user_id=200 + index,
+                message_id=900 + index,
+                level_id=str(400000000 + index),
+                complete=0,
+                queued_ts=200 + index,
+            )
 
-    row = await db.fetchone("SELECT * FROM level_outreach_queue WHERE id=?", (queue_id,))
-    await service._save_creator_snapshot(
-        row,
-        {"checked_ts": 2000, "creator_points": 0, "status": "ok", "name": "Creator"},
-    )
-    complete = await db.fetchone(
-        "SELECT creator_points_at_recommendation,current_creator_points,creator_component_g,"
-        "priority_points,priority_complete FROM level_outreach_queue WHERE id=?",
-        (queue_id,),
-    )
-    assert complete["creator_points_at_recommendation"] == 0
-    assert complete["current_creator_points"] == 0
-    assert complete["creator_component_g"] == pytest.approx(3.22, abs=0.01)
-    assert complete["priority_points"] == pytest.approx(6.57, abs=0.02)
-    assert complete["priority_complete"] == 1
-
-    row = await db.fetchone("SELECT * FROM level_outreach_queue WHERE id=?", (queue_id,))
-    await service._save_creator_snapshot(
-        row,
-        {"checked_ts": 3000, "creator_points": 3, "status": "ok", "name": "Creator"},
-    )
-    refreshed = await db.fetchone(
-        "SELECT creator_points_at_recommendation,current_creator_points,creator_component_g,"
-        "priority_points FROM level_outreach_queue WHERE id=?",
-        (queue_id,),
-    )
-    assert refreshed["creator_points_at_recommendation"] == 0
-    assert refreshed["current_creator_points"] == 3
-    assert refreshed["creator_component_g"] == pytest.approx(0.27, abs=0.01)
-    assert refreshed["priority_points"] == pytest.approx(3.62, abs=0.02)
-    await db.close()
+        cog = PrioritySystemCog(make_bot(db))
+        assert await cog.refresh_public_level_cache() == 15
+        assert get_public_level_payload("300000000")["public_priority_band"] == "top_priority"
+        assert get_public_level_payload("300000001")["public_priority_band"] == "high_priority"
+        assert get_public_level_payload("300000004")["public_priority_band"] == "standard_priority"
+        assert get_public_level_payload("300000009")["public_priority_band"] == "lower_priority"
+        for index in range(5):
+            payload = get_public_level_payload(str(400000000 + index))
+            assert payload["priority_complete"] is False
+            assert payload["public_priority_status"] == "pending"
+            assert payload["public_priority_band"] is None
+    finally:
+        set_public_level_data([])
+        await db.close()
 
 
 @pytest.mark.asyncio

@@ -303,6 +303,18 @@ def set_public_level_data(levels: list[dict]) -> None:
             priority_band = None
         if public_queue_state not in {"queued", "in_cycle"}:
             priority_band = None
+        raw_priority_complete = level.get("priority_complete")
+        priority_status = str(level.get("public_priority_status") or "").casefold()
+        priority_complete = (
+            bool(raw_priority_complete)
+            if raw_priority_complete is not None
+            else priority_band is not None
+        )
+        if priority_status not in {"ranked", "pending"}:
+            priority_status = "ranked" if priority_complete else "pending"
+        if priority_status == "pending":
+            priority_complete = False
+            priority_band = None
         outreach_state = str(
             level.get("public_outreach_state") or "unknown"
         ).casefold()
@@ -334,6 +346,8 @@ def set_public_level_data(levels: list[dict]) -> None:
             "recommendation_type": recommendation_type,
             "public_queue_state": public_queue_state,
             "public_priority_band": priority_band,
+            "priority_complete": priority_complete,
+            "public_priority_status": priority_status,
             "public_outreach_state": outreach_state,
             "public_outcome_state": outcome_state,
         }

@@ -76,7 +76,7 @@ Overview is personalized and uses real counts. Progress bars appear only where t
 
 ## Durable Data
 
-Database schema 14 includes the portal tables plus additive PPS evidence, model snapshot, network-era, capacity-forecast, exclusion and notification tables without replacing existing request/PPS tables:
+Database schema 15 includes the portal tables plus additive PPS evidence, Creator Points resolution, model snapshot, network-era, capacity-forecast, exclusion and notification tables without replacing existing request/PPS tables:
 
 - `staff_web_sessions`
 - `staff_queue_claims`

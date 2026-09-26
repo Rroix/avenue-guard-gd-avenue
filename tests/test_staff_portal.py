@@ -174,9 +174,9 @@ async def portal(tmp_path, monkeypatch):
     await db.close()
 
 
-async def insert_queue(service, *, level_id, message_id, priority, cp=0, state="queued"):
+async def insert_queue(service, *, level_id, message_id, priority, cp=0, state="queued", send_type="epic"):
     settings = priority_settings(service.bot.config.data)
-    components = score_components("epic", cp, 0, settings)
+    components = score_components(send_type, cp, 0, settings)
     return await service.db.execute_insert(
         "INSERT INTO level_outreach_queue(guild_id,wave_id,requester_id,request_message_id,level_id,send_type,"
         "queued_ts,prestige_t,prestige_component_f,current_creator_points,creator_component_g,waiting_cycles,"
@@ -188,7 +188,7 @@ async def insert_queue(service, *, level_id, message_id, priority, cp=0, state="
             500 + message_id,
             message_id,
             level_id,
-            "epic",
+            send_type,
             100,
             components["prestige_t"],
             components["prestige_component_f"],
@@ -403,6 +403,31 @@ async def test_overview_empty_account_works_for_every_staff_role(portal, user_id
     }
     assert payload["progress"]["outreach_attempts"] == 0
     assert payload["warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_cp_attention_is_visible_to_head_reviewer_but_not_reviewer(portal):
+    service, _guild = portal
+    queue_id = await insert_queue(
+        service,
+        level_id="123123123",
+        message_id=313,
+        priority=None,
+        cp=None,
+    )
+    now = int(time.time())
+    await service.db.execute(
+        "INSERT INTO creator_points_resolution_jobs(queue_id,guild_id,level_id,priority,state,attempt_count,next_attempt_ts,"
+        "first_pending_ts,attention_emitted_ts,generation,updated_ts) VALUES(?,?,?,100,'needs_attention',3,?,?,?,?,?)",
+        (queue_id, GUILD_ID, "123123123", now + 60, now - 1500, now, 1, now),
+    )
+
+    reviewer = await service.overview(principal(JUDGE_ID, "reviewer"))
+    head = await service.overview(principal(HEAD_ID, "head_reviewer"))
+    assert reviewer["attention_items"] == []
+    assert head["attention_items"][0]["queue_id"] == queue_id
+    assert head["attention_items"][0]["type"] == "creator_points"
+    assert head["attention_items"][0]["unresolved_minutes"] >= 25
 
 
 @pytest.mark.asyncio
@@ -662,16 +687,41 @@ async def test_judge_cannot_open_owner_operations(portal):
 
 
 @pytest.mark.asyncio
+async def test_owner_operations_exposes_private_creator_provider_health(portal):
+    service, _guild = portal
+    payload = await service.operations(principal(OWNER_ID, "owner"))
+    providers = payload["creator_points_providers"]
+    assert set(providers) == {"gdbrowser", "boomlings", "gdhistory", "gdrateplus"}
+    assert all("attempts" in item for item in providers.values())
+    assert all("median_latency_ms" in item for item in providers.values())
+    serialized = json.dumps(payload)
+    assert "response_fingerprint" not in serialized
+    assert "profile_path" not in serialized
+
+
+@pytest.mark.asyncio
 async def test_queue_rank_filters_and_unknown_cp_are_preserved(portal):
     service, _guild = portal
     lower = await insert_queue(service, level_id="111111111", message_id=1, priority=2, cp=0)
     higher = await insert_queue(service, level_id="222222222", message_id=2, priority=9, cp=None)
+    false_zero = await insert_queue(
+        service, level_id="333333330", message_id=4, priority=None, cp=0
+    )
+    await service.db.execute(
+        "UPDATE level_outreach_queue SET priority_complete=0,priority_points=NULL,creator_component_g=NULL WHERE id=?",
+        (false_zero,),
+    )
     data = await service.queue(principal(JUDGE_ID, "judge"), {"filter": "cp_unknown"})
     assert data["total"] == 1
     assert data["items"][0]["id"] == higher
-    assert data["items"][0]["rank"] == 2  # Incomplete values follow complete PPS rows.
+    assert data["items"][0]["rank"] is None
     assert data["items"][0]["cp"] is None
+    assert data["ranked_count"] == 1
+    assert data["pending_count"] == 2
     assert lower != higher
+    zero = await service.queue(principal(JUDGE_ID, "reviewer"), {"filter": "cp_zero"})
+    assert zero["total"] == 1
+    assert zero["items"][0]["id"] == lower
 
 
 @pytest.mark.asyncio
@@ -691,6 +741,61 @@ async def test_claim_has_one_owner_and_head_can_reassign(portal):
     assert await service.db.fetchone(
         "SELECT 1 FROM staff_queue_claims WHERE queue_id=? AND claim_state='active'", (queue_id,)
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_reviewer_cannot_claim_pending_priority(portal):
+    service, _guild = portal
+    queue_id = await insert_queue(
+        service, level_id="333333334", message_id=30, priority=None, cp=None
+    )
+    with pytest.raises(PortalError) as caught:
+        await service._claim(principal(JUDGE_ID, "reviewer"), queue_id, JUDGE_ID, "")
+    assert caught.value.status == 409
+    assert caught.value.code == "priority_pending"
+    assert "still being calculated" in caught.value.message
+
+
+@pytest.mark.asyncio
+async def test_pending_rate_and_feature_have_no_rank_then_order_by_resolved_pps(portal):
+    service, _guild = portal
+    rate_id = await insert_queue(
+        service,
+        level_id="333333335",
+        message_id=31,
+        priority=None,
+        cp=None,
+        send_type="rate",
+    )
+    feature_id = await insert_queue(
+        service,
+        level_id="333333336",
+        message_id=32,
+        priority=None,
+        cp=None,
+        send_type="feature",
+    )
+    pending = await service.queue(principal(JUDGE_ID, "reviewer"), {})
+    assert {item["id"]: item["rank"] for item in pending["items"]} == {
+        rate_id: None,
+        feature_id: None,
+    }
+
+    await service.priority.manual_cp_override(GUILD_ID, rate_id, OWNER_ID, 4, "test")
+    await service.priority.manual_cp_override(GUILD_ID, feature_id, OWNER_ID, 0, "test")
+    ranked = await service.queue(principal(JUDGE_ID, "reviewer"), {})
+    assert [(item["id"], item["rank"]) for item in ranked["items"]] == [
+        (feature_id, 1),
+        (rate_id, 2),
+    ]
+
+    await service.priority.manual_cp_override(GUILD_ID, rate_id, OWNER_ID, 0, "test reverse")
+    await service.priority.manual_cp_override(GUILD_ID, feature_id, OWNER_ID, 4, "test reverse")
+    reversed_rank = await service.queue(principal(JUDGE_ID, "reviewer"), {})
+    assert [(item["id"], item["rank"]) for item in reversed_rank["items"]] == [
+        (rate_id, 1),
+        (feature_id, 2),
+    ]
 
 
 @pytest.mark.asyncio

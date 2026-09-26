@@ -884,6 +884,7 @@ class Database:
             {**expected, "database": 11},
             {**expected, "database": 12},
             {**expected, "database": 13},
+            {**expected, "database": 14},
         ):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -911,7 +912,7 @@ class Database:
                 )
                 for stmt in PRIORITY_SCHEMA:
                     self._conn.execute(stmt)
-                self._ensure_column_sync("level_outreach_queue", "hidden_from_state", "TEXT")
+                self._ensure_priority_columns_sync()
                 self._ensure_column_sync("level_outreach_attempts", "episode_id", "INTEGER")
                 self._ensure_column_sync(
                     "level_outreach_attempts", "private_target_key", "TEXT NOT NULL DEFAULT ''"
@@ -922,6 +923,7 @@ class Database:
                 for stmt in BAYESIAN_SCHEMA:
                     self._conn.execute(stmt)
                 self._ensure_bayesian_columns_sync()
+                self._normalize_priority_pending_sync()
                 self._ensure_column_sync("staff_applications", "review_prompt_key", "TEXT")
                 self._ensure_column_sync("staff_applications", "review_thread_outbox_id", "INTEGER")
                 self._ensure_column_sync("staff_applications", "review_thread_id", "INTEGER")
@@ -1628,7 +1630,7 @@ class Database:
             self._conn.execute(stmt)
         for stmt in PRIORITY_SCHEMA:
             self._conn.execute(stmt)
-        self._ensure_column_sync("level_outreach_queue", "hidden_from_state", "TEXT")
+        self._ensure_priority_columns_sync()
         self._ensure_column_sync("level_outreach_attempts", "episode_id", "INTEGER")
         self._ensure_column_sync(
             "level_outreach_attempts", "private_target_key", "TEXT NOT NULL DEFAULT ''"
@@ -1639,6 +1641,7 @@ class Database:
         for stmt in BAYESIAN_SCHEMA:
             self._conn.execute(stmt)
         self._ensure_bayesian_columns_sync()
+        self._normalize_priority_pending_sync()
         self._ensure_column_sync("staff_applications", "review_prompt_key", "TEXT")
         self._ensure_column_sync("staff_applications", "review_thread_outbox_id", "INTEGER")
         self._ensure_column_sync("staff_applications", "review_thread_id", "INTEGER")
@@ -1666,6 +1669,36 @@ class Database:
         if column in cols:
             return
         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+    def _ensure_priority_columns_sync(self) -> None:
+        columns = (
+            ("level_outreach_queue", "hidden_from_state", "TEXT"),
+            ("level_outreach_queue", "creator_points_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("level_outreach_queue", "creator_points_source", "TEXT"),
+            ("level_outreach_queue", "creator_points_confidence", "TEXT"),
+            ("level_outreach_queue", "creator_points_observed_at", "INTEGER"),
+            ("level_outreach_queue", "creator_points_pending_reason", "TEXT DEFAULT 'creator_points'"),
+            ("level_outreach_queue", "creator_points_last_error_category", "TEXT"),
+            ("level_outreach_queue", "creator_points_profile_path", "TEXT"),
+            ("level_outreach_queue", "uploader_identity_confidence", "TEXT"),
+            ("level_outreach_cp_snapshots", "confidence", "TEXT"),
+            ("level_outreach_cp_snapshots", "provider_timestamp", "INTEGER"),
+            ("level_outreach_cp_snapshots", "response_fingerprint", "TEXT"),
+        )
+        for table, column, coltype in columns:
+            self._ensure_column_sync(table, column, coltype)
+        self._conn.execute(
+            "UPDATE level_outreach_queue SET creator_points_status='resolved',creator_points_pending_reason=NULL "
+            "WHERE current_creator_points IS NOT NULL AND creator_points_status='pending'"
+        )
+
+    def _normalize_priority_pending_sync(self) -> None:
+        self._conn.execute(
+            "UPDATE level_outreach_queue SET priority_points=NULL,creator_component_g=NULL,priority_complete=0,"
+            "creator_points_status=CASE WHEN creator_points_status='manual_override' THEN creator_points_status ELSE 'pending' END,"
+            "creator_points_pending_reason=CASE WHEN creator_points_status='manual_override' THEN NULL ELSE 'creator_points' END,"
+            "last_public_priority_band=NULL WHERE current_creator_points IS NULL AND queue_state IN('queued','in_cycle','awaiting_outcome')"
+        )
 
     def _ensure_bayesian_columns_sync(self) -> None:
         columns = (

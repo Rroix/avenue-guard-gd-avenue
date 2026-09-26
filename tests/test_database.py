@@ -44,40 +44,44 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         "level_outreach_cycle_entries",
         "level_outreach_attempts",
         "level_outreach_cp_snapshots",
-            "level_outreach_level_snapshots",
-            "level_network_eras",
-            "level_outreach_targets",
-            "level_outreach_opportunities",
-            "bayes_model_versions",
-            "bayes_model_snapshots",
-            "bayes_predictions",
-            "bayes_capacity_forecasts",
-            "bayes_model_exclusions",
-            "level_notification_subscriptions",
-            "level_notification_events",
-            "level_notification_deliveries",
-            "staff_web_sessions",
-            "staff_queue_claims",
-            "staff_queue_claim_events",
-            "staff_outreach_episodes",
-            "staff_tasks",
-            "staff_notes",
-            "staff_review_qa",
-            "staff_applications",
-            "staff_application_events",
-            "staff_application_notes",
-            "staff_application_assessments",
-            "staff_application_interviews",
-            "staff_application_probations",
-            "moderation_punishments",
-            "punishment_appeals",
-            "punishment_appeal_events",
-            "punishment_appeal_messages",
-            "punishment_appeal_assessments",
-            "punishment_appeal_cooldowns",
-            "staff_members",
-            "staff_milestones",
-            "staff_idempotency",
+        "level_outreach_level_snapshots",
+        "creator_points_resolution_jobs",
+        "creator_level_identities",
+        "creator_points_current",
+        "creator_points_provider_observations",
+        "level_network_eras",
+        "level_outreach_targets",
+        "level_outreach_opportunities",
+        "bayes_model_versions",
+        "bayes_model_snapshots",
+        "bayes_predictions",
+        "bayes_capacity_forecasts",
+        "bayes_model_exclusions",
+        "level_notification_subscriptions",
+        "level_notification_events",
+        "level_notification_deliveries",
+        "staff_web_sessions",
+        "staff_queue_claims",
+        "staff_queue_claim_events",
+        "staff_outreach_episodes",
+        "staff_tasks",
+        "staff_notes",
+        "staff_review_qa",
+        "staff_applications",
+        "staff_application_events",
+        "staff_application_notes",
+        "staff_application_assessments",
+        "staff_application_interviews",
+        "staff_application_probations",
+        "moderation_punishments",
+        "punishment_appeals",
+        "punishment_appeal_events",
+        "punishment_appeal_messages",
+        "punishment_appeal_assessments",
+        "punishment_appeal_cooldowns",
+        "staff_members",
+        "staff_milestones",
+        "staff_idempotency",
     } <= tables
 
     ticket_columns = {str(row["name"]) for row in await db.fetchall("PRAGMA table_info(tickets)")}
@@ -120,7 +124,7 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
     schema_rows = await db.fetchall("SELECT component,schema_version FROM schema_metadata")
     schema_versions = {str(row["component"]): int(row["schema_version"]) for row in schema_rows}
     assert schema_versions == {
-        "database": 14,
+        "database": 15,
         "config": 2,
         "runtime_settings": 2,
         "embed_templates": 2,
@@ -131,7 +135,32 @@ async def test_empty_database_migrates_all_critical_tables_and_columns(tmp_path)
         str(row["name"])
         for row in await db.fetchall("PRAGMA table_info(staff_application_cooldowns)")
     }
-    assert "hidden_from_state" in queue_columns
+    assert {
+        "hidden_from_state",
+        "creator_points_status",
+        "creator_points_source",
+        "creator_points_confidence",
+        "creator_points_observed_at",
+        "creator_points_pending_reason",
+        "creator_points_last_error_category",
+        "creator_points_profile_path",
+        "uploader_identity_confidence",
+    } <= queue_columns
+    job_columns = {
+        str(row["name"])
+        for row in await db.fetchall(
+            "PRAGMA table_info(creator_points_resolution_jobs)"
+        )
+    }
+    assert {
+        "queue_id",
+        "priority",
+        "state",
+        "attempt_count",
+        "next_attempt_ts",
+        "attention_emitted_ts",
+        "escalation_emitted_ts",
+    } <= job_columns
     assert {
         "review_prompt_key",
         "review_thread_outbox_id",

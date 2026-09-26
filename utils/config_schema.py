@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 CONFIG_SCHEMA_VERSION = 2
 RUNTIME_SCHEMA_VERSION = 2
 EMBED_SCHEMA_VERSION = 2
-DATABASE_SCHEMA_VERSION = 14
+DATABASE_SCHEMA_VERSION = 15
 
 
 @dataclass(frozen=True)
@@ -640,6 +640,7 @@ def validate_config(data: Any) -> list[ConfigIssue]:
                     issues.append(ConfigIssue(f"{path}.weight", "must be a positive integer"))
     from utils.historical_audit import audit_settings
     from utils.priority_system import priority_settings
+    from utils.creator_points import creator_points_settings
     try:
         audit_settings(data)
     except ValueError as exc:
@@ -648,4 +649,8 @@ def validate_config(data: Any) -> list[ConfigIssue]:
         priority_settings(data)
     except ValueError as exc:
         issues.append(ConfigIssue("priority_system", str(exc)))
+    try:
+        creator_points_settings(data)
+    except ValueError as exc:
+        issues.append(ConfigIssue("priority_system.creator_points", str(exc)))
     return issues
