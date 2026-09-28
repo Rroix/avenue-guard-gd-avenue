@@ -799,6 +799,92 @@ async def test_pending_rate_and_feature_have_no_rank_then_order_by_resolved_pps(
 
 
 @pytest.mark.asyncio
+async def test_queue_detail_tolerates_system_history_without_an_actor(portal):
+    service, _guild = portal
+    queue_id = await insert_queue(
+        service, level_id="333333337", message_id=33, priority=4
+    )
+    await service.db.execute(
+        "INSERT INTO workflow_events(correlation_id,workflow_type,entity_id,event,"
+        "guild_id,actor_id,payload_json,created_ts) VALUES(?,?,?,?,?,NULL,'{}',?)",
+        (
+            "system-history-test",
+            "priority_system",
+            f"queue:{queue_id}",
+            "automatic_refresh",
+            GUILD_ID,
+            int(time.time()),
+        ),
+    )
+
+    detail = await service.queue_detail(
+        principal(JUDGE_ID, "reviewer"), queue_id
+    )
+
+    assert detail["history"][0]["event"] == "automatic_refresh"
+    assert detail["history"][0]["actor_id"] is None
+    assert detail["history"][0]["actor"] is None
+
+
+@pytest.mark.asyncio
+async def test_owner_can_set_and_update_creator_points_from_queue_action(portal):
+    service, _guild = portal
+    queue_id = await insert_queue(
+        service,
+        level_id="333333338",
+        message_id=34,
+        priority=None,
+        cp=None,
+    )
+    owner = principal(OWNER_ID, "owner")
+    session = await service.create_session({"user_id": str(OWNER_ID)})
+    status, first = await service.handle_request(
+        "POST",
+        f"/api/staff/queue/{queue_id}/creator-points",
+        {
+            "x-avenue-portal-key": "test-service-token",
+            "x-staff-session": session["session_token"],
+            "x-csrf-token": session["csrf_token"],
+            "idempotency-key": "manual-creator-points-0001",
+        },
+        json.dumps(
+            {
+                "creator_points": 7,
+                "reason": "Verified against the creator profile",
+                "confirmed": True,
+            }
+        ).encode(),
+    )
+    second = await service.queue_action(
+        owner,
+        queue_id,
+        "creator-points",
+        {
+            "creator_points": "9",
+            "reason": "Creator profile changed",
+            "confirmed": True,
+        },
+    )
+
+    assert status == 200
+    assert first["queue"]["cp"] == 7
+    assert second["queue"]["cp"] == 9
+    assert second["queue"]["creator_points_source"] == "manual_override"
+    with pytest.raises(PortalError) as invalid:
+        await service.queue_action(
+            owner,
+            queue_id,
+            "creator-points",
+            {
+                "creator_points": 1.5,
+                "reason": "Invalid fractional value",
+                "confirmed": True,
+            },
+        )
+    assert invalid.value.code == "invalid_creator_points"
+
+
+@pytest.mark.asyncio
 async def test_outreach_submission_and_followup_keep_distinct_semantics(portal):
     service, _guild = portal
     queue_id = await insert_queue(service, level_id="444444444", message_id=4, priority=4)
@@ -2018,6 +2104,109 @@ async def test_v2_assessments_calibration_and_probation_gate_final_decision(port
     assert applicant_record["applicant_message"] == (
         "Thank you for the thoughtful application."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "user_id"),
+    (("admin", ADMIN_ID), ("owner", OWNER_ID), ("dev", DEV_ID)),
+)
+async def test_privileged_staff_can_assess_and_decide_application_alone(
+    portal, role, user_id
+):
+    service, _guild = portal
+    now = int(time.time())
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications("
+        "guild_id,applicant_id,application_type,status,answers_json,form_version,"
+        "submitted_answers_json,submitted_questions_json,created_ts,updated_ts,submitted_ts"
+        ") VALUES(?,?,'judge','submitted','{}','applications-v2','{}','[]',?,?,?)",
+        (GUILD_ID, 999, now, now, now),
+    )
+    rubric = service._application_rubric("judge")
+    staff = principal(user_id, role)
+    await service.application_assessment(
+        staff,
+        application_id,
+        {
+            "scores": {dimension["key"]: 4 for dimension in rubric["dimensions"]},
+            "evidence": {
+                dimension["key"]: f"Evidence for {dimension['label']}"
+                for dimension in rubric["dimensions"]
+            },
+            "recommendation": "reject",
+        },
+    )
+
+    listing = await service.applications(staff, {})
+    application = next(
+        item for item in listing["items"] if int(item["id"]) == application_id
+    )
+    assert application["solo_decision_allowed"] is True
+    assert application["assessment_summary"]["minimum"] == 1
+    assert application["assessment_summary"]["decision_ready"] is True
+
+    decided = await service.application_action(
+        staff,
+        application_id,
+        {
+            "action": "reject",
+            "category": "other",
+            "reason": "The documented rubric does not meet current expectations.",
+            "confirmed": True,
+        },
+    )
+    assert decided["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_privileged_staff_cannot_borrow_another_reviewers_solo_assessment(
+    portal,
+):
+    service, _guild = portal
+    now = int(time.time())
+    application_id = await service.db.execute_insert(
+        "INSERT INTO staff_applications("
+        "guild_id,applicant_id,application_type,status,answers_json,form_version,"
+        "submitted_answers_json,submitted_questions_json,created_ts,updated_ts,submitted_ts"
+        ") VALUES(?,?,'judge','submitted','{}','applications-v2','{}','[]',?,?,?)",
+        (GUILD_ID, 998, now, now, now),
+    )
+    rubric = service._application_rubric("judge")
+    await service.application_assessment(
+        principal(HEAD_ID, "head_reviewer"),
+        application_id,
+        {
+            "scores": {dimension["key"]: 4 for dimension in rubric["dimensions"]},
+            "evidence": {
+                dimension["key"]: f"Evidence for {dimension['label']}"
+                for dimension in rubric["dimensions"]
+            },
+            "recommendation": "accept",
+        },
+    )
+
+    owner = principal(OWNER_ID, "owner")
+    listing = await service.applications(owner, {})
+    application = next(
+        item for item in listing["items"] if int(item["id"]) == application_id
+    )
+
+    assert application["solo_decision_allowed"] is True
+    assert application["assessment_summary"]["minimum"] == 2
+    assert application["assessment_summary"]["decision_ready"] is False
+    with pytest.raises(PortalError) as incomplete:
+        await service.application_action(
+            owner,
+            application_id,
+            {
+                "action": "accept",
+                    "category": "standard_probation",
+                "reason": "Attempted without documenting an owner assessment.",
+                "confirmed": True,
+            },
+        )
+    assert incomplete.value.code == "assessments_incomplete"
 
 
 @pytest.mark.asyncio

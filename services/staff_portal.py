@@ -39,7 +39,7 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 10
+PORTAL_API_VERSION = 11
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
@@ -76,6 +76,7 @@ PORTAL_FEATURES = (
     "pps_model_exclusions",
     "creator_points_resolution",
     "creator_points_pending_queue",
+    "creator_points_manual_override",
 )
 DISCORD_ID_FIELDS = {
     "actor_id",
@@ -1017,7 +1018,10 @@ class StaffPortalService:
         if path == "/api/staff/search" and method == "GET":
             return 200, await self.search(principal, query.get("q", ""))
 
-        queue_match = re.fullmatch(r"/api/staff/queue/(\d+)(?:/(claim|release|reassign|state|requeue|rereview|tier|hide|restore|retry-cp))?", path)
+        queue_match = re.fullmatch(
+            r"/api/staff/queue/(\d+)(?:/(claim|release|reassign|state|requeue|rereview|tier|hide|restore|retry-cp|creator-points))?",
+            path,
+        )
         if queue_match:
             queue_id = int(queue_match.group(1))
             action = queue_match.group(2)
@@ -1728,12 +1732,18 @@ class StaffPortalService:
         outreach_items = []
         for item in attempts:
             payload = _row_dict(item)
-            payload["actor"] = identities.get(int(item["actor_id"]))
+            actor_id = item["actor_id"]
+            payload["actor"] = (
+                identities.get(int(actor_id)) if actor_id is not None else None
+            )
             outreach_items.append(payload)
         history_items = []
         for item in events:
             payload = _row_dict(item)
-            payload["actor"] = identities.get(int(item["actor_id"]))
+            actor_id = item["actor_id"]
+            payload["actor"] = (
+                identities.get(int(actor_id)) if actor_id is not None else None
+            )
             history_items.append(payload)
         detail = {
             "queue": await self._queue_payload(row),
@@ -1779,6 +1789,57 @@ class StaffPortalService:
             principal.require("queue.manage_state")
             result = await self.priority.creator_points.retry(queue_id)
             return {"ok": True, "resolution": result}
+        if action == "creator-points":
+            principal.require("pps.override")
+            if payload.get("confirmed") is not True:
+                raise PortalError(
+                    400,
+                    "confirmation_required",
+                    "Confirm the manual Creator Points update",
+                )
+            reason = _bounded_text(payload.get("reason"), 1000, required=True)
+            raw_creator_points = payload.get("creator_points")
+            if isinstance(raw_creator_points, bool) or raw_creator_points is None:
+                raise PortalError(
+                    400,
+                    "invalid_creator_points",
+                    "Enter a non-negative whole-number Creator Points value",
+                )
+            if (
+                isinstance(raw_creator_points, float)
+                and not raw_creator_points.is_integer()
+            ):
+                raise PortalError(
+                    400,
+                    "invalid_creator_points",
+                    "Enter a non-negative whole-number Creator Points value",
+                )
+            try:
+                creator_points = int(raw_creator_points)
+            except (TypeError, ValueError) as exc:
+                raise PortalError(
+                    400,
+                    "invalid_creator_points",
+                    "Enter a non-negative whole-number Creator Points value",
+                ) from exc
+            if creator_points < 0:
+                raise PortalError(
+                    400,
+                    "invalid_creator_points",
+                    "Creator Points cannot be negative",
+                )
+            result = await self.priority.manual_cp_override(
+                principal.guild_id,
+                queue_id,
+                principal.user_id,
+                creator_points,
+                reason,
+            )
+            await self._refresh_public_cache()
+            return {
+                "ok": True,
+                "queue": await self._queue_payload(result),
+            }
         if action == "release":
             return await self._release_claim(principal, queue_id, _bounded_text(payload.get("reason"), 500))
         if action == "reassign":
@@ -3188,6 +3249,25 @@ class StaffPortalService:
         return False
 
     @staticmethod
+    def _can_decide_application_solo(principal: StaffPrincipal) -> bool:
+        return canonical_role(principal.role) in {"admin", "owner", "dev"}
+
+    def _application_minimum_override(
+        self, principal: StaffPrincipal, assessments: list[Any]
+    ) -> int | None:
+        if not self._can_decide_application_solo(principal):
+            return None
+        return (
+            1
+            if any(
+                item["reviewer_id"] is not None
+                and int(item["reviewer_id"]) == principal.user_id
+                for item in assessments
+            )
+            else None
+        )
+
+    @staticmethod
     def _application_actions_for_status(
         status: str, *, interview_delivery_pending: bool = False
     ) -> list[str]:
@@ -3874,9 +3954,17 @@ class StaffPortalService:
         assessments: list[dict[str, Any]],
         *,
         calibration_resolved: bool,
+        minimum_override: int | None = None,
     ) -> dict[str, Any]:
         rubric = self._application_rubric(application_type)
-        minimum = int(rubric["minimum_assessments"])
+        minimum = max(
+            1,
+            int(
+                minimum_override
+                if minimum_override is not None
+                else rubric["minimum_assessments"]
+            ),
+        )
         threshold = max(
             1,
             min(
@@ -4042,10 +4130,12 @@ class StaffPortalService:
             if row["decided_by"] is not None:
                 identity_ids.add(int(row["decided_by"]))
         for note in notes:
-            identity_ids.add(int(note["author_id"]))
+            if note["author_id"] is not None:
+                identity_ids.add(int(note["author_id"]))
             notes_by_application[int(note["application_id"])].append(_row_dict(note))
         for event in events:
-            identity_ids.add(int(event["actor_id"]))
+            if event["actor_id"] is not None:
+                identity_ids.add(int(event["actor_id"]))
             event_payload = _row_dict(event)
             event_payload["detail"] = _json_object(event_payload.pop("detail_json", "{}"))
             events_by_application[int(event["application_id"])].append(event_payload)
@@ -4081,10 +4171,16 @@ class StaffPortalService:
         identities = await self._resolve_identities(identity_ids)
         for note_items in notes_by_application.values():
             for note in note_items:
-                note["author"] = identities.get(int(note["author_id"]))
+                author_id = note.get("author_id")
+                note["author"] = (
+                    identities.get(int(author_id)) if author_id is not None else None
+                )
         for event_items in events_by_application.values():
             for event in event_items:
-                event["actor"] = identities.get(int(event["actor_id"]))
+                actor_id = event.get("actor_id")
+                event["actor"] = (
+                    identities.get(int(actor_id)) if actor_id is not None else None
+                )
         for assessment_items in assessments_by_application.values():
             for assessment in assessment_items:
                 assessment["reviewer"] = identities.get(
@@ -4134,6 +4230,12 @@ class StaffPortalService:
                         str(row["application_type"]),
                         assessments_by_application[int(row["id"])],
                         calibration_resolved=bool(row["calibration_resolved_ts"]),
+                        minimum_override=self._application_minimum_override(
+                            principal, assessments_by_application[int(row["id"])]
+                        ),
+                    ),
+                    "solo_decision_allowed": self._can_decide_application_solo(
+                        principal
                     ),
                     "interviews": interviews_by_application[int(row["id"])],
                     "probation": probation_by_application.get(int(row["id"])),
@@ -4154,6 +4256,10 @@ class StaffPortalService:
                             assessments_by_application[int(row["id"])],
                             calibration_resolved=bool(
                                 row["calibration_resolved_ts"]
+                            ),
+                            minimum_override=self._application_minimum_override(
+                                principal,
+                                assessments_by_application[int(row["id"])],
                             ),
                         )["calibration_required"]
                         else []
@@ -4305,7 +4411,12 @@ class StaffPortalService:
         return {
             "ok": True,
             "assessment_summary": self._application_assessment_summary(
-                application_type, items, calibration_resolved=False
+                application_type,
+                items,
+                calibration_resolved=False,
+                minimum_override=self._application_minimum_override(
+                    principal, items
+                ),
             ),
         }
 
@@ -4701,10 +4812,14 @@ class StaffPortalService:
                 return {"ok": True, "status": old, "role_delivery": "pending"}
             if is_v2 and action in {"accept", "reject"}:
                 assessment_rows = await self.db.fetchall(
-                    "SELECT scores_json,evidence_json,recommendation FROM "
+                    "SELECT reviewer_id,scores_json,evidence_json,recommendation FROM "
                     "staff_application_assessments WHERE application_id=?",
                     (application_id,),
                 )
+                minimum_override = self._application_minimum_override(
+                    principal, assessment_rows
+                )
+                has_own_assessment = minimum_override == 1
                 summary = self._application_assessment_summary(
                     application_type,
                     [
@@ -4716,12 +4831,26 @@ class StaffPortalService:
                         for item in assessment_rows
                     ],
                     calibration_resolved=bool(row["calibration_resolved_ts"]),
+                    minimum_override=minimum_override,
                 )
                 if not summary["complete"]:
+                    if (
+                        self._can_decide_application_solo(principal)
+                        and not has_own_assessment
+                    ):
+                        message = (
+                            "Record your own rubric assessment, or collect 2 "
+                            "independent assessments before a final decision"
+                        )
+                    else:
+                        message = (
+                            f"Record {summary['minimum']} independent rubric "
+                            "assessments before a final decision"
+                        )
                     raise PortalError(
                         409,
                         "assessments_incomplete",
-                        f"Record {summary['minimum']} independent rubric assessments before a final decision",
+                        message,
                     )
                 if summary["calibration_required"]:
                     raise PortalError(
