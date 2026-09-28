@@ -8,6 +8,7 @@ from typing import Any
 
 import discord
 
+from utils.staff_auth import canonical_role
 from utils.workflows import new_correlation_id, record_workflow_event
 
 APPEAL_VERSION = "appeals-v1"
@@ -1016,23 +1017,36 @@ class PunishmentAppealService:
             item["staff_unread_count"] = int(unread["total"] or 0) if unread else 0
             item["assessments"] = assessments
             item["events"] = events
-            item["decision_ready"] = self._decision_ready(row, assessments)
+            item["decision_ready"] = self._decision_ready(
+                principal, row, assessments
+            )
             items.append(item)
         return {"items": items}
 
     @staticmethod
-    def _decision_ready(appeal: Any, assessments: list[dict[str, Any]]) -> dict[str, Any]:
+    def _decision_ready(
+        principal: Any, appeal: Any, assessments: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         issuer = int(appeal["issued_by_id"] or 0)
         eligible = {
             int(item["reviewer_id"])
             for item in assessments
             if not int(item.get("recused") or 0) and int(item["reviewer_id"]) != issuer
         }
+        solo_allowed = canonical_role(getattr(principal, "role", "")) in {
+            "admin",
+            "owner",
+            "dev",
+        }
+        own_assessment = int(getattr(principal, "user_id", 0) or 0) in eligible
+        minimum = 1 if solo_allowed and own_assessment else 2
         return {
-            "ready": len(eligible) >= 2,
+            "ready": len(eligible) >= minimum,
             "eligible_assessments": len(eligible),
-            "minimum": 2,
+            "minimum": minimum,
             "issuer_excluded": bool(issuer),
+            "solo_decision_allowed": solo_allowed,
+            "own_assessment_recorded": own_assessment,
         }
 
     async def assessment(self, principal, appeal_id: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1209,9 +1223,19 @@ class PunishmentAppealService:
                 (appeal_id,),
             )
         ]
-        ready = self._decision_ready(appeal, assessments)
+        ready = self._decision_ready(principal, appeal, assessments)
         if not ready["ready"]:
-            raise self._error(409, "second_review_required", "Two independent non-conflicted assessments are required before deciding a punishment appeal")
+            if ready["solo_decision_allowed"] and not ready["own_assessment_recorded"]:
+                message = (
+                    "Record your own non-conflicted assessment, or collect two "
+                    "independent assessments before deciding this appeal"
+                )
+            else:
+                message = (
+                    "Two independent non-conflicted assessments are required "
+                    "before deciding a punishment appeal"
+                )
+            raise self._error(409, "second_review_required", message)
         if int(appeal["issued_by_id"] or 0) == principal.user_id:
             raise self._error(409, "issuer_conflict", "The staff member who issued the punishment cannot make the final appeal decision")
         unban_outbox_id = int(appeal["unban_outbox_id"] or 0) or None

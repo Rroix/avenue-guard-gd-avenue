@@ -2629,6 +2629,79 @@ async def test_appeal_decision_requires_two_independent_reviews_and_queues_unban
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "user_id"),
+    (("admin", ADMIN_ID), ("owner", OWNER_ID), ("dev", DEV_ID)),
+)
+async def test_privileged_staff_can_decide_appeal_after_own_assessment(
+    portal, role, user_id
+):
+    service, guild = portal
+    guild.fetch_ban = AsyncMock(return_value=SimpleNamespace(reason="Original reason"))
+
+    async def audit_logs(**_kwargs):
+        if False:
+            yield None
+
+    guild.audit_logs = audit_logs
+    appeal = await service.appeals.save(
+        principal(999, "applicant"),
+        {
+            "answers": {
+                "primary_ground": "Other",
+                "chronology": "This is a complete chronological account for one authorized staff reviewer.",
+                "disputed_detail": "",
+                "reconsideration": "",
+                "evidence_links": "",
+                "requested_outcome": "Review the decision",
+                "confirmation": "I confirm",
+            }
+        },
+        submit=True,
+    )
+    appeal_id = int(appeal["application"]["id"])
+    staff = principal(user_id, role)
+    findings = {
+        "factual_accuracy": "Verified",
+        "rule_applicability": "Verified",
+        "proportionality": "Verified",
+        "consistency": "Verified",
+        "new_evidence": "Reviewed",
+        "current_risk": "Reviewed",
+    }
+    await service.appeals.assessment(
+        staff,
+        appeal_id,
+        {
+            "findings": findings,
+            "recommendation": "upheld",
+            "rationale": "The evidence supports the original decision.",
+        },
+    )
+
+    listing = await service.appeals.list_staff(staff, {})
+    stored = next(item for item in listing["items"] if int(item["id"]) == appeal_id)
+    readiness = stored["decision_ready"]
+    assert readiness["ready"] is True
+    assert readiness["minimum"] == 1
+    assert readiness["solo_decision_allowed"] is True
+    assert readiness["own_assessment_recorded"] is True
+
+    result = await service.appeals.action(
+        staff,
+        appeal_id,
+        {
+            "action": "decide",
+            "outcome": "upheld",
+            "internal_rationale": "Final decision based on the documented assessment.",
+            "applicant_explanation": "Staff reviewed the evidence and upheld the punishment.",
+        },
+    )
+    assert result["ok"] is True
+    assert result["outcome"] == "upheld"
+
+
+@pytest.mark.asyncio
 async def test_punishment_appeals_have_an_independent_runtime_switch(portal):
     service, _guild = portal
     await service.db.set_runtime_setting(

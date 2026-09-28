@@ -39,7 +39,7 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 11
+PORTAL_API_VERSION = 12
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
@@ -69,6 +69,7 @@ PORTAL_FEATURES = (
     "appeal_discord_evidence",
     "appeal_portal_messages",
     "appeal_unban_outbox",
+    "privileged_appeal_solo_decision",
     "pps_statistics_lab",
     "pps_network_eras",
     "pps_model_controls",
