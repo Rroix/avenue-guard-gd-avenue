@@ -223,7 +223,7 @@ def parse_gdbrowser_level(payload: Any, level_id: str) -> dict[str, Any]:
         "audit_metadata": {
             "uploader_user_id": _audit_integer(payload.get("playerID")),
             "uploader_account_id": _audit_integer(payload.get("accountID")),
-            "creator_points": _audit_integer(payload.get("cp")),
+            "level_creator_points": _audit_integer(payload.get("cp")),
             "stars": _audit_integer(payload.get("stars")),
             "featured": payload.get("featured") if isinstance(payload.get("featured"), bool) else None,
             "epic": payload.get("epic") if isinstance(payload.get("epic"), bool) else None,
@@ -293,7 +293,7 @@ def parse_gdrateplus_level(payload: Any, level_id: str) -> dict[str, Any]:
         "audit_metadata": {
             "uploader_user_id": _audit_integer(level.get("playerID")),
             "uploader_account_id": _audit_integer(level.get("accountID")),
-            "creator_points": _audit_integer(level.get("cp")),
+            "level_creator_points": _audit_integer(level.get("cp")),
             "stars": _audit_integer(level.get("stars")),
             "featured": featured,
             "epic": epic,

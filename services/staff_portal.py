@@ -23,6 +23,7 @@ from utils.priority_system import (
     normalize_send_type,
     priority_settings,
     score_components,
+    send_type_label,
 )
 from utils.staff_auth import (
     ROLE_ORDER,
@@ -39,7 +40,7 @@ from utils.staff_auth import (
 from utils.workflows import new_correlation_id, record_workflow_event
 
 MAX_SAFE_JS_INTEGER = 9_007_199_254_740_991
-PORTAL_API_VERSION = 12
+PORTAL_API_VERSION = 13
 PORTAL_FEATURES = (
     "application_data_reset",
     "application_interviews",
@@ -78,6 +79,7 @@ PORTAL_FEATURES = (
     "creator_points_resolution",
     "creator_points_pending_queue",
     "creator_points_manual_override",
+    "pps_component_explanations",
 )
 DISCORD_ID_FIELDS = {
     "actor_id",
@@ -1662,27 +1664,61 @@ class StaffPortalService:
         claim_identity = (
             await self._resolve_identity(claim_user_id) if claim_user_id else None
         )
+        settings = self.priority.settings
+        send_type = str(data.get("send_type") or "rate")
+        creator_points = data.get("current_creator_points")
+        waiting_cycles = int(data.get("waiting_cycles") or 0)
+        scored_waiting_cycles = min(
+            max(0, waiting_cycles), settings.waiting_score_cap_cycles
+        )
         return {
             "id": int(data.get("id") or 0),
             "rank": (int(data.get("exact_rank") or 0) or None) if bool(data.get("priority_complete")) else None,
             "level_id": str(data.get("level_id") or ""),
             "level_name": str(data.get("current_level_name") or "Unknown level"),
             "creator": str(data.get("uploader_name") or "Unknown creator"),
-            "tier": str(data.get("send_type") or "rate"),
-            "cp": data.get("current_creator_points"),
+            "tier": send_type,
+            "cp": creator_points,
             "creator_points_status": str(data.get("creator_points_status") or "pending"),
             "creator_points_source": str(data.get("creator_points_source") or "") or None,
+            "creator_points_confidence": str(data.get("creator_points_confidence") or "") or None,
             "creator_points_observed_at": data.get("creator_points_observed_at"),
             "priority_pending_reason": str(data.get("creator_points_pending_reason") or "") or None,
             "uploader_account_id": str(data.get("uploader_account_id")) if data.get("uploader_account_id") is not None else None,
             "uploader_player_id": str(data.get("uploader_user_id")) if data.get("uploader_user_id") is not None else None,
-            "waiting_cycles": int(data.get("waiting_cycles") or 0),
+            "waiting_cycles": waiting_cycles,
             "components": {
                 "f": data.get("prestige_component_f"),
                 "g": data.get("creator_component_g"),
                 "h": data.get("waiting_component_h"),
                 "p": data.get("priority_points"),
                 "complete": bool(data.get("priority_complete")),
+            },
+            "component_details": {
+                "f": {
+                    "recommendation_type": send_type,
+                    "recommendation_label": send_type_label(send_type),
+                    "prestige_t": data.get("prestige_t"),
+                    "base": settings.prestige_base,
+                },
+                "g": {
+                    "creator_points": creator_points,
+                    "zero_from_cp": settings.creator_zero_from_cp,
+                    "source": str(data.get("creator_points_source") or "") or None,
+                    "confidence": str(data.get("creator_points_confidence") or "") or None,
+                    "observed_at": data.get("creator_points_observed_at"),
+                },
+                "h": {
+                    "waiting_cycles": waiting_cycles,
+                    "scored_cycles": scored_waiting_cycles,
+                    "cap_cycles": settings.waiting_score_cap_cycles,
+                    "multiplier": settings.waiting_multiplier,
+                    "exponent": settings.waiting_exponent,
+                },
+                "p": {
+                    "formula": "F + G + H",
+                    "model_version": str(data.get("model_version") or settings.model_version),
+                },
             },
             "state": str(data.get("queue_state") or "queued"),
             "queued_ts": queued_ts,

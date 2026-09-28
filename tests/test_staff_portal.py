@@ -725,6 +725,50 @@ async def test_queue_rank_filters_and_unknown_cp_are_preserved(portal):
 
 
 @pytest.mark.asyncio
+async def test_queue_payload_explains_every_pps_component_input(portal):
+    service, _guild = portal
+    queue_id = await insert_queue(
+        service,
+        level_id="148134343",
+        message_id=36,
+        priority=10,
+        cp=6,
+        send_type="feature",
+    )
+    settings = service.priority.settings
+    score = score_components("feature", 6, 5, settings)
+    await service.db.execute(
+        "UPDATE level_outreach_queue SET uploader_name='amusablemonk78',uploader_account_id=13434788,"
+        "waiting_cycles=5,waiting_component_h=?,priority_points=?,creator_points_source='gdbrowser_api',"
+        "creator_points_confidence='verified_single_source',creator_points_observed_at=? WHERE id=?",
+        (
+            score["waiting_component_h"],
+            score["priority_points"],
+            int(time.time()),
+            queue_id,
+        ),
+    )
+
+    payload = (await service.queue(principal(JUDGE_ID, "reviewer"), {}))["items"][0]
+    details = payload["component_details"]
+    assert details["f"] == {
+        "recommendation_type": "feature",
+        "recommendation_label": "Feature",
+        "prestige_t": settings.prestige_x["feature"],
+        "base": settings.prestige_base,
+    }
+    assert details["g"]["creator_points"] == 6
+    assert details["g"]["zero_from_cp"] == settings.creator_zero_from_cp
+    assert details["g"]["source"] == "gdbrowser_api"
+    assert payload["components"]["g"] == 0
+    assert details["h"]["waiting_cycles"] == 5
+    assert details["h"]["scored_cycles"] == settings.waiting_score_cap_cycles
+    assert details["h"]["cap_cycles"] == settings.waiting_score_cap_cycles
+    assert details["p"]["formula"] == "F + G + H"
+    assert details["p"]["model_version"] == settings.model_version
+
+
+@pytest.mark.asyncio
 async def test_claim_has_one_owner_and_head_can_reassign(portal):
     service, _guild = portal
     queue_id = await insert_queue(service, level_id="333333333", message_id=3, priority=4)

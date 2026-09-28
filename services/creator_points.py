@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 import json
 import random
 import statistics
 import time
+from collections import defaultdict
 from typing import Any
 from urllib.parse import quote
 
@@ -17,13 +17,16 @@ from utils.creator_points import (
     GDBROWSER_PROFILE_HTML_URL,
     canonical_identity,
     creator_key,
+    creator_points_observation_is_usable,
     creator_points_settings,
+    creator_points_value_scope,
     explicit_nonnegative_int,
     parse_gdbrowser_level_html,
     parse_gdbrowser_profile_api,
     parse_gdbrowser_profile_html,
     response_fingerprint,
     select_creator_points,
+    trusted_creator_cache_source,
 )
 from utils.gd_profile import fetch_creator_profile
 from utils.gd_validation import _read_provider_text
@@ -92,24 +95,38 @@ class CreatorPointsResolver:
         now = int(time.time())
         states = ",".join("?" for _ in PPS_QUEUE_REFRESH_STATES)
         rows = await self.db.fetchall(
-            f"SELECT id,guild_id,level_id FROM level_outreach_queue WHERE guild_id=? AND queue_state IN({states}) "  # nosec B608
-            "AND (priority_complete=0 OR current_creator_points IS NULL)",
+            f"SELECT id,guild_id,level_id,CASE WHEN creator_points_source "  # nosec B608
+            "IN('gdrateplus','gdhistory','consensus') THEN 1 ELSE 0 END AS legacy_level_source "
+            f"FROM level_outreach_queue WHERE guild_id=? AND queue_state IN({states}) "  # nosec B608
+            "AND (priority_complete=0 OR current_creator_points IS NULL OR "
+            "creator_points_source IN('gdrateplus','gdhistory','consensus'))",
             (int(guild_id), *PPS_QUEUE_REFRESH_STATES),
         )
         statements: list[tuple[str, tuple[Any, ...]]] = []
         for row in rows:
+            conflict_clause = (
+                "ON CONFLICT(queue_id) DO UPDATE SET priority=MAX(priority,excluded.priority),state='pending',"
+                "attempt_count=0,next_attempt_ts=excluded.next_attempt_ts,generation=generation+1,updated_ts=excluded.updated_ts"
+                if bool(row["legacy_level_source"])
+                else "ON CONFLICT(queue_id) DO NOTHING"
+            )
             statements.append((
                 "INSERT INTO creator_points_resolution_jobs(queue_id,guild_id,level_id,priority,state,attempt_count,next_attempt_ts,"
-                "first_pending_ts,generation,updated_ts) VALUES(?,?,?,100,'pending',0,?,?,1,?) ON CONFLICT(queue_id) DO NOTHING",
+                f"first_pending_ts,generation,updated_ts) VALUES(?,?,?,100,'pending',0,?,?,1,?) {conflict_clause}",
                 (int(row["id"]), int(row["guild_id"]), str(row["level_id"]), now, now, now),
             ))
         if statements:
             statements.append((
-                f"UPDATE level_outreach_queue SET priority_points=NULL,creator_component_g=NULL,priority_complete=0,"  # nosec B608
+                "UPDATE level_outreach_queue SET current_creator_points=NULL,current_creator_points_checked_ts=NULL,"  # nosec B608
+                "creator_points_refresh_after_ts=NULL,creator_points_source=NULL,creator_points_confidence=NULL,"
+                "creator_points_observed_at=NULL,creator_points_at_recommendation=CASE WHEN creator_points_source "
+                "IN('gdrateplus','gdhistory','consensus') THEN NULL ELSE creator_points_at_recommendation END,"
+                "creator_points_checked_ts=CASE WHEN creator_points_source IN('gdrateplus','gdhistory','consensus') "
+                "THEN NULL ELSE creator_points_checked_ts END,priority_points=NULL,creator_component_g=NULL,priority_complete=0,"
                 "creator_points_status=CASE WHEN creator_points_status='manual_override' THEN creator_points_status ELSE 'pending' END,"
                 "creator_points_pending_reason=CASE WHEN creator_points_status='manual_override' THEN NULL ELSE 'creator_points' END,"
                 "last_public_priority_band=NULL,updated_ts=? WHERE guild_id=? AND queue_state IN(" + states + ") "
-                "AND current_creator_points IS NULL",
+                "AND (current_creator_points IS NULL OR creator_points_source IN('gdrateplus','gdhistory','consensus'))",
                 (now, int(guild_id), *PPS_QUEUE_REFRESH_STATES),
             ))
             await self.db.execute_transaction(statements, retry_safe=True)
@@ -261,9 +278,44 @@ class CreatorPointsResolver:
             await asyncio.gather(*pending, return_exceptions=True)
         identity = canonical_identity(observations)
         if identity:
-            cached = None if force else await self._cached_creator(identity)
-            if cached:
-                observations.append(cached)
+            has_profile_value = any(
+                creator_points_observation_is_usable(item, identity)
+                for item in observations
+            )
+            api_attempted = any(
+                item.get("provider") == "gdbrowser" and item.get("method") == "api_profile"
+                for item in observations
+            )
+            if (
+                not has_profile_value
+                and not api_attempted
+                and cfg["gdbrowser_api"]
+                and str(identity.get("username") or "").strip()
+            ):
+                key = identity.get("creator_key") or creator_key(
+                    account_id=identity.get("account_id"),
+                    player_id=identity.get("player_id"),
+                    username=identity.get("username"),
+                )
+
+                async def fetch_api_profile():
+                    return await self._gdbrowser_api_profile(session, cog, identity)
+
+                observations.append(
+                    await self._singleflight_profile(
+                        f"gdbrowser-api:{key or identity['username']}",
+                        fetch_api_profile,
+                    )
+                )
+                identity = canonical_identity(observations) or identity
+                has_profile_value = any(
+                    creator_points_observation_is_usable(item, identity)
+                    for item in observations
+                )
+            if not has_profile_value:
+                cached = await self._cached_creator(identity)
+                if cached:
+                    observations.append(cached)
             accepted = select_creator_points(observations, identity)
         else:
             accepted = {"resolved": False, "state": "identity_unresolved", "creator_points": None}
@@ -279,10 +331,12 @@ class CreatorPointsResolver:
         observation = {
             "provider": provider,
             "method": "level",
+            "value_scope": "level_identity",
             "username": str(result.get("creator") or "").strip() or None,
             "account_id": metadata.get("uploader_account_id"),
             "player_id": metadata.get("uploader_user_id"),
-            "creator_points": metadata.get("creator_points"),
+            "creator_points": None,
+            "level_creator_points": metadata.get("level_creator_points"),
             "provider_timestamp": result.get("snapshot_ts"),
             "observed_at": int(time.time()),
             "success": bool(result.get("ok") and result.get("exists") is True),
@@ -317,6 +371,7 @@ class CreatorPointsResolver:
                 "account_id": explicit_nonnegative_int(result.get("account_id")) or identity.get("account_id"),
                 "player_id": explicit_nonnegative_int(result.get("user_id")) or identity.get("player_id"),
                 "creator_points": result.get("current_creator_points") if result.get("ok") else None,
+                "value_scope": "creator_profile",
                 "observed_at": int(time.time()), "success": bool(result.get("ok")), "status_code": result.get("status_code"),
                 "error_category": None if result.get("ok") else self._normalize_error(result.get("failure_kind")),
                 "response_fingerprint": response_fingerprint({k: result.get(k) for k in ("ok", "account_id", "user_id", "name", "current_creator_points")}),
@@ -341,6 +396,7 @@ class CreatorPointsResolver:
         identity_obs = {
             "provider": "gdbrowser", "method": identity_method, "username": parsed_level.get("username"),
             "account_id": parsed_level.get("account_id"), "player_id": parsed_level.get("player_id"), "creator_points": None,
+            "value_scope": "level_identity",
             "profile_path": parsed_level.get("profile_path"), "observed_at": int(time.time()), "success": bool(parsed_level.get("ok")),
             "status_code": html_result.get("status_code"), "error_category": parsed_level.get("error_category"),
             "response_fingerprint": parsed_level.get("response_fingerprint"),
@@ -361,6 +417,7 @@ class CreatorPointsResolver:
                 "provider": "gdbrowser", "method": "html_profile", "username": parsed.get("username"),
                 "account_id": parsed.get("account_id") or parsed_level.get("account_id"), "player_id": parsed.get("player_id"),
                 "creator_points": parsed.get("creator_points"), "observed_at": int(time.time()), "success": bool(parsed.get("ok")),
+                "value_scope": "creator_profile",
                 "status_code": result.get("status_code"), "error_category": parsed.get("error_category"),
                 "response_fingerprint": parsed.get("response_fingerprint"), "latency_ms": round((time.perf_counter() - started) * 1000, 2),
                 "archival": False,
@@ -425,6 +482,7 @@ class CreatorPointsResolver:
             "provider": "gdbrowser", "method": "api_profile", "username": parsed.get("username"),
             "account_id": parsed.get("account_id") or identity.get("account_id"), "player_id": parsed.get("player_id"),
             "creator_points": parsed.get("creator_points"), "observed_at": int(time.time()), "success": bool(parsed.get("ok")),
+            "value_scope": "creator_profile",
             "status_code": result.get("status_code"), "error_category": parsed.get("error_category"),
             "response_fingerprint": parsed.get("response_fingerprint"), "latency_ms": round((time.perf_counter() - started) * 1000, 2), "archival": False,
         }
@@ -491,13 +549,14 @@ class CreatorPointsResolver:
             "SELECT * FROM creator_points_current WHERE creator_key=? AND expires_ts>?",
             (str(key), now),
         ) if key else None
-        if not row:
+        if not row or not trusted_creator_cache_source(row["source"]):
             return None
         return {
             "provider": "cache", "method": "creator_current", "username": row["username"], "account_id": row["account_id"],
             "player_id": row["player_id"], "creator_points": row["creator_points"], "observed_at": row["observed_at"],
             "provider_timestamp": row["provider_timestamp"], "success": True, "error_category": None,
             "response_fingerprint": row["response_fingerprint"], "archival": False,
+            "value_scope": "creator_profile", "expires_ts": row["expires_ts"],
             "cached_source": row["source"], "cached_confidence": row["confidence"],
         }
 
@@ -523,8 +582,14 @@ class CreatorPointsResolver:
         source = str(accepted.get("source") or "unknown")
         confidence = str(accepted.get("confidence") or "verified_single_source")
         key = str(identity["creator_key"])
-        observed_at = int((accepted.get("observation") or {}).get("observed_at") or now)
-        fingerprint = (accepted.get("observation") or {}).get("response_fingerprint")
+        accepted_observation = accepted.get("observation") or {}
+        observed_at = int(accepted_observation.get("observed_at") or now)
+        fingerprint = accepted_observation.get("response_fingerprint")
+        source_expiry = int(
+            accepted_observation.get("expires_ts")
+            or observed_at + self.settings.current_cp_ttl_seconds
+        )
+        refresh_at = max(now + 1, source_expiry)
         states = ",".join("?" for _ in PPS_QUEUE_REFRESH_STATES)
         related = await self.db.fetchall(
             f"SELECT * FROM level_outreach_queue WHERE guild_id=? AND queue_state IN({states}) AND (id=? OR "  # nosec B608
@@ -539,7 +604,7 @@ class CreatorPointsResolver:
                 "source=excluded.source,confidence=excluded.confidence,observed_at=excluded.observed_at,provider_timestamp=excluded.provider_timestamp,"
                 "response_fingerprint=excluded.response_fingerprint,expires_ts=excluded.expires_ts,updated_ts=excluded.updated_ts",
                 (key, identity.get("username"), identity.get("account_id"), identity.get("player_id"), points, source, confidence, observed_at,
-                 (accepted.get("observation") or {}).get("provider_timestamp"), fingerprint, now + self.settings.current_cp_ttl_seconds, now),
+                 accepted_observation.get("provider_timestamp"), fingerprint, refresh_at, now),
             )
         ]
         for item in related:
@@ -553,7 +618,7 @@ class CreatorPointsResolver:
                     "provider_timestamp,response_fingerprint) SELECT ?,?,?,?,?,NULL,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM level_outreach_cp_snapshots "
                     "WHERE queue_id=? AND creator_points=? AND source=? AND checked_ts>=?)",
                     (queue_id, identity.get("account_id"), observed_at, points, "ok", source, confidence,
-                     (accepted.get("observation") or {}).get("provider_timestamp"), fingerprint, queue_id, points, source, observed_at - 300),
+                     accepted_observation.get("provider_timestamp"), fingerprint, queue_id, points, source, observed_at - 300),
                 ),
                 (
                     "UPDATE level_outreach_queue SET uploader_name=COALESCE(?,uploader_name),uploader_account_id=COALESCE(?,uploader_account_id),"
@@ -563,10 +628,10 @@ class CreatorPointsResolver:
                     "creator_points_status='resolved',creator_points_source=?,creator_points_confidence=?,creator_points_observed_at=?,"
                     "creator_points_pending_reason=NULL,creator_points_last_error_category=NULL,creator_points_profile_path=COALESCE(?,creator_points_profile_path),updated_ts=? WHERE id=?",
                     (identity.get("username"), identity.get("account_id"), identity.get("player_id"), identity.get("confidence"), points, observed_at,
-                     points, observed_at, now + self.settings.current_cp_ttl_seconds, score["creator_component_g"], score["waiting_component_h"], score["priority_points"],
+                     points, observed_at, refresh_at, score["creator_component_g"], score["waiting_component_h"], score["priority_points"],
                      source, confidence, observed_at, next((x.get("profile_path") for x in observations if x.get("profile_path")), None), now, queue_id),
                 ),
-                ("UPDATE creator_points_resolution_jobs SET state='resolved',resolved_ts=?,last_error_category=NULL,last_error_summary=NULL,next_attempt_ts=?,updated_ts=? WHERE queue_id=?", (now, now + self.settings.current_cp_ttl_seconds, now, queue_id)),
+                ("UPDATE creator_points_resolution_jobs SET state='resolved',resolved_ts=?,last_error_category=NULL,last_error_summary=NULL,next_attempt_ts=?,updated_ts=? WHERE queue_id=?", (now, refresh_at, now, queue_id)),
             ])
         old = row["current_creator_points"]
         event = "cp_resolved" if old is None else ("cp_changed" if int(old) != points else "cp_verified")
@@ -636,11 +701,18 @@ class CreatorPointsResolver:
             "SELECT provider,method,username,account_id,player_id,creator_points,observed_at,provider_timestamp,success,status_code,error_category,latency_ms "
             "FROM creator_points_provider_observations WHERE queue_id=? ORDER BY observed_at DESC,id DESC LIMIT 50", (int(queue_id),),
         )
-        return {"job": dict(job) if job else None, "observations": [dict(item) for item in observations]}
+        observation_items = []
+        for row in observations:
+            item = dict(row)
+            item["value_scope"] = creator_points_value_scope(item)
+            item["creator_points_usable"] = creator_points_observation_is_usable(item)
+            observation_items.append(item)
+        return {"job": dict(job) if job else None, "observations": observation_items}
 
     async def health(self) -> dict[str, Any]:
         rows = await self.db.fetchall(
-            "SELECT provider,method,COUNT(*) attempts,SUM(success) successes,SUM(CASE WHEN success=1 AND creator_points IS NOT NULL THEN 1 ELSE 0 END) cp_successes,"
+            "SELECT provider,method,COUNT(*) attempts,SUM(success) successes,SUM(CASE WHEN success=1 AND creator_points IS NOT NULL "
+            "AND method IN('profile','direct_profile','html_profile','api_profile','creator_current','manual_override') THEN 1 ELSE 0 END) cp_successes,"
             "SUM(CASE WHEN error_category IN('malformed','cp_missing') THEN 1 ELSE 0 END) parse_failures,AVG(latency_ms) average_latency_ms,"
             "MAX(CASE WHEN success=1 THEN observed_at END) last_success,MAX(CASE WHEN success=0 THEN observed_at END) last_error "
             "FROM creator_points_provider_observations WHERE observed_at>=? GROUP BY provider,method",

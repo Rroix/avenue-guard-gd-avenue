@@ -9,10 +9,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from pathlib import Path
 import ssl
 import sys
 import time
+from pathlib import Path
 from urllib.parse import quote
 
 import aiohttp
@@ -27,6 +27,7 @@ from utils.creator_points import (
     GDBROWSER_PROFILE_API_URL,
     GDBROWSER_PROFILE_HTML_URL,
     canonical_identity,
+    creator_points_observation_is_usable,
     parse_gdbrowser_level_html,
     parse_gdbrowser_profile_api,
     parse_gdbrowser_profile_html,
@@ -48,7 +49,9 @@ def _level_observation(provider: str, result: dict) -> dict:
         "username": result.get("creator"),
         "account_id": metadata.get("uploader_account_id"),
         "player_id": metadata.get("uploader_user_id"),
-        "creator_points": metadata.get("creator_points"),
+        "creator_points": None,
+        "level_creator_points": metadata.get("level_creator_points"),
+        "value_scope": "level_identity",
         "observed_at": int(time.time()),
         "success": bool(result.get("ok") and result.get("exists") is True),
         "error_category": None if result.get("ok") else result.get("failure_kind"),
@@ -97,6 +100,7 @@ async def smoke_level(session: aiohttp.ClientSession, level_id: str, *, api_fall
                     "account_id": int(profile["account_id"]) if profile.get("account_id") else level_observation.get("account_id"),
                     "player_id": int(profile["user_id"]) if profile.get("user_id") else level_observation.get("player_id"),
                     "creator_points": profile.get("current_creator_points") if profile.get("ok") else None,
+                    "value_scope": "creator_profile",
                     "observed_at": int(time.time()),
                     "success": bool(profile.get("ok")),
                     "error_category": None if profile.get("ok") else profile.get("failure_kind"),
@@ -116,6 +120,7 @@ async def smoke_level(session: aiohttp.ClientSession, level_id: str, *, api_fall
                 "account_id": parsed_level.get("account_id"),
                 "player_id": parsed_level.get("player_id"),
                 "creator_points": None,
+                "value_scope": "level_identity",
                 "observed_at": int(time.time()),
                 "success": True,
                 "error_category": None,
@@ -143,6 +148,7 @@ async def smoke_level(session: aiohttp.ClientSession, level_id: str, *, api_fall
                 "account_id": parsed_profile.get("account_id") or parsed_level.get("account_id"),
                 "player_id": parsed_profile.get("player_id"),
                 "creator_points": parsed_profile.get("creator_points"),
+                "value_scope": "creator_profile",
                 "observed_at": int(time.time()),
                 "success": bool(parsed_profile.get("ok")),
                 "error_category": parsed_profile.get("error_category"),
@@ -171,6 +177,7 @@ async def smoke_level(session: aiohttp.ClientSession, level_id: str, *, api_fall
                     "account_id": parsed_api.get("account_id"),
                     "player_id": parsed_api.get("player_id"),
                     "creator_points": parsed_api.get("creator_points"),
+                    "value_scope": "creator_profile",
                     "observed_at": int(time.time()),
                     "success": bool(parsed_api.get("ok")),
                     "error_category": parsed_api.get("error_category"),
@@ -179,6 +186,42 @@ async def smoke_level(session: aiohttp.ClientSession, level_id: str, *, api_fall
             )
 
     identity = canonical_identity(observations)
+    if (
+        api_fallback
+        and identity
+        and identity.get("username")
+        and not any(creator_points_observation_is_usable(item, identity) for item in observations)
+        and not any(item.get("provider") == "gdbrowser" and item.get("method") == "api_profile" for item in observations)
+    ):
+        api_status, api_text = await _text(
+            session,
+            GDBROWSER_PROFILE_API_URL.format(username=quote(str(identity["username"]))),
+        )
+        try:
+            api_payload = json.loads(api_text) if api_status == 200 else None
+        except ValueError:
+            api_payload = None
+        parsed_api = parse_gdbrowser_profile_api(
+            api_payload,
+            expected_username=identity.get("username"),
+            expected_account_id=identity.get("account_id"),
+        )
+        observations.append(
+            {
+                "provider": "gdbrowser",
+                "method": "api_profile",
+                "value_scope": "creator_profile",
+                "username": parsed_api.get("username"),
+                "account_id": parsed_api.get("account_id") or identity.get("account_id"),
+                "player_id": parsed_api.get("player_id"),
+                "creator_points": parsed_api.get("creator_points"),
+                "observed_at": int(time.time()),
+                "success": bool(parsed_api.get("ok")),
+                "error_category": parsed_api.get("error_category"),
+                "archival": False,
+            }
+        )
+        identity = canonical_identity(observations) or identity
     accepted = select_creator_points(observations, identity) if identity else {"resolved": False, "state": "identity_unresolved", "creator_points": None}
     safe_observations = [
         {

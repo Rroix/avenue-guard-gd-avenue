@@ -142,6 +142,7 @@ def test_gdrateplus_maps_only_official_level_fields_and_exact_id():
             "epic": False,
             "legendary": False,
             "mythic": False,
+            "cp": 0,
         },
         "communityTier": {"name": "Mythic"},
     }
@@ -155,6 +156,8 @@ def test_gdrateplus_maps_only_official_level_fields_and_exact_id():
     assert result["featured"] is True
     assert result["mythic"] is False
     assert result["demon"] is True
+    assert result["audit_metadata"]["level_creator_points"] == 0
+    assert "creator_points" not in result["audit_metadata"]
     mismatch = parse_gdrateplus_level(payload, "222222222")
     assert mismatch["ok"] is False
     assert mismatch["failure_kind"] == "invalid_response"

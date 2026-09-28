@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
-from html.parser import HTMLParser
 import json
 import re
 import unicodedata
+from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -41,6 +41,28 @@ CP_ERROR_CATEGORIES = {
     "conflict",
     "internal",
 }
+CREATOR_PROFILE_METHODS = frozenset(
+    {
+        "profile",
+        "direct_profile",
+        "html_profile",
+        "api_profile",
+        "creator_current",
+        "manual_override",
+    }
+)
+TRUSTED_CREATOR_CACHE_SOURCES = frozenset(
+    {
+        "boomlings",
+        "gdbrowser",
+        "gdbrowser_html",
+        "gdbrowser_api",
+        "profile_consensus",
+        "gdhistory_profile",
+        "gdrateplus_profile",
+        "manual_override",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -128,6 +150,36 @@ def explicit_nonnegative_int(value: Any) -> int | None:
         return None
     text = str(value).strip()
     return int(text) if text.isascii() and text.isdecimal() else None
+
+
+def creator_points_value_scope(observation: dict[str, Any]) -> str:
+    """Classify whether an observation can represent a creator's total CP.
+
+    Level endpoints may expose a field named ``cp``, but that value describes
+    the level and must never be used as the uploader profile's total CP.
+    """
+    explicit = str(observation.get("value_scope") or "").strip().casefold()
+    if explicit in {"creator_profile", "level_identity"}:
+        return explicit
+    method = str(observation.get("method") or "").strip().casefold()
+    return "creator_profile" if method in CREATOR_PROFILE_METHODS else "level_identity"
+
+
+def creator_points_observation_is_usable(
+    observation: dict[str, Any],
+    identity: dict[str, Any] | None = None,
+) -> bool:
+    if (
+        not observation.get("success")
+        or creator_points_value_scope(observation) != "creator_profile"
+        or explicit_nonnegative_int(observation.get("creator_points")) is None
+    ):
+        return False
+    return identity is None or identities_match(observation, identity)
+
+
+def trusted_creator_cache_source(value: Any) -> bool:
+    return str(value or "").strip().casefold() in TRUSTED_CREATOR_CACHE_SOURCES
 
 
 def response_fingerprint(value: str | bytes | dict[str, Any]) -> str:
@@ -363,14 +415,40 @@ def canonical_identity(observations: list[dict[str, Any]]) -> dict[str, Any] | N
 def select_creator_points(observations: list[dict[str, Any]], identity: dict[str, Any]) -> dict[str, Any]:
     usable = [
         item for item in observations
-        if item.get("success") and explicit_nonnegative_int(item.get("creator_points")) is not None and identities_match(item, identity)
+        if creator_points_observation_is_usable(item, identity)
     ]
     if not usable:
         return {"resolved": False, "state": "providers_unavailable", "creator_points": None}
+
+    def source_for(item: dict[str, Any]) -> str:
+        provider = str(item.get("provider") or "unknown").strip().casefold()
+        method = str(item.get("method") or "").strip().casefold()
+        if provider == "cache":
+            return str(item.get("cached_source") or "cache")
+        if provider == "gdbrowser" and method == "html_profile":
+            return "gdbrowser_html"
+        if provider == "gdbrowser" and method == "api_profile":
+            return "gdbrowser_api"
+        if method == "profile" and provider not in {"boomlings", "gdbrowser"}:
+            return f"{provider}_profile"
+        return provider
+
+    def accepted(item: dict[str, Any], *, source: str | None = None, confidence: str) -> dict[str, Any]:
+        if item.get("provider") == "cache":
+            confidence = str(item.get("cached_confidence") or confidence)
+        return {
+            "resolved": True,
+            "state": "resolved",
+            "creator_points": int(item["creator_points"]),
+            "source": source or source_for(item),
+            "confidence": confidence,
+            "observation": item,
+        }
+
     direct = [item for item in usable if item.get("provider") == "boomlings" and item.get("method") == "direct_profile"]
     if direct:
         chosen = max(direct, key=lambda item: int(item.get("observed_at") or 0))
-        return {"resolved": True, "state": "resolved", "creator_points": int(chosen["creator_points"]), "source": "boomlings", "confidence": "direct_authoritative", "observation": chosen}
+        return accepted(chosen, source="boomlings", confidence="direct_authoritative")
     grouped: dict[int, list[dict[str, Any]]] = {}
     for item in usable:
         grouped.setdefault(int(item["creator_points"]), []).append(item)
@@ -388,14 +466,14 @@ def select_creator_points(observations: list[dict[str, Any]], identity: dict[str
         )
         chosen_group = consensus[0]
         chosen = max(chosen_group, key=lambda item: int(item.get("observed_at") or 0))
-        return {"resolved": True, "state": "resolved", "creator_points": int(chosen["creator_points"]), "source": "consensus", "confidence": "consensus", "observation": chosen}
+        return accepted(chosen, source="profile_consensus", confidence="consensus")
     values = set(grouped)
     if len(values) > 1:
         current_html = [item for item in usable if item.get("provider") == "gdbrowser" and item.get("method") == "html_profile" and not item.get("archival")]
         archival_only_others = all(item.get("archival") for item in usable if item not in current_html)
         if current_html and archival_only_others:
             chosen = max(current_html, key=lambda item: int(item.get("observed_at") or 0))
-            return {"resolved": True, "state": "resolved", "creator_points": int(chosen["creator_points"]), "source": "gdbrowser_html", "confidence": "verified_single_source", "observation": chosen}
+            return accepted(chosen, source="gdbrowser_html", confidence="verified_single_source")
         return {"resolved": False, "state": "conflict", "creator_points": None}
     chosen = max(usable, key=lambda item: (item.get("provider") == "gdbrowser" and item.get("method") == "html_profile", int(item.get("observed_at") or 0)))
-    return {"resolved": True, "state": "resolved", "creator_points": int(chosen["creator_points"]), "source": "gdbrowser_html" if chosen.get("provider") == "gdbrowser" and chosen.get("method") == "html_profile" else str(chosen.get("provider")), "confidence": "verified_single_source", "observation": chosen}
+    return accepted(chosen, confidence="verified_single_source")

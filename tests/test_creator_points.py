@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from utils.config import Config
 from utils.creator_points import (
     canonical_identity,
     creator_points_settings,
+    creator_points_value_scope,
     parse_gdbrowser_level_html,
     parse_gdbrowser_profile_api,
     parse_gdbrowser_profile_html,
@@ -19,7 +21,6 @@ from utils.creator_points import (
 )
 from utils.db import Database
 from utils.priority_system import priority_settings, score_components
-
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -200,6 +201,67 @@ def test_cached_observation_does_not_fake_independent_provider_consensus():
     assert result["state"] == "conflict"
 
 
+def test_level_cp_is_never_treated_as_creator_profile_total():
+    identity = {"username": "amusablemonk78", "account_id": 13434788, "player_id": 128276989}
+    level_value = observation(
+        "gdrateplus",
+        0,
+        method="level",
+        account_id=13434788,
+        username="amusablemonk78",
+        observed_at=200,
+    )
+    profile_value = observation(
+        "gdbrowser",
+        6,
+        method="api_profile",
+        account_id=13434788,
+        username="amusablemonk78",
+        observed_at=100,
+    )
+
+    assert creator_points_value_scope(level_value) == "level_identity"
+    assert select_creator_points([level_value], identity) == {
+        "resolved": False,
+        "state": "providers_unavailable",
+        "creator_points": None,
+    }
+    accepted = select_creator_points([level_value, profile_value], identity)
+    assert accepted["creator_points"] == 6
+    assert accepted["source"] == "gdbrowser_api"
+
+
+def test_trusted_profile_cache_beats_level_scoped_zero_without_renewing_its_source():
+    identity = {"username": "amusablemonk78", "account_id": 13434788, "player_id": 128276989}
+    cached = observation(
+        "cache",
+        6,
+        method="creator_current",
+        account_id=13434788,
+        username="amusablemonk78",
+        observed_at=100,
+    )
+    cached.update(
+        {
+            "cached_source": "gdbrowser_html",
+            "cached_confidence": "verified_single_source",
+        }
+    )
+    level_value = observation(
+        "gdrateplus",
+        0,
+        method="level",
+        account_id=13434788,
+        username="amusablemonk78",
+        observed_at=200,
+    )
+
+    accepted = select_creator_points([level_value, cached], identity)
+    assert accepted["creator_points"] == 6
+    assert accepted["source"] == "gdbrowser_html"
+    assert accepted["confidence"] == "verified_single_source"
+
+
 def test_creator_points_config_defaults_are_valid_and_include_daily_backoff():
     settings = creator_points_settings(Config(str(ROOT / "config.json")).data)
     assert settings.enabled is True
@@ -245,6 +307,134 @@ async def test_level_singleflight_deduplicates_concurrent_resolution(tmp_path, m
         )
         assert calls == 1
         assert len(results) == 5
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_gdrateplus_identity_can_fall_back_to_gdbrowser_profile_api(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "profile-api-fallback.db"))
+    await db.connect()
+    try:
+        resolver = PrioritySystemService(make_bot(db)).creator_points
+        cog = SimpleNamespace(_get_level_validation_session=lambda: None)
+
+        async def get_session():
+            return object()
+
+        cog._get_level_validation_session = get_session
+        resolver.bot.get_cog = lambda name: cog if name == "RequestLevelsCog" else None
+
+        async def gdbrowser_level_failed(_session, _cog, _level_id, *, force=False):
+            return [
+                {
+                    "provider": "gdbrowser",
+                    "method": "html_level",
+                    "username": None,
+                    "account_id": None,
+                    "player_id": None,
+                    "creator_points": None,
+                    "observed_at": int(time.time()),
+                    "success": False,
+                    "error_category": "identity_mismatch",
+                }
+            ]
+
+        async def level_identity(_cog, _session, provider, _level_id):
+            if provider == "gdrateplus":
+                return [
+                    observation(
+                        "gdrateplus",
+                        0,
+                        method="level",
+                        account_id=13434788,
+                        username="amusablemonk78",
+                    )
+                ]
+            return [
+                {
+                    "provider": provider,
+                    "method": "level",
+                    "username": None,
+                    "account_id": None,
+                    "player_id": None,
+                    "creator_points": None,
+                    "observed_at": int(time.time()),
+                    "success": False,
+                    "error_category": "provider_unavailable",
+                }
+            ]
+
+        api_calls = 0
+
+        async def profile_api(_session, _cog, identity):
+            nonlocal api_calls
+            api_calls += 1
+            assert identity["account_id"] == 13434788
+            return observation(
+                "gdbrowser",
+                6,
+                method="api_profile",
+                account_id=13434788,
+                username="amusablemonk78",
+                observed_at=int(time.time()),
+            )
+
+        monkeypatch.setattr(resolver, "_gdbrowser_observations", gdbrowser_level_failed)
+        monkeypatch.setattr(resolver, "_validation_observations", level_identity)
+        monkeypatch.setattr(resolver, "_gdbrowser_api_profile", profile_api)
+
+        result = await resolver._resolve_level("148134343", force=True)
+
+        assert api_calls == 1
+        assert result["identity"]["account_id"] == 13434788
+        assert result["accepted"]["creator_points"] == 6
+        assert result["accepted"]["source"] == "gdbrowser_api"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_level_derived_creator_cache_is_ignored(tmp_path):
+    db = Database(str(tmp_path / "legacy-level-cache.db"))
+    await db.connect()
+    try:
+        resolver = PrioritySystemService(make_bot(db)).creator_points
+        now = int(time.time())
+        await db.execute(
+            "INSERT INTO creator_points_current(creator_key,username,account_id,player_id,creator_points,source,confidence,"
+            "observed_at,provider_timestamp,response_fingerprint,expires_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "account:13434788",
+                "amusablemonk78",
+                13434788,
+                128276989,
+                0,
+                "gdrateplus",
+                "verified_single_source",
+                now,
+                None,
+                "legacy-level-value",
+                now + 3600,
+                now,
+            ),
+        )
+        identity = {
+            "username": "amusablemonk78",
+            "account_id": 13434788,
+            "player_id": 128276989,
+            "creator_key": "account:13434788",
+        }
+
+        assert await resolver._cached_creator(identity) is None
+
+        await db.execute(
+            "UPDATE creator_points_current SET creator_points=6,source='gdbrowser_api' WHERE creator_key=?",
+            ("account:13434788",),
+        )
+        cached = await resolver._cached_creator(identity)
+        assert cached and cached["creator_points"] == 6
+        assert cached["cached_source"] == "gdbrowser_api"
     finally:
         await db.close()
 
@@ -448,6 +638,50 @@ async def test_bootstrap_repairs_false_priority_and_enqueues_active_pending_rows
         assert row["priority_complete"] == 0
         assert row["creator_points_status"] == "pending"
         assert job and job["state"] == "pending"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_invalidates_legacy_level_derived_cp_resolution(tmp_path):
+    db = Database(str(tmp_path / "bootstrap-level-cp.db"))
+    await db.connect()
+    try:
+        resolver = PrioritySystemService(make_bot(db)).creator_points
+        queue_id = await insert_pending(
+            db, level_id="148134343", message_id=35, send_type="feature"
+        )
+        await db.execute(
+            "UPDATE level_outreach_queue SET uploader_name='amusablemonk78',uploader_account_id=13434788,"
+            "current_creator_points=0,current_creator_points_checked_ts=100,creator_points_at_recommendation=0,"
+            "creator_points_checked_ts=100,creator_points_source='gdrateplus',creator_points_confidence='verified_single_source',"
+            "creator_component_g=3.2,priority_points=4.2,priority_complete=1,creator_points_status='resolved' WHERE id=?",
+            (queue_id,),
+        )
+        await resolver.enqueue(queue_id)
+        await db.execute(
+            "UPDATE creator_points_resolution_jobs SET state='resolved',attempt_count=4,next_attempt_ts=? WHERE queue_id=?",
+            (int(time.time()) + 3600, queue_id),
+        )
+
+        assert await resolver.bootstrap(GUILD_ID) == 1
+
+        row = await db.fetchone(
+            "SELECT * FROM level_outreach_queue WHERE id=?", (queue_id,)
+        )
+        assert row["current_creator_points"] is None
+        assert row["creator_points_at_recommendation"] is None
+        assert row["creator_points_source"] is None
+        assert row["creator_component_g"] is None
+        assert row["priority_points"] is None
+        assert row["priority_complete"] == 0
+        assert row["creator_points_status"] == "pending"
+        job = await db.fetchone(
+            "SELECT * FROM creator_points_resolution_jobs WHERE queue_id=?", (queue_id,)
+        )
+        assert job["state"] == "pending"
+        assert job["attempt_count"] == 0
+        assert int(job["next_attempt_ts"]) <= int(time.time())
     finally:
         await db.close()
 
